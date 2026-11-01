@@ -920,7 +920,7 @@ pub fn warm_worktree(repo: &Path, worktree: &Path, folders: &[String]) -> bool {
 #[cfg(any(target_os = "linux", test))]
 fn linux_clone_command(source: &Path, destination: &Path) -> Command {
     let mut command = Command::new("cp");
-    command.args(["-R", "--reflink=always"]).arg(source).arg(destination);
+    command.args(["-a", "--reflink=always"]).arg(source).arg(destination);
     command
 }
 
@@ -946,7 +946,8 @@ fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()
         let source = CString::new(source.as_os_str().as_bytes())?;
         let destination = CString::new(destination.as_os_str().as_bytes())?;
         // SAFETY: both paths are valid, NUL-terminated strings, live for this call.
-        // clonefile has no full-copy fallback; errors fail this cache folder open.
+        // clonefile preserves file timestamps and has no full-copy fallback;
+        // errors fail this cache folder open.
         if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
             Ok(())
         } else {
@@ -1623,12 +1624,36 @@ pub(crate) mod tests {
         assert_eq!(
             args,
             [
-                std::ffi::OsStr::new("-R"),
+                std::ffi::OsStr::new("-a"),
                 std::ffi::OsStr::new("--reflink=always"),
                 source.as_os_str(),
                 destination.as_os_str()
             ]
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_clone_preserves_file_modification_time() {
+        let dir = match std::env::var_os("ATOMICS_COW_TEST_DIR") {
+            Some(parent) => crate::test_support::tempdir_in(parent).unwrap(),
+            None => crate::test_support::tempdir().unwrap(),
+        };
+        let source = dir.path().join("source");
+        let destination = dir.path().join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let file = source.join("dependency");
+        std::fs::write(&file, "cached dependency").unwrap();
+        // An old, fractional timestamp catches copies that reset mtime, without sleeps.
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 123_456_789);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(modified).unwrap();
+        let expected = std::fs::metadata(&file).unwrap().modified().unwrap();
+        if !probe_cache_clone(&source, dir.path()).unwrap() {
+            eprintln!("skipping timestamp check: filesystem does not support cache clones");
+            return;
+        }
+        assert!(clone_directory(&source, &destination));
+        assert_eq!(std::fs::metadata(destination.join("dependency")).unwrap().modified().unwrap(), expected);
     }
 
     #[test]
