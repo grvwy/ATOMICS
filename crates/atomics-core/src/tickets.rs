@@ -1366,6 +1366,12 @@ impl Vars {
     }
 }
 
+fn finish_url_link(mut link: TicketLink, id: Option<String>, key: Option<String>) -> Option<TicketLink> {
+    link.id = id.or_else(|| key.clone())?;
+    link.key = key;
+    Some(link)
+}
+
 fn key_number(key: &str) -> Option<&str> {
     key.rsplit('-').next().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
@@ -1504,6 +1510,57 @@ impl TicketConfig {
             link.url = Some(Vars::new(&self.system).ticket(&link).render(template)?);
         }
         Ok(link)
+    }
+
+    /// The ticket a web address names, read back from the `link_url` template: each placeholder
+    /// in it captures what the address holds there. `None` when the profile has no template, the
+    /// address does not fit it, or it holds neither an id nor a key.
+    pub fn link_from_url(&self, url: &str) -> Option<TicketLink> {
+        let template = self.link_url.as_deref()?;
+        let mut rest = url;
+        let mut template = template;
+        let link = TicketLink { system: self.system.clone(), url: Some(url.to_string()), ..Default::default() };
+        let (mut id, mut key) = (None, None);
+        loop {
+            let Some(start) = template.find('{') else {
+                return if rest == template { finish_url_link(link, id, key) } else { None };
+            };
+            let after = &template[start + 1..];
+            let name = after.find('}').map(|end| &after[..end]).filter(|name| PLACEHOLDERS.contains(name));
+            let Some(name) = name else {
+                // Not a placeholder: a literal brace, as `render` treats it.
+                let literal = &template[..start + 1];
+                rest = rest.strip_prefix(literal)?;
+                template = after;
+                continue;
+            };
+            rest = rest.strip_prefix(&template[..start])?;
+            template = &after[name.len() + 1..];
+            // A capture ends where the next literal text starts, or at the end of the address.
+            let literal_end = template.find('{').unwrap_or(template.len());
+            let next = &template[..literal_end];
+            if next.is_empty() && !template.is_empty() {
+                return None;
+            }
+            let captured = if template.is_empty() {
+                std::mem::take(&mut rest)
+            } else {
+                let at = rest.find(next)?;
+                let (head, tail) = rest.split_at(at);
+                rest = tail;
+                head
+            };
+            if captured.is_empty() {
+                return None;
+            }
+            let value = percent_decode(captured);
+            match name {
+                "id" | "uuid" => id = Some(value),
+                "key" => key = Some(value),
+                "system" if value == self.system => {}
+                _ => return None,
+            }
+        }
     }
 
     /// Whether comments by this author are posted.
@@ -2701,6 +2758,43 @@ mod tests {
             at: None,
             conversation: "conversation-1".into(),
         }
+    }
+
+    #[test]
+    fn link_url_templates_read_back_into_the_ticket_they_name() {
+        let config = |template: &str| TicketConfig {
+            system: "Example".into(),
+            link_url: Some(template.into()),
+            ..Default::default()
+        };
+        let by_key = config("https://tickets.example/browse/{key}");
+        let link = by_key.link_from_url("https://tickets.example/browse/ABC-12").unwrap();
+        assert_eq!(
+            (link.id.as_str(), link.key.as_deref(), link.system.as_str()),
+            ("ABC-12", Some("ABC-12"), "Example")
+        );
+        assert_eq!(link.url.as_deref(), Some("https://tickets.example/browse/ABC-12"));
+        for wrong in [
+            "https://tickets.example/browse/",
+            "https://tickets.example/other/ABC-12",
+            "http://tickets.example/browse/ABC-12",
+            "",
+        ] {
+            assert!(by_key.link_from_url(wrong).is_none(), "{wrong}");
+        }
+        let by_id = config("https://tickets.example/?team={system}&selected={uuid}&view=full");
+        assert!(
+            by_id
+                .link_from_url("https://tickets.example/?team=Example&selected=7f&view=full")
+                .is_some_and(|link| link.id == "7f" && link.key.is_none())
+        );
+        assert!(by_id.link_from_url("https://tickets.example/?team=Other&selected=7f&view=full").is_none());
+        assert!(by_id.link_from_url("https://tickets.example/?team=Example&selected=7f").is_none());
+        // Percent-encoding is undone; a template with nothing to read back, or no template, names nothing.
+        assert_eq!(by_key.link_from_url("https://tickets.example/browse/A%2D1").unwrap().id, "A-1");
+        assert!(config("https://tickets.example/{key_number}").link_from_url("https://tickets.example/12").is_none());
+        assert!(config("https://tickets.example/{id}{key}").link_from_url("https://tickets.example/12").is_none());
+        assert!(TicketConfig::default().link_from_url("https://tickets.example/browse/ABC-12").is_none());
     }
 
     #[test]

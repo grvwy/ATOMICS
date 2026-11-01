@@ -28,6 +28,8 @@ pub(super) enum Job {
     Read,
     Children,
     Related,
+    /// The card an `atomics://open` link names, read to draft a plan for it.
+    Link,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,9 +174,11 @@ pub(super) struct TicketsPanel {
     pub tab: Option<usize>,
     /// The filter chips switched on, by their index in `[[tickets.filters]]`.
     pub chips: std::collections::BTreeSet<usize>,
+    /// The read an `atomics://open` link waits for: its job number.
+    pub(super) open_link: Option<u64>,
     /// A ticket was opened: the panel takes the keys on the next frame.
     focus: bool,
-    seq: u64,
+    pub(super) seq: u64,
 }
 
 /// The Plan with chief dialog: the ticket, whether to plan it alone, and the user's own words.
@@ -651,7 +655,7 @@ impl State {
     /// Whether the ticket system needs a sign-in before anything is sent: the sign-in state
     /// (`SignState`, read from the keychain when not yet polled) is not signed in, or the worker
     /// said a sign-in is required.
-    fn plan_needs_sign_in(&self, config: &TicketConfig) -> bool {
+    pub(super) fn plan_needs_sign_in(&self, config: &TicketConfig) -> bool {
         use crate::ticket_signin::SignState;
         let state = match self.tickets.sign.state() {
             Some(state) => state.clone(),
@@ -786,6 +790,10 @@ impl State {
                     (Job::Related, Err((_, error))) => read.related = Part::Failed(error),
                     _ => read.error = Some("unexpected ticket result".into()),
                 }
+            }
+            Job::Link if panel.open_link == Some(seq) => {
+                panel.open_link = None;
+                self.link_card_read(result);
             }
             _ => {}
         }
@@ -3087,6 +3095,149 @@ mod tests {
         assert_eq!(super::super::board::mode_label(&plan, &auto), "auto (deciding…)");
         let forced = TicketConfig { mode: TicketMode::Board, ..auto };
         assert_eq!(super::super::board::mode_label(&Plan::default(), &forced), "board");
+    }
+
+    fn toasted(app: &Desktop<'_>) -> String {
+        app.runtime.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default()
+    }
+
+    /// Gives the profile a `link_url` and returns the address it makes for the ticket.
+    fn with_link_url(app: &mut Desktop<'_>, ticket: &TicketLink) -> String {
+        app.runtime.config.tickets.link_url = Some("https://tickets.example/?selected={id}".into());
+        app.runtime.apply_ticket_config();
+        format!("https://tickets.example/?selected={}", ticket.id)
+    }
+
+    fn open(app: &mut Desktop<'_>, ticket: &str, system: Option<&str>) -> Result<(), String> {
+        let link = crate::open_link::OpenLink {
+            ticket: Some(ticket.into()),
+            system: system.map(str::to_string),
+            ..Default::default()
+        };
+        let result = app.runtime.open_link(Ok(link));
+        settle(app);
+        result
+    }
+
+    #[test]
+    fn a_plan_link_selects_that_plan_and_unknown_ones_toast() {
+        with_app("app::tickets_panel::tests::a_plan_link_selects_that_plan_and_unknown_ones_toast", |app, _| {
+            let id = |app: &mut Desktop<'_>, goal: &str| {
+                super::super::tests::request(app, json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a"}]})).result
+                    ["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let one = id(app, "One");
+            let two = id(app, "Two");
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, two);
+            let link = |plan: &str| crate::open_link::OpenLink { plan: Some(plan.into()), ..Default::default() };
+            app.runtime.open_link(Ok(link(&one))).unwrap();
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
+            assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Diff);
+            assert!(app.runtime.open_link(Ok(link("nope"))).is_err());
+            assert!(toasted(app).contains("No open plan nope"), "{}", toasted(app));
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
+            // A bare link only focuses.
+            app.runtime.open_link(Ok(Default::default())).unwrap();
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
+            // The control socket takes the same request, and a refused link becomes a toast.
+            let reply = super::super::tests::request(app, json!({"cmd":"open_link", "plan": two}));
+            assert!(reply.ok);
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, two);
+            let reply =
+                super::super::tests::request(app, json!({"cmd":"open_link", "rejected": "no path is accepted"}));
+            assert!(!reply.ok);
+            assert!(toasted(app).contains("no path is accepted"), "{}", toasted(app));
+            let reply = super::super::tests::request(app, json!({"cmd":"open_link", "plan": "a", "ticket": "A-1"}));
+            assert!(!reply.ok);
+        });
+    }
+
+    #[test]
+    fn a_ticket_link_selects_the_plan_that_links_it() {
+        with_app("app::tickets_panel::tests::a_ticket_link_selects_the_plan_that_links_it", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            quiet_chief(app);
+            let epic = read_epic(app, dir.path());
+            app.runtime.plan_with_chief(epic.clone(), TicketMode::Board, "").unwrap();
+            let planned = app.runtime.selected_plan;
+            super::super::tests::request(app, json!({"cmd":"plan_set", "goal":"Other", "tasks":[{"id":"a"}]}));
+            assert_ne!(app.runtime.selected_plan, planned);
+            let (plans, sent) = (app.runtime.plans.len(), sent_to_chief(app).len());
+
+            // By key, and by the address the profile's link_url makes.
+            open(app, "DEMO-1", None).unwrap();
+            assert_eq!(app.runtime.selected_plan, planned);
+            super::super::tests::request(app, json!({"cmd":"plan_set", "goal":"Other again", "tasks":[{"id":"a"}]}));
+            let url = with_link_url(app, &epic);
+            open(app, &url, Some("meaning-example")).unwrap();
+            assert_eq!(app.runtime.selected_plan, planned);
+
+            assert!(app.runtime.chief_draft.is_none());
+            assert_eq!((app.runtime.plans.len(), sent_to_chief(app).len()), (plans + 1, sent));
+        });
+    }
+
+    #[test]
+    fn a_ticket_link_without_a_plan_drafts_one_for_the_chief_and_never_sends_it() {
+        with_app(
+            "app::tickets_panel::tests::a_ticket_link_without_a_plan_drafts_one_for_the_chief_and_never_sends_it",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                let epic = read_epic(app, dir.path());
+                let (plans, selected) = (app.runtime.plans.len(), app.runtime.selected_plan);
+                app.runtime.chief_open = false;
+
+                open(app, "DEMO-1", Some("MEANING-example")).unwrap();
+                let draft = format!("Plan DEMO-1: {}", epic.title.as_deref().unwrap());
+                assert_eq!(app.runtime.chief_draft.as_deref(), Some(draft.as_str()));
+                assert!(app.runtime.chief_open);
+                // Typed into the prompt for the user to send; nothing went to the chief, no plan was made.
+                assert!(sent_to_chief(app).is_empty());
+                assert_eq!((app.runtime.plans.len(), app.runtime.selected_plan), (plans, selected));
+
+                // The same through an address.
+                app.runtime.chief_draft = None;
+                let url = with_link_url(app, &epic);
+                open(app, &url, None).unwrap();
+                assert_eq!(app.runtime.chief_draft.as_deref(), Some(draft.as_str()));
+                assert!(sent_to_chief(app).is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn a_ticket_link_for_another_or_signed_out_system_asks_to_sign_in_and_does_nothing_else() {
+        with_app(
+            "app::tickets_panel::tests::a_ticket_link_for_another_or_signed_out_system_asks_to_sign_in_and_does_nothing_else",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                fake_profile(app, dir.path());
+                let before = app.runtime.plans.len();
+
+                assert!(open(app, "DEMO-1", Some("elsewhere")).is_err());
+                assert!(toasted(app).contains("Sign in to elsewhere"), "{}", toasted(app));
+                app.runtime.tickets.panel.signin = true;
+                assert!(open(app, "DEMO-1", None).is_err());
+                assert!(toasted(app).contains("Sign in to meaning-example first"), "{}", toasted(app));
+                app.runtime.tickets.panel.signin = false;
+                // Neither a foreign address nor a malformed key is looked up.
+                assert!(open(app, "https://elsewhere.example/?selected=1", None).is_err());
+                assert!(open(app, "DEMO 1/../x", None).is_err());
+
+                assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
+                assert_eq!(app.runtime.plans.len(), before);
+                app.runtime.tickets.config = None;
+                app.runtime.config.tickets = Default::default();
+                app.runtime.apply_ticket_config();
+                assert!(open(app, "DEMO-1", None).is_err());
+                assert!(toasted(app).contains("not configured"), "{}", toasted(app));
+            },
+        );
     }
 
     include!("ticket_demo.rs");

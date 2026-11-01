@@ -271,11 +271,40 @@ fn control(request: ControlRequest, channels: &Channels, ctx: &egui::Context, st
     }
 }
 
+/// Why a request did not get an answer.
+#[derive(Debug)]
+pub enum RequestError {
+    /// Nothing listens on the socket.
+    NotRunning(String),
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::NotRunning(message) => f.write_str(message),
+            RequestError::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for RequestError {
+    fn from(error: E) -> Self {
+        RequestError::Failed(error.into())
+    }
+}
+
 /// Sends one control request to a running ATOMICS (for `atomics ctl` and `atomics mcp`).
 pub fn request(request: &ControlRequest) -> Result<ControlResponse> {
-    let path = atomics_core::paths::socket_path();
-    let stream =
-        UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("ATOMICS is not running ({}: {e})", path.display()))?;
+    request_at(&atomics_core::paths::socket_path(), request).map_err(|error| match error {
+        RequestError::NotRunning(message) => anyhow::anyhow!(message),
+        RequestError::Failed(error) => error,
+    })
+}
+
+pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlResponse, RequestError> {
+    let stream = UnixStream::connect(path)
+        .map_err(|e| RequestError::NotRunning(format!("ATOMICS is not running ({}: {e})", path.display())))?;
     // A sandbox command may wait its timeout for a slot, then run for as long.
     let timeout = match request {
         ControlRequest::Exec { timeout_secs, .. } => 2 * crate::sandbox::exec::timeout(*timeout_secs).as_secs() + 120,

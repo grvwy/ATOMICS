@@ -110,3 +110,40 @@ fn installer_reaches_real_setup_from_a_fresh_home() {
     assert!(stdout.contains("sudo apt-get install libsecret-tools gnome-keyring"), "{stdout}");
     assert!(home.join(".local/bin/atomics").exists(), "installation survives interrupted setup");
 }
+
+#[test]
+fn installer_registers_the_atomics_link_scheme() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin = dir.path().join("tools");
+    let target = dir.path().join("target");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(target.join("fixture-linux-native/release")).unwrap();
+    script(&bin.join("cargo"), "#!/bin/sh\nexit 0\n");
+    script(&bin.join("rustc"), "#!/bin/sh\necho 'host: fixture-linux-native'\n");
+    script(&bin.join("xdg-mime"), "#!/bin/sh\necho \"$@\" >> \"$MIME_LOG\"\n");
+    script(&target.join("fixture-linux-native/release/atomics"), "#!/bin/sh\nexit 0\n");
+    let log = dir.path().join("mime.log");
+    let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/linux-install.sh");
+    let run = |args: &[&str]| {
+        test_support::output(
+            Command::new("sh")
+                .arg(&installer)
+                .args(args)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("CARGO_TARGET_DIR", &target)
+                .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+                .env("MIME_LOG", &log),
+        )
+    };
+    assert!(run(&[]).status.success());
+    let entry = std::fs::read_to_string(home.join("data/applications/atomics.desktop")).unwrap();
+    assert!(entry.contains("MimeType=x-scheme-handler/atomics;"), "{entry}");
+    let exec = entry.lines().find(|line| line.starts_with("Exec=")).unwrap();
+    assert!(exec.ends_with(" %u"), "{exec}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "default atomics.desktop x-scheme-handler/atomics");
+    // Uninstalling registers nothing.
+    assert!(run(&["--uninstall"]).status.success());
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+}

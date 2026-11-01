@@ -283,6 +283,13 @@ impl Terminal {
         });
     }
 
+    /// Types `text` into the program's prompt without pressing Enter.
+    pub fn draft(&self, text: &str) {
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        self.term.lock().scroll_display(Scroll::Bottom);
+        self.write(atomics_core::steer::paste_bytes(text, bracketed));
+    }
+
     /// Types editor commands: each step after a lone Escape, with pauses so the
     /// editor reads Escape as a key of its own rather than as Alt+next key.
     pub fn type_steps(&self, steps: Vec<String>, initial_delay: Duration) {
