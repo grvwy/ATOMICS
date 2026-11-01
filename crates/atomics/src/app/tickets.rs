@@ -60,6 +60,8 @@ pub(super) struct Tickets {
     /// Find and Read are independent: opening a ticket must not cancel its in-flight list page.
     panel_find_sequence: Arc<std::sync::atomic::AtomicU64>,
     panel_read_sequence: Arc<std::sync::atomic::AtomicU64>,
+    /// The ticket an `atomics://open` link reads has its own, for the same reason.
+    panel_link_sequence: Arc<std::sync::atomic::AtomicU64>,
     done_tx: crate::host::Sender<Done>,
     done_rx: Receiver<Done>,
     /// Jobs sent and not yet answered.
@@ -117,6 +119,7 @@ impl Tickets {
             jobs: None,
             panel_find_sequence: Default::default(),
             panel_read_sequence: Default::default(),
+            panel_link_sequence: Default::default(),
             done_tx,
             done_rx,
             pending: 0,
@@ -381,6 +384,7 @@ impl State {
             let current = match job {
                 Job::Find | Job::More => self.tickets.panel_find_sequence.clone(),
                 Job::Read | Job::Children | Job::Related => self.tickets.panel_read_sequence.clone(),
+                Job::Link => self.tickets.panel_link_sequence.clone(),
             };
             current.store(*seq, std::sync::atomic::Ordering::Relaxed);
             Some((current, *seq))

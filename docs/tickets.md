@@ -615,6 +615,59 @@ On a plan with a ticket the board header reads `SYSTEM board (auto)` or `SYSTEM 
 `auto (deciding…)` before one is made), and in board mode `N of M tasks tracked` beside the existing count of the
 board's tickets without a task.
 
+## Open from a link
+
+A ticket system (or anything else that can show a link) can open ATOMICS at a plan or a ticket with an
+`atomics://open` link. Relay is the example here; any system works, since ATOMICS only reads the key or address and
+the profile's `link_url`.
+
+| Link | Effect |
+| --- | --- |
+| `atomics://open` | Focuses the ATOMICS window. |
+| `atomics://open?plan=<plan id>` | Selects the open plan's tab. |
+| `atomics://open?ticket=<key or ticket URL>&system=<name>` | Selects the open plan that links the ticket; if none does, opens the chief with `Plan <KEY>: <title>` in its prompt as a draft. |
+
+Values are percent-encoded, so a ticket address goes in whole:
+`atomics://open?ticket=https%3A%2F%2Ftickets.example%2F%3Fselected%3D7f&system=relay`. `system` is optional and only
+allowed with `ticket`.
+
+How `ticket=` resolves:
+
+1. A value containing `://` must match the profile's `link_url` template: each `{key}`, `{id}` or `{uuid}` in it
+   is read back from the address. Any other value is taken as a key; one with spaces, slashes or other address characters is refused.
+2. An open plan whose ticket (or one of whose tasks' tickets) is that ticket is selected, and its board shows.
+3. Otherwise ATOMICS reads the ticket for its title, starts the chief if needed, shows it, and types
+   `Plan <KEY>: <title>` into its prompt without pressing Enter. Nothing is sent and no plan is created until you
+   send the message.
+
+If `system` differs from `[tickets] system`, or the configured system needs a sign-in, a toast asks you to sign in
+and nothing else happens. A link is refused, with a toast, if its scheme is not `atomics`, its host not `open`, it has
+a path, user, port or fragment, a parameter other than `ticket`, `system` and `plan`, a repeated or empty parameter, or
+both `plan` and `ticket`. A link never does more than open and focus.
+
+When ATOMICS is running, `atomics '<link>'` (which is what the operating system runs) forwards the link over the
+control socket (`{"cmd":"open_link",…}`) and exits; otherwise it starts ATOMICS and handles the link after loading.
+
+### Registering the scheme
+
+- **Linux:** `scripts/linux-install.sh` writes `MimeType=x-scheme-handler/atomics;` and `Exec=… %u` in
+  `atomics.desktop` and runs `xdg-mime default atomics.desktop x-scheme-handler/atomics` when `xdg-mime` exists. To
+  do it by hand: add those two lines to the desktop entry, run the `xdg-mime` command, then
+  `xdg-open 'atomics://open'` to try it.
+- **macOS:** `scripts/macos-app.sh` adds `CFBundleURLTypes` with the `atomics` scheme to `Info.plist`; the app takes
+  the link from the open-URL event. Open ATOMICS.app once after building so Launch Services learns the scheme.
+- **Windows:** the installer does not register it. For the current user, create these keys (replace the path with your
+  `atomics` build; the `%1` is the link):
+
+  ```
+  [HKEY_CURRENT_USER\Software\Classes\atomics]
+  @="URL:ATOMICS"
+  "URL Protocol"=""
+
+  [HKEY_CURRENT_USER\Software\Classes\atomics\shell\open\command]
+  @="\"C:\\path\\to\\atomics.exe\" \"%1\""
+  ```
+
 ## The trace lane
 
 Under the chief's terminal (floating or docked) a **TRACE** lane shows what the chief did with tickets, as cards, live

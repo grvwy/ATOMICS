@@ -23,6 +23,16 @@ impl State {
             }
             changed = true;
         }
+        if let Some(link) = self.pending_link.take() {
+            let _ = self.open_link(link);
+            changed = true;
+        }
+        #[cfg(target_os = "macos")]
+        for url in crate::open_link::macos::take() {
+            let _ = self.open_link(crate::open_link::parse(&url));
+            changed = true;
+        }
+        self.flush_chief_draft();
         self.refresh_integrations();
         self.serve_dispatches();
         changed |= self.poll_cleanup();

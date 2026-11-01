@@ -24,6 +24,18 @@ pub enum ControlRequest {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// An `atomics://open` link, parsed by the launching process: focus the window and show a
+    /// plan, or the plan for a ticket. `rejected` carries why a link was refused, for a toast.
+    OpenLink {
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        ticket: Option<String>,
+        #[serde(default)]
+        system: Option<String>,
+        #[serde(default)]
+        rejected: Option<String>,
+    },
     /// Starts an agent in `folder`, in a new worktree of `repo` on `branch`, or without either
     /// in a scratch folder of its own outside any project. `isolation` overrides the settings for it.
     Start {

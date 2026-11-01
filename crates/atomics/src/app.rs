@@ -49,6 +49,7 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
+mod open_link;
 mod plan_cleanup;
 mod plan_view;
 mod plans;
@@ -95,6 +96,8 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     pub screenshot_delay: f32,
     pub migration_errors: Vec<String>,
+    /// An `atomics://open` link the launch was given, handled once the app has loaded.
+    pub link: Option<crate::open_link::Incoming>,
 }
 
 pub struct Session {
@@ -576,6 +579,10 @@ pub(crate) struct State {
     watch_tx: crate::host::Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
+    /// A link the launch was given, opened on the first tick after loading.
+    pending_link: Option<crate::open_link::Incoming>,
+    /// Text for the chief's prompt that is typed but never sent, once the chief is up.
+    chief_draft: Option<String>,
     pending_open: Vec<(String, PathBuf)>,
     resume: Vec<SessionRecord>,
     restarting: bool,
@@ -785,6 +792,9 @@ impl App {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
+        // After launch, so this handler replaces the system's for links the Dock and Finder send.
+        #[cfg(target_os = "macos")]
+        crate::open_link::macos::register(&cc.egui_ctx);
         let client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
         Self { host: state.into_host(), client, replies: Vec::new() }
@@ -1006,6 +1016,8 @@ impl State {
             watch_tx,
             watch_rx,
             toast: None,
+            pending_link: options.link,
+            chief_draft: None,
             pending_open: options.open,
             resume: Vec::new(),
             restarting: false,
