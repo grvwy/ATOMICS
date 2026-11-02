@@ -47,7 +47,9 @@ impl State {
         let Some(guard) = self.sessions[index].ref_guard.clone() else { return };
         // A turn under way or just finished, or an agent too quick to show busy, may have written refs; one that sat idle cannot have.
         let session = &self.sessions[index];
-        if session.screen_busy || matches!(session.status, AgentStatus::Starting | AgentStatus::Working | AgentStatus::Exited) {
+        if session.screen_busy
+            || matches!(session.status, AgentStatus::Starting | AgentStatus::Working | AgentStatus::Exited)
+        {
             guard.mark_ran();
         }
         let (id, actions) = (self.sessions[index].id.clone(), self.action_tx.clone());
@@ -314,8 +316,8 @@ mod tests {
 
     /// A repository with a guarded sandbox worktree, a host worktree `other`, and `ahead`, a commit past
     /// `other`'s branch; the guard is open before anything moves.
-    fn guarded_with_an_ahead_branch(
-    ) -> (crate::test_support::TempDir, PathBuf, PathBuf, PathBuf, String, crate::ref_guard::Shared) {
+    fn guarded_with_an_ahead_branch()
+    -> (crate::test_support::TempDir, PathBuf, PathBuf, PathBuf, String, crate::ref_guard::Shared) {
         let (dir, repo) = repository();
         let (guarded, other) = (dir.path().join("guarded"), dir.path().join("other"));
         git::add_worktree(&repo, &guarded, "guarded", "main").unwrap();
