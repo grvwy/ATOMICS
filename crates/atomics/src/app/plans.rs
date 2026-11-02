@@ -657,6 +657,8 @@ impl State {
                 session.status = match status {
                     "done" => AgentStatus::Done,
                     "question" | "blocked" => AgentStatus::NeedsInput,
+                    // The agent is talking again, so whatever stopped it is behind it.
+                    "progress" if session.status == AgentStatus::NeedsInput => AgentStatus::Working,
                     _ => session.status,
                 };
                 if status != "progress" {
@@ -685,10 +687,14 @@ impl State {
                 summary: summary.to_string(),
                 at: atomics_core::store::now(),
             });
+            if matches!(status, "progress" | "done") {
+                task.ref_alert = None;
+            }
             if task.status != TaskStatus::Done {
                 match status {
                     "done" => task.set_status(TaskStatus::Review),
                     "blocked" | "question" => task.set_status(TaskStatus::Blocked),
+                    "progress" if task.status == TaskStatus::Blocked => task.set_status(TaskStatus::Running),
                     _ => {}
                 }
             }

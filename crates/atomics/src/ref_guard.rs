@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -511,6 +512,15 @@ impl RefGuard {
         Ok(alerts)
     }
 
+    /// Takes the refs as they are for the baseline, without restoring anything: for a session that ran
+    /// nothing since the last check, so whatever moved was not its doing.
+    fn adopt(&mut self) -> Result<()> {
+        let started = now();
+        self.refs = read_refs(&self.cwd)?;
+        self.checked = Some(started);
+        self.save()
+    }
+
     /// Takes the values ATOMICS left under `names`, ref names or prefixes, as this guard's baseline for them.
     fn accept(&mut self, names: &[String], values: &BTreeMap<String, RefValue>) -> Result<()> {
         let ours = |name: &String| names.iter().any(|pattern| covers(pattern, name));
@@ -536,6 +546,9 @@ pub struct Shared {
     pub common: PathBuf,
     pub branch: Option<String>,
     guard: Arc<Mutex<RefGuard>>,
+    /// Whether the session may have written since the last check: a sandbox that sat idle cannot
+    /// have moved a ref, so a check of it blames nobody. Starts set, for the check before its first turn.
+    ran: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -545,11 +558,28 @@ impl Shared {
         let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
         open.retain(|open| open.strong_count() > 0);
         open.push(Arc::downgrade(&guard));
-        Self { common, branch, guard }
+        Self { common, branch, guard, ran: Arc::new(AtomicBool::new(true)) }
+    }
+
+    /// Notes that the session ran, or may have: a turn began or ended, or a command ran in its sandbox.
+    pub fn mark_ran(&self) {
+        self.ran.store(true, Ordering::SeqCst);
     }
 
     /// Runs git: call it on [`Checks`]' thread.
     pub fn check(&self, exempt: &Exempt) -> Result<Vec<String>> {
+        if !self.ran.swap(false, Ordering::SeqCst) {
+            let mut guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+            return guard.adopt().map(|()| Vec::new());
+        }
+        let checked = self.check_ran(exempt);
+        if checked.is_err() {
+            self.mark_ran();
+        }
+        checked
+    }
+
+    fn check_ran(&self, exempt: &Exempt) -> Result<Vec<String>> {
         let mut concurrent = exempt.resolve(&self.common);
         let (pending, written) = host_writes(&self.common);
         concurrent.extend(pending);
@@ -766,6 +796,7 @@ mod tests {
         assert!(guard.check(&Default::default()).unwrap().is_empty());
         git::git(&repo, &["update-ref", "refs/tags/host-made", initial.trim()]).unwrap();
         drop(write);
+        guard.mark_ran();
         let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.iter().any(|a| a.contains("Restored refs/tags/untouched")), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "untouched"]).unwrap(), initial);
@@ -933,6 +964,7 @@ mod tests {
         git::git(&repo, &["add", "scratch"]).unwrap();
         git::git(&repo, &["stash", "-q"]).unwrap();
 
+        guard.mark_ran();
         let alerts = guard.check(&Exempt::default()).unwrap();
         assert_eq!(alerts.len(), 2, "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap().trim(), mine);
@@ -957,6 +989,7 @@ mod tests {
         let write = host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);
         git::git(&repo, &["fetch", "-q", "--no-write-fetch-head", "origin"]).unwrap();
         drop(write);
+        guard.mark_ran();
         assert!(guard.check(&Exempt::default()).unwrap().is_empty());
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
         git::git(
@@ -969,6 +1002,7 @@ mod tests {
             &["fetch", "-q", "--no-write-fetch-head", &origin.display().to_string(), "+main:refs/remotes/origin/main"],
         )
         .unwrap();
+        guard.mark_ran();
         let alerts = guard.check(&Exempt::default()).unwrap();
         assert!(alerts.len() == 1 && alerts[0].contains("Restored refs/remotes/origin/main"), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
@@ -979,6 +1013,7 @@ mod tests {
         std::fs::write(repo.join("scratch"), "more work").unwrap();
         git::git(&repo, &["add", "scratch"]).unwrap();
         git::git(&repo, &["stash", "-q"]).unwrap();
+        guard.mark_ran();
         let alerts = guard.check(&Exempt::default()).unwrap();
         assert!(alerts.len() == 1 && alerts[0].contains("Restored refs/heads/later"), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "later"]).unwrap().trim(), mine);

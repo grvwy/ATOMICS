@@ -45,6 +45,13 @@ impl State {
 
     fn queue_ref_check(&self, index: usize, exempt: Exempt) {
         let Some(guard) = self.sessions[index].ref_guard.clone() else { return };
+        // A turn under way or just finished, or an agent too quick to show busy, may have written refs; one that sat idle cannot have.
+        let session = &self.sessions[index];
+        if session.screen_busy
+            || matches!(session.status, AgentStatus::Starting | AgentStatus::Working | AgentStatus::Exited)
+        {
+            guard.mark_ran();
+        }
         let (id, actions) = (self.sessions[index].id.clone(), self.action_tx.clone());
         self.ref_checks.run(move || {
             let alerts =
@@ -305,5 +312,69 @@ mod tests {
                 app.runtime.sessions.clear();
             },
         );
+    }
+
+    /// A repository with a guarded sandbox worktree, a host worktree `other`, and `ahead`, a commit past
+    /// `other`'s branch; the guard is open before anything moves.
+    fn guarded_with_an_ahead_branch()
+    -> (crate::test_support::TempDir, PathBuf, PathBuf, PathBuf, String, crate::ref_guard::Shared) {
+        let (dir, repo) = repository();
+        let (guarded, other) = (dir.path().join("guarded"), dir.path().join("other"));
+        git::add_worktree(&repo, &guarded, "guarded", "main").unwrap();
+        git::add_worktree(&repo, &other, "other", "main").unwrap();
+        let ahead = git::git(&repo, &["commit-tree", "main^{tree}", "-p", "main", "-m", "ahead"]).unwrap();
+        let ahead = ahead.trim().to_string();
+        git::git(&repo, &["branch", "ahead", &ahead]).unwrap();
+        let guard = crate::ref_guard::RefGuard::open(&guarded, dir.path().join("snapshot.json")).unwrap().unwrap();
+        (dir, repo, guarded, other, ahead, crate::ref_guard::Shared::new(guard))
+    }
+
+    #[test]
+    fn a_host_side_fast_forward_of_another_worktrees_branch_is_left_alone() {
+        let (_dir, repo, _guarded, other, ahead, shared) = guarded_with_an_ahead_branch();
+        git::git(&other, &["merge", "--ff-only", "ahead"]).unwrap();
+        shared.mark_ran();
+        let alerts = shared.check(&Default::default()).unwrap();
+        assert!(alerts.is_empty(), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap().trim(), ahead);
+        let quarantined = git::git(&repo, &["for-each-ref", "refs/atomics/quarantine/"]).unwrap();
+        assert!(quarantined.trim().is_empty(), "{quarantined}");
+    }
+
+    #[test]
+    fn a_sandboxs_own_illegal_ref_write_is_still_restored_but_an_idle_one_is_not_blamed() {
+        let (_dir, repo, guarded, _other, ahead, shared) = guarded_with_an_ahead_branch();
+        let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
+        shared.mark_ran();
+        git::git(&guarded, &["update-ref", "refs/heads/other", &ahead]).unwrap();
+        let alerts = shared.check(&Default::default()).unwrap();
+        assert!(alerts.iter().any(|alert| alert.contains("Restored refs/heads/other")), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original);
+
+        // Nothing ran since that check, so a ref that moved meanwhile was not the sandbox's doing.
+        git::git(&repo, &["update-ref", "refs/heads/other", &ahead]).unwrap();
+        let alerts = shared.check(&Default::default()).unwrap();
+        assert!(alerts.is_empty(), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap().trim(), ahead);
+    }
+
+    #[test]
+    fn a_progress_report_clears_the_ref_alert_and_the_blocked_task() {
+        with_app("app::ref_guard::tests::a_progress_report_clears_the_ref_alert_and_the_blocked_task", |app, _| {
+            let (dir, _repo) = repository();
+            app.runtime.sessions = vec![session("s", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
+            let task = Task { id: "t".into(), session: Some("s".into()), ..Default::default() };
+            app.runtime.plans = vec![Plan { id: "p".into(), tasks: vec![task], ..Default::default() }];
+            for status in ["progress", "done"] {
+                app.runtime.ref_alert("s", "moved".into());
+                assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
+                assert!(app.runtime.plans[0].tasks[0].ref_alert.is_some());
+                app.runtime.report(Some("s"), status, "carrying on");
+                let task = &app.runtime.plans[0].tasks[0];
+                assert!(task.ref_alert.is_none(), "{status}");
+                assert_ne!(task.status, TaskStatus::Blocked, "{status}");
+            }
+            app.runtime.sessions.clear();
+        });
     }
 }

@@ -692,6 +692,9 @@ impl State {
     /// after a turn. A sandbox it started for an agent that has gone stops again.
     pub(super) fn exec_finished(&mut self, id: &str, sandbox: String) {
         if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+            if let Some(guard) = &self.sessions[index].ref_guard {
+                guard.mark_ran();
+            }
             self.check_refs(index);
         }
         let attached = self.sessions.iter().any(|s| {
