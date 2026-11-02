@@ -1,0 +1,93 @@
+{
+  description = "ATOMICS desktop application and NixOS module";
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "aarch64-linux" "x86_64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+      vm = self.nixosConfigurations.atomics-vm;
+      # The VM with the example .NET and Azure DevOps stack turned on, so the example keeps building.
+      vmWithExample = vm.extendModules {
+        modules = [ { atomics.examples.dotnetAzure.enable = true; } ];
+      };
+    in
+    {
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        {
+          atomics = pkgs.callPackage ./nix/atomics.nix { };
+          atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
+          default = self.packages.${system}.atomics;
+        } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
+          atomics-vm-image = vm.config.system.build.image;
+          # The Mac side of the VM: wrappers, socket forward, lima.yaml and config snippet.
+          atomics-vm-mac = vm.config.programs.atomics.macDesktop.bundle;
+        });
+
+      checks = forAllSystems (system:
+        let
+          onboardTest = args: nixpkgs.legacyPackages.${system}.callPackage ./nix/vm/onboard-test.nix ({
+            atomics-onboard = self.packages.${system}.atomics-onboard;
+          } // args);
+        in
+        {
+          atomics = self.packages.${system}.atomics;
+          atomics-onboard = onboardTest { };
+          atomics-onboard-dotnet-azure = onboardTest {
+            name = "atomics-onboard-dotnet-azure-test";
+            script = ./nix/examples/dotnet-azure/onboard-test.sh;
+            args = [ "${./nix/examples/dotnet-azure/onboard.sh}" ];
+          };
+        } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
+          atomics-vm = vm.config.system.build.toplevel;
+          atomics-vm-dotnet-azure = vmWithExample.config.system.build.toplevel;
+          atomics-vm-mac = import ./nix/tests/mac-desktop.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vm.config;
+          };
+        });
+
+      nixosModules.atomics = import ./nix/modules/atomics.nix { inherit self; };
+
+      # Settings (atomics.vm.user, macUser, cpus, memoryGiB, diskGiB, onboardSteps, checks, and
+      # atomics.examples.dotnetAzure.enable) are set with extendModules; see docs/nixos-vm.md.
+      nixosConfigurations.atomics-vm = nixpkgs.lib.nixosSystem {
+        system = "aarch64-linux";
+        modules = [
+          self.nixosModules.atomics
+          ./nix/atomics-vm.nix
+          ./nix/examples/dotnet-azure.nix
+        ];
+      };
+
+      nixosConfigurations.atomics-test = nixpkgs.lib.nixosSystem {
+        system = "aarch64-linux";
+        modules = [
+          self.nixosModules.atomics
+          ({ lib, ... }: {
+            boot.loader.grub.enable = false;
+            fileSystems."/" = {
+              device = "/dev/null";
+              fsType = "ext4";
+            };
+            networking.hostName = "atomics-test";
+            system.stateVersion = "25.11";
+            users.users.atomics-test = {
+              isNormalUser = true;
+              home = "/home/atomics-test";
+            };
+            programs.atomics.enable = true;
+            programs.atomics.user = "atomics-test";
+            programs.atomics.settings = {
+              base_ref = "main";
+              layout.diff_split = "auto";
+            };
+          })
+        ];
+      };
+    };
+}
