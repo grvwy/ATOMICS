@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 renderer=${1:?wgpu or glow}; extra=${2:-}
 features=$renderer${extra:+,$extra}
-env -u CARGO_MAKEFLAGS cargo build --release --target wasm32-unknown-unknown --no-default-features --features "$features" -j 2
+env -u CARGO_MAKEFLAGS cargo build --release --target wasm32-unknown-unknown --no-default-features --features "$features" -j "${JOBS:-2}"
 raw=${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/atomics_wasm_spike.wasm
 out=target/out-$renderer${extra:+-$extra}
 rm -rf "$out"

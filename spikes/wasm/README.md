@@ -4,12 +4,14 @@ Standalone crate, outside the ATOMICS workspace. Answers: bundle size per render
 iOS soft-keyboard question (egui text agent vs hidden `<textarea>`).
 
 **Status:** all four variants build for wasm32 (rustc 1.99.0, eframe 0.37.0, wasm-bindgen 0.2.130, binaryen 133, snow 0.10.0).
+The lock now pins wasm-bindgen 0.2.129 (js-sys/web-sys 0.3.106) to match the CLI on the test machine; the sizes
+below were measured with 0.2.130.
 Nothing has been run in a browser yet: the page and the `snow` handshake are unverified at runtime. The phone
 test page (below) is pending its device run.
 
-## Build (toolchain 1.99.0, `-j 2`)
+## Build (toolchain 1.99.0, `-j ${JOBS:-2}`)
 
-Needs the wasm32 target, `cargo install wasm-bindgen-cli --version 0.2.130 --locked` (same version as the
+Needs the wasm32 target, `cargo install wasm-bindgen-cli --version 0.2.129 --locked` (same version as the
 `wasm-bindgen` in `Cargo.lock`), and optionally `wasm-opt` (binaryen) and `brotli`. `.cargo/config.toml` sets the
 `getrandom_backend="wasm_js"` cfg that `snow` needs.
 
