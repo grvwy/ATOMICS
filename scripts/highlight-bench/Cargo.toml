@@ -3,7 +3,7 @@ name = "highlight-bench"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Measures syntect's regex engines (onig vs fancy-regex) for the wasm highlighter choice, RELAY-11973 C1a"
+description = "Measures syntect's regex engines (onig vs fancy-regex) for the wasm highlighter choice (embedded ATOMICS, task C1a)"
 
 # Not a member of the ATOMICS workspace: it exists to be built on its own with each engine.
 [workspace]

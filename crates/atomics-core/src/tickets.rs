@@ -3255,8 +3255,8 @@ mod tests {
     #[test]
     fn tickets_configured_mention_escaping_inserts_word_joiner_after_every_at() {
         let config = TicketConfig { escape_mentions: true, ..Default::default() };
-        let text = "@max-agent email@example.com @@a @ @\u{2060}already";
-        let expected = "@\u{2060}max-agent email@\u{2060}example.com @\u{2060}@\u{2060}a @\u{2060} @\u{2060}already";
+        let text = "@alice-agent email@example.com @@a @ @\u{2060}already";
+        let expected = "@\u{2060}alice-agent email@\u{2060}example.com @\u{2060}@\u{2060}a @\u{2060} @\u{2060}already";
         assert_eq!(config.comment_body(text), expected);
         assert_eq!(config.comment_body(expected), expected);
         let short = TicketConfig { max_comment_chars: 20, ..config };

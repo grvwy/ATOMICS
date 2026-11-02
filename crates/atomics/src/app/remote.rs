@@ -1141,7 +1141,7 @@ mod tests {
                 app.runtime.sessions[0].chief = true;
                 mirror_event(
                     app,
-                    json!({"hook_event_name":"UserPromptSubmit", "prompt":"[From Max, a verified steering human, via example conversation on DEMO-1, message 2.]\nstatus?"}),
+                    json!({"hook_event_name":"UserPromptSubmit", "prompt":"[From Alice, a verified steering human, via example conversation on DEMO-1, message 2.]\nstatus?"}),
                 );
                 settle(app, 1);
                 assert_eq!(fake(&path)["posts"].as_array().unwrap().len(), count, "no worker mirror or steering echo");

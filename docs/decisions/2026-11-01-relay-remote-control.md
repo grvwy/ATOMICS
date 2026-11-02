@@ -1,20 +1,20 @@
-# Decision: Relay as ATOMICS's remote control (RELAY-11972, design d2)
+# Decision: Relay as ATOMICS's remote control (design d2)
 
-Status: proposed d2 (2026-11-01), waiting for Max's approval. d2 revises d1 (`1747bdc`) after the host review
-(`docs/decisions/2026-11-01-relay-remote-control-review.md`, `bbeb9d8`) and the chief's fixed decisions. The
-review records how each finding was resolved. No code changed; nothing was built or run.
+Status: proposed d2 (2026-11-01), waiting for the user's approval. d2 revises d1 (`1747bdc`) after the host
+review (`docs/decisions/2026-11-01-relay-remote-control-review.md`, `bbeb9d8`) and the chief's fixed decisions.
+The review records how each finding was resolved. No code changed; nothing was built or run.
 
 Sources:
 
-- RELAY-11972 and its comments, read live on 2026-11-01: Max's scope addition (seq 8731) and the chief's
-  decisions (seq 8753).
+- The remote-control ticket and its comments, read live on 2026-11-01: the user's scope addition and the
+  chief's decisions.
 - Code, read only, after `git fetch`, at the heads the review read:
   - foundation-template `origin/main` `44128b5e` (the kernel, **FT**);
   - relay-backend `089e68c8d` (**RB**);
   - relay-spatial `279e8d8`, `next/` (Flat, **RS**).
 - Also platform-gitops `origin/main` (**GO**) and relay-frontend `origin/main` (**RF**, the porting source for push).
-- ATOMICS at this commit, plus RELAY-11955 a1 (`674d72e`, on `atomics/plan-relay-11955-a1-and-a2-atomics-ticket-wri`,
-  not yet in main).
+- ATOMICS at this commit, plus the ticket-writes plan's a1 (`674d72e`, on
+  `atomics/plan-<ticket>-a1-and-a2-atomics-ticket-wri`, not yet in main).
 
 **Who owns which Relay code.** RB's `kernel.ownership.json` hands `src/Services/TicketService/**` to Relay
 ("handover"), so the ticket MCP tools, the GitHub linker and the ticket readability provider are Relay's. It
@@ -24,8 +24,8 @@ the generic agent MCP tools are therefore the kernel's.
 
 ## The idea
 
-ATOMICS's chief signs in to Relay as an agent. Any agent works; in Max's setup it is **Max Claude**, a product
-agent with no owner. ATOMICS opens a **ticket-linked conversation** on the plan's ticket and names the humans
+ATOMICS's chief signs in to Relay as an agent. Any agent works; in the user's setup it is the **product agent**,
+which has no owner. ATOMICS opens a **ticket-linked conversation** on the plan's ticket and names the humans
 who may steer it. That conversation is the remote:
 - the chief's turns and tool cards appear in it;
 - its steering humans read it on a phone or iPad in the Relay PWA, and their replies reach the chief as the
@@ -40,8 +40,8 @@ generic: profile operations, a local steering list, a pure verdict function and 
 
 Five rules decide the rest:
 
-1. **Outbound only.** ATOMICS calls Relay's MCP endpoint. Nothing connects to the ATOMICS host; RELAY-11973's
-   tunnel is not needed.
+1. **Outbound only.** ATOMICS calls Relay's MCP endpoint. Nothing connects to the ATOMICS host; the
+   embedded-ATOMICS work's tunnel is not needed.
 2. **Two identities.** The connection identity is any agent. Steering and approval rights come only from a
    configured list of **human** user ids. The list defaults to whoami's `ownerUserId` when the connection is a
    personal agent, and is set explicitly otherwise. Comments or messages by any agent never steer.
@@ -63,7 +63,7 @@ that moves still does nothing.
 
 | Capability | Status | Where | Use in d2 |
 | --- | --- | --- | --- |
-| Caller identity | exists (RB #748) | RB `TicketService.Integration/TicketMcpTools.cs:64-69`; `TicketIntegrationOperations.cs:1570-1595` (`kind` = `human` / `personalAgent` / `agent`, `ownerUserId`, `ownerDisplayName`) | Default steering list for personal agents. Max Claude reports `kind:"agent"` and no owner, by design. |
+| Caller identity | exists (RB #748) | RB `TicketService.Integration/TicketMcpTools.cs:64-69`; `TicketIntegrationOperations.cs:1570-1595` (`kind` = `human` / `personalAgent` / `agent`, `ownerUserId`, `ownerDisplayName`) | Default steering list for personal agents. The product agent reports `kind:"agent"` and no owner, by design. |
 | Comment author and kind | exists | FT `Kernel.SharedLogic/Messaging/AddObjectCommentCommandConsumer.cs:68-73` (author = acting user); kind joined from the author's current row, `ObjectCommentQueries.cs:92`; values `Human` / `Agent` / `System` (`Foundation.Kernel.Abstractions/UserIdentity.cs:6-11`) | Main comments stay data. The casing differs from whoami's (M2). |
 | Comment writes over MCP | exists | RB `TicketMcpTools.cs:149-168` (`add_ticket_comment`, no mentions parameter); alias parse and agent-writer refusal `TicketIntegrationOperations.cs:516-572`; parser `KernelService.Contracts/Models/AgentMentionResolution.cs:29-59` | a1 maps it for lifecycle comments; ATOMICS escapes `@` (§3.9). |
 | Mention pushes | browser comments only, with text | FT `KernelService.Service/Consumers/ObjectCommentSubmittedEventConsumer.cs:136-157,172-174`; `WebPush/WebPushSender.cs:37-42` (title ≤ 140, body ≤ 300 characters) | Not used (§5.1.5). |
@@ -142,9 +142,9 @@ comes only from the conversation, and state approval is gone.
 7. **G-A7** Mention escaping on lifecycle comments.
 
 d1's G-A8 (stages) is covered by Relay's linker once branches match and the repositories are connected;
-`record_stage` stays with RELAY-11955 A5. d1's G-A9 (attention) became conversation activity.
+`record_stage` stays with the ticket-writes plan's A5. d1's G-A9 (attention) became conversation activity.
 
-### 2.5 Operator (Max)
+### 2.5 Operator
 
 - Connect `xmagit/ATOMICS` and `atomisk-ai/relay-spatial` to Relay's GitHub app.
 - Set the profile's branch template and steering list.
@@ -242,14 +242,14 @@ only in the profile. The section follows the same workspace precedence as the re
 The doctor:
 - **errors** when `owners` contains whoami's `id`, or when whoami's kind equals `human_kind`. A human
   connection would write its own mirror as a human.
-- **turns remote off, and says why,** when `owners` is empty and whoami has no owner, as for Max Claude:
+- **turns remote off, and says why,** when `owners` is empty and whoami has no owner, as for the product agent:
   "set `[tickets.remote] owners`".
 - **turns remote off, and says why,** when `conversation_read` doesn't map `author_id` and `author_kind`.
 
 No setting turns the kind check off.
 
-The sign-in chip names both identities, for example "relay · Max Claude (agent) · steering: Max Falk", or
-"relay · Max Falk's agent · steering: Max Falk (owner)". The steering names come from `conversation_steerers`.
+The sign-in chip names both identities, for example "relay · Product Agent (agent) · steering: Alice", or
+"relay · Alice's agent · steering: Alice (owner)". The steering names come from `conversation_steerers`.
 
 ### 3.3 Sidecar state and the outbox
 
@@ -305,7 +305,7 @@ and 5 on the server too (§4.2); the local check is defence in depth, and covers
    stripped, is cut at 4000 characters with "(cut; the full message is in the conversation)", and names its
    source:
    ```
-   [From Max Falk, a verified steering human, via the relay conversation on RELAY-11972, message 41.]
+   [From Alice, a verified steering human, via the relay conversation on DEMO-1, message 41.]
    status?
    ```
    If no chief runs, `send_to_chief` starts one with this text as its first prompt (`app/chief.rs:136-153`).
@@ -341,7 +341,7 @@ and the Plan events since the latest Approval event list the tasks. Flat reads i
 
 **Approve.** A verified steering human's message whose first line is `/approve <digest>` is handled like this:
 - current digest, plan not approved: call `approve_plan(index)` (`app/plans.rs:267`), the board button's path,
-  which emits the same `plan` event. Acknowledge, post "Approved by Max Falk from the conversation; the chief is
+  which emits the same `plan` event. Acknowledge, post "Approved by Alice from the conversation; the chief is
   dispatching", and set activity `working`;
 - stale digest: post "This plan changed; the new digest is …", followed by a fresh request;
 - already approved: post "Already approved".
@@ -392,14 +392,14 @@ Only the chief session is mirrored.
 Relay links PRs, CI runs and deployments by the head branch `prefix/number-slug` (`GitHubWebhook.cs:46-56,
 517-521`). ATOMICS already supports a branch template (`tickets.rs:597-622`). In ticket mode the integration
 branch uses it, and task branches append `-<task id>` (`app/plans.rs:388-408,497-515`; `docs/tickets.md:311-321`).
-So Max's profile sets:
+So the user's profile sets:
 
 ```toml
 [tickets]
 branch = "relay/{key_number}-{slug}"
 ```
 
-That gives `relay/11972-relay-as-atomics-s-remote-control` and `relay/11972-…-x1`:
+That gives `relay/<number>-relay-as-atomics-s-remote-control` and `relay/<number>-…-x1`:
 - `short_slug` (`plan.rs:644-649`) already produces the regex's slug form;
 - task ids must be letters and digits; the chief's `t1` and `x1` qualify;
 - in board mode, each task branch uses its own task ticket's number;
@@ -414,18 +414,18 @@ a1's lifecycle comments (dispatch notes and reports) stay on the main timeline, 
 
 A new generic setting, `[tickets] escape_mentions = true`, inserts U+2060 WORD JOINER after each `@` in bodies
 ATOMICS posts. Relay's alias parser needs an ASCII letter or digit right after `@`
-(`AgentMentionResolution.cs:36-48`), so an agent report that says `@max-agent` neither starts Relay work nor
+(`AgentMentionResolution.cs:36-48`), so an agent report that says `@alice-agent` neither starts Relay work nor
 trips the agent-writer refusal (`TicketIntegrationOperations.cs:567-572`). The Relay profile sets it.
 
 ---
 
 ## 4. Security model
 
-### 4.1 Identities (Max's rule)
+### 4.1 Identities
 
-ATOMICS's chief may connect as any agent. In Max's setup that is **Max Claude**, a product agent with
-sysadmin-like permissions and no owner. **Max Falk's agent** is a separate OAuth personal agent. Steering and
-approval rights come only from a configured list of human user ids. The list defaults to whoami's
+ATOMICS's chief may connect as any agent. In the user's setup that is the **product agent**, which has
+sysadmin-like permissions and no owner. **The user's personal agent** is separate: an OAuth personal agent.
+Steering and approval rights come only from a configured list of human user ids. The list defaults to whoami's
 `ownerUserId` for personal agents, and is set explicitly otherwise. Comments or messages by any agent never
 steer.
 
@@ -465,7 +465,7 @@ it. ManageAgents on the node grants nothing for this kind, and operational sessi
 ### 4.4 Power limits (M4, Q7)
 
 Steering is broader than approval. A delivered message is the user's words, and the chief acts on it with its
-full local permissions; its Relay connection (Max Claude) is broad too. So:
+full local permissions; its Relay connection (the product agent) is broad too. So:
 - **These stay confirmed at the desk:** merges, releases and product deploys, cluster mutations, secrets and
   deletions. The chief's prompt rule (§3.6) requires a local confirmation when a remote message asks for one.
   ATOMICS's own confirmations (merge dialogs, permission approvals) are unchanged and can't be answered
@@ -498,7 +498,7 @@ full local permissions; its Relay connection (Max Claude) is broad too. So:
 A conversation is one `AgentWorkRequestRecord` with a new source kind, `ItemConversation`:
 - `AgentUserId` is the calling agent;
 - `SourceEntityType` and `SourceEntityId` are the item (`ticket` and its id);
-- `SourceReference` is the item's URL from its presentation provider, for example `/tickets/11972?xtl=1.2.3`;
+- `SourceReference` is the item's URL from its presentation provider, for example `/tickets/<number>?xtl=1.2.3`;
 - `DisplayTitle` is the title;
 - `RequestingUserId` is the first steering human. The record needs one, but authorization never relies on it
   for this kind;
@@ -706,7 +706,7 @@ Tickets at ≤ 760 px wide:
   links as PR, CI, merge and deploy rows (`:993`);
 - the composer stays above the keyboard (`visualViewport`), with safe-area insets.
 
-Light mode is already forced on phones (RELAY-11786).
+Light mode is already forced on phones.
 
 #### 5.3.6 Deep links
 
@@ -726,7 +726,7 @@ bell.
 | Ticket readability in the integration host | relay-backend | `TicketService.Integration` module registration |
 | CI failed and deployed notices | relay-backend | `TicketService.Service/Consumers/UpsertTicketDevelopmentStatusCommandConsumer.cs` |
 | PWA, subscription, phone layouts, Conversation, Approve, the Relay-side doc | relay-spatial | `next/web/*`, `next/crates/relay-flat/*`, `relay-model`, `relay-api`, `deploy/Caddyfile`, `next/docs/` |
-| Webhook repositories | platform-gitops (Max) | `inventory/products.json:493-501` |
+| Webhook repositories | platform-gitops (the operator) | `inventory/products.json:493-501` |
 | Profile operations, remote, mirror, approval | ATOMICS | `crates/atomics-core/src/tickets.rs`, `crates/atomics/src/app/*` |
 
 ---
@@ -739,30 +739,31 @@ Shared rules:
   in CI (L4).
 - **Kernel.** R1 runs under an ATOM delivery ticket, on an `atom/<number>-<slug>` branch. After it merges,
   dispatch `release-kernel` on foundation-template main; adoption reaches relay-backend as the bot's PR.
-  Product deploys are Max's.
+  Product deploys are the operator's.
 - **ATOMICS.** No Relay names in code. The fake ticket server gains each new operation in all three dialects.
   Docs land with the code. Run focused tests while working, and the full suite once at the end through
   `atomics queue --class test -- cargo test --workspace` (L3), with `CARGO_BUILD_JOBS=2`.
 - **.NET.** Test runs go through `atomics queue --class test -- dotnet test …`.
 - At most two build-heavy tasks run at once.
-- **Tickets.** Create each task's ticket when it is dispatched: RELAY sub-tickets of RELAY-11972, and R1's ATOM
-  ticket. Assign them to Max Claude. Branches follow `prefix/number-slug`, so Relay links them.
+- **Tickets.** Create each task's ticket when it is dispatched: sub-tickets of the remote-control ticket, and a
+  kernel delivery ticket for R1. Assign them to the product agent. Branches follow `prefix/number-slug`, so
+  Relay links them.
 
 Waves:
 
 | Wave | Tasks | Gate |
 | --- | --- | --- |
-| 1 | X1, R1 | Max approves d2. X1 also needs a1 merged to main. |
+| 1 | X1, R1 | The user approves d2. X1 also needs a1 merged to main. |
 | 2 | X2, R3 | X2 needs X1. R3 starts with the PWA and phone layouts, and takes R1's API once R1 merges. |
 | 3 | X3, R2 | X3 needs X2. R2 needs R1 released and adopted. |
 | 4 | X4 | X2. It runs after X3 because both touch `app/remote.rs`. |
-| 5 | X5 | Everything deployed (Max's product deploys), and O1 done. |
+| 5 | X5 | Everything deployed (the operator's product deploys), and O1 done. |
 
-O1, Max's operator steps, can happen at any time before wave 5.
+O1, the operator's steps, can happen at any time before wave 5.
 
 ### X1 — whoami, comment identity, typed placeholders, sidecar outbox, mention escaping (codex)
 
-Repo: ATOMICS, branched from main after a1 merges. Depends on: RELAY-11955 a1 merged to main.
+Repo: ATOMICS, branched from main after a1 merges. Depends on: the ticket-writes plan's a1 merged to main.
 
 Files:
 - `crates/atomics-core/src/tickets.rs`, `crates/atomics/src/tickets.rs`, `crates/atomics/src/app/tickets.rs`;
@@ -799,13 +800,13 @@ Pass means:
 - a sidecar round-trips, and an old plan without one loads;
 - `plan_json` contains no remote fields;
 - an outbox write retried after a dropped reply sends the same nonce, and the fake server stores one write;
-- `@max-agent` in a posted body arrives as `@⁠max-agent`;
+- `@alice-agent` in a posted body arrives as `@⁠alice-agent`;
 - the Relay example parses and passes doctor against the fake server.
 
 ### R1 — Kernel: item conversations, MCP tools, notifications, MCP rate limit (claude)
 
 Repo: foundation-template. ATOM ticket "Item conversations: a ticket-linked agent conversation with named
-steering humans, over MCP"; branch `atom/<number>-item-conversations`. Depends on: Max's approval of d2.
+steering humans, over MCP"; branch `atom/<number>-item-conversations`. Depends on: the user's approval of d2.
 
 Files:
 - `src/BuildingBlocks/Foundation.Contracts/AgentWorkRequestedEvent.cs` (the kind `ItemConversation`), plus the
@@ -1040,11 +1041,11 @@ link opens the tab.
 
 ### X5 — End to end on devices, and docs (claude)
 
-Repo: ATOMICS (docs), with Relay deployed. Depends on: X1–X4, R1–R3 deployed by Max, and O1 done.
+Repo: ATOMICS (docs), with Relay deployed. Depends on: X1–X4, R1–R3 deployed by the operator, and O1 done.
 
 Steps:
-1. Configure Max's profile: the Relay operations, `[tickets.remote] owners = ["<Max Falk's user id>"]`, and
-   `branch = "relay/{key_number}-{slug}"`, signed in as Max Claude.
+1. Configure the user's profile: the Relay operations, `[tickets.remote] owners = ["<the user's id>"]`, and
+   `branch = "relay/{key_number}-{slug}"`, signed in as the product agent.
 2. On an iPhone, with Relay installed to the Home Screen, then on Android Chrome:
    1. turn notifications on;
    2. receive a push when a plan needs approval;
@@ -1059,13 +1060,13 @@ Steps:
 Acceptance: the device checklist in the task report, with screenshots, and
 `atomics queue --class test -- cargo test --workspace` once.
 
-### O1 — Operator steps (Max)
+### O1 — Operator steps
 
 1. Install Relay's GitHub app for `xmagit/ATOMICS` on the `xmagit` account, and for `atomisk-ai/relay-spatial`
    if the existing installation doesn't cover it.
 2. Merge a platform-gitops PR that adds both repositories to `IntegrationWeb__GitHubWebhooks__Repositories`
    (`inventory/products.json:493-501`), and roll it out.
-3. In Max's ATOMICS profile, set `[tickets] branch = "relay/{key_number}-{slug}"` and `[tickets.remote] owners`.
+3. In the user's ATOMICS profile, set `[tickets] branch = "relay/{key_number}-{slug}"` and `[tickets.remote] owners`.
 
 | Task | Repo | Agent | Depends on | Build-heavy | Wave |
 | --- | --- | --- | --- | --- | --- |
@@ -1077,13 +1078,13 @@ Acceptance: the device checklist in the task report, with screenshots, and
 | R2 ticket readability in the integration host, notices | relay-backend | codex | R1 released and adopted | yes (Relay CI) | 3 |
 | X4 mirror and activity | ATOMICS | codex | X2, after X3 | yes | 4 |
 | X5 devices and docs | ATOMICS | claude | all deployed, O1 | once | 5 |
-| O1 GitHub app, webhook repositories, profile | operator (Max) | — | — | no | any |
+| O1 GitHub app, webhook repositories, profile | operator | — | — | no | any |
 
 Relay CI runs: three PRs (R1, R2, R3), one per repository, plus the kernel adoption PR.
 
 ---
 
-## 7. Open questions for Max
+## 7. Open questions for the user
 
 1. **Offline shell.** The ticket lists an offline shell under PWA polish. Flat removed its caching worker on
    purpose ("requests go to the current deployment", `next/web/sw.js:1-3`). d2's worker has no `fetch`

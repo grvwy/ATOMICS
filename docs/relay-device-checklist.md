@@ -1,6 +1,6 @@
 # Relay remote control: device checklist
 
-Steps for Max. Run the iPhone (installed PWA) first, then Android Chrome. Setup is in
+Steps for the user. Run the iPhone (installed PWA) first, then Android Chrome. Setup is in
 [Relay: remote control](tickets.md#relay-remote-control). Record each result as **Pass**, **Fail** or
 **Skip**, with a short note (what you saw, a screenshot name, the message text). The chief collects the
 results; reply to it with the table for each device.
@@ -9,7 +9,7 @@ results; reply to it with the table for each device.
 
 - ATOMICS runs on the desk machine with the workspace `dev.toml` (`[tickets.remote] enabled = true`), signed
   in to Relay. The sign-in chip shows `relay · <agent> (agent) · steering: <you>`.
-- Use a scratch ticket you may spam (RELAY-11985 worked on 2026-11-01). Link it to the ATOMICS ticket
+- Use a scratch ticket you may spam. Link it to the ATOMICS ticket
   panel, then **Plan with chief** so there is a plan on it.
 - On the phone, sign in to Relay as yourself (the steering human, not the agent). Notifications for the
   Relay PWA are allowed in the OS settings (iPhone: the PWA must be added to the Home Screen first).
@@ -35,7 +35,7 @@ results; reply to it with the table for each device.
 
 ## Results
 
-Filled by the chief with Max's answers.
+Filled by the chief with the user's answers.
 
 | Device | Steps | Result | Notes |
 |--------|-------|--------|-------|

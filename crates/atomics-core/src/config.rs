@@ -120,7 +120,7 @@ close_done_agents = true
 # BEGIN RELAY PROFILE
 # Relay example: OAuth, state pushes and comments; check with doctor before use.
 # # Stage keys are per project; verify them before enabling state pushes.
-# # find_tickets needs relay-backend #752 to be live; browse, accepts and paging need RELAY-11976.
+# # find_tickets must be live on the endpoint; browse, accepts and paging need its browse support.
 # [tickets]
 # system = "relay"
 # mode = "auto"

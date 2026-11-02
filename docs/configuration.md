@@ -65,7 +65,7 @@ values win, so `atomics --workspace dev` can open one conversation as the chief 
 
 ```toml
 # workspaces/<host>/dev.toml
-projects = ["~/Projects/relay-backend", "~/Projects/ATOMICS"]
+projects = ["~/Projects/backend", "~/Projects/ATOMICS"]
 
 [chief]
 cwd = "~/Projects"

@@ -1758,7 +1758,7 @@ pub(crate) mod tests {
         let path = fake_state(dir.path(), json!([{"id":id, "key":"DEMO-1", "comments":[]}]));
         let mut config = example_profile("meaning-example", &path);
         config.max_comment_chars = 240;
-        let original = format!("@max-agent @all @équipe user@example.com {}", "🦀é界".repeat(200));
+        let original = format!("@alice-agent @all @équipe user@example.com {}", "🦀é界".repeat(200));
         let task = Task { id: "a".into(), title: "@team".into(), brief: original.clone(), ..Default::default() };
         let author = Author::Agent("Test".into());
         let bodies = [
@@ -1781,7 +1781,7 @@ pub(crate) mod tests {
             assert_eq!(body.chars().count(), 240);
             assert!(body.ends_with(" … (truncated)"));
             assert!(
-                body.contains("@\u{2060}max-agent @\u{2060}all @\u{2060}équipe user@\u{2060}example.com"),
+                body.contains("@\u{2060}alice-agent @\u{2060}all @\u{2060}équipe user@\u{2060}example.com"),
                 "{body}"
             );
             assert!(!body.contains("@team"));

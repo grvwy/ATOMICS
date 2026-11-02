@@ -1,4 +1,4 @@
-# RELAY-11973 Phase 0 spike. Standalone: the empty [workspace] table keeps it out of the ATOMICS workspace.
+# Embedded ATOMICS Phase 0 spike. Standalone: the empty [workspace] table keeps it out of the ATOMICS workspace.
 [workspace]
 
 [package]

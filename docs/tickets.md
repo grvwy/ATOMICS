@@ -98,12 +98,12 @@ chief, injects live Pre/Post hooks and checks the six-task board and approval ga
 ### Relay profile
 
 Use the [Relay example](#relay-a-board-per-plan), then open Tickets (`cmd+k`), **Sign in**, consent in the
-browser, and search `link relay and atomics, personal agent sign-in`. Read **RELAY-11953**, inspect its
-children, then **Plan with chief** (`cmd+enter`) and review the trace and board. In SSH/a sandbox, open
+browser, and search `link relay and atomics, personal agent sign-in`. Read a ticket that has children, inspect
+them, then **Plan with chief** (`cmd+enter`) and review the trace and board. In SSH/a sandbox, open
 the authorization URL on your own machine and paste the final callback address back into ATOMICS.
 
-The endpoint must have OAuth and `list_ticket_children` deployed (RELAY-11952/11954); meaning search
-needs **relay-backend #752** live. Real scores, ordering, snippets and task counts vary. This profile
+The endpoint must have OAuth and `list_ticket_children` deployed; meaning search needs the backend's
+`find_tickets` live. Real scores, ordering, snippets and task counts vary. This profile
 pushes mapped states and posts lifecycle comments, using a fresh idempotency key per logical write.
 Check the project stage keys, the profile with doctor, and reads on your desktop machine before
 recording; the fake demo is the reproducible reference.
@@ -1051,8 +1051,8 @@ still need the user's confirmation in ATOMICS.
 
 ## Relay remote control
 
-Remote control on Relay was live on 2026-11-01: Max steered the chief from the Relay PWA, and a "Hello"
-on RELAY-11985 reached it. This section is the profile for it, the two identities it involves, the approval
+Remote control on Relay was live on 2026-11-01: the user steered the chief from the Relay PWA, and a "Hello"
+on a scratch ticket reached it. This section is the profile for it, the two identities it involves, the approval
 contract and the operator steps. The generic rules are in [Remote control](#remote-control); the phone
 test plan is in [relay-device-checklist.md](relay-device-checklist.md).
 
@@ -1096,8 +1096,8 @@ The full TOML for each is in the [Relay example](#relay-a-board-per-plan). Relay
 `WaitingForInput`, `WaitingForApproval`, `Failed` and `Completed`.
 
 The **branch template** is not part of remote control; it comes from the `[tickets] branch` setting of the
-same workspace profile (see [Ticket-aware branches](#ticket-aware-branches)). Max's live profile uses
-`branch = "relay/{key_number}-{slug}"`, so a review branch for RELAY-11985 is `relay/11985-…`.
+same workspace profile (see [Ticket-aware branches](#ticket-aware-branches)). A profile with
+`branch = "relay/{key_number}-{slug}"` names a review branch for ticket `PROJ-123` `relay/123-…`.
 
 ### The identities
 
@@ -1141,16 +1141,16 @@ Details, the digest definition and the exact replies are in [Remote control](#re
 This example maps Relay's reads, state pushes and comments over native OAuth. The schemas exposed
 through the connected MCP gateway were checked on 2026-11-01: `get_ticket` accepts keys and returns
 `row`, `ticket.description`, `comments` and `ticket.developmentLinks`; search and related use
-`result.tickets`; `list_ticket_children` returns `children`. A live `get_ticket 11967` confirmed the
+`result.tickets`; `list_ticket_children` returns `children`. A live `get_ticket` call confirmed the
 read shape. The commented default template contains the same example.
 
-`find_tickets` needs **relay-backend #752** to be live; a declared schema alone does not prove the
-backend is deployed. The views use `find_tickets` without `about` (`browse`): **Recent** lists by
+`find_tickets` must be live on the endpoint; a declared schema alone does not prove the backend is
+deployed. The views use `find_tickets` without `about` (`browse`): **Recent** lists by
 `updatedAtUtc`, newest first; **Being worked on** passes `status = ["active"]`, the stage category of work
 in progress; the **Mine** chip passes `assignee = "owner"`, the human the connection acts for, and meaning
 search `accepts` it and `status`. More follows `result.nextCursor` through `cursor`. Listing without
-`about`, these filters and paging need **RELAY-11976** on your endpoint. Snippets appear only when returned. Children use **RELAY-11954**'s tool and must
-be deployed on your endpoint. The profile reads the first 50 children and up to 10 search hits; it does
+`about`, these filters and paging need the backend's browse support on your endpoint. Snippets appear only when
+returned. Children use `list_ticket_children`, which must be deployed on your endpoint. The profile reads the first 50 children and up to 10 search hits; it does
 not fetch subsequent child or comment pages automatically.
 
 State pushes and comments use a caller-chosen `idempotencyKey` from `{nonce}`. Keep both the UUID
@@ -1159,7 +1159,7 @@ before calling the server. Read a key first, then link using the returned UUID a
 links keep their ID and must be relinked with the UUID. Creation remains unmapped.
 
 Stage keys are per project and case-sensitive. Live MCP `get_ticket` reads on 2026-11-01 confirmed
-`Backlog` (RELAY-11955) and `InProgress` (RELAY-11250) in the Relay project. This example maps planned
+`Backlog` and `InProgress` in the Relay project. This example maps planned
 and running only; check your project's keys before using it. Review and completion remain with the
 project's PR/deployment automation. `change_ticket_status` cannot close a terminal completed stage;
 waiting/cancelled outcomes also need a result comment, so do not add those mappings without their
@@ -1168,7 +1168,7 @@ Related matches are never treated as children.
 
 ```toml
 # Stage keys are per project; verify them before enabling state pushes.
-# find_tickets needs relay-backend #752 to be live; browse, accepts and paging need RELAY-11976.
+# find_tickets must be live on the endpoint; browse, accepts and paging need its browse support.
 [tickets]
 system = "relay"
 mode = "auto"

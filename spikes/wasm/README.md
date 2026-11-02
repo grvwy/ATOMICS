@@ -1,4 +1,4 @@
-# Phase 0 wasm spike (RELAY-11973, design §9)
+# Phase 0 wasm spike (embedded ATOMICS design §9)
 
 Standalone crate, outside the ATOMICS workspace. Answers: bundle size per renderer, `snow` on wasm32, and the
 iOS soft-keyboard question (egui text agent vs hidden `<textarea>`).

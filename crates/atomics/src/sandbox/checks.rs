@@ -821,7 +821,7 @@ mod tests {
         .unwrap();
         assert_eq!(misfiled_text(&unknown.misfiled), "2 misfiled secrets in scope <unrecognised scope>, anthropic");
 
-        // Doctor, against the fake sbx: Max's token-as-name in a scope named anthropic.
+        // Doctor, against the fake sbx: a user's token-as-name in a scope named anthropic.
         let dir = fixture();
         let dir = dir.path();
         std::fs::write(dir.join("misfiled-scoped"), "").unwrap();

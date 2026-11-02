@@ -744,7 +744,7 @@ mod tests {
                 .join("\n")
         };
         assert_eq!(run(), "none=Some([]) plain=Some([]) work=None");
-        // Max's daily workspace tracks its work in Linear; setup run without --workspace sees it.
+        // The user's daily workspace tracks its work in Linear; setup run without --workspace sees it.
         std::fs::write(workspaces.join("work.toml"), "projects = []\n[tickets]\nsystem = \"Linear\"\n").unwrap();
         let ran = run();
         assert!(ran.starts_with(r#"none=Some(["linear"]) plain=Some([]) work=Some(["linear"])"#), "{ran}");

@@ -1,6 +1,6 @@
-# Embedded ATOMICS through Relay (RELAY-11973)
+# Embedded ATOMICS through Relay
 
-Design round, 2026-11-02. No code. Decided by Max on 2026-11-02 ("let us go for that, behind the application
+Design round, 2026-11-02. No code. Decided by the user on 2026-11-02 ("let us go for that, behind the application
 switcher"): the full ATOMICS egui UI runs inside Relay, opened from Flat's application switcher. The ATOMICS
 host on the developer's machine dials out to Relay, which pairs it with the user's session and forwards only
 encrypted traffic. ATOMICS stays agnostic: Relay is one hosted option beside the tailnet and auth-proxy routes.
@@ -8,13 +8,13 @@ encrypted traffic. ATOMICS stays agnostic: Relay is one hosted option beside the
 Reviewed the same day (section 13). Phase 0's reads are done: every Relay-side fact below was checked against
 `origin/main`. The review corrected host authentication (5.3) and where the browser keys live (4.2, 8).
 
-**Max's decisions after the review (2026-11-02):**
+**The user's decisions after the review (2026-11-02):**
 
 1. A signed-in, paired session may **type in terminals**. ATOMICS needs a good mobile UX for it: touch, a key bar,
    a compact layout (4.4).
 2. **Live, interactive terminals are in the first release**, with the board, plans and diffs (9).
 3. **Full scope**, despite the larger estimate.
-4. **One long-lived feature branch per repo** (`relay/11973-embedded-atomics`). Nothing merges to `main` until the
+4. **One long-lived feature branch per repo** (`relay/<ticket>-embedded-atomics`). Nothing merges to `main` until the
    whole thing works without regression (10).
 
 ## 0. Sources
@@ -70,9 +70,9 @@ JSON envelopes, cursors, `ack`/`resync`, operation IDs and journaling. `daemon.m
 snapshots and deltas, and `daemon.md:147-167` covers reconnect and control leases. This design adopts that
 protocol and adds only a session layer under it (section 5).
 
-**RELAY-11972 is live and already covers the everyday phone surface** (chief conversation, steering, `/approve`):
-a polled, ticket-hosted conversation through MCP tools (`docs/tickets.md:836-985`, `988-1073`). It is not
-end-to-end private: the mirror posts the chief's prompts and answers to Relay (`tickets.md:864-866`). Embedded
+**The Relay remote control is live and already covers the everyday phone surface** (chief conversation, steering,
+`/approve`): a polled, ticket-hosted conversation through MCP tools (`docs/tickets.md:836-985`, `988-1073`). It is
+not end-to-end private: the mirror posts the chief's prompts and answers to Relay (`tickets.md:864-866`). Embedded
 ATOMICS adds what that cannot: terminals, diffs, the board, and a private channel.
 
 **ATOMICS already uses the word "relay" for something else**: the host credential relay (`crates/atomics/src/relay.rs:1-11`).
@@ -85,11 +85,11 @@ New modules therefore use "tunnel" and "rendezvous", never "relay", which also s
 | Flat | Leptos compiled to wasm with Trunk, served at `/flat/` and drawn at any address (RS `next/crates/relay-flat/index.html:16-31`, `scripts/build-flat.sh:1-12`). The whole frontend is one Caddy image built from relay-spatial (RS `Dockerfile:12`, `:47`), pushed by commit SHA (RS `.github/workflows/deploy-development.yml:34-46`) and pinned by digest in gitops |
 | Applications | `App` is `Relay`, `Remail`, `Reelay` (RS `next/crates/relay-model/src/apps.rs:17-27`); every place belongs to exactly one application (`apps.rs:8-10`, `:29-36`). An application is a set of Flat places, so ATOMICS cannot be an `App` without owning places |
 | Switcher | `Switcher` in RS `next/crates/relay-flat/src/chrome.rs:57-103`: one `menuitemradio` per application the user `opens` (`chrome.rs:82-89`, `relay-model/src/access.rs:110-113`), then tenants and branches on a phone (`chrome.rs:90-99`) |
-| RELAY-11985 | **Not on `origin/main`.** It is local commit `2306872` on `atomics/plan-relay-11985-open-atomics-from-relay-atom`, with no remote branch and no PR. It adds a plain `menuitem` after the applications, **desktop only** (`<Show when=!relay.phone>`), a first-use dialog, and `atomics://open?ticket=<key>&system=relay`. The ATOMICS `atomics://` handler is also unmerged (branch `…-A1-atomics-atomics-scheme-and-open-handler`). That item is the extension point (section 4.5) |
+| Open ATOMICS from Relay | **Not on `origin/main`.** It is local commit `2306872` on `atomics/plan-<ticket>-open-atomics-from-relay-atom`, with no remote branch and no PR. It adds a plain `menuitem` after the applications, **desktop only** (`<Show when=!relay.phone>`), a first-use dialog, and `atomics://open?ticket=<key>&system=relay`. The ATOMICS `atomics://` handler is also unmerged (branch `…-A1-atomics-atomics-scheme-and-open-handler`). That item is the extension point (section 4.5) |
 | Ingress | `relay.atomisk.ai` is a Traefik `Ingress`: integration-web prefixes, `/api/v1/ai/streams` → `ai-web:8078`, everything else → `relay-spatial` (GO `environments/sven/relay/ingress.yaml:59-135`). Caddy in the frontend image then sends `/api/*`, `/mgmt/api/*`, `/hubs/*` to backend-web, `/oauth/*` and the authorization-server metadata to backend-web, and its own integration list to integration-web (RS `deploy/Caddyfile:33-48`) |
 | WebSockets | Already in production: `/hubs/` (SignalR) goes from Traefik straight to backend-web with a sticky affinity cookie (GO `environments/sven/relay/realtime-ingress.yaml:9-26`). Traefik is k3s's bundled one with no timeout overrides; the only values set are access logs, which keep failures only and drop client addresses (GO `platform/sven/traefik-config.yaml:11-37`) |
 | MCP and OAuth | `/mcp` is on `relay-integration.atomisk.ai` → integration-web (GO `ingress.yaml:219-226`; ATOMICS example `crates/atomics-core/src/config.rs:134`, `docs/tickets.md:1118`). integration-web maps it with `RequireAuthorization()` and an MCP rate limit (FT `src/Services/IntegrationService/IntegrationService.WebApi/IntegrationWebApiModule.cs:116`, `:403-405`). The kernel's OAuth authorization server is public on `relay.atomisk.ai` (RS `Caddyfile:38-43`). MCP access tokens are ES256 JWTs whose audience must be the MCP resource (FT `IntegrationMcpOAuthRegistration.cs:29-42`), and the kernel re-derives grant, subject and owner authority on every call (FT `IntegrationMcpGrantResolver.cs:15-19`). ATOMICS requests them with an RFC 8707 resource indicator (`mcp_client/oauth.rs:1-4`) |
-| Identity | ATOMICS's ticket connection signs in by OAuth as the user's **personal agent**. whoami returns `kind = "personalAgent"` when the agent's scope is personal, and `ownerUserId` from the agent record (RB `src/Services/TicketService/TicketService.Integration/TicketIntegrationOperations.cs:1574-1592`). OAuth consent in agent mode creates or reuses the agent whose `AgentOwnerUserId` is the consenting user, and refuses any other (FT `src/Services/KernelService/KernelService.Infrastructure/OAuth/OAuthConsentService.cs:271-308`). Live, 2026-11-02: `Max Falk's agent`, `kind: personalAgent`, owner Max Falk. ATOMICS documents the same (`docs/tickets.md:1040-1049`) |
+| Identity | ATOMICS's ticket connection signs in by OAuth as the user's **personal agent**. whoami returns `kind = "personalAgent"` when the agent's scope is personal, and `ownerUserId` from the agent record (RB `src/Services/TicketService/TicketService.Integration/TicketIntegrationOperations.cs:1574-1592`). OAuth consent in agent mode creates or reuses the agent whose `AgentOwnerUserId` is the consenting user, and refuses any other (FT `src/Services/KernelService/KernelService.Infrastructure/OAuth/OAuthConsentService.cs:271-308`). Live, 2026-11-02: the user's personal agent, `kind: personalAgent`, owned by the user. ATOMICS documents the same (`docs/tickets.md:1040-1049`) |
 | Kernel realtime | Two pieces, both kernel-owned. (1) SignalR hubs `/hubs/notifications` and `/hubs/collaboration` on backend-web with a Redis backplane (FT `src/BuildingBlocks/Foundation.Hosting/WebAppConfigurator.cs:213-214`, `:302-303`); product hosts may not `MapHub` (FT `tests/Foundation.Architecture.Tests/BoundaryTests.cs:2190`). (2) **AiWebHost**, a separately deployed minimal host that streams assistant turns as server-sent events (FT `src/Services/AiService/AiService.WebHost/Program.cs:7-18`, `TurnStreamEndpoint.cs:8-12`). A client is admitted by a Data Protection "stream pass" that the main web host issues for 10 minutes (FT `AiService.Streaming/AssistantTurnStreamPasses.cs:19-41`, `Foundation.Constants/FoundationConstants.cs:2252-2253`). Shared Data Protection keys and Redis come from one call (FT `Foundation.Hosting/ServiceDefaults.cs:130-159`). Neither is a duplex byte pipe |
 | Services | Product-owned: `src/Services/**`, `src/Web/**`, `deploy/**` (RB `kernel.ownership.json:55-69`); `src/Services/AiService/**` and `infrastructure/**` are kernel-owned (`:9`, `:33`). Product workloads live in `deploy/kubernetes/components/<name>/` (e.g. `workforce/workload.yaml`, `network-policy.yaml`), composed through `deploy/kubernetes/product` (RB `infrastructure/kubernetes/application/kustomization.yaml:11-14`). Images are listed in RB `product.delivery.json:14-34`; gitops pins them by digest (GO `clusters/sven/applications/generated/atomisk-relay-backend.yaml:28-41`) |
 | Session cookie | `HttpOnly`, **`SameSite=Lax`** on purpose (external OIDC returns through a cross-site navigation), 8 h sliding (FT `ServiceDefaults.cs:479-490`), host-scoped (GO `ingress.yaml:63-64`) |
@@ -136,9 +136,9 @@ uses types that already exist in the browser-safe core (`daemon.md:53-55`, spans
 
 ### 3.2 Serve it first from the running desktop app
 
-`daemon.md:306-319` makes phase 3 a separate headless host. For Relay that is the wrong first move. Max's host
-today is the desktop app, left running while Max is away; a headless host needs shutdown ownership changed
-(`daemon.md:317-319`) and an egui-free service construction (`daemon.md:308-309`), both invasive.
+`daemon.md:306-319` makes phase 3 a separate headless host. For Relay that is the wrong first move. The user's
+host today is the desktop app, left running while the user is away; a headless host needs shutdown ownership
+changed (`daemon.md:317-319`) and an egui-free service construction (`daemon.md:308-309`), both invasive.
 
 **Decision:** the protocol ships as a server thread inside the desktop process. Projections (snapshot structs built
 from plain data) are built on the runtime thread at its existing deadlines and published as immutable `Arc`
@@ -148,7 +148,7 @@ sent after it (`daemon.md:129`). The headless split (phase 3 proper) becomes mov
 without an `egui::Context`, not a redesign. Remote access is **off by default**: with no `[remote]` configuration
 there is no thread and no socket, so the desktop behaves exactly as today (a regression-gate check, 10.3).
 
-Rejected: **wait for the headless host first** (adds weeks, and the desktop is where Max's agents run).
+Rejected: **wait for the headless host first** (adds weeks, and the desktop is where the user's agents run).
 Rejected: **raw ANSI over the wire** (contradicts `daemon.md:114-115`, and the client would need a second emulator).
 
 ### 3.3 Carrier
@@ -180,8 +180,8 @@ The client is the existing egui UI compiled with eframe's web backend. Facts fro
   colours, cursor, selection), used by the desktop too, so the browser and the desktop cannot drift.
 
 Rejected: **a Flat-native (Leptos) client.** The review proposed one as a read-only stepping stone that could ship
-weeks earlier. Max put interactive terminals in the first release and nothing merges before the whole thing works,
-so a stepping stone would not reach anyone sooner and would duplicate the board, diff viewer and terminal grid.
+weeks earlier. The user put interactive terminals in the first release and nothing merges before the whole thing
+works, so a stepping stone would not reach anyone sooner and would duplicate the board, diff viewer and terminal grid.
 
 ### 4.2 Embedding and origin
 
@@ -230,13 +230,13 @@ never the session cookie.
 
 ### 4.4 Mobile UX, terminals first
 
-As Max's comment says: no new screens, a mobile UX mode (RELAY-11973, comment of 2026-10-31). Typing in terminals
+As the user's ticket comment of 2026-10-31 says: no new screens, a mobile UX mode. Typing in terminals
 from a phone is in release 1, so the terminal is the part of the mode that gets the most design:
 
 - **Mode:** chosen from viewport width and `pointer: coarse`, with a manual override. The top bar was tested at
   480/550 points (`daemon.md:292-294`).
 - **Compact layout:** one pane at a time (board, a plan, a diff, a terminal, the chief), switched from a bottom bar
-  like Flat's phone shell (RELAY-11984). A terminal fills the width.
+  like Flat's phone shell. A terminal fills the width.
 - **The grid is the desktop's.** Resizing comes only from the lease holder and viewers scale or letterbox
   (`daemon.md:139`). A phone that takes the lease does **not** resize the PTY by default, because that would rewrap
   the terminal on the desktop; it pans and zooms the canonical grid. "Fit to this screen" is an explicit action
@@ -267,18 +267,19 @@ also confirms that an iframe on a same-site dedicated origin keeps its storage i
 ### 4.5 The switcher
 
 Verified (1.2): applications are sets of Flat places and the switcher lists them as radio items
-(RS `chrome.rs:82-89`). ATOMICS owns no places, so it is not an `App`. It is the plain menu item that
-RELAY-11985 adds after the applications. That change is unmerged (local `2306872`); open question 6 asks whether
-it lands first or folds into the feature branch. Behaviour:
+(RS `chrome.rs:82-89`). ATOMICS owns no places, so it is not an `App`. It is the plain menu item that the
+open-from-Relay change adds after the applications. That change is unmerged (local `2306872`); open question 6
+asks whether it lands first or folds into the feature branch. Behaviour:
 
-- **Show it on phones.** 11985 hides it on phones because `atomics://` means nothing there; with embedded
-  ATOMICS the phone is the main target.
-- No paired host: the item opens the pairing page; on desktop "Open the ATOMICS app" (`atomics://open…`, as 11985
-  builds it) stays as the second action. That keeps the fallback the task requires.
+- **Show it on phones.** The open-from-Relay change hides it on phones because `atomics://` means nothing
+  there; with embedded ATOMICS the phone is the main target.
+- No paired host: the item opens the pairing page; on desktop "Open the ATOMICS app" (`atomics://open…`, as that
+  change builds it) stays as the second action. That keeps the fallback the task requires.
 - One paired host: open it. Several: a host picker.
 - Gate it with an access rule like the applications' (`access.rs:110-113`), so a tenant without the feature does
   not see it.
-- 11972's "Open in ATOMICS" button (Max's comment of 2026-10-31) deep-links to `/atomics?host=<id>&view=chief`.
+- The remote control's "Open in ATOMICS" button (the user's comment of 2026-10-31) deep-links to
+  `/atomics?host=<id>&view=chief`.
 
 ## 5. Tunnel (decision 3)
 
@@ -297,7 +298,7 @@ frames are untrusted hints: a forged `joined` yields a failed handshake, nothing
 
 ### 5.2 Which service owns the broker
 
-Open question 4 asks Max to confirm; the recommendation follows from the verified ownership rules.
+Open question 4 asks the user to confirm; the recommendation follows from the verified ownership rules.
 
 | Option | Verdict |
 | --- | --- |
@@ -329,15 +330,15 @@ restart visible as a short freeze and a reconnect; leases fence any input sent a
 
 ### 5.3 Host authentication: the personal agent registers, the device key proves (corrected)
 
-**The draft's premise was wrong.** It rejected the OAuth identity because "Max's connection is a product agent with
-no owner". That came from the RELAY-11972 review's Q1 (`docs/decisions/2026-11-01-relay-remote-control-review.md:76`),
-which assumed ATOMICS signs in as Max Claude. It does not. ATOMICS's ticket connection signs in by OAuth as the
-user's personal agent: whoami returns `kind = "personalAgent"` and `ownerUserId` = the human (RB
-`TicketIntegrationOperations.cs:1574-1592`; live on 2026-11-02 as "Max Falk's agent", owner Max Falk). The kernel
-creates that agent only for the consenting user (FT `OAuthConsentService.cs:271-308`). ATOMICS documents this setup
-(`docs/tickets.md:1040-1049`) and already relies on it: the default steering list is whoami's owner
-(`tickets.md:843-848`). So the OAuth connection is exactly the binding the tunnel needs: a credential the human
-consented to, whose agent names that human.
+**The draft's premise was wrong.** It rejected the OAuth identity because "the user's connection is a product agent
+with no owner". That came from the remote-control review's Q1
+(`docs/decisions/2026-11-01-relay-remote-control-review.md:76`), which assumed ATOMICS signs in as a product agent.
+It does not. ATOMICS's ticket connection signs in by OAuth as the user's personal agent: whoami returns
+`kind = "personalAgent"` and `ownerUserId` = the human (RB `TicketIntegrationOperations.cs:1574-1592`; live on
+2026-11-02 as the user's personal agent, owned by the user). The kernel creates that agent only for the consenting
+user (FT `OAuthConsentService.cs:271-308`). ATOMICS documents this setup (`docs/tickets.md:1040-1049`) and already
+relies on it: the default steering list is whoami's owner (`tickets.md:843-848`). So the OAuth connection is exactly
+the binding the tunnel needs: a credential the human consented to, whose agent names that human.
 
 What OAuth cannot do alone: the access token's audience is the MCP resource (FT
 `IntegrationMcpOAuthRegistration.cs:29-42`), so a broker that accepted it would be accepting a token issued for
@@ -385,7 +386,7 @@ proved). **A long-lived bearer pasted into the host** (theft is silent and it br
   ticket are the cross-site defences, not the cookie.
 - **Signed in means signed in:** the broker re-checks the Relay session behind each channel every 60 s and on
   sign-out, and closes the channel when it has ended (8 h sliding, `ServiceDefaults.cs:489-490`). Typing therefore
-  needs a live Relay session as well as a paired device (Max's decision 1).
+  needs a live Relay session as well as a paired device (the user's decision 1).
 - Presence: `GET /api/v1/atomics/hosts` lists the user's hosts with name, online state, protocol major and last seen
   (plaintext, user-chosen display name).
 - **Several hosts per user:** a table `(user, host_id, name, signing_pub, noise_pub, created, revoked)`; limit 5 hosts
@@ -429,8 +430,8 @@ completes or expires. On iOS the pairing happens inside the installed PWA (4.4).
 
 **Both screens show a six-digit code** derived from the Noise handshake hash, and the desktop asks "Pair 'iPhone
 Safari'? Codes match?". A link that leaked, or a script that read the fragment and raced the phone, produces a
-different code, so a device cannot be added silently. A paired device may type (Max's decision 1); the prompt also
-offers "view only" for a device that should not.
+different code, so a device cannot be added silently. A paired device may type (the user's decision 1); the prompt
+also offers "view only" for a device that should not.
 
 ### 6.2 Handshake and transport
 
@@ -499,8 +500,8 @@ reveals nothing", not "a fully compromised Relay cannot read anything". Mitigati
   pairs two WebSockets and checks a pass works. Relay's broker is one implementation.
 - **No Relay names in ATOMICS code.** Config is `[remote.rendezvous] url = ...` plus the operations; UI strings say
   "your account's rendezvous service" unless a profile supplies a label. A test greps the new modules for `relay` /
-  `Relay`, the same discipline the 11972 work held. The Relay example profile in `atomics-core/src/config.rs` may
-  gain the URL and operations as commented examples, nothing else.
+  `Relay`, the same discipline the remote-control work held. The Relay example profile in
+  `atomics-core/src/config.rs` may gain the URL and operations as commented examples, nothing else.
 - The bundle is an ATOMICS release artifact with no Relay content (4.3); Relay hosts it like any other server could.
 - The **desktop `atomics://` fallback** stays (section 4.5).
 
@@ -539,10 +540,10 @@ Not defended: a compromised ATOMICS host, and malware on the developer machine.
 
 ## 9. Phases: one release, three streams
 
-Max's decisions make release 1 the whole product: board, plans, diffs, approvals and steering, and live interactive
-terminals, with pairing, the broker and the switcher entry. All work happens on the feature branches (section 10);
-the milestones below are internal and each has a gate on the branch. Efforts are agent-days of focused work,
-excluding review wait.
+The user's decisions make release 1 the whole product: board, plans, diffs, approvals and steering, and live
+interactive terminals, with pairing, the broker and the switcher entry. All work happens on the feature branches
+(section 10); the milestones below are internal and each has a gate on the branch. Efforts are agent-days of focused
+work, excluding review wait.
 
 **Not in release 1** (Phase F, later): the container profile, signed-bundle verification in the
 loader (release 1 has hash pinning), non-extractable browser keys, short-code pairing, the device-code fallback for
@@ -613,8 +614,8 @@ Starts on day one, in parallel with H1, against an in-process `Backend` first.
 ### Totals
 
 About 75-90 agent-days in all (H 30, C 30-40, R 13-16, Phase 0 and M6 about 7), which is the draft's 14-18
-weeks that Max accepted. Running H, C and R in parallel, the calendar is set by stream C: about 8-11 weeks to M5,
-then about a week for the regression gate and the merges, plus review wait.
+weeks that the user accepted. Running H, C and R in parallel, the calendar is set by stream C: about 8-11 weeks to
+M5, then about a week for the regression gate and the merges, plus review wait.
 
 ## 10. Branching and the regression gate (decision 8)
 
@@ -622,10 +623,10 @@ then about a week for the regression gate and the merges, plus review wait.
 
 | Repo | Feature branch | Notes |
 | --- | --- | --- |
-| ATOMICS | `relay/11973-embedded-atomics` | Every 11973 plan's integration branch is this branch, never `main` |
-| relay-spatial | `relay/11973-embedded-atomics` | Takes or replaces RELAY-11985's unmerged switcher item (open question 6) |
-| relay-backend | `relay/11973-embedded-atomics` | Product code only (5.2, 5.3) |
-| platform-gitops | `relay/11973-embedded-atomics` | Ingress, image pin and dedicated origin; merged last, because gitops `main` is what the cluster runs |
+| ATOMICS | `relay/<ticket>-embedded-atomics` | Every plan's integration branch for this ticket is this branch, never `main` |
+| relay-spatial | `relay/<ticket>-embedded-atomics` | Takes or replaces the open-from-Relay change's unmerged switcher item (open question 6) |
+| relay-backend | `relay/<ticket>-embedded-atomics` | Product code only (5.2, 5.3) |
+| platform-gitops | `relay/<ticket>-embedded-atomics` | Ingress, image pin and dedicated origin; merged last, because gitops `main` is what the cluster runs |
 | foundation-template | none expected | The design needs no kernel change. If one appears, it follows the kernel's own rule: an ATOM delivery ticket and an `atom/<n>-…` branch, held unmerged like the rest, then a kernel release and the kernel-upgrade PR into relay-backend's feature branch |
 
 Sub-tickets get short work branches cut from the feature branch, with reviewed PRs **into the feature branch**; CI
@@ -648,7 +649,7 @@ and long browser or visual suites run locally, not in CI. Fixes for other ticket
 - **After each merge** the feature branch's CI must be green before new work lands on it, so a break is always
   traceable to one merge.
 - **Dogfooding:** the branch build runs with an isolated `ATOMICS_HOME`, `ATOMICS_SOCKET` and `ATOMICS_CONFIG`
-  (`daemon.md:285-287`), never against the instance Max works in (`daemon.md:236`).
+  (`daemon.md:285-287`), never against the instance the user works in (`daemon.md:236`).
 
 ### 10.3 The regression gate before the final merge
 
@@ -657,25 +658,25 @@ a failure goes back to the branch, never to `main`.
 
 | Repo | Gate |
 | --- | --- |
-| ATOMICS | Full test suite, including the production-thread gates in `app::host_tests` and the terminal regressions (`daemon.md:270-283`); the browser-core platform test (`platform_tests.rs:14-24`) and the web crate's wasm32 build and dependency test; the no-Relay-names test; clippy. **With remote off (no `[remote]` config) the desktop opens no socket and starts no thread**, and the queued native QA (`daemon.md:285-287`) passes. With one remote client attached, runtime deadlines and frame times on the desktop are no worse than on `main` (measured). 11972's remote control still works (the operator steps, `docs/tickets.md:1060-1071`, and `docs/relay-device-checklist.md`) |
-| relay-backend | Full CI, including the architecture tests and the `kernel.lock` verification; the MCP catalogue differs from `main` only by the added tools; existing ticket tools, whoami and the 11972 conversation tools behave as before |
-| relay-spatial | Quick checks (`scripts/check-fast.sh`), the wasm checks; locally: Flat on a phone (RELAY-11984), PWA install and push, the ATOMICS Conversation and Approve (RELAY-11979), the switcher on desktop and phone |
+| ATOMICS | Full test suite, including the production-thread gates in `app::host_tests` and the terminal regressions (`daemon.md:270-283`); the browser-core platform test (`platform_tests.rs:14-24`) and the web crate's wasm32 build and dependency test; the no-Relay-names test; clippy. **With remote off (no `[remote]` config) the desktop opens no socket and starts no thread**, and the queued native QA (`daemon.md:285-287`) passes. With one remote client attached, runtime deadlines and frame times on the desktop are no worse than on `main` (measured). The Relay remote control still works (the operator steps, `docs/tickets.md:1060-1071`, and `docs/relay-device-checklist.md`) |
+| relay-backend | Full CI, including the architecture tests and the `kernel.lock` verification; the MCP catalogue differs from `main` only by the added tools; existing ticket tools, whoami and the remote-control conversation tools behave as before |
+| relay-spatial | Quick checks (`scripts/check-fast.sh`), the wasm checks; locally: Flat on a phone, PWA install and push, the ATOMICS Conversation and Approve, the switcher on desktop and phone |
 | platform-gitops | Its test suite (for example `tests/test_browser_integration_ingress.py`) and rendering of the changed manifests |
 | End to end, on devices | An installed iPhone PWA, an Android phone and a desktop browser: pair (QR, link, code check), board, plan, diff, approve, steer, type in a terminal, take the lease back on the desktop, revoke from each side, reconnect after a network switch, a slow client, a host restart (new epoch, reset), a broker restart |
 | Security | The M2 gate list again, on the release candidate; the Relay-sees table of 6.3 checked against the broker's database and logs |
 
 ### 10.4 The final merge, in order
 
-Each step is a PR from the feature branch to `main`, merged by Max (the SRE ruleset blocks other merges), and each
-leaves production working if the next step is delayed:
+Each step is a PR from the feature branch to `main`, merged by the operator (the SRE ruleset blocks other merges),
+and each leaves production working if the next step is delayed:
 
 1. **ATOMICS.** Inert without a `[remote]` configuration. Cut a release; it publishes the `atomics-web` artifact.
 2. **relay-backend.** The broker image and the MCP tools. Inert until routed: nothing calls the tools and no ingress
    reaches the broker.
 3. **platform-gitops.** The broker workload pin and ingress (and the dedicated origin), with the release-move PR;
-   Max deploys.
-4. **relay-spatial.** Pins the released artifact and shows the switcher item. This is the step users see; Max
-   deploys.
+   the operator deploys.
+4. **relay-spatial.** Pins the released artifact and shows the switcher item. This is the step users see; the
+   operator deploys.
 
 Rollback goes in reverse: hiding the item (the access rule or a revert of step 4) removes the feature for users at
 once; the broker can then be scaled to zero; the ATOMICS feature is off by default.
@@ -685,17 +686,17 @@ once; the broker can then be scaled to zero; the ATOMICS feature is off by defau
 Since nothing reaches `main`, device testing needs an environment that runs the branches. Recommended: the local
 stack (Relay backend, Flat and the broker from the feature branches) reached from phones over the tailnet, for
 development and M1-M5; and, for the gate's device runs, a separate preview deployment of the branch images, which
-is a cluster change and Max's decision (open question 7).
+is a cluster change and the operator's decision (open question 7).
 
 ## 11. Rejected at the top level
 
-- **Making 11972's conversation the whole of this ticket**: it already exists, and it is not private.
+- **Making the remote control's conversation the whole of this ticket**: it already exists, and it is not private.
 - **Put the terminal bytes through a Relay-side MCP tool.** Wrong transport (polled, posted as text, cleaner-applied,
   non-private).
-- **Tailnet or auth proxy only.** It remains supported, but it is not the "zero-setup" Relay route Max chose.
-- **A Flat-native client** (4.1), and **merging phases to `main` behind flags** (Max's decision 4).
+- **Tailnet or auth proxy only.** It remains supported, but it is not the "zero-setup" Relay route the user chose.
+- **A Flat-native client** (4.1), and **merging phases to `main` behind flags** (the user's decision 4).
 
-## 12. Open questions for Max
+## 12. Open questions for the user
 
 Answered on 2026-11-02 and folded in above: typing from a phone (yes), live terminals in release 1 (yes), full scope
 (yes), one feature branch per repo with nothing on `main` until it all works (yes). Remaining:
@@ -715,9 +716,9 @@ Answered on 2026-11-02 and folded in above: typing from a phone (yes), live term
 5. **Host auth.** **Recommended: both.** The personal-agent OAuth connection registers the host and fetches passes
    through two product MCP tools; the device key signs and is what phones pin. This means release 1 needs the Relay
    ticket connection on the host; the device-code fallback is deferred. Confirm?
-6. **RELAY-11985.** Its switcher item and the ATOMICS `atomics://` handler are unmerged local branches.
-   **Recommended:** merge 11985 to `main` on its own as it is (desktop only, small, independent), and let the feature
-   branch extend the item for phones. Or fold it into the feature branch so the item ships once?
+6. **The open-from-Relay change.** Its switcher item and the ATOMICS `atomics://` handler are unmerged local
+   branches. **Recommended:** merge it to `main` on its own as it is (desktop only, small, independent), and let the
+   feature branch extend the item for phones. Or fold it into the feature branch so the item ships once?
 7. **Preview environment.** May the gate's device runs use a separate preview deployment of the branch images on the
    cluster (a cluster change), or should all pre-merge testing stay on the local stack?
 8. **Where the host runs.** The first host is the desktop app. Does the headless host (Phase F) need to come earlier
@@ -726,33 +727,34 @@ Answered on 2026-11-02 and folded in above: typing from a phone (yes), live term
 
 ## 13. Review (2026-11-02)
 
-Each finding names where it is fixed in this document. Max's later decisions are noted where they change a finding.
+Each finding names where it is fixed in this document. The user's later decisions are noted where they
+change a finding.
 
 ### HIGH
 
-- **H1. Host auth rested on a factual error.** The draft said Max's connection is a product agent with no owner,
-  citing the 11972 review's Q1. ATOMICS signs in as the personal agent "Max Falk's agent" (`kind: personalAgent`,
-  `ownerUserId` = Max; RB `TicketIntegrationOperations.cs:1574-1592`, FT `OAuthConsentService.cs:271-308`,
+- **H1. Host auth rested on a factual error.** The draft said the user's connection is a product agent with no
+  owner, citing the remote-control review's Q1. ATOMICS signs in as the user's personal agent (`kind: personalAgent`,
+  `ownerUserId` = the user; RB `TicketIntegrationOperations.cs:1574-1592`, FT `OAuthConsentService.cs:271-308`,
   `docs/tickets.md:1040-1049`). The rejected option was the right binding. Re-decided as "both" in 5.3: OAuth
   proves the human through product MCP tools (no kernel change, because the token's audience is `/mcp`), and the
   device key authenticates the tunnel and is pinned by phones. The QR's claim secret is gone (6.1).
 - **H2. The UI extraction is the critical path, and the draft started it late.** It is 41,803 lines whose draw code
   is `impl State` in 37 files, a terminal painter that reads alacritty's `Term`, and a C-based `syntect` that will not
-  build for wasm32 (1.1). The review first proposed a Flat-native stepping stone. Max then put interactive terminals
-  in release 1 and kept everything off `main` until it all works, so a stepping stone would ship nothing sooner.
-  Fixed in 9: the extraction (stream C) starts on day one in parallel with the protocol, and its slicing is planned
-  around the long-lived branch (10.2).
+  build for wasm32 (1.1). The review first proposed a Flat-native stepping stone. The user then put interactive
+  terminals in release 1 and kept everything off `main` until it all works, so a stepping stone would ship nothing
+  sooner. Fixed in 9: the extraction (stream C) starts on day one in parallel with the protocol, and its slicing is
+  planned around the long-lived branch (10.2).
 - **H3. Same-origin keys meant any Flat XSS reads everything, and now types too.** The phone's Noise key and decrypted
   frames would live in Relay's origin, whose CSP allows `script-src 'unsafe-inline'` (RS `Caddyfile:68`), and the
-  key is extractable (6.2). With typing in release 1 (Max's decision 1), that would be terminal access. Recommended
-  fix: a dedicated origin in release 1 (4.2, open question 1). The cookie objection falls away because Flat passes the
-  single-use connect ticket by `postMessage`.
+  key is extractable (6.2). With typing in release 1 (the user's decision 1), that would be terminal access.
+  Recommended fix: a dedicated origin in release 1 (4.2, open question 1). The cookie objection falls away because
+  Flat passes the single-use connect ticket by `postMessage`.
 
 ### MEDIUM
 
-- **M1. The switcher entry is not merged and hides on phones.** RELAY-11985 is local commit `2306872` with no PR, and
-  shows the item only when `!relay.phone`; the ATOMICS handler is unmerged too. ATOMICS cannot be an `App`
-  (applications own places, RS `apps.rs:8-10`). Fixed in 1.2 and 4.5; open question 6.
+- **M1. The switcher entry is not merged and hides on phones.** The open-from-Relay change is local commit
+  `2306872` with no PR, and shows the item only when `!relay.phone`; the ATOMICS handler is unmerged too. ATOMICS
+  cannot be an `App` (applications own places, RS `apps.rs:8-10`). Fixed in 1.2 and 4.5; open question 6.
 - **M2. iOS pairing by QR lands in the wrong storage.** The Camera app opens Safari, whose storage is separate from
   the installed PWA, and Safari may clear an unused site's storage after 7 days. Pair inside the PWA; the scanner
   needs `camera=(self)` in both header sets (RS `Caddyfile:67`, GO `ingress.yaml:12`). Fixed in 4.4, spiked in
@@ -794,5 +796,5 @@ Each finding names where it is fixed in this document. Max's later decisions are
   section 9.
 - **N2.** The Web Push antiforgery citation lacked its path: FT `src/BuildingBlocks/Foundation.Hosting/WebPush/WebPushController.cs:38`.
   Fixed.
-- **N3.** Pronouns for Max replaced with neutral wording (3.2).
+- **N3.** Pronouns for the user replaced with neutral wording (3.2).
 - **N4.** `host.rs` line citations adjusted to the struct and `start` (`host.rs:13-42`).

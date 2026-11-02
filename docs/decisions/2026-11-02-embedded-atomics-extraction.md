@@ -1,4 +1,4 @@
-# Embedded ATOMICS: extracting the web UI (RELAY-11973 C1)
+# Embedded ATOMICS: extracting the web UI (task C1)
 
 Companion to `2026-11-02-embedded-atomics.md` (§4.1 client, §9 stream C, §10.2 slicing). Numbers below were counted on
 this branch with `grep` and `wc`, not by a build. Line counts are approximate (test modules are mixed into the files).

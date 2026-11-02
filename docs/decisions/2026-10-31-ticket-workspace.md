@@ -1,4 +1,4 @@
-# Decision: the ticket workspace (RELAY-11967, task d1)
+# Decision: the ticket workspace (task d1)
 
 Status: implemented through T7 (2026-11-01); focused demo and ticket acceptance checks are recorded in
 T7's report. The final review owns the full suite. macOS/Windows manual sign-in remains a release check.
@@ -6,8 +6,8 @@ The resolved choices and current example-profile caveats below supersede the ori
 
 Sources checked for this design:
 
-- RELAY-11967, RELAY-11953 (the epic), RELAY-11952 and RELAY-11954, read live through Relay's MCP tools on
-  2026-10-31. `find_tickets`, `find_related_tickets`, `get_ticket` and `get_ticket_by_id` were all called.
+- This design's ticket, its epic, and the epic's OAuth and children tickets, read live through Relay's MCP tools
+  on 2026-10-31. `find_tickets`, `find_related_tickets`, `get_ticket` and `get_ticket_by_id` were all called.
 - ATOMICS at `a66cc24`: `atomics-core/src/tickets.rs`, `atomics/src/tickets.rs`, `mcp_client.rs`,
   `connections.rs`, `credentials.rs`, `atomics-core/src/hook.rs`, `app/{editor,board,chief,sidebar,topbar,input}.rs`,
   `docs/tickets.md`, README, `examples/fake_ticket_server.rs`.
@@ -48,13 +48,13 @@ chief is docked on the right, closed to a pill until it is used. Times are targe
 | 0:00 | Press `cmd+k` (Ctrl+Shift+K on Linux/Windows). The panel shows **Tickets**: a query box, a banner "relay is not signed in" and a **Sign in** button. | Worker found no token: `AuthRequired`, shown as state, not as an error. |
 | 0:08 | Click **Sign in**. The default browser opens on Relay's consent page. The banner says "waiting for the browser…" with a Cancel. | i1's flow: discovery from the 401, DCR, PKCE, loopback redirect. |
 | 0:25 | Back in ATOMICS the banner turns into a chip: `relay · signed in`. The query box is focused. | Token stored in the OS keychain. |
-| 0:30 | Type `link relay and atomics, personal agent sign-in`, press Enter. After a second, 5 results with relevance bars; RELAY-11953 is first at 0.82. Each row: key, title, state chip, assignee, score bar, and a snippet when the server provides one. | `semantic_search` operation. |
-| 0:45 | `↓` to RELAY-11953, Enter. The panel switches to the reading view: header, markdown description with Goal / Decisions / Work / Order headings, comments, **Children (4)** and **Related (5)**. | `read`, `children` and `related` run in parallel on the worker; sections fill as each returns. |
+| 0:30 | Type `link relay and atomics, personal agent sign-in`, press Enter. After a second, 5 results with relevance bars; DEMO-1 is first at 0.82. Each row: key, title, state chip, assignee, score bar, and a snippet when the server provides one. | `semantic_search` operation. |
+| 0:45 | `↓` to DEMO-1, Enter. The panel switches to the reading view: header, markdown description with Goal / Decisions / Work / Order headings, comments, **Children (4)** and **Related (5)**. | `read`, `children` and `related` run in parallel on the worker; sections fill as each returns. |
 | 1:00 | `PageDown` steps from section to section, `PageDown` scrolls, as in the diff. The sidebar shows the same tree: epic, children, state dots. | Reading is local once loaded. |
-| 1:10 | Press **Plan with chief** (`cmd+enter`). A one-line confirm "Plan RELAY-11953 with 4 child tickets as tasks?" appears; Enter. The plan tab `RELAY-11953 · planning…` appears in the tab bar. The chief window opens. | A message is sent to the chief (section 6). An empty plan with the ticket link is created at once. |
-| 1:15 | The **trace lane** in the chief window fills, live: a spinner card "read RELAY-11953", which settles into a ticket card with its state, 4 children and 3 comments; then a "children" card listing 4 tickets; then a "related" card with 5 scored tickets. | PreToolUse starts a card; PostToolUse completes it. Results parsed through the profile. |
-| 1:35 | A **plan card**: "atomics_plan_set · 6 tasks", with titles and dependency arrows, and the link `RELAY-11953`. The tab changes to `RELAY-11953 · 0/6 · needs you`. | `atomics_plan_set` mapped to a plan card. |
-| 1:45 | Click the tab. The board shows 6 task cards, four of them with ticket chips (`RELAY-11952`, `11954`, `11955`, `11956`), and **Approve plan**. | Existing board. |
+| 1:10 | Press **Plan with chief** (`cmd+enter`). A one-line confirm "Plan DEMO-1 with 4 child tickets as tasks?" appears; Enter. The plan tab `DEMO-1 · planning…` appears in the tab bar. The chief window opens. | A message is sent to the chief (section 6). An empty plan with the ticket link is created at once. |
+| 1:15 | The **trace lane** in the chief window fills, live: a spinner card "read DEMO-1", which settles into a ticket card with its state, 4 children and 3 comments; then a "children" card listing 4 tickets; then a "related" card with 5 scored tickets. | PreToolUse starts a card; PostToolUse completes it. Results parsed through the profile. |
+| 1:35 | A **plan card**: "atomics_plan_set · 6 tasks", with titles and dependency arrows, and the link `DEMO-1`. The tab changes to `DEMO-1 · 0/6 · needs you`. | `atomics_plan_set` mapped to a plan card. |
+| 1:45 | Click the tab. The board shows 6 task cards, four of them with ticket chips (`DEMO-2` to `DEMO-5`), and **Approve plan**. | Existing board. |
 | 1:55 | Approve. Agents start; chips move to In Progress; the Relay tickets move with them. | Existing lifecycle. |
 
 Current demo caveats (updated for T7):
@@ -62,10 +62,10 @@ Current demo caveats (updated for T7):
 - The deterministic recording uses DEMO-1 with four children and four related matches, five search
   hits and a scripted six-task plan. See [the runnable Demo](../tickets.md#demo). Fake search filters
   words and returns seeded scores; production ordering and task counts vary.
-- Relay sign-in needs its OAuth deployment (RELAY-11952); children use `list_ticket_children`
-  (RELAY-11954), now declared by the connected gateway. Search needs relay-backend #752 live.
+- Relay sign-in needs its OAuth deployment; children use `list_ticket_children`, now declared by the connected
+  gateway. Search needs the backend's `find_tickets` live.
 - The current Relay example maps reads only. State/comment writes need a fresh `idempotencyKey`
-  per event (RELAY-11955 A1), so approving with that profile does not move external states or post reports.
+  per event (ticket-layer slice A1), so approving with that profile does not move external states or post reports.
 - A sandbox cannot open its host's browser. The test uses fake OAuth through the paste path; SSH users
   open the authorization URL elsewhere and paste the final callback into ATOMICS.
 
@@ -79,7 +79,7 @@ Current demo caveats (updated for T7):
 | --- | --- | --- |
 | Panel (`PanelMode`, `app.rs:321`) | `Diff`, `Editor`, `Plan` | Add `Tickets`, with two sub-views: **Find** and **Read**. Toggle key `toggle_tickets`, default `cmd+k` (`cmd+j` remains next_attention). |
 | Top bar | Brand, view tabs, chief pill, actions | A **Tickets** entry in the actions slot (and the Actions overflow menu). It shows the sign-in state as a dot. |
-| Tab bar (`view_tabs`) | All, Ungrouped, Repos, one tab per plan | Unchanged structure; a plan with a ticket shows its **key** and progress instead of a long goal: `RELAY-11953 · 2/6`. Agents stay grouped under their plan's tab as now. While the chief plans: `RELAY-11953 · planning…`. |
+| Tab bar (`view_tabs`) | All, Ungrouped, Repos, one tab per plan | Unchanged structure; a plan with a ticket shows its **key** and progress instead of a long goal: `DEMO-1 · 2/6`. Agents stay grouped under their plan's tab as now. While the chief plans: `DEMO-1 · planning…`. |
 | Sidebar | Agents, explorer | A **TICKETS** section above the agents in plan views: the plan's ticket tree (ticket, children, state dots, the task's agent status). In All view: Find row and the last 5 tickets read. Click opens Read. |
 | Board (`plan_panel`) | Header, cards with ticket chips | Plan header shows the ticket chip and, in the new auto mode, how many children have no task yet. Unchanged otherwise. |
 | Chief window (`chief_content`) | Header + terminal | A **trace lane** below the terminal, collapsible, draggable height. In the docked column cards collapse to one line each. |
@@ -149,16 +149,16 @@ The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYL
 │ [ link relay and atomics, personal agent sign-in                    ]  (•) meaning ( ) keyword│
 │ 5 tickets by meaning · include closed [ ]                                                    │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
-│▶RELAY-11953  Relay × ATOMICS: end-to-end integration and personal-agent MCP sign-in          │
-│              ▇▇▇▇▇▇▇▇▇▇ 0.82   [Backlog]   Max Claude   epic                                  │
+│▶DEMO-1       Relay × ATOMICS: end-to-end integration and personal-agent MCP sign-in          │
+│              ▇▇▇▇▇▇▇▇▇▇ 0.82   [Backlog]   Alice Claude   epic                                │
 │              …MCP sign-in should hook any client up to the user's personal agent…             │
-│ RELAY-11952  Connect any MCP client to Relay as your personal agent (browser OAuth)          │
-│              ▇▇▇▇▇▇▇▇▇░ 0.80   [Deploying] Max Claude   task                                  │
-│ RELAY-10151  Prove Discord @relay thread-to-ticket flow end to end                           │
-│              ▇▇▇▇▇▇▇▇░░ 0.77   [Backlog]   Max Agent                                          │
-│ RELAY-11967  ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan… │
-│              ▇▇▇▇▇▇▇▇░░ 0.77   [Backlog]   Max Claude                                         │
-│ RELAY-10379  Make Relay the control plane for persistent agent workforces                    │
+│ DEMO-2       Connect any MCP client to Relay as your personal agent (browser OAuth)          │
+│              ▇▇▇▇▇▇▇▇▇░ 0.80   [Deploying] Alice Claude   task                                │
+│ DEMO-7       Prove Discord @relay thread-to-ticket flow end to end                           │
+│              ▇▇▇▇▇▇▇▇░░ 0.77   [Backlog]   Alice Agent                                        │
+│ DEMO-6       ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan… │
+│              ▇▇▇▇▇▇▇▇░░ 0.77   [Backlog]   Alice Claude                                       │
+│ DEMO-8       Make Relay the control plane for persistent agent workforces                    │
 │              ▇▇▇▇▇▇▇▇░░ 0.77   [Backlog]   unassigned                                         │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Shift+↑/↓ select · Enter read · Tab meaning/keyword · Ctrl+1…9 agents                        │
@@ -169,7 +169,7 @@ The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYL
   for a good one), so a fixed 0–1 bar would look the same for every result. The bar is scaled from the lowest
   to the highest score in the set and the raw number is printed beside it. A set with one result shows a
   full bar. No threshold ("good match") is ever drawn; scores from different calls are not comparable
-  (related tickets for RELAY-11953 scored 0.85–0.90 against the same corpus).
+  (related tickets for the epic scored 0.85–0.90 against the same corpus).
 - **State chips use the system's own names** (`InReview`, `Deploying`), colored only when the profile's
   `states` map one to an ATOMICS status; unmapped states are neutral. Nothing guesses meaning from names.
 - **Assignee** is shown when the result carries one; `unassigned` is shown only for an explicit null.
@@ -181,27 +181,27 @@ The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYL
 #### The reading view
 
 ```
-┌ TICKETS ── RELAY-11953 ─────────────────────────────────  [Back Alt+←] [Open in browser] [Plan with chief ⌘↵] ┐
+┌ TICKETS ── DEMO-1 ──────────────────────────────────────  [Back Alt+←] [Open in browser] [Plan with chief ⌘↵] ┐
 │ Relay × ATOMICS: end-to-end integration and personal-agent MCP sign-in                                         │
-│ [Backlog]  epic · High · Max Claude · updated 2026-10-31 12:26 · 4 children · dev: –                           │
+│ [Backlog]  epic · High · Alice Claude · updated 2026-10-31 12:26 · 4 children · dev: –                         │
 ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ ## Goal                                                                                      ◀ section 1/9    │
 │  • ATOMICS (github.com/xmagit/ATOMICS, open source, agnostic) is our main developer workflow…                 │
 │  • Relay is the system of record.                                                                              │
-│ ## Decisions (Max, 2026-10-31)                                                                                 │
+│ ## Decisions (the user, 2026-10-31)                                                                            │
 │  • ATOMICS workers are disposable: one worktree, one task, closed on acceptance.                              │
 │  …                                                                                                             │
 │ ## Order                                                                                                       │
-│  1. RELAY-11952 as the first ticket-as-board …                                                                 │
+│  1. DEMO-2 as the first ticket-as-board …                                                                      │
 ├─ Comments (0) ─────────────────────────────────────────────────────────────────────────────────────────────────┤
 │  No comments.                                                                                                  │
 ├─ Children (4) ─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ ▸ RELAY-11952 [Deploying]  Connect any MCP client to Relay as your personal agent        Max Claude  PR ✓ CI ✓ │
-│ ▸ RELAY-11954 [Backlog]    MCP: list a ticket's children and record development stages   Max Claude           │
-│ ▸ RELAY-11955 [Backlog]    ATOMICS: generic ticket-layer support for Relay                Max Claude           │
-│ ▸ RELAY-11956 [Backlog]    Engineering department on agentboxes                           Max Claude           │
+│ ▸ DEMO-2 [Deploying]  Connect any MCP client to Relay as your personal agent           Alice Claude  PR ✓ CI ✓ │
+│ ▸ DEMO-3 [Backlog]    MCP: list a ticket's children and record development stages      Alice Claude           │
+│ ▸ DEMO-4 [Backlog]    ATOMICS: generic ticket-layer support for Relay                   Alice Claude           │
+│ ▸ DEMO-5 [Backlog]    Engineering department on agentboxes                              Alice Claude           │
 ├─ Related (5) · by meaning ─────────────────────────────────────────────────────────────────────────────────────┤
-│ ▇▇▇▇▇▇▇▇▇▇ 0.90 RELAY-11967 [Backlog] ATOMICS ticket workspace …     ▇▇▇▇▇▇▇▇▇░ 0.85 RELAY-10054 [Completed] … │
+│ ▇▇▇▇▇▇▇▇▇▇ 0.90 DEMO-6 [Backlog] ATOMICS ticket workspace …          ▇▇▇▇▇▇▇▇▇░ 0.85 DEMO-9 [Completed] …      │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -220,7 +220,7 @@ The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYL
 #### Plan with chief
 
 ```
-┌ Plan RELAY-11953 with the chief? ───────────────────────────────────────────────┐
+┌ Plan DEMO-1 with the chief? ────────────────────────────────────────────────────┐
 │ Relay × ATOMICS: end-to-end integration and personal-agent MCP sign-in           │
 │                                                                                  │
 │ 4 child tickets will become tasks (board). To plan the ticket alone, use         │
@@ -242,23 +242,23 @@ A ticket without children shows "ticket mode: one plan; progress is reported on 
 
 ```
 ┌ ◆ CHIEF AGENT ───────────────────────────────────────────────────────  [dock] [minimize] ┐
-│ ● Plan RELAY-11953 …                                                                       │
+│ ● Plan DEMO-1 …                                                                            │
 │ (terminal: the chief's own session)                                                        │
 │                                                                                            │
-├─ TRACE ─ plan RELAY-11953 ───────────────────────────────── 5 calls · 3.1 s · [clear] [▾] ┤
+├─ TRACE ─ plan DEMO-1 ────────────────────────────────────── 5 calls · 3.1 s · [clear] [▾] ┤
 │ ✓ 0.4s  search by meaning  “link relay and atomics, personal agent sign-in”     5 tickets │
-│         ▇▇▇▇▇▇▇▇▇▇ 0.82 RELAY-11953 [Backlog] Relay × ATOMICS: end-to-end integration…     │
-│         ▇▇▇▇▇▇▇▇▇░ 0.80 RELAY-11952 [Deploying] Connect any MCP client to Relay as…       │
+│         ▇▇▇▇▇▇▇▇▇▇ 0.82 DEMO-1 [Backlog] Relay × ATOMICS: end-to-end integration…          │
+│         ▇▇▇▇▇▇▇▇▇░ 0.80 DEMO-2 [Deploying] Connect any MCP client to Relay as…            │
 │         + 3 more                                                                           │
-│ ✓ 0.6s  read RELAY-11953   [Backlog] epic · Max Claude                                     │
+│ ✓ 0.6s  read DEMO-1   [Backlog] epic · Alice Claude                                        │
 │         2,914 chars · 0 comments · 4 children                           [open ↗ in panel]  │
-│ ✓ 0.5s  children of RELAY-11953                                                  4 tickets │
-│         RELAY-11952 [Deploying] · RELAY-11954 [Backlog] · RELAY-11955 · RELAY-11956        │
-│ ✓ 0.7s  related to RELAY-11953                                                   5 tickets │
+│ ✓ 0.5s  children of DEMO-1                                                       4 tickets │
+│         DEMO-2 [Deploying] · DEMO-3 [Backlog] · DEMO-4 · DEMO-5                            │
+│ ✓ 0.7s  related to DEMO-1                                                        5 tickets │
 │ ⠋ 1.2s  plan  atomics_plan_set …                                                           │
-│ ✓ 0.1s  plan RELAY-11953 · 6 tasks                                                         │
+│ ✓ 0.1s  plan DEMO-1 · 6 tasks                                                              │
 │         t1 Link OAuth profile ─┐  t2 Search ops ─┬─ t4 Panel ─ t6 Review                    │
-│         RELAY-11952 t1 · RELAY-11954 t2 · RELAY-11955 t3 · RELAY-11956 t5 · 2 untracked    │
+│         DEMO-2 t1 · DEMO-3 t2 · DEMO-4 t3 · DEMO-5 t5 · 2 untracked                        │
 │ ✗ 0.3s  mcp__other__lookup  {"q":"…"}                              error: unauthorized     │
 └────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -271,7 +271,7 @@ as in Find, so a click opens it in the Read view and a hover shows the system, l
 Cards collapse to a header line in the docked column and expand on click or `Enter`; `Shift+↓/↑` steps card by
 card when the lane is focused (same rule as above), PageUp/PageDown scroll it.
 
-The tickets panel footer shows a one-line echo of the newest card ("chief · read RELAY-11953 ✓") that opens
+The tickets panel footer shows a one-line echo of the newest card ("chief · read DEMO-1 ✓") that opens
 the chief when clicked, so the user watching the panel is not forced to open the chief window.
 
 ---
@@ -303,7 +303,7 @@ operations are named here so profiles can use them: `record_stage` (post a devel
 | Placeholder | Value | Why |
 | --- | --- | --- |
 | `{query}` | The search text, as typed, never trimmed of inner text. Substituted in one pass like the others, so a query containing `{id}` stays literal. | Search |
-| `{key_number}` | The trailing digits of the key (`RELAY-11967` → `11967`). Already exists for branch templates; promoted to a general placeholder. | Servers that accept only a bare number |
+| `{key_number}` | The trailing digits of the key (`DEMO-123` → `123`). Already exists for branch templates; promoted to a general placeholder. | Servers that accept only a bare number |
 | `{uuid}` | The link's `id` when it parses as a UUID, else unknown (the operation fails naming `{uuid}`). | Relay's `get_ticket_by_id` takes a UUID |
 
 Numeric arguments stay literal (`take = 10`), as today. The query box never builds arguments by string
@@ -361,21 +361,21 @@ behaves as **ticket** mode. The decision is stored on the plan as it is made, so
 ### 3.5 Degradation table
 
 Legend: **●** supported by the profile/server contract; **◐** conditional or unverified; **○** not mapped.
-Updated 2026-11-01: Relay read schemas are exposed by the connected gateway and `get_ticket 11967`
-was read live. Search requires relay-backend #752 deployed; a schema is not deployment verification.
+Updated 2026-11-01: Relay read schemas are exposed by the connected gateway and `get_ticket <number>`
+was read live. Search requires the backend's `find_tickets` deployed; a schema is not deployment verification.
 A live Linear `tools/list` returned HTTP 401, so its schemas and result paths remain unverified.
 
 | Feature | Operation | Relay example | Linear example (unverified) | Fake server |
 | --- | --- | --- | --- | --- |
 | Keyword search | `search` | ○ meaning only | ◐ `list_issues` with `query` | ● query-filtered |
-| Meaning search and score bars | `semantic_search`, `score` | ◐ `find_tickets {about, take, includeClosed}` → `result.tickets`; #752 needed | ○ | ● seeded scores |
+| Meaning search and score bars | `semantic_search`, `score` | ◐ `find_tickets {about, take, includeClosed}` → `result.tickets`; backend search needed | ○ | ● seeded scores |
 | Snippet | `snippet` | ◐ mapped when returned | ○ | ● |
 | Key, title, state, URL, assignee, kind | result paths | ● consistent rows; `row.*` on get/read | ◐ verify fields | ● |
 | Description and comments | `read` | ● `ticket.description`, `comments` | ◐ description only; comments need another call | ● |
-| Direct children | `children` | ◐ `list_ticket_children {ticket, take}` → `children`; endpoint needs RELAY-11954 | ◐ verify `parentId` | ● four children |
+| Direct children | `children` | ◐ `list_ticket_children {ticket, take}` → `children`; endpoint must be deployed | ◐ verify `parentId` | ● four children |
 | Related matches | `related` | ● `find_related_tickets {ticket}` → `result.tickets` | ○ | ● |
 | PR/CI links | `read.links` | ● `ticket.developmentLinks` | ○ | ● |
-| State/comment/create writes | optional writes | ○ idempotency keys required (RELAY-11955 A1) | ◐ verify `save_issue`, `save_comment` | ● fixture write dialects |
+| State/comment/create writes | optional writes | ○ idempotency keys required (ticket-layer slice A1) | ◐ verify `save_issue`, `save_comment` | ● fixture write dialects |
 | Development stage writes | `record_stage` | ○ | ○ | ○ |
 | Account identity in sign-in chip | `whoami` | ○ not mapped; shows signed in | ○ | ○ |
 | Sign-in | native OAuth or bridge | ◐ OAuth deployment required | ◐ OAuth or stdio bridge | ● fake OAuth in scripted demo; stdio interactively |
@@ -407,8 +407,8 @@ every dependent task is to read what i1 actually merged and use its names; the c
   (`/.well-known/oauth-authorization-server`, falling back to OIDC discovery for servers that only publish
   that).
 - Dynamic registration (RFC 7591) as a public client (`token_endpoint_auth_method = "none"`), with
-  `client_name` set to `ATOMICS` so a server that lists connected clients (Relay's agent page,
-  RELAY-11952) shows which machine is which. The native flow requires dynamic client registration; a server without it needs a pre-authenticated bridge.
+  `client_name` set to `ATOMICS` so a server that lists connected clients (Relay's agent page)
+  shows which machine is which. The native flow requires dynamic client registration; a server without it needs a pre-authenticated bridge.
 - Authorization code with PKCE `S256` (RFC 7636), a random `state` that is verified, and the `resource`
   parameter (RFC 8707) in **both** the authorization and token requests, with the MCP server's canonical URI
   (no trailing slash, no fragment). Sent even if the server ignores it.
@@ -435,7 +435,7 @@ Why two and not one shared token:
   process a rotating secret it could rotate under us, and a refresh-token rotation by either side would sign
   the other out.
 - Revocation stays independent. On Relay each client is one runtime of the personal agent and revoking one
-  must not stop the other (RELAY-11952's own acceptance).
+  must not stop the other (an acceptance criterion of Relay's OAuth sign-in).
 - The default flow needs no second token: agents (chief and workers) reach the ticket system through ATOMICS's
   tools, which run on this machine with ATOMICS's token. Existing docs already state this (`docs/tickets.md`,
   "Agent access").
@@ -615,7 +615,7 @@ ids): the lane draws the task graph from the call, not from the reply, so it app
 ### 6.2 The message
 
 ```
-Plan and implement ticket RELAY-11953 (system: relay), plan id <plan-id>.
+Plan and implement ticket DEMO-1 (system: relay), plan id <plan-id>.
 Title: Relay × ATOMICS: end-to-end integration and personal-agent MCP sign-in
 URL: https://relay.atomisk.ai/tickets?…
 Mode: board (the ticket has children; each child ticket becomes one task) | ticket (one plan for this ticket).
@@ -643,7 +643,7 @@ the dialog is the only free text; it is limited to 4 KB.
 | Plan link | The ticket | The ticket, acting as the board (`{board}` = its id) |
 | Tasks | Chief's own breakdown; tasks carry no tickets, or the chief creates sub-tickets with `create` | One task per child ticket by default (`tasks[].ticket`), the chief may add untracked tasks (reviews, glue) |
 | State pushes | Plan's overall status on the ticket (existing) | Each child moves with its task; the parent follows the plan's status |
-| Header | `RELAY-11967 · ticket` | `RELAY-11953 · 4 of 6 tasks tracked · sync` (children without tasks counted, as board mode does) |
+| Header | `DEMO-6 · ticket` | `DEMO-1 · 4 of 6 tasks tracked · sync` (children without tasks counted, as board mode does) |
 | Comments | On the ticket | On each child (existing) |
 
 Children map to tasks one-to-one by default, with the child's description as the task's *what* and the chief's
@@ -662,7 +662,7 @@ are not current deployment claims.
 Short ticket texts, ready to paste. Relay's MCP server is the product here: each ask removes a degradation
 in §3.5 and needs no ATOMICS code.
 
-1. **`list_children` (exists: RELAY-11954).** Add: "Return `parentTicketId`, `number`, `subject`, `status`,
+1. **`list_children` (already requested).** Add: "Return `parentTicketId`, `number`, `subject`, `status`,
    `assignee`, `updatedAtUtc`, `url` per child, direct children only, paged. Also return a `childCount` in
    `get_ticket`." *Why: ticket-as-board, the demo's children step.*
 2. **Snippets and highlights in `find_tickets` and `find_related_tickets`.** "Return `snippet` (≤ 240
@@ -676,15 +676,15 @@ in §3.5 and needs no ATOMICS code.
    `get_ticket` and `get_ticket_by_id` all return the same row: `id`, `number`, `subject`, `status`,
    `assigneeDisplayName`, `type`, `updatedAtUtc`, `url`." Today search rows have no `url`, `type` or
    `updatedAtUtc`, and `get_ticket` has `assigneeUserId` but no name.
-5. **Accept the ticket key in `get_ticket`.** "`get_ticket` takes the bare number; accept `RELAY-11967`
+5. **Accept the ticket key in `get_ticket`.** "`get_ticket` takes the bare number; accept the full key
    too." Removes the need for `{key_number}` in profiles.
 6. **Filters and paging for search.** "`find_tickets`: `project`, `status`, `assignee`, `type`, `parent`
    filters and a `cursor`. `take` is capped at 25." *Why: "my open tickets in this epic".*
-7. **`record_stage` (RELAY-11954, second half).** "Idempotent; stage key, optional URL and note; shows on
+7. **`record_stage` (already requested, with ask 1).** "Idempotent; stage key, optional URL and note; shows on
    the timeline and in `developmentLinks`." *Why: ATOMICS pushes PR opened / CI passed to the ticket, the
    loop closes in Relay.*
 8. **`whoami`.** "Return the signed-in identity (agent display name, owner, branch) for the connected
-   client." *Why: ATOMICS shows `signed in as Max Claude (personal agent)`.*
+   client." *Why: ATOMICS shows `signed in as Alice Claude (personal agent)`.*
 9. **Tool annotations.** "Mark read tools `readOnlyHint: true`, and ticket-changing tools
    `destructiveHint: false`, `idempotentHint` where true." *Why: clients can pre-approve reads.*
 
