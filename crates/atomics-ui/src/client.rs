@@ -1,0 +1,44 @@
+//! What one UI holds for itself, apart from the host: the palette it draws with, the cards it has open,
+//! what waits for the user's confirmation, and the intents its last draw recorded.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use atomics_core::plan::PlanStatus;
+
+use crate::Intent;
+use crate::theme::{Fonts, Palette};
+
+/// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
+/// the desktop's client as the draw code that uses them moves into this crate.
+pub struct Client {
+    /// The colors and fonts to draw with, made by the platform from the host's theme.
+    pub palette: Arc<Palette>,
+    /// What the user asked the host to do while this UI drew, oldest first. The platform takes them
+    /// after each draw.
+    pub intents: Vec<Intent>,
+    /// The task cards open on boards, by plan and task id.
+    pub expanded_tasks: HashSet<(String, String)>,
+    /// A plan waiting for the user to confirm closing it, and the status it would close with.
+    pub confirm_plan_close: Option<(String, PlanStatus)>,
+}
+
+impl Default for Client {
+    /// A client drawing with the default built-in theme until the platform gives it the host's.
+    fn default() -> Self {
+        let tokens = atomics_core::theme::builtin(atomics_core::theme::DEFAULT).expect("the default theme is built in");
+        Self {
+            palette: Arc::new(Palette::new(&tokens, Fonts::default())),
+            intents: Vec::new(),
+            expanded_tasks: HashSet::new(),
+            confirm_plan_close: None,
+        }
+    }
+}
+
+impl Client {
+    /// Records what the user asked for; the host carries it out after the draw.
+    pub fn act(&mut self, intent: Intent) {
+        self.intents.push(intent);
+    }
+}

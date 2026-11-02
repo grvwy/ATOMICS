@@ -98,6 +98,19 @@ impl Backend for Local<'_> {
                 .collect(),
             ticket_config: state.ticket_config(),
             board_counts,
+            worktrees: plan
+                .tasks
+                .iter()
+                .filter(|task| task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir()))
+                .map(|task| task.id.clone())
+                .collect(),
+            codex: plan
+                .tasks
+                .iter()
+                .filter(|task| state.config.agent(&task.agent).is_some_and(|agent| agent.is_codex()))
+                .map(|task| task.id.clone())
+                .collect(),
+            now: atomics_core::store::now(),
             plan: plan.clone(),
         })
     }

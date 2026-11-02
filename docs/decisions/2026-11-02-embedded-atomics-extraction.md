@@ -203,6 +203,36 @@ Checked with screenshots before and after on macOS and Linux (Xvfb): a changed a
 comment, and on macOS also an unchanged file's whole-file view. The diff panel is identical pixel for pixel; the
 rest of the window differs only where two runs of the same build differ too (the load gauge, terminal text).
 
+### 4.6 S7
+
+The draw code moves into `atomics-ui` file by file. A moved view is a function of `(ui, …, &dyn Backend, &mut
+Client)`:
+
+- `atomics_ui::Client` holds the view state the moved code keeps (the palette to draw with, open cards,
+  confirmations). Fields leave the desktop's `Client` as the code that uses them moves; the desktop's `Client`
+  keeps the rest and holds the moved part as `ui`, and derefs to it, so desktop code and tests that name a
+  moved field read as before.
+- Writes are `atomics_ui::Intent` values the draw code records on the client: a plan by its position in the
+  last list read, as reads address it. `Desktop` is the shim that still holds `&mut State`: `Desktop::draw`
+  gives the client the host's palette, runs the moved code over the in-process `Backend` and then carries
+  out the recorded intents with the posts and view-hint writes the desktop code made (`app/intents.rs`).
+  So an intent runs in the same frame, when the draw function returns, rather than where the click was
+  handled; nothing the moved code reads changes in between. S8 turns intents into the protocol's commands.
+- Facts the draw code read from the host's disk or native modules come from the host on the view types.
+
+Commits, one per file group:
+
+1. **Board** (`board.rs`). `atomics_ui::board::draw` is `plan_panel`, the plan header and the kanban
+   columns, with `ticket_chip`, `stage_chip`, `mode_label`, `tracked_label` and `task_result`; its
+   clicks, which it already gathered and handled after drawing, become intents. `PlanState::color`
+   replaces the desktop's `PlanColor`, `atomics_ui::status` holds `status_color`, `status_dot` and
+   `task_color`, and `atomics_ui::text` holds `truncate`. `BoardView` gains what `task_result` read from the
+   host: `worktrees` (finished tasks whose worktree is still on disk), `codex` (tasks of a Codex agent, which
+   resume without a saved id) and `now`, the host's clock, which the ticket chip and a task's last report
+   compare against. The completed-task tiles (fleet, not moved yet) call `task_result` through a desktop
+   wrapper that works these out as before. `expanded_tasks` and `confirm_plan_close` move to the client.
+   `plan_with_chief_names_the_auto_decision_in_the_board_header` moved with the labels it tests.
+
 ## 5. The dependency test
 
 `crates/atomics-ui/tests/dependencies.rs` runs `cargo tree --locked -p atomics-ui` for the host target and for

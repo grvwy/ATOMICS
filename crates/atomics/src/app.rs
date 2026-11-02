@@ -33,6 +33,8 @@ use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
 use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use atomics_core::workspace::{self, Workspace};
+use atomics_ui::status::{status_color, status_dot};
+use atomics_ui::text::truncate;
 use atomics_ui::{Backend, PlanRow};
 use serde_json::json;
 
@@ -51,6 +53,7 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
+mod intents;
 mod open_link;
 mod plan_cleanup;
 mod plan_view;
@@ -79,7 +82,7 @@ mod worktrees;
 use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};
 use editor::save_png;
 use fleet::queue_note;
-use plan_view::{PlanColor, PlanState};
+use plan_view::PlanState;
 
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
@@ -644,9 +647,11 @@ enum ClientEvent {
 
 /// View data belongs to the desktop, never to the runtime scheduler.
 struct Client {
+    /// The view state the draw code in atomics-ui keeps; the fields below are the desktop's own.
+    ui: atomics_ui::Client,
     ctx: egui::Context,
     /// The host's theme in egui colors and fonts, with the theme it was made from.
-    palette: std::cell::RefCell<Option<(Arc<Theme>, Arc<Palette>)>>,
+    palette_cache: std::cell::RefCell<Option<(Arc<Theme>, Arc<Palette>)>>,
     project_picker: Option<PathBuf>,
     approval_decisions: HashSet<(String, String)>,
     focus_terminal: Option<String>,
@@ -668,13 +673,11 @@ struct Client {
     focus_editor: bool,
     editor_id: Option<egui::Id>,
     terminal_views: HashMap<egui::Id, TerminalView>,
-    expanded_tasks: HashSet<(String, String)>,
     selected: HashSet<String>,
     steer_text: String,
     steer_target: SteerTarget,
     focus_steer: bool,
     confirm_close: Option<String>,
-    confirm_plan_close: Option<(String, PlanStatus)>,
     new_dialog: Option<NewDialog>,
     rename: Option<Rename>,
     quick_open: Option<QuickOpen>,
@@ -701,7 +704,7 @@ struct Client {
 impl Client {
     /// `theme` in egui colors and fonts, made again only when the host's theme changed.
     fn palette(&self, theme: &Arc<Theme>) -> Arc<Palette> {
-        let mut made = self.palette.borrow_mut();
+        let mut made = self.palette_cache.borrow_mut();
         match &*made {
             Some((made_from, palette)) if Arc::ptr_eq(made_from, theme) => palette.clone(),
             _ => {
@@ -715,8 +718,9 @@ impl Client {
     fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         Self {
+            ui: atomics_ui::Client::default(),
             ctx: ctx.clone(),
-            palette: Default::default(),
+            palette_cache: Default::default(),
             project_picker: None,
             approval_decisions: HashSet::new(),
             focus_terminal: None,
@@ -737,13 +741,11 @@ impl Client {
             focus_editor: false,
             editor_id: None,
             terminal_views: HashMap::new(),
-            expanded_tasks: HashSet::new(),
             selected: HashSet::new(),
             steer_text: String::new(),
             steer_target: SteerTarget::Active,
             focus_steer: false,
             confirm_close: None,
-            confirm_plan_close: None,
             new_dialog: None,
             rename: None,
             quick_open: None,
@@ -768,7 +770,22 @@ impl Client {
     }
 }
 
-/// A short-lived desktop borrow. Runtime effects are sent as host commands.
+/// The desktop's code names the fields that moved to atomics-ui as before.
+impl std::ops::Deref for Client {
+    type Target = atomics_ui::Client;
+    fn deref(&self) -> &atomics_ui::Client {
+        &self.ui
+    }
+}
+impl std::ops::DerefMut for Client {
+    fn deref_mut(&mut self) -> &mut atomics_ui::Client {
+        &mut self.ui
+    }
+}
+
+/// A short-lived desktop borrow. Runtime effects are sent as host commands. It is also the shim between
+/// the draw code that moved to atomics-ui and the host's model: [`Desktop::draw`] runs that code over the
+/// in-process [`Backend`] and then carries out the intents it recorded.
 struct Desktop<'a> {
     runtime: &'a mut State,
     client: &'a mut Client,
@@ -1360,28 +1377,8 @@ fn state_refresh(state: &mut DiffData) {
     state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
 }
 
-fn status_color(status: AgentStatus, p: &Palette) -> Color32 {
-    match status {
-        AgentStatus::Starting => p.muted,
-        AgentStatus::Idle => lerp(p.muted, p.foreground, 0.3),
-        AgentStatus::Working => p.accent,
-        AgentStatus::NeedsInput => p.warning,
-        AgentStatus::Done => p.success,
-        AgentStatus::Exited => lerp(p.error, p.background, 0.4),
-    }
-}
-
-/// The status dot; working agents pulse like Claude Code's spinner.
-fn status_dot(status: AgentStatus, p: &Palette, time: f64) -> Color32 {
-    let color = status_color(status, p);
-    if status == AgentStatus::Working {
-        let pulse = 0.55 + 0.45 * ((time * 3.2).sin() * 0.5 + 0.5) as f32;
-        lerp(p.background, color, pulse)
-    } else {
-        color
-    }
-}
-
+/// A task's result on a completed-task tile. The board draws the same through atomics-ui, from what the
+/// host read for it.
 fn task_result(
     ui: &mut egui::Ui,
     task: &Task,
@@ -1391,62 +1388,19 @@ fn task_result(
     config: &Config,
     p: &Palette,
 ) -> Option<&'static str> {
-    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-        let mut action = None;
-        if task.finished_at.is_some() {
-            ui.label(
-                RichText::new(task.completion_line().unwrap_or_else(|| "Agent completed".into()))
-                    .color(p.success)
-                    .size(12.0),
-            );
-        } else if matches!(status, Some(AgentStatus::Idle | AgentStatus::Done))
-            && let Some(line) = task.reported_line(atomics_core::store::now())
-        {
-            ui.label(RichText::new(line).color(p.muted).size(12.0));
-        }
-        if let Some(report) = &task.report {
-            let summary = if expanded {
-                report.summary.clone()
-            } else {
-                truncate(&report.summary.lines().take(3).collect::<Vec<_>>().join("\n"), 360)
-            };
-            let (summary, color) = if task.finished_at.is_some() {
-                (summary, p.foreground)
-            } else {
-                let color = match report.status.as_str() {
-                    "done" => p.success,
-                    "blocked" | "question" => p.warning,
-                    _ => p.info,
-                };
-                (format!("{}: {summary}", report.status), color)
-            };
-            ui.label(RichText::new(summary).color(color).size(12.0));
-        }
-        if task.finished_at.is_some() {
-            let available = task.worktree.as_ref().is_some_and(|path| path.is_dir());
-            ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
-            ui.horizontal(|ui| {
-                if ui.add_enabled(available, egui::Button::new("diff").small()).clicked() {
-                    action = Some("diff");
-                }
-                if !read_only
-                    && ui
-                        .add_enabled(
-                            status.is_none()
-                                && available
-                                && (task.resume_id.is_some()
-                                    || config.agent(&task.agent).is_some_and(|agent| agent.is_codex())),
-                            egui::Button::new("resume").small(),
-                        )
-                        .clicked()
-                {
-                    action = Some("resume");
-                }
-            });
-        }
-        action
-    })
-    .inner
+    let available = task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir());
+    let codex = config.agent(&task.agent).is_some_and(|agent| agent.is_codex());
+    atomics_ui::board::task_result(
+        ui,
+        task,
+        status,
+        expanded,
+        read_only,
+        available,
+        codex,
+        atomics_core::store::now(),
+        p,
+    )
 }
 
 fn status_glyph(status: AgentStatus) -> &'static str {
@@ -1456,13 +1410,6 @@ fn status_glyph(status: AgentStatus) -> &'static str {
         AgentStatus::Working => "◐",
         AgentStatus::Exited => "×",
         _ => "○",
-    }
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text.to_string(),
     }
 }
 

@@ -9,6 +9,9 @@ use atomics_core::plan::{Plan, PlanStatus};
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
 use atomics_core::tickets::TicketConfig;
+use egui::Color32;
+
+use crate::theme::Palette;
 
 /// What a plan is doing, for its tab. Selection is independent of activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,16 @@ impl PlanState {
             Self::Idle => format!("{name} · idle"),
             Self::Completed => format!("✓ {name}"),
             Self::Archived => format!("✓ {name} · archived"),
+        }
+    }
+
+    /// The color a plan's goal and tab are drawn in.
+    pub fn color(self, palette: &Palette) -> Color32 {
+        match self {
+            Self::Running(_) => palette.accent,
+            Self::NeedsYou => palette.warning,
+            Self::Idle => palette.foreground,
+            Self::Completed | Self::Archived => palette.muted,
         }
     }
 }
@@ -115,6 +128,13 @@ pub struct BoardView {
     pub ticket_config: Option<Arc<TicketConfig>>,
     /// The tickets on the plan's board, and how many of them no task follows, once the host has read them.
     pub board_counts: Option<(usize, usize)>,
+    /// Finished tasks whose worktree is still on the host, by id: their `diff` and `resume` need it.
+    pub worktrees: HashSet<String>,
+    /// Tasks run by a Codex agent, by id: Codex resumes a session without a saved id.
+    pub codex: HashSet<String>,
+    /// The host's clock when it read the board, in seconds since the epoch: how old a report or a ticket
+    /// read is.
+    pub now: u64,
 }
 
 /// A permission request a session waits on, as its approval banner shows it.

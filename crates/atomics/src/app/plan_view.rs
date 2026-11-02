@@ -3,22 +3,6 @@ use super::*;
 
 pub(super) use atomics_ui::PlanState;
 
-/// A plan state's color is the desktop palette's business, not the shared state's.
-pub(super) trait PlanColor {
-    fn color(self, palette: &Palette) -> Color32;
-}
-
-impl PlanColor for PlanState {
-    fn color(self, palette: &Palette) -> Color32 {
-        match self {
-            Self::Running(_) => palette.accent,
-            Self::NeedsYou => palette.warning,
-            Self::Idle => palette.foreground,
-            Self::Completed | Self::Archived => palette.muted,
-        }
-    }
-}
-
 impl State {
     pub(super) fn plan_state(&self, index: usize) -> PlanState {
         let plan = &self.plans[index];
