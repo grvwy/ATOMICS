@@ -185,6 +185,17 @@ pub struct UiConfig {
     pub agents: Vec<String>,
 }
 
+/// What the diff panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMode {
+    Diff,
+    Editor,
+    /// The orchestrator's plan board.
+    Plan,
+    /// Find and read tickets from the configured ticket system.
+    Tickets,
+}
+
 /// What the host's model holds about what is on screen. The desktop writes these view hints into the
 /// model so that `atomics ctl` and the host's scheduling see them; the UI reads them back from there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +204,55 @@ pub struct ViewHints {
     pub active: Option<String>,
     /// The worktree whose diff the diff panel shows: the active session's, else one picked in the explorer.
     pub diff_target: Option<PathBuf>,
+    /// A plan's tab is on screen.
+    pub plan_view: bool,
+    /// The Ungrouped tab is on screen: every session outside a plan.
+    pub ungrouped: bool,
+    /// The project tab on screen; `None` shows every project.
+    pub project: Option<PathBuf>,
+    /// The plan of the plan tab and the board, by position in [`Backend::plan_list`].
+    pub selected_plan: usize,
+    pub diff_open: bool,
+    pub panel: PanelMode,
+}
+
+/// The host's messages for the notice line, beyond the sessions that need the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Notices {
+    /// The last short message, while it shows.
+    pub toast: Option<String>,
+    /// Why the config no longer loads; the last good one stays in effect.
+    pub config_error: Option<String>,
+    /// What the loaded config asks for that cannot work.
+    pub config_problems: Option<String>,
+    /// What the theme could not apply.
+    pub theme_error: Option<String>,
+    /// Why agents' hooks cannot reach the host.
+    pub hook_error: Option<String>,
+}
+
+/// What the sandbox VMs' process trees use on the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxLoad {
+    /// Memory and CPU of all of them together, once sampled.
+    pub total: Option<String>,
+    /// How many VMs were sampled.
+    pub sampled: usize,
+    /// Why the last sample failed.
+    pub error: Option<String>,
+}
+
+/// What the Project menu offers besides opening a folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectMenu {
+    /// Recently opened projects that are not open and still exist, with each as the host writes paths.
+    pub recent: Vec<(PathBuf, String)>,
+    /// The saved workspaces, by name.
+    pub workspaces: Vec<String>,
+    /// The workspace open now.
+    pub current: Option<String>,
+    /// Projects are open, so they can be saved as a workspace.
+    pub can_save: bool,
 }
 
 /// A session that is no longer running, which the RECENT list offers to resume.
@@ -271,4 +331,17 @@ pub trait Backend {
 
     /// `path` as the host writes paths, with its home folder as `~`.
     fn display(&self, path: &Path) -> String;
+
+    /// When the plan at `index` of [`plan_list`](Backend::plan_list) was last saved, or its last task
+    /// finished, as the host's local date.
+    fn plan_date(&self, index: usize) -> String;
+
+    /// The notice line's messages.
+    fn notices(&self) -> Notices;
+
+    /// What the sandbox VMs use on the host.
+    fn sandbox_load(&self) -> SandboxLoad;
+
+    /// The Project menu's recent projects and workspaces.
+    fn project_menu(&self) -> ProjectMenu;
 }

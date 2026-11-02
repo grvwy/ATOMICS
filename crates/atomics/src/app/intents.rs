@@ -110,6 +110,24 @@ impl Desktop<'_> {
                 }
                 Intent::OpenCleanup { repo, preselect } => self.open_cleanup(repo, preselect),
                 Intent::OpenFile { root, path } => self.open_file(&root, &path),
+                Intent::ClosePlanTab(plan) => self.close_plan_tab(plan),
+                Intent::ViewPlanHistory(plan) => self.view_plan_history(plan),
+                Intent::SetView(view) => self.runtime.set_view(view),
+                Intent::ShowUngrouped => self.runtime.show_ungrouped(),
+                Intent::ShowPlan(plan) => {
+                    self.runtime.selected_plan = plan;
+                    self.runtime.show_plan_fleet();
+                }
+                Intent::CloseIdle(root) => self.post(move |state| {
+                    let closed = state.close_idle(&root);
+                    state.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
+                }),
+                Intent::ToggleDiff => self.runtime.diff_open = !self.runtime.diff_open,
+                Intent::NewSession => self.open_new_dialog(None),
+                Intent::TogglePlan => self.runtime.toggle_plan(),
+                Intent::OpenProject(root) => self.open_project(&root),
+                Intent::OpenWorkspace(name) => self.open_workspace(&name),
+                Intent::SaveWorkspace(name) => self.save_workspace(&name),
             }
         }
     }

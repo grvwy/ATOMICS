@@ -36,6 +36,10 @@ pub struct Client {
     pub selected: HashSet<String>,
     /// A session waiting for the user to confirm closing it, by id.
     pub confirm_close: Option<String>,
+    /// The ATOMICS icon, once the platform has loaded it.
+    pub icon: Option<egui::TextureHandle>,
+    /// The name typed for saving the open projects as a workspace.
+    pub workspace_input: String,
 }
 
 impl Default for Client {
@@ -53,6 +57,8 @@ impl Default for Client {
             explorers: HashMap::new(),
             selected: HashSet::new(),
             confirm_close: None,
+            icon: None,
+            workspace_input: String::new(),
         }
     }
 }

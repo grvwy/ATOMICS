@@ -33,9 +33,9 @@ use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
 use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use atomics_core::workspace::{self, Workspace};
-use atomics_ui::status::status_dot;
+use atomics_ui::status::{PULSE_STEP, status_dot};
 use atomics_ui::text::truncate;
-use atomics_ui::{Backend, PlanRow};
+use atomics_ui::{Backend, PanelMode};
 use serde_json::json;
 
 mod approvals;
@@ -82,14 +82,12 @@ mod worktrees;
 use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};
 use editor::save_png;
 use fleet::queue_note;
-use plan_view::PlanState;
 
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
 const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
-const PULSE_STEP: Duration = Duration::from_millis(250);
 /// The answer to a request only a desktop window can serve, in the headless host.
 const NO_WINDOW: &str = "no window: this is the headless host (atomics host); start the desktop for window commands";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
@@ -332,16 +330,6 @@ enum CleanupEvent {
     Removed(PathBuf, Result<(), String>),
     SandboxRemoved(String, Result<(), String>),
     Finished(String),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PanelMode {
-    Diff,
-    Editor,
-    /// The orchestrator's plan board.
-    Plan,
-    /// Find and read tickets from the configured ticket system.
-    Tickets,
 }
 
 /// A status change, kept so `wait` can answer "what happened since cursor N".
@@ -661,9 +649,7 @@ struct Client {
     cleanup_delete_branches: bool,
     plan_cleanup_open: bool,
     plan_cleanup_selected: HashSet<(PathBuf, String)>,
-    icon: egui::TextureHandle,
     load: (Instant, Option<f64>),
-    workspace_input: String,
     split: Option<f32>,
     editor_file: HashMap<PathBuf, String>,
     focus_editor: bool,
@@ -712,7 +698,10 @@ impl Client {
     fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         Self {
-            ui: atomics_ui::Client::default(),
+            ui: atomics_ui::Client {
+                icon: Some(ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR)),
+                ..Default::default()
+            },
             ctx: ctx.clone(),
             palette_cache: Default::default(),
             project_picker: None,
@@ -723,9 +712,7 @@ impl Client {
             cleanup_delete_branches: true,
             plan_cleanup_open: false,
             plan_cleanup_selected: HashSet::new(),
-            icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
             load: (Instant::now() - Duration::from_secs(10), None),
-            workspace_input: String::new(),
             split: None,
             editor_file: HashMap::new(),
             focus_editor: false,

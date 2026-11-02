@@ -113,4 +113,26 @@ pub enum Intent {
         root: PathBuf,
         path: String,
     },
+    /// Close a plan's tab: an open plan asks to be closed first, a finished one is archived.
+    ClosePlanTab(usize),
+    /// Show a finished plan's board, read-only.
+    ViewPlanHistory(usize),
+    /// Show every project's sessions, or one project's.
+    SetView(Option<PathBuf>),
+    /// Show the sessions outside any plan.
+    ShowUngrouped,
+    /// Show an open plan's sessions and board.
+    ShowPlan(usize),
+    /// Close a project's idle sessions that no plan task uses.
+    CloseIdle(PathBuf),
+    /// Show or hide the diff panel.
+    ToggleDiff,
+    /// Open the new-session dialog.
+    NewSession,
+    /// Show or hide the plan board.
+    TogglePlan,
+    OpenProject(PathBuf),
+    OpenWorkspace(String),
+    /// Save the open projects as a workspace.
+    SaveWorkspace(String),
 }

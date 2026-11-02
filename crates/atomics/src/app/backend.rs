@@ -1,8 +1,8 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, PlanRow, RecentSession, SessionRow, UiConfig, ViewHints,
-    WorktreeRow,
+    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, Notices, PlanRow, ProjectMenu, RecentSession,
+    SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
 };
 
 use super::*;
@@ -174,7 +174,17 @@ impl Backend for Local<'_> {
     }
 
     fn view_hints(&self) -> ViewHints {
-        ViewHints { active: self.0.active.clone(), diff_target: self.0.diff_target() }
+        let state = self.0;
+        ViewHints {
+            active: state.active.clone(),
+            diff_target: state.diff_target(),
+            plan_view: state.plan_view,
+            ungrouped: state.ungrouped,
+            project: state.view.clone(),
+            selected_plan: state.selected_plan,
+            diff_open: state.diff_open,
+            panel: state.panel,
+        }
     }
 
     fn visible_sessions(&self) -> Vec<usize> {
@@ -227,6 +237,47 @@ impl Backend for Local<'_> {
 
     fn display(&self, path: &Path) -> String {
         paths::display(path)
+    }
+
+    fn plan_date(&self, index: usize) -> String {
+        self.0.plans.get(index).map(super::plan_view::history_date).unwrap_or_default()
+    }
+
+    fn notices(&self) -> Notices {
+        let state = self.0;
+        Notices {
+            toast: state.toast.as_ref().map(|(text, _)| text.clone()),
+            config_error: state.config_error.clone(),
+            config_problems: state.config_problems.clone(),
+            theme_error: state.theme_error.clone(),
+            hook_error: state.hook_error.clone(),
+        }
+    }
+
+    fn sandbox_load(&self) -> SandboxLoad {
+        let sampler = &self.0.sandbox_usage;
+        SandboxLoad {
+            total: (!sampler.usage.is_empty()).then(|| sampler.total().label()),
+            sampled: sampler.usage.len(),
+            error: sampler.error.clone(),
+        }
+    }
+
+    fn project_menu(&self) -> ProjectMenu {
+        let state = self.0;
+        ProjectMenu {
+            recent: state
+                .store
+                .recent_projects
+                .iter()
+                .filter(|p| !state.open_projects.contains(p) && p.is_dir())
+                .take(8)
+                .map(|p| (p.clone(), paths::display(p)))
+                .collect(),
+            workspaces: Workspace::list(),
+            current: state.workspace.clone(),
+            can_save: !state.open_projects.is_empty(),
+        }
     }
 }
 

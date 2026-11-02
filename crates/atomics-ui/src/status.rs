@@ -1,10 +1,15 @@
 //! The colors that say what a session or a task is doing.
 
+use std::time::Duration;
+
 use atomics_core::plan::TaskStatus;
 use atomics_core::session::AgentStatus;
 use egui::Color32;
 
 use crate::theme::{Palette, lerp};
+
+/// How often a pulsing status (a working agent, a running plan) is drawn again.
+pub const PULSE_STEP: Duration = Duration::from_millis(250);
 
 pub fn status_color(status: AgentStatus, p: &Palette) -> Color32 {
     match status {

@@ -60,7 +60,8 @@ impl Desktop<'_> {
     }
 }
 
-fn history_date(plan: &Plan) -> String {
+/// When a plan was last saved, or its last task finished, as the host's local date.
+pub(super) fn history_date(plan: &Plan) -> String {
     let path = paths::atomics_home().join("plans").join(format!("{}.json", plan.id));
     let timestamp = modified(&path)
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -74,69 +75,6 @@ fn history_date(plan: &Plan) -> String {
     local
         .map(|date| format!("{:04}-{:02}-{:02}", date.tm_year + 1900, date.tm_mon + 1, date.tm_mday))
         .unwrap_or_else(|| "date unavailable".into())
-}
-
-impl Desktop<'_> {
-    pub(super) fn history_menu(&mut self, ui: &mut egui::Ui) {
-        let mut view = None;
-        let mut reopen = None;
-        let response = ui
-            .menu_button("History", |ui| {
-                for (index, plan) in self
-                    .runtime
-                    .plans
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, plan)| !plan.id.is_empty() && plan.status != PlanStatus::Open)
-                {
-                    ui.push_id(&plan.id, |ui| {
-                        ui.horizontal(|ui| {
-                            let state = self.runtime.plan_state(index);
-                            ui.label(RichText::new(&plan.goal).color(state.color(&self.palette())));
-                            let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
-                            ui.label(
-                                RichText::new(format!("{status} · {}", history_date(plan))).color(self.palette().muted),
-                            )
-                            .on_hover_text(
-                                "Date the plan was last saved, or its last task completion when no saved file exists",
-                            );
-                            let response = ui.button("View");
-                            record_history_action(ui, &plan.id, "view", &response);
-                            if response.clicked() {
-                                view = Some(index);
-                                ui.close();
-                            }
-                            let response = ui.button("Reopen");
-                            record_history_action(ui, &plan.id, "reopen", &response);
-                            if response.clicked() {
-                                reopen = Some(index);
-                                ui.close();
-                            }
-                        });
-                    });
-                }
-            })
-            .response;
-        super::topbar::record_item(ui, "History", &response);
-        if let Some(index) = view {
-            self.view_plan_history(index);
-        }
-        if let Some(index) = reopen {
-            self.post_plan(index, |state, index| {
-                if let Err(error) = state.reopen_plan(index) {
-                    state.toast(error);
-                }
-            });
-        }
-    }
-}
-
-fn record_history_action(_ui: &egui::Ui, _plan: &str, _action: &str, _response: &egui::Response) {
-    #[cfg(test)]
-    if !_ui.is_sizing_pass() {
-        _ui.ctx()
-            .data_mut(|data| data.insert_temp(egui::Id::NULL.with(("plan-history", _plan, _action)), _response.rect));
-    }
 }
 
 #[cfg(test)]

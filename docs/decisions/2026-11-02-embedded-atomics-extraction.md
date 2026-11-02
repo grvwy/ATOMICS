@@ -257,6 +257,20 @@ Commits, one per file group:
    resume, pick a project, start an agent in a folder, new worktree, close a project, show a folder's
    diff, clean up worktrees, open a file. `selected`, `confirm_close` and `explorers` move to the client.
    The sidebar frame (USAGE, the TICKETS section of S4) stays in the desktop and calls both.
+5. **Top bar** (`topbar.rs`, the tabs in `sidebar.rs`, the history in `plan_view.rs`). `atomics_ui::tabs` is
+   the navigation: the tabs, their overflow menu and the plan history (`view_tabs`, `urgent_tabs_label`,
+   `urgent_navigation_width`). `atomics_ui::topbar` gains the brand, the notice line, the diff, `+ New` and
+   Plan buttons and the Project menu. `ViewHints` gains the tab on screen (`plan_view`, `ungrouped`,
+   `project`, `selected_plan`) and the diff panel's `diff_open` and `panel`; `PanelMode` moves to
+   `atomics-ui`. New reads: `plan_date(index)` (the history's date: a file's time in the host's time zone),
+   `notices()`, `sandbox_load()` and `project_menu()` (recent projects that still exist, workspaces). The
+   buttons are three draw calls, so a click on Show diff reaches the Plan button drawn after it in the same
+   frame, as before. The tabs are one: a click on a tab takes effect once the strip is drawn, so in that
+   frame the tabs after it still show the old selection, as the tabs before it always did, and the next
+   frame shows the new one. `icon` and `workspace_input` move to the client, and `record_item` and the history's
+   records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stays in the desktop with the
+   items that have not moved: the chief pill, the Tickets button and sign-in (S4), the GitHub counter, the
+   load gauge and the Settings menu.
 
 ## 5. The dependency test
 
