@@ -221,9 +221,9 @@ allowed_origins = []     # exact Origin values; a native client sends none
   deadline, so a peer that trickles bytes is dropped like one that sends none. A local process that keeps the pool full
   can still delay *new* connections; connected clients are unaffected, and the token is still required to get in.
 - **No locks across I/O.** The runtime thread publishes `Arc` projections (and the accepted diff content) and the
-  protocol thread only reads them; it never takes the `State` mutex. Each collection is rebuilt only when a
-  fingerprint of what it is built from changes, so a runtime pass that changes nothing a client sees allocates
-  nothing. `hub.rs` turns published changes into numbered
+  protocol thread only reads them; it never takes the `State` mutex. Every runtime pass rebuilds the projections,
+  but a collection's revision moves only when its content does, so a pass with nothing new sends no event.
+  `hub.rs` turns published changes into numbered
   events and keeps a replay ring (200 events, 8 MiB, 5 minutes); its mutex guards memory only. Every socket has its own
   thread, so a socket write blocks nothing but that client. That thread waits on its socket and a wake pipe, and
   queueing anything for the client wakes it, so frames are sent as soon as they are queued.

@@ -3,7 +3,6 @@
 //! load the published `Arc` snapshots and never touch `State`.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -17,21 +16,10 @@ use atomics_core::projection::{
 use super::State;
 use crate::protocol::{Departed, TerminalEntry, Terminals};
 
-/// What the last publish was built from. Every runtime pass publishes under the `State` lock and
-/// most change nothing a client sees, so each collection keeps a fingerprint of its source and is
-/// rebuilt only when that moves. (`State` is changed from too many places for a counter bumped at
-/// each to stay right; a fingerprint of what the projection reads cannot go stale, and finding
-/// that nothing changed allocates nothing.)
+/// Diff summaries already built, by worktree and the diff revision they were built from, so an
+/// unchanged diff is not walked again on every runtime pass.
 #[derive(Default)]
-pub(crate) struct DiffSummaries {
-    /// Diff summaries already built, by worktree and the diff revision they were built from, so
-    /// an unchanged diff is not walked again.
-    summaries: HashMap<PathBuf, (u64, DiffSummary)>,
-    sessions: Option<u64>,
-    plans: Option<u64>,
-    approvals: Option<u64>,
-    diffs: Option<u64>,
-}
+pub(crate) struct DiffSummaries(HashMap<PathBuf, (u64, DiffSummary)>);
 
 /// The accepted diff content per worktree, published so the protocol thread can answer `diff_get`
 /// without the `State` lock. Holds `Arc`s of what the diff worker already built, and remembers
@@ -105,85 +93,13 @@ impl State {
         self.config.remote.clone()
     }
 
-    /// Publish sessions, plans, approvals and diff summaries. Each collection's revision moves
-    /// only when its content does, and a collection whose source is unchanged is not rebuilt.
+    /// Publish sessions, plans, approvals and diff summaries. Every pass rebuilds them; each
+    /// collection's revision, and so the event cursor, moves only when its content does.
     pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
-        let plans = self.plans_fingerprint();
-        // A session's task link comes from the plans, so they are part of its source.
-        let sessions = fingerprint(|h| (self.sessions_fingerprint(), plans).hash(h));
-        let approvals = self.approvals_fingerprint();
-        let diffs = self.diffs_fingerprint();
-        if cache.sessions != Some(sessions) {
-            out.publish_sessions(self.session_infos());
-            cache.sessions = Some(sessions);
-        }
-        if cache.plans != Some(plans) {
-            out.publish_plans(self.plan_infos());
-            cache.plans = Some(plans);
-        }
-        if cache.approvals != Some(approvals) {
-            out.publish_approvals(self.approval_infos());
-            cache.approvals = Some(approvals);
-        }
-        if cache.diffs != Some(diffs) {
-            self.publish_diffs(out, cache, bodies);
-            cache.diffs = Some(diffs);
-        }
-    }
-
-    /// Rebuild and publish everything whether or not it changed, as every pass used to; kept to
-    /// measure `publish_projections` against.
-    #[cfg(test)]
-    fn publish_projections_unconditionally(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
         out.publish_sessions(self.session_infos());
         out.publish_plans(self.plan_infos());
         out.publish_approvals(self.approval_infos());
         self.publish_diffs(out, cache, bodies);
-    }
-
-    /// Everything `session_infos` reads from the sessions (the plans are fingerprinted apart).
-    fn sessions_fingerprint(&self) -> u64 {
-        fingerprint(|h| {
-            for s in &self.sessions {
-                (&s.id, &s.agent, &s.title, &s.cwd, s.worktree.as_ref().map(|w| &w.root), s.branch()).hash(h);
-                (s.status, s.chief, s.approvals.len()).hash(h);
-            }
-        })
-    }
-
-    /// Everything `plan_infos` reads.
-    fn plans_fingerprint(&self) -> u64 {
-        fingerprint(|h| {
-            for p in &self.plans {
-                (&p.id, p.status as u8, &p.goal, &p.project, p.approved, &p.integration, p.tasks.len()).hash(h);
-                for t in &p.tasks {
-                    (&t.id, &t.title, t.status, &t.agent, &t.depends_on, &t.session, &t.branch).hash(h);
-                    (&t.integrated, t.additions, t.deletions).hash(h);
-                    t.report.as_ref().map(|r| (&r.status, &r.summary, r.at)).hash(h);
-                }
-            }
-        })
-    }
-
-    /// Everything `approval_infos` reads.
-    fn approvals_fingerprint(&self) -> u64 {
-        fingerprint(|h| {
-            for s in &self.sessions {
-                for a in &s.approvals {
-                    (&a.id, &s.id, &a.request.tool, &a.request.command, &a.request.cwd, &a.request.reason).hash(h);
-                }
-            }
-        })
-    }
-
-    /// Order-independent, as the diffs are a map. The content pointer is in it because the bodies
-    /// published for `diff_get` are replaced when it changes, even at an unchanged revision.
-    fn diffs_fingerprint(&self) -> u64 {
-        self.diffs
-            .iter()
-            .filter_map(|(root, data)| Some((root, data.revision, Arc::as_ptr(data.prepared.as_ref()?) as usize)))
-            .map(|entry| fingerprint(|h| entry.hash(h)))
-            .fold(0u64, u64::wrapping_add)
     }
 
     fn session_infos(&self) -> Vec<SessionInfo> {
@@ -267,17 +183,17 @@ impl State {
     }
 
     fn publish_diffs(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
-        cache.summaries.retain(|root, _| self.diffs.contains_key(root));
+        cache.0.retain(|root, _| self.diffs.contains_key(root));
         let mut diffs = Vec::new();
         let mut contents = HashMap::new();
         for (root, data) in &self.diffs {
             let Some(prepared) = &data.prepared else { continue };
             contents.insert(text(root), (data.revision, prepared.clone()));
-            let entry = match cache.summaries.get(root) {
+            let entry = match cache.0.get(root) {
                 Some((revision, summary)) if *revision == data.revision => summary.clone(),
                 _ => {
                     let summary = DiffSummary::new(&text(root), data.revision, &prepared.diff);
-                    cache.summaries.insert(root.clone(), (data.revision, summary.clone()));
+                    cache.0.insert(root.clone(), (data.revision, summary.clone()));
                     summary
                 }
             };
@@ -288,12 +204,6 @@ impl State {
         bodies.replace(contents);
         out.publish_diffs(diffs);
     }
-}
-
-fn fingerprint(feed: impl FnOnce(&mut DefaultHasher)) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    feed(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]
@@ -360,10 +270,16 @@ mod tests {
         Box::new(f)
     }
 
+    /// The event cursor and each collection's revision, as they stand in `out`.
+    fn revisions(out: &Projections) -> (u64, [u64; 4]) {
+        let l = out.load();
+        (l.cursor, [l.sessions.revision, l.plans.revision, l.approvals.revision, l.diffs.revision])
+    }
+
     #[test]
-    fn an_unchanged_board_is_not_rebuilt_and_every_projected_field_still_republishes() {
+    fn every_pass_rebuilds_but_revisions_move_only_on_a_real_change() {
         with_state(
-            "app::projection::tests::an_unchanged_board_is_not_rebuilt_and_every_projected_field_still_republishes",
+            "app::projection::tests::every_pass_rebuilds_but_revisions_move_only_on_a_real_change",
             |mut state, _| {
                 let root = state.launch_dir.clone();
                 state.sessions = vec![
@@ -390,19 +306,20 @@ mod tests {
                 state.publish_projections(&out, &mut cache, &bodies);
                 assert_eq!(published(&out), built(&state));
                 assert_eq!(published(&out).0[0].task.as_ref().map(|t| t.task.as_str()), Some("t1"));
-                let cursor = out.cursor();
 
-                // Nothing changed, so nothing is rebuilt: a marker planted in the published slot stays.
-                out.publish_sessions(Vec::new());
-                let planted = out.cursor();
+                // Passes that change nothing a client sees move no revision, so clients get no
+                // event: neither does a change to something the projection leaves out.
+                let quiet = revisions(&out);
+                for _ in 0..3 {
+                    state.publish_projections(&out, &mut cache, &bodies);
+                }
+                state.plans[0].tasks[0].brief = "not on the wire".into();
+                state.plans[0].tasks[0].notes.push("nor this".into());
                 state.publish_projections(&out, &mut cache, &bodies);
-                assert!(out.sessions.load().data.is_empty(), "an unchanged board was rebuilt");
-                assert_eq!(out.cursor(), planted);
-                assert!(planted > cursor);
-                // Put the real sessions back for what follows.
-                out.publish_sessions(state.session_infos());
+                assert_eq!(revisions(&out), quiet, "a pass with nothing to tell moved a revision");
 
-                // Each change to something a client sees is published, and only then.
+                // Each change to something a client sees is published and moves the cursor; the
+                // pass after it moves nothing.
                 let changes: Vec<(&str, Change)> = vec![
                     ("session title", change(|s| s.sessions[1].title = "renamed".into())),
                     ("session status", change(|s| s.sessions[1].status = AgentStatus::Done)),
@@ -438,22 +355,29 @@ mod tests {
                     let was = built(&state);
                     change(&mut state);
                     assert_ne!(built(&state), was, "{what}: the change is not visible in the projection");
+                    let before = revisions(&out);
                     state.publish_projections(&out, &mut cache, &bodies);
                     assert_eq!(published(&out), built(&state), "{what}: not republished");
-                    let cursor = out.cursor();
+                    assert!(revisions(&out).0 > before.0, "{what}: no revision moved");
+                    let after = revisions(&out);
                     state.publish_projections(&out, &mut cache, &bodies);
-                    assert_eq!(out.cursor(), cursor, "{what}: republished without a change");
+                    assert_eq!(revisions(&out), after, "{what}: a revision moved without a change");
                 }
 
-                // A diff is republished when its revision moves, and its bodies whenever its content does.
+                // A diff's summary moves with its revision; new content at the same revision only
+                // replaces the bodies `diff_get` reads.
                 let root = std::path::PathBuf::from("/work/tree");
                 state.diffs.entry(root.clone()).or_default().prepared = Some(prepared(1));
+                let before = revisions(&out);
                 state.publish_projections(&out, &mut cache, &bodies);
                 assert_eq!(out.diffs.load().data[0].files.len(), 1);
+                assert!(revisions(&out).0 > before.0);
                 assert!(bodies.file("/work/tree", "src/file1.rs").is_none());
                 state.diffs.get_mut(&root).unwrap().prepared = Some(prepared(2));
+                let quiet = revisions(&out);
                 state.publish_projections(&out, &mut cache, &bodies);
                 assert!(bodies.file("/work/tree", "src/file1.rs").is_some(), "new content at the same revision");
+                assert_eq!(revisions(&out), quiet);
                 state.diffs.get_mut(&root).unwrap().revision = 1;
                 state.publish_projections(&out, &mut cache, &bodies);
                 assert_eq!(out.diffs.load().data[0].files.len(), 2);
@@ -501,9 +425,8 @@ mod tests {
                 data.prepared = Some(prepared(50));
             }
             let (out, bodies) = (Projections::default(), DiffBodies::default());
-            let (mut before, mut after) = (DiffSummaries::default(), DiffSummaries::default());
-            state.publish_projections_unconditionally(&out, &mut before, &bodies);
-            state.publish_projections(&out, &mut after, &bodies);
+            let mut cache = DiffSummaries::default();
+            state.publish_projections(&out, &mut cache, &bodies);
             const PASSES: u32 = 300;
             let time = |f: &mut dyn FnMut()| {
                 let started = std::time::Instant::now();
@@ -512,26 +435,20 @@ mod tests {
                 }
                 started.elapsed() / PASSES
             };
-            let idle_before = time(&mut || state.publish_projections_unconditionally(&out, &mut before, &bodies));
-            let idle_after = time(&mut || state.publish_projections(&out, &mut after, &bodies));
+            let idle = time(&mut || state.publish_projections(&out, &mut cache, &bodies));
             // One session changes on every pass (its title, as a running agent's would).
             let mut n = 0;
-            let busy_before = time(&mut || {
+            let busy = time(&mut || {
                 n += 1;
                 state.sessions[0].title = format!("t{n}");
-                state.publish_projections_unconditionally(&out, &mut before, &bodies);
-            });
-            let busy_after = time(&mut || {
-                n += 1;
-                state.sessions[0].title = format!("t{n}");
-                state.publish_projections(&out, &mut after, &bodies);
+                state.publish_projections(&out, &mut cache, &bodies);
             });
             std::fs::write(
                 report,
                 format!(
                     "board: 400 sessions, 100 plans x 20 tasks, 100 approvals, 100 diffs x 50 files\n\
-                     per pass, unchanged board: before {idle_before:?}, after {idle_after:?}\n\
-                     per pass, one session title changed: before {busy_before:?}, after {busy_after:?}\n"
+                     per pass, unchanged board: {idle:?}\n\
+                     per pass, one session title changed: {busy:?}\n"
                 ),
             )
             .unwrap();
