@@ -78,6 +78,18 @@ impl Desktop<'_> {
                 }),
                 Intent::CleanUpPlan(plan) => self.open_plan_cleanup(plan),
                 Intent::Decide { session, approval, decision } => self.approve_request(session, approval, decision),
+                Intent::EditComments { root, before, after } => self.post(move |runtime| {
+                    runtime.diffs.entry(root).or_default().edit_comments(before, after);
+                }),
+                Intent::SendReview(root) => self.send_review(&root),
+                Intent::RefreshDiff(root) => {
+                    self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default()))
+                }
+                Intent::CloseDiff => self.runtime.diff_open = false,
+                Intent::Edit { root, path, line } => {
+                    let ctx = self.client.ctx.clone();
+                    self.edit(&ctx, &root, path.as_deref(), line);
+                }
             }
         }
     }

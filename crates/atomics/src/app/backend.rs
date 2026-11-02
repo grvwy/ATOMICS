@@ -1,6 +1,6 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
-use atomics_ui::{ApprovalRow, Backend, BoardView, DiffSnapshot, PlanRow, SessionRow};
+use atomics_ui::{ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, PlanRow, SessionRow, UiConfig};
 
 use super::*;
 
@@ -144,6 +144,25 @@ impl Backend for Local<'_> {
             file: data.file.clone(),
             file_error: data.file_error.clone(),
         })
+    }
+
+    fn diff_heading(&self, root: &Path) -> DiffHeading {
+        let state = self.0;
+        let session = state.active_index().map(|i| &state.sessions[i]);
+        let title = session
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let branch = session
+            .and_then(|s| s.branch().map(str::to_string))
+            .or_else(|| state.worktrees.iter().find(|w| w.path == root).and_then(|w| w.branch.clone()))
+            .filter(|b| *b != title);
+        let can_send = state.sessions.iter().any(|s| s.root() == root && s.is_agent() && s.can_receive());
+        DiffHeading { title, branch, can_send }
+    }
+
+    fn ui_config(&self) -> UiConfig {
+        let config = &self.0.config;
+        UiConfig { keys: config.keys.clone(), font: config.font.clone(), layout: config.layout.clone() }
     }
 }
 

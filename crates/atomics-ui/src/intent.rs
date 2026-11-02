@@ -4,8 +4,11 @@
 //! task by id, or by its position in the plan the board read. Slice S8 turns intents into the protocol's
 //! commands.
 
+use std::path::PathBuf;
+
 use atomics_core::approvals::Decision;
 use atomics_core::plan::TaskStatus;
+use atomics_core::steer::ReviewComment;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
@@ -59,5 +62,23 @@ pub enum Intent {
         session: usize,
         approval: String,
         decision: Decision,
+    },
+    /// The review comments on a worktree's diff changed from `before` to `after`.
+    EditComments {
+        root: PathBuf,
+        before: Vec<ReviewComment>,
+        after: Vec<ReviewComment>,
+    },
+    /// Send a worktree's review comments to the agent working there.
+    SendReview(PathBuf),
+    /// Read a worktree's diff again now.
+    RefreshDiff(PathBuf),
+    /// Hide the diff panel.
+    CloseDiff,
+    /// Open a worktree's file, or the worktree itself, in the editor; at `line` if given.
+    Edit {
+        root: PathBuf,
+        path: Option<String>,
+        line: Option<u32>,
     },
 }

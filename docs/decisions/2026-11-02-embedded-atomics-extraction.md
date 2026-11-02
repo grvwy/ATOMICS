@@ -237,6 +237,15 @@ Commits, one per file group:
    before. `approval_decisions` moves to the client. The tile around it stays in the desktop until fleet moves.
    The `cfg(test)` record of the banner's buttons is `cfg(feature = "test-support")` in `atomics-ui`; the
    desktop's dev-dependency turns the feature on, as it does `atomics-core`'s.
+3. **Diff view** (`editor.rs`). `atomics_ui::diff_panel::draw` is the end of `diff_panel`: a worktree's diff
+   under its header. Two reads join the `Backend`: `diff_heading(root)` (the active session's title and
+   branch, else the worktree's, and whether an agent there can take a review) and `ui_config()` (the
+   config's `keys`, `font` and `layout`, which the header's shortcut, the diff's font and the split read).
+   Review comment edits, Send review, Refresh, Close and Edit become intents; the side-by-side toggle stays
+   on the client with `diff_views` and `diff_split`, which move. The rest of `diff_panel` stays in the
+   desktop until the panels it switches between move: the board (moved), the Tickets panel (S4), the pull
+   request diff (`github.rs`), the changed-files column, whose clicks open the editor in editor mode, and
+   the editor terminal.
 
 ## 5. The dependency test
 

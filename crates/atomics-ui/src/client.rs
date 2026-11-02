@@ -1,12 +1,15 @@
 //! What one UI holds for itself, apart from the host: the palette it draws with, the cards it has open,
 //! what waits for the user's confirmation, and the intents its last draw recorded.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use atomics_core::layout::DiffSplit;
 use atomics_core::plan::PlanStatus;
 
 use crate::Intent;
+use crate::diff_view::DiffState;
 use crate::theme::{Fonts, Palette};
 
 /// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
@@ -23,6 +26,10 @@ pub struct Client {
     pub confirm_plan_close: Option<(String, PlanStatus)>,
     /// Permission requests decided here that the host has not answered yet, by session and request id.
     pub approval_decisions: HashSet<(String, String)>,
+    /// Each worktree's diff view: scroll, focus, folds, the file open whole and review comments, by root.
+    pub diff_views: HashMap<PathBuf, DiffState>,
+    /// Side by side or unified, picked in the diff header; wins over the config until the UI closes.
+    pub diff_split: Option<DiffSplit>,
 }
 
 impl Default for Client {
@@ -35,6 +42,8 @@ impl Default for Client {
             expanded_tasks: HashSet::new(),
             confirm_plan_close: None,
             approval_decisions: HashSet::new(),
+            diff_views: HashMap::new(),
+            diff_split: None,
         }
     }
 }

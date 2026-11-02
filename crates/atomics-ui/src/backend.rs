@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomics_core::approvals::ApprovalRequest;
-use atomics_core::config::AgentKind;
+use atomics_core::config::{AgentKind, FontConfig, KeyConfig};
 use atomics_core::diff_data::{FileView, Prepared};
+use atomics_core::layout::LayoutConfig;
 use atomics_core::plan::{Plan, PlanStatus};
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
@@ -160,6 +161,26 @@ pub struct DiffSnapshot {
     pub file_error: Option<String>,
 }
 
+/// What the diff panel's header shows of a worktree beyond its diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffHeading {
+    /// The active session's title, else the worktree's folder name.
+    pub title: String,
+    /// The active session's branch, else the worktree's; `None` when it is the title.
+    pub branch: Option<String>,
+    /// An agent working there can take a review now.
+    pub can_send: bool,
+}
+
+/// The parts of the host's config the UI is drawn by.
+#[derive(Debug, Clone)]
+pub struct UiConfig {
+    pub keys: KeyConfig,
+    /// Terminal and diff text sizes; a theme's sizes win over them.
+    pub font: FontConfig,
+    pub layout: LayoutConfig,
+}
+
 /// Everything the UI reads from a host. Methods take `&self` and return owned or shared data, so an
 /// implementation can sit over a lock, a snapshot or a socket. Writes are added as their own slices.
 pub trait Backend {
@@ -187,4 +208,10 @@ pub trait Backend {
 
     /// The diff of one worktree.
     fn diff(&self, root: &Path) -> Option<DiffSnapshot>;
+
+    /// What the diff panel's header shows of the worktree at `root`.
+    fn diff_heading(&self, root: &Path) -> DiffHeading;
+
+    /// The keys, fonts and layout the host's config sets.
+    fn ui_config(&self) -> UiConfig;
 }
