@@ -40,7 +40,7 @@ impl Desktop<'_> {
                         .and_then(|s| s.prepared.as_ref())
                         .and_then(|p| p.diff.files.first().map(|f| f.path().to_string()))
                 });
-                self.edit(ctx, &root, file.as_deref(), None);
+                self.send(Command::Edit { root, path: file, line: None });
             }
         }
         // The GitHub controls, like the agent chords, are taken before the focused terminal or editor.
@@ -111,12 +111,7 @@ impl Desktop<'_> {
                 let target = if hunk { state.step_hunk(step) } else { state.step(step) };
                 if target.is_some() {
                     // Keep the host in diff mode without reopening the file over the jump.
-                    self.post(move |runtime| {
-                        let data = runtime.diffs.entry(root).or_default();
-                        data.viewing = None;
-                        data.file = None;
-                        data.file_error = None;
-                    });
+                    self.send(Command::LeaveFile(root));
                 }
             }
         }
@@ -194,7 +189,7 @@ impl Desktop<'_> {
         if pressed(&keys.refresh_diff)
             && let Some(root) = self.runtime.diff_target()
         {
-            self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default()));
+            self.send(Command::RefreshDiff(root));
         }
         if pressed(&keys.next_attention) {
             let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
@@ -249,7 +244,7 @@ impl Desktop<'_> {
                                 })
                             })
                         });
-                        self.edit(ctx, &root, path.as_deref(), None);
+                        self.send(Command::Edit { root, path, line: None });
                     }
                 } else if self.runtime.panel == PanelMode::Tickets {
                     // Find stays in Find; Read shows the agent's ticket.

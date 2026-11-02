@@ -85,6 +85,31 @@ pub enum Command {
         branches: Vec<(PathBuf, String)>,
     },
 
+    // ── Review comments and the diff ─────────────────────────────────────────────────────────────────
+    /// The review comments on a worktree's diff changed from `before` to `after`.
+    EditComments {
+        root: PathBuf,
+        before: Vec<ReviewComment>,
+        after: Vec<ReviewComment>,
+    },
+    /// Send a worktree's review comments to the agent working there.
+    SendReview(PathBuf),
+    /// Read a worktree's diff again now.
+    RefreshDiff(PathBuf),
+    /// Show a file of a worktree in its diff view: its hunks when changed, the whole file otherwise.
+    OpenFile {
+        root: PathBuf,
+        path: String,
+    },
+    /// The diff view moved to another file or hunk: the host stops showing a file whole there.
+    LeaveFile(PathBuf),
+    /// Open a worktree's file, or the worktree itself, in the editor; at `line` if given.
+    Edit {
+        root: PathBuf,
+        path: Option<String>,
+        line: Option<u32>,
+    },
+
     // ── Not sent yet: the desktop carries these out itself ──────────────────────────────────────────
     /// A task brief on the board has the keyboard this frame: the host holds off a restart until the edit
     /// is done.
@@ -96,24 +121,8 @@ pub enum Command {
     },
     /// Show a task's session, with its diff.
     OpenTaskSession(String),
-    /// The review comments on a worktree's diff changed from `before` to `after`.
-    EditComments {
-        root: PathBuf,
-        before: Vec<ReviewComment>,
-        after: Vec<ReviewComment>,
-    },
-    /// Send a worktree's review comments to the agent working there.
-    SendReview(PathBuf),
-    /// Read a worktree's diff again now.
-    RefreshDiff(PathBuf),
     /// Hide the diff panel.
     CloseDiff,
-    /// Open a worktree's file, or the worktree itself, in the editor; at `line` if given.
-    Edit {
-        root: PathBuf,
-        path: Option<String>,
-        line: Option<u32>,
-    },
     /// Make a session the active one, opening the diff panel if `open_diff`.
     Activate {
         session: String,
@@ -139,11 +148,6 @@ pub enum Command {
     OpenCleanup {
         repo: PathBuf,
         preselect: Option<PathBuf>,
-    },
-    /// Show a file of a worktree whole in its diff view.
-    OpenFile {
-        root: PathBuf,
-        path: String,
     },
     /// Close a plan's tab: an open plan asks to be closed first, a finished one is archived.
     ClosePlanTab(usize),

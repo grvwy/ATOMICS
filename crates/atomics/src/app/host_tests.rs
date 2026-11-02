@@ -610,7 +610,7 @@ fn delayed_file_open_keeps_the_hosts_resolved_target() {
             {
                 let mut state = host.state();
                 let mut app = Desktop { runtime: &mut state, client: &mut client };
-                app.open_file(&repo, path);
+                app.send(Command::OpenFile { root: repo.clone(), path: path.into() });
                 // Do not drain the action or consume events across these frames.
                 for _ in 0..2 {
                     ctx.run_ui(egui::RawInput::default(), |_| app.sync_diffs()).drop_without_applying_deltas();

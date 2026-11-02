@@ -145,6 +145,21 @@ impl Local<'_> {
                     state.toast(error);
                 }
             }),
+            Command::EditComments { root, before, after } => state.post(move |state| {
+                state.diffs.entry(root).or_default().edit_comments(before, after);
+            }),
+            Command::SendReview(root) => state.post(move |state| {
+                state.send_review(&root);
+            }),
+            Command::RefreshDiff(root) => state.post(move |state| state_refresh(state.diffs.entry(root).or_default())),
+            Command::OpenFile { root, path } => state.post(move |state| state.open_file(&root, &path)),
+            Command::LeaveFile(root) => state.post(move |state| {
+                let data = state.diffs.entry(root).or_default();
+                data.viewing = None;
+                data.file = None;
+                data.file_error = None;
+            }),
+            Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
             Command::CleanUpPlan(plan) => state.post_plan(plan, |state, index| state.open_plan_cleanup(index)),
             Command::ReloadPlanCleanup => state.post(State::reload_plan_cleanup),
             Command::RemovePlanBranches { plan, branches } => {
@@ -168,8 +183,8 @@ impl Desktop<'_> {
         result
     }
 
-    /// Carries out a command now: an approval or plan command through the in-process backend, the others
-    /// with the posts and view-hint writes the desktop's code made, until their domains reach it too.
+    /// Carries out a command now: an approval, plan or review command through the in-process backend, the
+    /// others with the posts and view-hint writes the desktop's code made, until their domains reach it too.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::EditingPlan => self.runtime.plan_edit_open = true,
@@ -178,18 +193,7 @@ impl Desktop<'_> {
                 self.activate(&session, true);
                 self.runtime.panel = PanelMode::Diff;
             }
-            Command::EditComments { root, before, after } => self.post(move |runtime| {
-                runtime.diffs.entry(root).or_default().edit_comments(before, after);
-            }),
-            Command::SendReview(root) => self.send_review(&root),
-            Command::RefreshDiff(root) => {
-                self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default()))
-            }
             Command::CloseDiff => self.runtime.diff_open = false,
-            Command::Edit { root, path, line } => {
-                let ctx = self.client.ctx.clone();
-                self.edit(&ctx, &root, path.as_deref(), line);
-            }
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
             Command::Rename(session) => self.begin_rename(&session),
             Command::Resume(record) => self.post(move |state| state.resume.push(record)),
@@ -209,7 +213,6 @@ impl Desktop<'_> {
                 self.runtime.diff_open = true;
             }
             Command::OpenCleanup { repo, preselect } => self.open_cleanup(repo, preselect),
-            Command::OpenFile { root, path } => self.open_file(&root, &path),
             Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
             Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
             Command::SetView(view) => self.runtime.set_view(view),
@@ -254,23 +257,6 @@ impl Desktop<'_> {
     pub(super) fn close(&self, id: &str) {
         let id = id.to_string();
         self.post(move |state| state.close(&id));
-    }
-
-    pub(super) fn edit(&self, _ctx: &egui::Context, root: &Path, path: Option<&str>, line: Option<u32>) {
-        let (root, path) = (root.to_path_buf(), path.map(str::to_string));
-        self.post(move |state| state.edit(&root, path.as_deref(), line));
-    }
-
-    pub(super) fn open_file(&self, root: &Path, path: &str) {
-        let (root, path) = (root.to_path_buf(), path.to_string());
-        self.post(move |state| state.open_file(&root, &path));
-    }
-
-    pub(super) fn send_review(&self, root: &Path) {
-        let root = root.to_path_buf();
-        self.post(move |state| {
-            state.send_review(&root);
-        });
     }
 
     pub(super) fn toggle_chief(&self, _ctx: &egui::Context) {
