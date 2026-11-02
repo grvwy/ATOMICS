@@ -836,8 +836,9 @@ impl State {
             if session.sandbox.is_none() && session.status == AgentStatus::NeedsInput {
                 continue;
             }
-            let screen = terminal.screen_text(12);
-            let busy = screen_busy(&screen, &busy_text);
+            let full = terminal.screen_text(60);
+            let screen = screen_tail(&full, 12);
+            let busy = view_busy(&full, &screen, &busy_text);
             if !busy && session.sandbox.is_some() {
                 if screen.trim().is_empty() && session.status == AgentStatus::Starting {
                     continue;
@@ -1132,6 +1133,19 @@ const LONG_PROMPT: usize = 700;
 /// cannot reach ATOMICS.
 const SANDBOX_BUSY: &str = "esc to interrupt";
 const SCREEN_QUIET: Duration = Duration::from_millis(800);
+
+/// The last `lines` lines of `screen`.
+fn screen_tail(screen: &str, lines: usize) -> String {
+    let all: Vec<_> = screen.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Busy by the footer, or, in an agent view scrolled up from its live end (it shows a "Jump to
+/// bottom" pill instead of its footer), by the busy text anywhere on the screen. The terminal's
+/// own scroll position never matters: the screen read is always the live one.
+fn view_busy(full: &str, tail: &str, busy: &str) -> bool {
+    screen_busy(tail, busy) || screen_busy(full, "jump to bottom") && screen_busy(full, busy)
+}
 
 /// Footers can wrap or change case, including Codex's `esc to interrupt` and Claude's `Esc to interrupt`.
 fn screen_busy(screen: &str, busy: &str) -> bool {
@@ -2038,5 +2052,20 @@ esac
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn busy_survives_a_scrolled_up_agent_view() {
+        let busy = "esc to interrupt";
+        let spinner = "✻ Building… (5m · esc to interrupt)";
+        let filler = "transcript\n".repeat(30);
+        let live = format!("{filler}{spinner}\n> ");
+        assert!(view_busy(&live, &screen_tail(&live, 12), busy));
+        // Scrolled up: the spinner sits above the tail, under a "Jump to bottom" pill.
+        let scrolled = format!("{spinner}\n{filler}Jump to bottom");
+        assert!(view_busy(&scrolled, &screen_tail(&scrolled, 12), busy));
+        // Quoted busy text in a live transcript is still not busy.
+        let quoted = format!("the footer says {busy}\n{filler}> ");
+        assert!(!view_busy(&quoted, &screen_tail(&quoted, 12), busy));
     }
 }

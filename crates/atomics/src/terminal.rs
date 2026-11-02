@@ -615,6 +615,21 @@ mod tests {
         terminal.shutdown();
     }
 
+    #[test]
+    fn screen_text_is_the_live_screen_while_the_display_is_scrolled() {
+        let (terminal, _view, _metrics, _dir) = selected_terminal();
+        {
+            let mut term = terminal.term.lock();
+            let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+            parser.advance(&mut *term, "line\r\n".repeat(200).as_bytes());
+            parser.advance(&mut *term, b"\r\nesc to interrupt");
+            term.scroll_display(Scroll::Top);
+            assert!(term.grid().display_offset() > 0);
+        }
+        assert!(terminal.screen_text(24).contains("esc to interrupt"));
+        terminal.shutdown();
+    }
+
     fn selected_terminal() -> (Terminal, TerminalView, Metrics, crate::test_support::TempDir) {
         let dir = crate::test_support::tempdir().unwrap();
         let palette = Palette::from_config(&atomics_core::config::ThemeConfig::default());
