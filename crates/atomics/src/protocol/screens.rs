@@ -142,6 +142,18 @@ impl Current {
     }
 }
 
+impl Current {
+    /// The `oversize` error a client gets instead of a snapshot that does not fit in frames.
+    pub fn oversize(&self) -> Arc<str> {
+        let message = format!(
+            "the screen of session {} does not fit in a frame (generation {}, revision {}); it is sent again once it does",
+            self.session, self.generation, self.revision
+        );
+        let envelope = WireError::new(ErrorCode::Oversize, message).into_envelope(None, Some(self.epoch.clone()));
+        wire::encode(&envelope).expect("an error frame is small").into()
+    }
+}
+
 /// Where a client's slot finds the current snapshot of its screen.
 pub type Feed = Arc<RwLock<Option<Arc<Current>>>>;
 
@@ -346,8 +358,10 @@ impl Screens {
     /// One pass of the protocol thread: follow terminal replacements, drop closed clients, and copy
     /// every subscribed screen that changed and is due. True while some screen is in its echo
     /// window, when the caller should look again after `echo_poll` rather than its usual interval.
+    /// A pass that finds nothing due allocates nothing, however often it runs.
     pub fn poll(&self) -> bool {
         let terminals = self.terminals.load();
+        let mut echoing = false;
         let work: Vec<(String, Arc<Stream>, Vec<Subscriber>)> = {
             let mut watches = self.watches();
             watches.retain(|session, watch| {
@@ -364,41 +378,58 @@ impl Screens {
                 }
                 true
             });
+            let mut due = false;
+            for watch in watches.values() {
+                let Some(stream) = &watch.stream else { continue };
+                let look = self.look(stream, &stream.state(), watch.subscribers.iter().any(|s| s.focused));
+                echoing |= look.echoing;
+                due |= look.due;
+            }
+            if !due {
+                return echoing;
+            }
             watches
                 .iter()
                 .filter_map(|(session, w)| Some((session.clone(), w.stream.clone()?, w.subscribers.clone())))
                 .collect()
         };
-        let mut echoing = false;
         for (session, stream, subscribers) in work {
             echoing |= self.pump(&session, &stream, &subscribers);
         }
         echoing
     }
 
-    /// Copy one screen if it changed and is due. True while it is in its echo window.
-    fn pump(&self, session: &str, stream: &Stream, subscribers: &[Subscriber]) -> bool {
+    /// Whether `stream` is in its echo window, and whether it is due for a copy: new, or changed
+    /// and its cadence has passed (none for the first change after input).
+    fn look(&self, stream: &Stream, state: &StreamState, focused: bool) -> Look {
         let input = stream.control.lease().input_at();
         let echoing =
             input != 0 && micros(Instant::now()).saturating_sub(input) < self.config.echo_window.as_micros() as u64;
-        let (outcome, current) = {
+        let cadence = if input > state.echoed {
+            Duration::ZERO // the first change after input: its echo
+        } else if echoing {
+            self.config.echo_floor
+        } else if focused {
+            self.config.focused
+        } else {
+            self.config.visible
+        };
+        let fresh = state.last.is_none() || state.tracker.generation != state.generation;
+        let changed = state.seen != Some(stream.source.changes());
+        let due = fresh || (changed && state.captured.is_none_or(|at| at.elapsed() >= cadence));
+        Look { input, echoing, due }
+    }
+
+    /// Copy one screen if it changed and is due. True while it is in its echo window.
+    fn pump(&self, session: &str, stream: &Stream, subscribers: &[Subscriber]) -> bool {
+        let (outcome, current, echoing) = {
             let mut state = stream.state();
-            let cadence = if input > state.echoed {
-                Duration::ZERO // the first change after input: its echo
-            } else if echoing {
-                self.config.echo_floor
-            } else if subscribers.iter().any(|s| s.focused) {
-                self.config.focused
-            } else {
-                self.config.visible
-            };
-            let fresh = state.last.is_none() || state.tracker.generation != state.generation;
-            let changes = stream.source.changes();
-            let due = state.seen != Some(changes) && state.captured.is_none_or(|at| at.elapsed() >= cadence);
-            if !fresh && !due {
+            let Look { input, echoing, due } = self.look(stream, &state, subscribers.iter().any(|s| s.focused));
+            if !due {
                 return echoing;
             }
             // Read before copying: a change racing the copy moves the counter again and is seen next time.
+            let changes = stream.source.changes();
             let screen = stream.source.capture(&mut state.tracker, &self.generations);
             state.seen = Some(changes);
             state.captured = Some(Instant::now());
@@ -428,7 +459,7 @@ impl Screens {
                 screen,
                 frames: OnceLock::new(),
             });
-            (outcome, current)
+            (outcome, current, echoing)
         };
         // Publish before queueing, so a client that loads this snapshot skips the delta that led to it.
         *stream.feed.write().unwrap_or_else(|e| e.into_inner()) = Some(current);
@@ -449,6 +480,14 @@ impl Screens {
         }
         echoing
     }
+}
+
+/// What one look at a stream found.
+struct Look {
+    /// The last input admitted (`Lease::input_at`).
+    input: u64,
+    echoing: bool,
+    due: bool,
 }
 
 fn stale(generation: u64) -> WireError {

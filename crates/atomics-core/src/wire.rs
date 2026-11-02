@@ -95,6 +95,9 @@ pub enum ErrorCode {
     Fenced,
     /// Input whose sequence number is not the next one in its lease. It was not applied.
     OutOfOrder,
+    /// A code from a newer peer. Minor versions may add codes; an older client still reads the frame.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a frame was refused. Convert with `into_envelope` to answer the sender.

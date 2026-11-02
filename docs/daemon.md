@@ -204,7 +204,8 @@ allowed_origins = []     # exact Origin values; a native client sends none
 ```
 
 - **Where it listens.** `127.0.0.1` only. On start the app writes `protocol.json` (`{url, token, pid}`, mode 0600) in its
-  state directory and removes it on exit; the token is new on every start and is never logged.
+  state directory and removes it on exit; the token is new on every start and is never logged. The headless host
+  removes one an earlier run left behind as it starts, so with `[remote]` off no stale advert remains.
 - **Upgrade.** Refused with 403/401/400 unless the `Host` header is the loopback address and port, any `Origin` is
   listed, `Authorization: Bearer <token>` matches (constant-time) and the client offers the `atomics.v1` subprotocol.
   At most four clients at once.
@@ -221,6 +222,7 @@ allowed_origins = []     # exact Origin values; a native client sends none
   snapshot. A client can also send `resync` at any time. `atomics_core::mirror::Mirror` is the reference client model.
 - **Bad input.** Malformed JSON, unknown kinds, a wrong major version, an oversize frame (over 256 KiB, refused before
   it is buffered) and binary frames get a typed `error` frame; oversize frames and a ninth error end the connection.
+  An error `code` or lease `reason` a peer does not know (a newer minor version's) decodes as `unknown`.
   A first message other than `hello` ends it. Idle clients are pinged every 25 s and dropped after 60 s of silence.
 - **Not yet.** Chunked transfers of the board and diffs (a board or diff over one frame fails with `oversize`),
   `file_get` (answers `not_found`), and every mutation (H4). A removed diff is sent as a
@@ -230,7 +232,8 @@ allowed_origins = []     # exact Origin values; a native client sends none
 ### Terminal screens
 
 Stream H2. A client that negotiated the `terminals` capability subscribes to `{"topic": "screen", "session", "focused"}`
-and gets a `screen_snapshot`, then `screen_delta`s. The types and the reference client (`Screen`, `ScreenMirror`) are in
+and gets a `screen_snapshot`, then `screen_delta`s. A `subscribe` is checked whole first (the capability, every
+screen's terminal, the subscription limit), so a refused one subscribes to nothing. The types and the reference client (`Screen`, `ScreenMirror`) are in
 `atomics_core::screen`; the host side is `protocol/screens.rs` and `terminal/screen.rs`.
 
 - **Who copies.** The runtime thread only publishes which terminals exist (`Terminals`), and only while the server runs;
@@ -245,7 +248,8 @@ and gets a `screen_snapshot`, then `screen_delta`s. The types and the reference 
   the client derives, as the desktop does) or `"#rrggbb"`. Snapshots carry the palette (the theme with the program's
   OSC colour changes), title, cursor shape and blink, and the modes a client needs to encode input: application cursor
   and keypad, bracketed paste, mouse modes and encodings, focus reporting, alternate scroll and kitty keyboard flags.
-  Soft wraps are kept per line; trailing blanks and blank rows are left out.
+  Soft wraps are kept per line; trailing blanks and blank rows are left out. A copy keeps at most 1 KiB of the title
+  (cut at a character boundary) and 16 combining marks per cell, whatever the program writes.
 - **Revisions.** The first copy of a generation is a snapshot at revision 1. Each later change is one delta naming its
   generation, base and revision: `scroll` (lines that moved into history) first, then the changed lines, cursor, modes,
   title or palette. A resize, an alternate-screen switch, a replaced terminal, or output that cannot be followed exactly
@@ -265,7 +269,10 @@ and gets a `screen_snapshot`, then `screen_delta`s. The types and the reference 
   frames. A client whose mirror reports a gap sends `resync {"screens": [session]}` and gets a snapshot. A socket that
   stays unwritable for the write timeout still disconnects the client; the emulator never waits for one.
 - **Large screens.** A snapshot over the frame limit is split by rows into self-contained parts (`part {index, count}`),
-  applied when the last part arrives; a delta over the limit becomes a snapshot.
+  applied when the last part arrives; a delta over the limit becomes a snapshot. A screen whose single line still does
+  not fit is not sent: the client gets one `oversize` error naming the session, its other screens keep streaming, and
+  the screen's snapshot is sent at its first change that fits. Snapshots are encoded outside the client's queue lock,
+  so the threads that queue for it never wait for an encoding.
 - **Remote off.** No `Terminals`, no screens thread, nothing copied: the runtime thread skips publishing. The only
   change on the desktop's path is a counter the listener bumps on a title change and a theme change bumps.
 - **Not yet.** Editor terminals and OSC 8 hyperlinks. Input and leases are H3, below.
@@ -306,19 +313,27 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   whenever the lease changes hands or the holder's size comes or goes: `holder` (its `client_id`), `resized`, and
   `reason` (`granted`, `taken_over`, `released`, `expired`, `disconnected` or `desktop`). Only the holder is told the
   fencing token (`lease`), the `next` input number and `ttl_ms`. Each lease request is answered with a `lease_state`.
+  When a followed terminal goes away (its session ended), its followers get a `lease_state` with no holder and
+  `reason: disconnected`. `input` is offered only together with `terminals`.
 - **Fencing.** Each grant takes a fencing token from one counter for the whole process, so tokens only go up and
   never come back. A lease belongs to the connection that took it. It ends when it is released or taken over, after
   30 s without input, a resize or a `lease_renew`, when its connection ends, or when someone types on the desktop.
-  Input, a resize, a renew or a release naming an ended lease gets `fenced` and is not applied. `fenced` and
-  `lease_held` never count towards disconnecting a client: one that races another meets them as a matter of course.
+  Input, a resize, a renew or a release naming an ended lease gets `fenced` and is not applied. `fenced`,
+  `lease_held` and `slow_client` never count towards disconnecting a client: one that races another, or types faster
+  than a program reads, meets them as a matter of course. Nor does `not_found` for something that went away meanwhile:
+  the terminal of a screen the client follows or subscribes to, or a diff file it was told of.
 - **Order, and no replay.** `seq` starts at 1 in each lease and must be the next one; a repeat or a gap gets
   `out_of_order` and is not applied. The client's own thread writes admitted input to the PTY under the lease's lock,
   so input admitted under an old lease can never land after a takeover. Nothing is replayed across a disconnect: the
   replay ring holds no input, the lease ends with the connection, and a new connection cannot use the old token.
   `Typist::disconnected` forgets the lease, so a client sends nothing it typed before or during the outage.
-- **Input.** `data` is UTF-8 text the client encoded from the screen's published modes, at most 64 KiB per frame
-  (`Typist` splits longer pastes at character boundaries); 8-bit meta bytes cannot be sent. Remote input does not
-  move the desktop's scrolled view.
+- **Input.** `data` is UTF-8 text the client encoded from the screen's published modes, at most 64 KiB per frame;
+  more is refused as `oversize`. `Typist` splits longer pastes at character boundaries so that each piece is at most
+  64 KiB once JSON-escaped: a control character takes six bytes in a frame, so 64 KiB of raw text could outgrow the
+  256 KiB frame limit. 8-bit meta bytes cannot be sent. Remote input does not move the desktop's scrolled view.
+- **A program that does not read.** Admitted input the PTY has not taken yet is bounded at 1 MiB per terminal
+  (counted as the PTY writes it). Above that, input gets `slow_client` and is not applied; its number is not used, so
+  the client sends the same input again once the program reads (its echo shows).
 - **Resizing only when asked.** Taking the lease or typing never resizes. `terminal_resize` with a `size` ("fit to
   this screen") resizes for the holder; without one it returns to the host's own size. The holder's size lasts as
   long as its lease: however the lease ends, the terminal returns to the desktop's size (the pane's last size, or
@@ -337,8 +352,8 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
 - **Tests.** `protocol/lease.rs` covers every rule in isolation, with a fake clock. `protocol/input_tests.rs` checks
   them over real loopback sockets with emulators that echo what they are sent: order, fencing, takeover seen by
   everyone, expiry and renewal, no replay after a reconnect, resizing only when asked and restored when the lease
-  ends, debounced bursts, the desktop taking the lease back, capability, subscription and role, and an echo that does
-  not wait for a 5 s cadence. `app::host_tests` types into a real shell through the host while the `State` lock is
+  ends, debounced bursts, the desktop taking the lease back, a terminal that closes, a program that stops reading,
+  capability, subscription and role, and an echo that does not wait for a 5 s cadence. `app::host_tests` types into a real shell through the host while the `State` lock is
   held. `terminal::tests` drives `TerminalView` to show that desktop typing still reaches the PTY and takes the lease
   back. The headless gate (`tests/headless_host.rs`) types into a shell that ctl started. `protocol/link.rs` races
   wakes against the wake pipe's drain and checks that a later wake still ends a wait at once.

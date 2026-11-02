@@ -27,6 +27,23 @@ pub const MAX_ROWS: u16 = 512;
 pub const PALETTE_LEN: usize = 259;
 /// The most history lines one `history_get` may ask for; the host may send fewer.
 pub const MAX_HISTORY_LINES: u32 = 1000;
+/// The longest title a screen carries, in bytes. The host cuts a longer one at a character
+/// boundary when it copies the screen, so a program's title alone can never outgrow a frame.
+pub const MAX_TITLE_BYTES: usize = 1024;
+/// The most combining marks one cell carries; the host leaves out any after these.
+pub const MAX_COMBINING: usize = 16;
+
+/// `title` cut to at most [`MAX_TITLE_BYTES`], at a character boundary.
+pub fn clip_title(title: &str) -> &str {
+    if title.len() <= MAX_TITLE_BYTES {
+        return title;
+    }
+    let mut end = MAX_TITLE_BYTES;
+    while !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    &title[..end]
+}
 
 pub const FOREGROUND: u16 = 256;
 pub const BACKGROUND: u16 = 257;
@@ -1007,5 +1024,14 @@ mod tests {
             lines,
         };
         assert_eq!(chunk.decode().unwrap(), a.lines);
+    }
+
+    #[test]
+    fn titles_are_clipped_at_a_character_boundary() {
+        assert_eq!(clip_title("vim"), "vim");
+        let long = "é".repeat(MAX_TITLE_BYTES); // two bytes each
+        assert_eq!(clip_title(&long).len(), MAX_TITLE_BYTES);
+        let odd = format!("a{long}");
+        assert_eq!(clip_title(&odd).len(), MAX_TITLE_BYTES - 1, "never splits a character");
     }
 }

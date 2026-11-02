@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use atomics_core::diff::FileDiff;
-use atomics_core::lease::LeaseReason;
+use atomics_core::lease::{LeaseReason, LeaseState};
 use atomics_core::projection::DiffFileBody;
 use atomics_core::wire::{
     self, CAPABILITIES, Envelope, ErrorCode, INPUT, Limits, MAX_SUBSCRIPTIONS, Message, Role, Seq, TERMINALS, Topic,
@@ -182,8 +182,12 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
     if let Some(waker) = out.link.waker() {
         outbox.set_waker(waker);
     }
-    let capabilities = wire::common_capabilities(capabilities, CAPABILITIES);
+    let mut capabilities = wire::common_capabilities(capabilities, CAPABILITIES);
     let terminals = capabilities.iter().any(|c| c == TERMINALS);
+    // `input` needs `terminals`; alone it is not offered.
+    if !terminals {
+        capabilities.retain(|c| c != INPUT);
+    }
     let mut follows = Follows {
         keys: HashSet::new(),
         screens: HashSet::new(),
@@ -247,10 +251,35 @@ struct Follows {
     told: HashMap<String, (usize, u64)>,
 }
 
-/// Refusals a well-behaved client meets when another one races it for a lease; they never count
-/// towards disconnecting it.
+/// Refusals a well-behaved client meets as a matter of course: another one races it for a lease,
+/// or it types faster than the program reads. They never count towards disconnecting it.
 fn expected(code: ErrorCode) -> bool {
-    matches!(code, ErrorCode::Fenced | ErrorCode::LeaseHeld)
+    matches!(code, ErrorCode::Fenced | ErrorCode::LeaseHeld | ErrorCode::SlowClient)
+}
+
+/// Why a request was refused, and whether it counts towards disconnecting the client.
+struct Refusal {
+    error: WireError,
+    counts: bool,
+}
+
+impl Refusal {
+    /// What the request named went away meanwhile (its terminal closed, its diff file changed):
+    /// a well-behaved client meets that too, so it does not count.
+    fn gone(error: WireError) -> Self {
+        Self { error, counts: false }
+    }
+}
+
+impl From<WireError> for Refusal {
+    fn from(error: WireError) -> Self {
+        let counts = !expected(error.code);
+        Self { error, counts }
+    }
+}
+
+fn no_terminal() -> WireError {
+    WireError::new(ErrorCode::NotFound, "that session has no terminal")
 }
 
 fn conversation(
@@ -295,9 +324,9 @@ fn conversation(
                 if let Err(e) = handle(out, shared, outbox, subscriptions, envelope) {
                     match e {
                         Handled::Link(ended) => return Err(ended),
-                        Handled::Refused(error, request_id) => {
+                        Handled::Refused(Refusal { error, counts }, request_id) => {
                             let code = error.code;
-                            if !expected(code) {
+                            if counts {
                                 errors += 1;
                             }
                             out.error(error, request_id).map_err(link_ended)?;
@@ -329,7 +358,24 @@ fn conversation(
 fn tell_leases(out: &mut Out<'_>, shared: &Shared, follows: &mut Follows) -> Result<(), LinkError> {
     let now = Instant::now();
     for session in &follows.screens {
-        let Some((identity, control)) = shared.screens.terminals().control(session) else { continue };
+        let Some((identity, control)) = shared.screens.terminals().control(session) else {
+            // Its terminal went away, and the lease with it: nobody holds it now. Said once; a
+            // new terminal for the session is told about afresh.
+            if follows.told.remove(session).is_some() {
+                let state = LeaseState {
+                    session: session.clone(),
+                    holder: None,
+                    yours: false,
+                    lease: None,
+                    next: None,
+                    ttl_ms: None,
+                    resized: false,
+                    reason: Some(LeaseReason::Disconnected),
+                };
+                out.envelope(&Envelope::host(&out.epoch, Message::LeaseState(state)))?;
+            }
+            continue;
+        };
         control.tick(now, &shared.lease);
         if follows.told.get(session) == Some(&(identity, control.lease().version())) {
             continue;
@@ -346,21 +392,18 @@ fn controllable(
     shared: &Shared,
     follows: &Follows,
     session: &str,
-) -> Result<(usize, Arc<dyn TerminalControl>), WireError> {
+) -> Result<(usize, Arc<dyn TerminalControl>), Refusal> {
     if !follows.input {
-        return Err(WireError::new(ErrorCode::Unauthorised, "the input capability was not negotiated"));
+        return Err(WireError::new(ErrorCode::Unauthorised, "the input capability was not negotiated").into());
     }
     if follows.role != Role::Controller {
-        return Err(WireError::new(ErrorCode::Unauthorised, "this client is view-only"));
+        return Err(WireError::new(ErrorCode::Unauthorised, "this client is view-only").into());
     }
     if !follows.screens.contains(session) {
-        return Err(WireError::new(ErrorCode::NotFound, "subscribe to that screen first"));
+        return Err(WireError::new(ErrorCode::NotFound, "subscribe to that screen first").into());
     }
-    shared
-        .screens
-        .terminals()
-        .control(session)
-        .ok_or_else(|| WireError::new(ErrorCode::NotFound, "that session has no terminal"))
+    // It follows the screen, so a missing terminal closed meanwhile.
+    shared.screens.terminals().control(session).ok_or_else(|| Refusal::gone(no_terminal()))
 }
 
 /// Answer a lease request with the lease as this client now sees it.
@@ -389,7 +432,7 @@ fn resync(out: &mut Out<'_>, shared: &Shared, outbox: &Outbox) -> Result<(), End
 
 enum Handled {
     Link(Ended),
-    Refused(WireError, Option<String>),
+    Refused(Refusal, Option<String>),
 }
 
 impl From<LinkError> for Handled {
@@ -406,24 +449,49 @@ fn handle(
     envelope: Envelope,
 ) -> Result<(), Handled> {
     let id = envelope.request_id.clone();
-    let refuse = |code: ErrorCode, message: &str| Handled::Refused(WireError::new(code, message), id.clone());
-    let refused = |error: WireError| Handled::Refused(error, id.clone());
+    let refuse = |code: ErrorCode, message: &str| Handled::Refused(WireError::new(code, message).into(), id.clone());
+    let refused = |error: WireError| Handled::Refused(error.into(), id.clone());
+    let refusal = |refusal: Refusal| Handled::Refused(refusal, id.clone());
+    let gone = |error: WireError| Handled::Refused(Refusal::gone(error), id.clone());
     let no_terminals = || refuse(ErrorCode::Unauthorised, "the terminals capability was not negotiated");
     match envelope.message {
         Message::Subscribe { topics } => {
-            for topic in topics {
-                let key = topic.key();
-                if !subscriptions.keys.contains(&key) && subscriptions.keys.len() >= MAX_SUBSCRIPTIONS {
-                    return Err(refuse(ErrorCode::TooMany, "too many subscriptions"));
-                }
-                if let Topic::Screen { session, focused } = &topic {
+            // The whole list is checked first, so a refused request subscribes to nothing.
+            let mut fresh = HashSet::new();
+            for topic in &topics {
+                if let Topic::Screen { session, .. } = topic {
                     if !subscriptions.terminals {
                         return Err(no_terminals());
                     }
-                    shared.screens.subscribe(session, outbox, *focused).map_err(refused)?;
-                    subscriptions.screens.insert(session.clone());
+                    if shared.screens.terminals().control(session).is_none() {
+                        return Err(gone(no_terminal()));
+                    }
                 }
-                subscriptions.keys.insert(key);
+                let key = topic.key();
+                if !subscriptions.keys.contains(&key) {
+                    fresh.insert(key);
+                }
+            }
+            if subscriptions.keys.len() + fresh.len() > MAX_SUBSCRIPTIONS {
+                return Err(refuse(ErrorCode::TooMany, "too many subscriptions"));
+            }
+            let mut screens: Vec<String> = Vec::new();
+            for topic in &topics {
+                if let Topic::Screen { session, focused } = topic {
+                    if let Err(error) = shared.screens.subscribe(session, outbox, *focused) {
+                        // Its terminal closed since the check: undo what this request added.
+                        for session in screens {
+                            subscriptions.screens.remove(&session);
+                            shared.screens.unsubscribe(&session, outbox);
+                        }
+                        subscriptions.keys.retain(|key| !fresh.contains(key));
+                        return Err(gone(error));
+                    }
+                    if subscriptions.screens.insert(session.clone()) {
+                        screens.push(session.clone());
+                    }
+                }
+                subscriptions.keys.insert(topic.key());
             }
             Ok(())
         }
@@ -447,16 +515,19 @@ fn handle(
             if !subscriptions.terminals {
                 return Err(no_terminals());
             }
+            let followed = subscriptions.screens.contains(&request.session);
             let chunk = shared
                 .screens
                 .history(&request.session, request.generation.0, request.before.0, request.count)
-                .map_err(refused)?;
+                // A followed screen without a stream is one whose terminal closed meanwhile.
+                .map_err(|e| if e.code == ErrorCode::NotFound && followed { gone(e) } else { refused(e) })?;
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
         }
         Message::DiffGet { worktree, path, revision } => {
             let Some((current, file)) = shared.diffs.file(&worktree, &path) else {
-                return Err(refuse(ErrorCode::NotFound, "no such diff file"));
+                // The diff may have changed since the client was told of the file.
+                return Err(gone(WireError::new(ErrorCode::NotFound, "no such diff file")));
             };
             if revision.is_some_and(|r| r != Seq(current)) {
                 return Err(refuse(ErrorCode::StaleRevision, &format!("the diff is at revision {current}")));
@@ -465,27 +536,27 @@ fn handle(
             let reply = Envelope::host(&out.epoch, Message::DiffFile { body }).reply_to(id);
             match wire::encode(&reply) {
                 Ok(frame) => Ok(out.raw(&frame)?),
-                Err(e) => Err(Handled::Refused(e, reply.request_id)),
+                Err(e) => Err(Handled::Refused(e.into(), reply.request_id)),
             }
         }
         Message::FileGet { .. } => Err(refuse(ErrorCode::NotFound, "this host does not serve file contents yet")),
         Message::LeaseAcquire { session, takeover } => {
-            let terminal = controllable(shared, subscriptions, &session).map_err(refused)?;
+            let terminal = controllable(shared, subscriptions, &session).map_err(refusal)?;
             terminal.1.acquire(&subscriptions.me, takeover, Instant::now(), &shared.lease).map_err(refused)?;
             reply_lease(out, shared, subscriptions, &session, terminal, id)
         }
         Message::LeaseRenew { session, lease } => {
-            let terminal = controllable(shared, subscriptions, &session).map_err(refused)?;
+            let terminal = controllable(shared, subscriptions, &session).map_err(refusal)?;
             terminal.1.renew(&subscriptions.me, lease.0, Instant::now(), &shared.lease).map_err(refused)?;
             reply_lease(out, shared, subscriptions, &session, terminal, id)
         }
         Message::LeaseRelease { session, lease } => {
-            let terminal = controllable(shared, subscriptions, &session).map_err(refused)?;
+            let terminal = controllable(shared, subscriptions, &session).map_err(refusal)?;
             terminal.1.release(&subscriptions.me, lease.0, Instant::now(), &shared.lease).map_err(refused)?;
             reply_lease(out, shared, subscriptions, &session, terminal, id)
         }
         Message::TerminalInput { session, lease, seq, data } => {
-            let (_, control) = controllable(shared, subscriptions, &session).map_err(refused)?;
+            let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
             control
                 .input(&subscriptions.me, (lease.0, seq.0), data.into_bytes(), Instant::now(), &shared.lease)
                 .map_err(refused)?;
@@ -494,7 +565,7 @@ fn handle(
             Ok(())
         }
         Message::TerminalResize { session, lease, size } => {
-            let (_, control) = controllable(shared, subscriptions, &session).map_err(refused)?;
+            let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
             control.resize_for(&subscriptions.me, lease.0, size, Instant::now(), &shared.lease).map_err(refused)
         }
         Message::Ack { cursor } => {

@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,9 @@ pub struct Shared {
     /// The desktop's own size (its pane, or the size the terminal started with). `size` is what is
     /// in force, which is a lease holder's size while it has one.
     local: Mutex<WindowSize>,
+    /// Bytes lease holders sent that the PTY has not taken yet ([`CountedPty`]). A program that
+    /// stops reading its input leaves them queued; the lease refuses more above a bound.
+    unwritten: AtomicUsize,
 }
 
 impl Shared {
@@ -86,11 +89,13 @@ impl Shared {
             screen_changes: AtomicU64::new(0),
             lease: Lease::default(),
             local: Mutex::new(size),
+            unwritten: AtomicUsize::new(0),
         }
     }
 
     fn set_title(&self, title: Option<String>) {
-        *self.screen_title.lock().unwrap() = title.clone();
+        // Remote screens carry at most MAX_TITLE_BYTES of it; a program may set any length.
+        *self.screen_title.lock().unwrap() = title.as_deref().map(|t| atomics_core::screen::clip_title(t).to_string());
         self.screen_changes.fetch_add(1, Ordering::Release);
         *self.title.lock().unwrap() = title;
     }
@@ -277,6 +282,7 @@ impl Terminal {
         let pty = tty::new(&options, size, 0)?;
         let process_id = pty.child().id();
         let shared = Arc::new(Shared::new(wake, size, colors));
+        let pty = CountedPty::new(pty, shared.clone())?;
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
         let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
@@ -476,6 +482,99 @@ impl Drop for Terminal {
     }
 }
 
+/// alacritty's PTY with its writes counted, so a lease holder's input that the program has not
+/// read yet is known ([`Shared::unwritten`]). Everything else is the PTY's own.
+struct CountedPty {
+    pty: tty::Pty,
+    writer: CountedWriter,
+}
+
+impl CountedPty {
+    fn new(pty: tty::Pty, shared: Arc<Shared>) -> std::io::Result<Self> {
+        // The same open file, so the same non-blocking mode and the same order of bytes.
+        let file = pty.file().try_clone()?;
+        Ok(Self { pty, writer: CountedWriter { file, shared } })
+    }
+}
+
+struct CountedWriter {
+    file: std::fs::File,
+    shared: Arc<Shared>,
+}
+
+impl std::io::Write for CountedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = std::io::Write::write(&mut self.file, bytes)?;
+        // The desktop's own input is written here too but never counted: stop at zero.
+        let unwritten = &self.shared.unwritten;
+        let mut queued = unwritten.load(Ordering::Acquire);
+        while queued > 0 {
+            match unwritten.compare_exchange_weak(
+                queued,
+                queued.saturating_sub(written),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => queued = now,
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.file)
+    }
+}
+
+impl tty::EventedReadWrite for CountedPty {
+    type Reader = <tty::Pty as tty::EventedReadWrite>::Reader;
+    type Writer = CountedWriter;
+
+    unsafe fn register(
+        &mut self,
+        poll: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> std::io::Result<()> {
+        // SAFETY: the caller's contract is the PTY's; this registers exactly what it would.
+        unsafe { self.pty.register(poll, interest, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> std::io::Result<()> {
+        self.pty.reregister(poll, interest, mode)
+    }
+
+    fn deregister(&mut self, poll: &Arc<polling::Poller>) -> std::io::Result<()> {
+        self.pty.deregister(poll)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        self.pty.reader()
+    }
+
+    fn writer(&mut self) -> &mut CountedWriter {
+        &mut self.writer
+    }
+}
+
+impl tty::EventedPty for CountedPty {
+    fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+        self.pty.next_child_event()
+    }
+}
+
+impl alacritty_terminal::event::OnResize for CountedPty {
+    fn on_resize(&mut self, size: WindowSize) {
+        self.pty.on_resize(size);
+    }
+}
+
 /// What the protocol thread needs to stream one terminal: the emulator, locked only to copy the
 /// screen, and the counters that say whether there is anything new to copy. Holding one does not
 /// keep the PTY or child alive.
@@ -531,14 +630,28 @@ impl TerminalControl for ScreenHandle {
     fn write(&self, bytes: Vec<u8>) {
         match &self.input {
             Input::Pty(sender) => {
-                let _ = sender.send(Msg::Input(Cow::Owned(bytes)));
+                // Counted before it is queued, so the PTY's write can never be counted first.
+                self.shared.unwritten.fetch_add(bytes.len(), Ordering::AcqRel);
+                if sender.send(Msg::Input(Cow::Owned(bytes))).is_err() {
+                    // The PTY is gone and will take nothing more.
+                    self.shared.unwritten.store(0, Ordering::Release);
+                }
             }
             #[cfg(test)]
             Input::Echo(echo) => {
                 echo.written.lock().unwrap().extend_from_slice(&bytes);
-                echo.feed(&self.term, &self.shared, &bytes);
+                if echo.stalled.load(Ordering::Acquire) {
+                    // A program that reads nothing: the bytes wait, unread.
+                    self.shared.unwritten.fetch_add(bytes.len(), Ordering::AcqRel);
+                } else {
+                    echo.feed(&self.term, &self.shared, &bytes);
+                }
             }
         }
+    }
+
+    fn unwritten(&self) -> usize {
+        self.shared.unwritten.load(Ordering::Acquire)
     }
 
     fn resize(&self, size: Option<GridSize>) {
@@ -557,6 +670,8 @@ impl TerminalControl for ScreenHandle {
 pub(crate) struct Echo {
     parser: Mutex<alacritty_terminal::vte::ansi::Processor>,
     written: Mutex<Vec<u8>>,
+    /// The program reads nothing; input waits in `Shared::unwritten`.
+    stalled: AtomicBool,
 }
 
 #[cfg(test)]
@@ -586,7 +701,11 @@ impl Detached {
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
         let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(cols, rows), listener)));
-        let echo = Arc::new(Echo { parser: Mutex::new(Default::default()), written: Mutex::new(Vec::new()) });
+        let echo = Arc::new(Echo {
+            parser: Mutex::new(Default::default()),
+            written: Mutex::new(Vec::new()),
+            stalled: AtomicBool::new(false),
+        });
         Self { handle: ScreenHandle { term, shared, input: Input::Echo(echo.clone()) }, echo }
     }
 
@@ -611,6 +730,15 @@ impl Detached {
         (&self.handle as &dyn TerminalControl).take_back()
     }
 
+    /// Stop the program reading its input (`true`), or let it read again: what waited is taken
+    /// (and not echoed).
+    pub fn stall(&self, stalled: bool) {
+        self.echo.stalled.store(stalled, Ordering::Release);
+        if !stalled {
+            self.handle.shared.unwritten.store(0, Ordering::Release);
+        }
+    }
+
     /// Say the screen changed without touching the emulator.
     pub fn touch(&self) {
         self.handle.shared.revision.fetch_add(1, Ordering::Release);
@@ -631,6 +759,21 @@ impl Detached {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_counted_writer_takes_what_the_pty_wrote_off_the_unwritten_input() {
+        let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+        let shared = Arc::new(Shared::new(crate::host::Wake::default(), size, Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("pty")).unwrap();
+        let mut writer = CountedWriter { file, shared: shared.clone() };
+        shared.unwritten.store(5, Ordering::Release);
+        assert_eq!(std::io::Write::write(&mut writer, b"abc").unwrap(), 3);
+        assert_eq!(shared.unwritten.load(Ordering::Acquire), 2);
+        // The desktop's own input is written too, and never counted below zero.
+        std::io::Write::write_all(&mut writer, b"desktop").unwrap();
+        assert_eq!(shared.unwritten.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn chief_input_history_clears_only_at_submit_or_turn_end() {

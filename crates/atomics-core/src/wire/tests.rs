@@ -268,7 +268,8 @@ fn malformed_frames_are_rejected_with_a_typed_error() {
         format!("{{{v},\"kind\":\"session_removed\",\"cursor\":\"1\",\"id\":5}}"),
         format!("{{{v},\"kind\":\"subscribe\",\"topics\":[{{\"topic\":\"nope\"}}]}}"),
         format!("{{{v},\"kind\":\"hello\",\"client_id\":\"c\",\"versions\":[]}}"),
-        format!("{{{v},\"kind\":\"error\",\"code\":\"made_up\",\"message\":\"x\"}}"),
+        // An unknown code is read as `unknown` (a newer peer); a code that is not a string is not.
+        format!("{{{v},\"kind\":\"error\",\"code\":7,\"message\":\"x\"}}"),
     ];
     for case in cases {
         let error = decode(&case).unwrap_err();
@@ -307,6 +308,13 @@ fn a_newer_minor_decodes_and_unknown_fields_are_ignored() {
     let envelope = decode(frame).unwrap();
     assert_eq!(envelope.message, Message::Ping { nonce: Some("n".into()) });
     assert_eq!(envelope.v, Version { major: 1, minor: 7 });
+}
+
+#[test]
+fn an_error_code_from_a_newer_peer_decodes_as_unknown() {
+    let frame = r#"{"v":{"major":1,"minor":3},"kind":"error","code":"quota_exceeded","message":"later"}"#;
+    let envelope = decode(frame).unwrap();
+    assert_eq!(envelope.message, Message::Error { code: ErrorCode::Unknown, message: "later".into() });
 }
 
 #[test]

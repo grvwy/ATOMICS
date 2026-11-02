@@ -9,6 +9,8 @@ description.workspace = true
 
 [dependencies]
 alacritty_terminal = "0.26.0"
+# alacritty_terminal's poller types, for the PTY wrapper that counts what the PTY has taken.
+polling = "3.11.0"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 atomics-core = { version = "0.1.0", path = "../atomics-core" }

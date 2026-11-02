@@ -19,6 +19,7 @@ use crate::screen::{MAX_COLS, MAX_ROWS};
 use crate::wire::{Message, Seq};
 
 /// The most text one `terminal_input` carries; a longer paste is sent as consecutive inputs.
+/// [`Typist`] keeps each one's JSON-escaped length within it too, so its frame always fits.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 /// The largest cell, in pixels, a client may report with a size.
 pub const MAX_CELL_PIXELS: u16 = 512;
@@ -65,6 +66,10 @@ pub enum LeaseReason {
     Disconnected,
     /// Someone typed on the desktop, which takes the terminal back.
     Desktop,
+    /// A reason from a newer host. Minor versions may add reasons; an older client still reads the
+    /// lease state.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Who holds one terminal's lease, as the host tells one client. The token, the next input number
@@ -105,8 +110,9 @@ pub(crate) fn invalid_input(data: &str) -> Option<&'static str> {
 /// A client's side of one terminal's lease: the reference model for typing.
 ///
 /// It keeps the fencing token while the host says this client holds the lease, numbers input from
-/// 1 within each lease, splits long input at character boundaries, and forgets the lease on a
-/// disconnect, so input typed before or during an outage is never sent on the next connection.
+/// 1 within each lease, splits long input at character boundaries so that each piece is at most
+/// [`MAX_INPUT_BYTES`] once JSON-escaped, and forgets the lease on a disconnect, so input typed
+/// before or during an outage is never sent on the next connection.
 #[derive(Debug, Clone, Default)]
 pub struct Typist {
     pub session: String,
@@ -147,27 +153,31 @@ impl Typist {
         self.lease.is_some()
     }
 
-    /// The frames that type `data`, in order; none without the lease.
+    /// The frames that type `data`, in order; none without the lease. Each carries at most
+    /// [`MAX_INPUT_BYTES`] of escaped JSON: a control character takes six bytes in a frame
+    /// (`\u001b`), so 64 KiB of them would not fit in one.
     pub fn input(&mut self, data: &str) -> Vec<Message> {
         let Some(lease) = self.lease else { return Vec::new() };
         let mut out = Vec::new();
-        let mut rest = data;
-        while !rest.is_empty() {
-            let mut end = rest.len().min(MAX_INPUT_BYTES);
-            while !rest.is_char_boundary(end) {
-                end -= 1;
+        let (mut start, mut encoded) = (0, 0);
+        for (at, c) in data.char_indices() {
+            let len = escaped_len(c);
+            if encoded + len > MAX_INPUT_BYTES {
+                out.push(self.typed(lease, &data[start..at]));
+                (start, encoded) = (at, 0);
             }
-            let (chunk, tail) = rest.split_at(end);
-            out.push(Message::TerminalInput {
-                session: self.session.clone(),
-                lease,
-                seq: Seq(self.next),
-                data: chunk.to_string(),
-            });
-            self.next += 1;
-            rest = tail;
+            encoded += len;
+        }
+        if start < data.len() {
+            out.push(self.typed(lease, &data[start..]));
         }
         out
+    }
+
+    fn typed(&mut self, lease: Seq, data: &str) -> Message {
+        let seq = Seq(self.next);
+        self.next += 1;
+        Message::TerminalInput { session: self.session.clone(), lease, seq, data: data.to_string() }
     }
 
     /// Resize to `size` ("fit to this screen"), or back to the host's own size with `None`.
@@ -188,6 +198,15 @@ impl Typist {
     pub fn disconnected(&mut self) {
         self.lease = None;
         self.state = None;
+    }
+}
+
+/// How many bytes `c` takes in a JSON string as serde_json writes it.
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        '\0'..='\u{1f}' => 6,
+        c => c.len_utf8(),
     }
 }
 
@@ -263,6 +282,32 @@ mod tests {
         assert!(frames.iter().all(|(_, _, d)| d.len() <= MAX_INPUT_BYTES && invalid_input(d).is_none()));
         assert_eq!(frames.iter().map(|(_, s, _)| *s).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(frames.iter().map(|(_, _, d)| d.as_str()).collect::<String>(), text);
+    }
+
+    #[test]
+    fn input_is_split_by_its_escaped_length_so_every_frame_fits() {
+        let mut typist = Typist::new("s");
+        typist.apply(&granted(1, 1));
+        // Escape sequences, quotes and backslashes take two to six bytes once encoded.
+        let text = "\u{1b}[A\"\\\u{7}é".repeat(MAX_INPUT_BYTES / 4);
+        let messages = typist.input(&text);
+        assert!(messages.len() > 1);
+        for message in &messages {
+            let Message::TerminalInput { data, .. } = message else { panic!("not input") };
+            assert!(invalid_input(data).is_none());
+            let escaped = serde_json::to_string(data).unwrap().len() - 2;
+            assert_eq!(escaped, data.chars().map(escaped_len).sum::<usize>(), "escaped_len matches serde_json");
+            assert!(escaped <= MAX_INPUT_BYTES);
+            let frame = crate::wire::encode(&crate::wire::Envelope::new(message.clone())).expect("fits in a frame");
+            assert!(crate::wire::decode(&frame).is_ok());
+        }
+        assert_eq!(sent(&messages).into_iter().map(|(_, _, d)| d).collect::<String>(), text);
+    }
+
+    #[test]
+    fn an_unknown_reason_from_a_newer_host_is_read() {
+        let state: LeaseState = serde_json::from_str(r#"{"session":"s","reason":"maintenance"}"#).unwrap();
+        assert_eq!(state.reason, Some(LeaseReason::Unknown));
     }
 
     #[test]

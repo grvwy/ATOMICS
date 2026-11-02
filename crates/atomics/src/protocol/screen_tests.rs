@@ -85,6 +85,8 @@ struct Viewer {
     /// Screens whose snapshot was asked for; gaps before it arrives are expected.
     awaiting: std::collections::HashSet<String>,
     errors: Vec<(ErrorCode, Option<String>)>,
+    /// The text of each error, in the same order.
+    messages: Vec<String>,
     chunks: Vec<atomics_core::screen::HistoryChunk>,
 }
 
@@ -111,6 +113,7 @@ impl Viewer {
             gaps: Vec::new(),
             awaiting: Default::default(),
             errors: Vec::new(),
+            messages: Vec::new(),
             chunks: Vec::new(),
         };
         viewer.until(|v| v.client.mirror.epoch.is_some());
@@ -149,7 +152,10 @@ impl Viewer {
                 }
             }
             Message::HistoryChunk(chunk) => self.chunks.push(chunk),
-            Message::Error { code, .. } => self.errors.push((code, envelope.request_id)),
+            Message::Error { code, message } => {
+                self.errors.push((code, envelope.request_id));
+                self.messages.push(message);
+            }
             _ => {}
         }
     }
@@ -592,5 +598,114 @@ fn copying_waits_for_the_emulator_lock_without_holding_up_the_board() {
     drop(gate);
     locker.join().unwrap();
     terminal.feed(b"after the lock");
+    viewer.until_shows("s1", &terminal);
+}
+
+#[test]
+fn a_huge_title_is_cut_when_copied_and_the_screen_still_arrives() {
+    let terminal = Detached::new(40, 6, 10);
+    // A 300 KB OSC 0 title: with it, no snapshot part would fit in a frame.
+    terminal.feed(format!("\x1b]0;{}\x07$ ready", "t".repeat(300 * 1024)).as_bytes());
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let mut viewer = Viewer::connect(&f);
+    viewer.subscribe("s1", true);
+    viewer.until_shows("s1", &terminal);
+    let screen = viewer.screen("s1").unwrap();
+    assert_eq!(screen.lines[0].text(), "$ ready");
+    assert_eq!(screen.title.as_deref(), Some("t".repeat(atomics_core::screen::MAX_TITLE_BYTES).as_str()));
+    assert!(viewer.errors.is_empty(), "{:?}", viewer.messages);
+
+    // Marks stacked on one cell are cut too.
+    terminal.feed(format!("\r\ne{}", "\u{301}".repeat(200)).as_bytes());
+    viewer.until_shows("s1", &terminal);
+    let cell = &viewer.screen("s1").unwrap().lines[1].cells[0];
+    assert_eq!(cell.combining.as_deref().map(<[char]>::len), Some(atomics_core::screen::MAX_COMBINING));
+}
+
+/// Copies a terminal's screen and, while `bloated`, gives it a title no frame can carry: a screen
+/// too large to send, as a source without the copy's caps would make.
+struct Bloated {
+    inner: Arc<dyn ScreenSource>,
+    bloated: AtomicBool,
+}
+
+impl ScreenSource for Bloated {
+    fn changes(&self) -> u64 {
+        self.inner.changes()
+    }
+
+    fn capture(&self, tracker: &mut Tracker, generations: &AtomicU64) -> Screen {
+        let mut screen = self.inner.capture(tracker, generations);
+        if self.bloated.load(Ordering::Acquire) {
+            screen.title = Some("x".repeat(wire::MAX_FRAME_BYTES));
+        }
+        screen
+    }
+
+    fn history(
+        &self,
+        tracker: &mut Tracker,
+        generations: &AtomicU64,
+        before: u64,
+        count: u32,
+    ) -> crate::terminal::screen::HistoryLines {
+        self.inner.history(tracker, generations, before, count)
+    }
+}
+
+#[test]
+fn a_screen_too_large_to_send_is_answered_once_with_oversize_and_sent_once_it_fits() {
+    let big = Detached::new(40, 6, 10);
+    big.feed(b"big screen");
+    let other = Detached::new(40, 6, 10);
+    other.feed(b"other screen");
+    let source = Arc::new(Bloated { inner: Arc::new(big.handle.clone()), bloated: AtomicBool::new(true) });
+    let f = start_with(config(), &[("s2", &other)]);
+    let bloated = TerminalEntry {
+        session: "big".into(),
+        identity: big.handle.identity(),
+        source: source.clone(),
+        control: Arc::new(big.handle.clone()),
+    };
+    f.terminals.publish(vec![entry("s2", &other), bloated]);
+    let mut viewer = Viewer::connect(&f);
+    viewer.subscribe("big", true);
+    viewer.subscribe("s2", false);
+    let oversize = |v: &Viewer| v.errors.iter().filter(|(code, _)| *code == ErrorCode::Oversize).count();
+    viewer.until(|v| oversize(v) == 1 && v.screen("s2").is_some());
+    assert!(viewer.messages.iter().any(|m| m.contains("session big")), "{:?}", viewer.messages);
+    assert!(viewer.screen("big").is_none());
+
+    // It keeps changing while too large: the client was told, and other screens keep streaming.
+    for i in 0..5 {
+        big.feed(format!("\r\nmore {i}").as_bytes());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    other.feed(b"\r\nstill streaming");
+    viewer.until_shows("s2", &other);
+    assert_eq!(oversize(&viewer), 1, "told once, not at every change");
+
+    source.bloated.store(false, Ordering::Release);
+    big.feed(b"\r\nfits again");
+    viewer.until(|v| v.screen("big").is_some_and(|s| s.text().contains("fits again")));
+    assert_eq!(oversize(&viewer), 1);
+}
+
+#[test]
+fn a_subscribe_list_is_checked_whole_before_anything_is_subscribed() {
+    let terminal = Detached::new(20, 4, 10);
+    terminal.feed(b"here");
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let mut viewer = Viewer::connect(&f);
+    let topics = vec![
+        Topic::Screen { session: "s1".into(), focused: true },
+        Topic::Screen { session: "nope".into(), focused: true },
+    ];
+    viewer.client.send(&Envelope::new(Message::Subscribe { topics }));
+    viewer.until(|v| !v.errors.is_empty());
+    assert_eq!(viewer.errors[0].0, ErrorCode::NotFound);
+    viewer.drain_for(Duration::from_millis(200));
+    assert_eq!(viewer.snapshots, 0, "the screen listed before the refused one was not subscribed");
+    viewer.subscribe("s1", true);
     viewer.until_shows("s1", &terminal);
 }

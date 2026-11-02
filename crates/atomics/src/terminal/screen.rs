@@ -13,7 +13,9 @@ use alacritty_terminal::index::{Column, Line as GridLine};
 use alacritty_terminal::term::cell::{Cell as TermCell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape as TermShape, NamedColor, Rgb as TermRgb};
-use atomics_core::screen::{Cell, Color, Cursor, CursorShape, Line, Modes, PALETTE_LEN, Rgb, Screen, Style};
+use atomics_core::screen::{
+    Cell, Color, Cursor, CursorShape, Line, MAX_COMBINING, Modes, PALETTE_LEN, Rgb, Screen, Style, clip_title,
+};
 
 /// Line numbering for one terminal: the generation it belongs to and the ID of the top screen
 /// line. Lives as long as the terminal's stream; [`capture`] and [`history`] bring it up to date.
@@ -124,7 +126,8 @@ fn line(grid: &Grid<TermCell>, at: i32) -> Line {
             && col + 1 < cols
             && row[Column(col + 1)].flags.contains(Flags::WIDE_CHAR_SPACER);
         let c = if spacer || cell.c == '\0' { ' ' } else { cell.c };
-        let combining = cell.zerowidth().filter(|z| !z.is_empty()).map(Box::from);
+        // A program can stack any number of marks on one cell; a client draws the first few.
+        let combining = cell.zerowidth().filter(|z| !z.is_empty()).map(|z| Box::from(&z[..z.len().min(MAX_COMBINING)]));
         cells.push(Cell { c, combining, width: if wide { 2 } else { 1 }, style });
     }
     let wrapped = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
@@ -193,7 +196,8 @@ fn fill_palette<T>(term: &Term<T>, theme: &[TermRgb], palette: &mut [Rgb]) {
 }
 
 /// Copy the live screen. Call with the emulator locked; nothing here allocates more than the
-/// screen itself or does I/O.
+/// screen itself or does I/O. The title is cut to `MAX_TITLE_BYTES` and each cell keeps at most
+/// `MAX_COMBINING` marks, so what a program writes cannot make a screen too large to send.
 pub fn capture<T>(
     term: &Term<T>,
     theme: &[TermRgb],
@@ -210,7 +214,10 @@ pub fn capture<T>(
         lines: (0..rows as i32).map(|r| line(grid, r)).collect(),
         cursor: cursor(term),
         modes: modes(*term.mode()),
-        title,
+        title: title.map(|title| match clip_title(&title) {
+            clipped if clipped.len() < title.len() => clipped.to_string(),
+            _ => title,
+        }),
         palette: palette(term, theme),
         first_line: tracker.first_line,
         history: grid.history_size() as u64,

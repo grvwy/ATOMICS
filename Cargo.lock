@@ -500,6 +500,7 @@ dependencies = [
  "notify",
  "objc2 0.6.5",
  "png",
+ "polling",
  "rfd",
  "ring",
  "serde",

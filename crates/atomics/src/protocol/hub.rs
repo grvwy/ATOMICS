@@ -18,7 +18,7 @@ use atomics_core::projection::{Loaded, Projections};
 use atomics_core::wire::{self, Cursor, Disposition, Envelope, Message, Resume, Seq, WireError};
 
 use super::link::Waker;
-use super::screens::Feed;
+use super::screens::{Current, Feed};
 
 /// Replay ring bounds: entries, bytes and age. It is an optimisation, not persistence.
 #[derive(Debug, Clone)]
@@ -53,6 +53,9 @@ struct Slot {
     snapshot: bool,
     /// The generation and revision the client will hold once everything queued is sent.
     at: Option<(u64, u64)>,
+    /// The client was told this screen does not fit in a frame; it is told again only after a
+    /// snapshot of it has been sent.
+    oversize: bool,
 }
 
 impl Slot {
@@ -132,8 +135,26 @@ impl Outbox {
 
     /// Everything queued (board events first, then screens), or that the client must be
     /// resynchronised first. A screen that needs a snapshot gets the one its feed holds now; until
-    /// the first copy is published it waits.
+    /// the first copy is published it waits. A snapshot that cannot fit in frames is answered once
+    /// with an `oversize` error naming the session, and tried again at the screen's next change.
+    ///
+    /// Snapshots are encoded with the queue unlocked, so the threads that push to it never wait
+    /// for an encoding. One the feed replaced meanwhile is not sent; the next call takes the newer.
     pub fn take(&self) -> Taken {
+        let wanted: Vec<(String, Arc<Current>)> = {
+            let q = self.queue();
+            if q.lagged {
+                return Taken::Lagged;
+            }
+            q.screens
+                .iter()
+                .filter(|(_, slot)| slot.snapshot)
+                .filter_map(|(session, slot)| Some((session.clone(), current(&slot.feed)?)))
+                .collect()
+        };
+        // Encoded once per revision and shared by every client (`Current::frames`).
+        let encoded: Vec<_> =
+            wanted.into_iter().map(|(session, current)| (session, current.frames(), current)).collect();
         let mut q = self.queue();
         if q.lagged {
             return Taken::Lagged;
@@ -141,23 +162,41 @@ impl Outbox {
         q.bytes = 0;
         let mut frames: Vec<Arc<str>> = q.frames.drain(..).collect();
         let mut sent = 0;
-        for slot in q.screens.values_mut() {
-            if !slot.snapshot {
-                sent += slot.bytes;
-                slot.bytes = 0;
-                frames.append(&mut slot.deltas);
-                continue;
-            }
-            let current = slot.feed.read().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(current) = current
-                && let Some(snapshot) = current.frames()
-            {
-                frames.extend(snapshot.iter().cloned());
-                slot.snapshot = false;
-                slot.at = Some((current.generation, current.revision));
-            }
+        for slot in q.screens.values_mut().filter(|slot| !slot.snapshot) {
+            sent += slot.bytes;
+            slot.bytes = 0;
+            frames.append(&mut slot.deltas);
         }
         q.screen_bytes -= sent;
+        let mut again = false;
+        for (session, snapshot, encoded_from) in encoded {
+            let Some(slot) = q.screens.get_mut(&session).filter(|slot| slot.snapshot) else { continue };
+            // A newer copy (or a new terminal) was published meanwhile: its delta was not queued,
+            // so only its own snapshot will do.
+            if !current(&slot.feed).is_some_and(|now| Arc::ptr_eq(&now, &encoded_from)) {
+                again = true;
+                continue;
+            }
+            slot.snapshot = false;
+            match snapshot {
+                Some(snapshot) => {
+                    frames.extend(snapshot.iter().cloned());
+                    slot.at = Some((encoded_from.generation, encoded_from.revision));
+                    slot.oversize = false;
+                }
+                None => {
+                    // Not followed by deltas: the next change asks for a snapshot again.
+                    slot.at = None;
+                    if !std::mem::replace(&mut slot.oversize, true) {
+                        frames.push(encoded_from.oversize());
+                    }
+                }
+            }
+        }
+        drop(q);
+        if again {
+            self.wake();
+        }
         Taken::Frames(frames)
     }
 
@@ -168,7 +207,7 @@ impl Outbox {
             let q = &mut *q;
             let old = q.screens.insert(
                 session.to_string(),
-                Slot { feed: feed.clone(), deltas: Vec::new(), bytes: 0, snapshot: true, at: None },
+                Slot { feed: feed.clone(), deltas: Vec::new(), bytes: 0, snapshot: true, at: None, oversize: false },
             );
             q.screen_bytes -= old.map_or(0, |s| s.bytes);
         }
@@ -243,6 +282,11 @@ impl Outbox {
 pub enum Taken {
     Frames(Vec<Arc<str>>),
     Lagged,
+}
+
+/// The copy a screen's feed holds now.
+fn current(feed: &Feed) -> Option<Arc<Current>> {
+    feed.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub struct Hub {

@@ -323,9 +323,14 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
 #[test]
 fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
     let instance = Instance::new(None);
+    // An advert from an earlier run with remote on names a server that is gone.
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
+    let advert = instance.home().join("protocol.json");
+    std::fs::write(&advert, json!({"url":"ws://127.0.0.1:1","token":"stale","pid":1}).to_string()).unwrap();
     let mut host = instance.host();
     instance.ready(&mut host);
-    assert!(!instance.home().join("protocol.json").exists());
+    assert!(!advert.exists(), "a stale protocol.json outlived the start of a host without remote");
     let plan = instance.ctl(json!({"cmd":"plan_set","goal":"Local only","tasks":[]}));
     let id = plan["plan"].as_str().unwrap().to_string();
 

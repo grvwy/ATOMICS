@@ -40,7 +40,7 @@ impl super::DiffSource for NoDiffs {
 
 struct Fixture {
     server: Server,
-    #[allow(dead_code)] // keeps the published terminals alive with the server
+    /// Keeps the published terminals alive with the server; tests republish through it.
     terminals: Arc<Terminals>,
 }
 
@@ -540,4 +540,75 @@ fn the_echo_is_sent_at_once_not_at_the_screen_cadence() {
         slowest = slowest.max(started.elapsed());
     }
     assert!(slowest < wait(Duration::from_millis(250)), "an echo took {slowest:?}");
+}
+
+#[test]
+fn a_closed_terminal_is_told_as_free_and_racing_its_close_never_costs_the_connection() {
+    let terminal = Detached::new(40, 6, 100);
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let mut phone = Typer::connect(&f, "phone");
+    phone.subscribe("s1");
+    let lease = token(&phone.acquire("s1", false).unwrap());
+
+    // The session's terminal closes: everyone following it is told that nobody holds its lease.
+    f.terminals.publish(Vec::new());
+    phone.until(|t| {
+        t.lease("s1").is_some_and(|l| l.holder.is_none() && !l.yours && l.reason == Some(LeaseReason::Disconnected))
+    });
+    assert!(!phone.typist("s1").may_type());
+
+    // Input sent before the client heard of it meets not_found, however often: a well-behaved
+    // client racing a close is never disconnected for it.
+    for _ in 0..=SessionConfig::default().max_errors + 2 {
+        let id = phone.raw_input("s1", lease, 1, "late");
+        assert_eq!(phone.refusal(&id), ErrorCode::NotFound);
+    }
+    let id = phone.send(Message::Subscribe { topics: vec![Topic::Screen { session: "s1".into(), focused: true }] });
+    assert_eq!(phone.refusal(&id), ErrorCode::NotFound);
+
+    // Still connected: a new terminal for the session streams, and its lease is told afresh.
+    let second = Detached::new(40, 6, 100);
+    second.feed(b"second terminal");
+    f.terminals.publish(vec![entry("s1", &second)]);
+    phone.until(|t| t.screen_text("s1").is_some_and(|s| s.contains("second terminal")));
+    phone.until(|t| t.lease("s1").is_some_and(|l| l.reason.is_none()));
+    assert_eq!(terminal.written(), "");
+}
+
+#[test]
+fn input_a_program_has_not_read_is_bounded_and_answered_with_slow_client() {
+    let terminal = Detached::new(40, 6, 100);
+    let mut cfg = config();
+    cfg.lease = Policy { max_unwritten: 8, ..Policy::default() };
+    let f = start_with(cfg, &[("s1", &terminal)]);
+    let mut phone = Typer::connect(&f, "phone");
+    phone.subscribe("s1");
+    let lease = token(&phone.acquire("s1", false).unwrap());
+
+    terminal.stall(true);
+    phone.raw_input("s1", lease, 1, "12345");
+    // Above the bound input is refused, not queued, and keeps its number; a client that keeps
+    // trying is not disconnected for it.
+    for _ in 0..=SessionConfig::default().max_errors + 2 {
+        let id = phone.raw_input("s1", lease, 2, "67890");
+        assert_eq!(phone.refusal(&id), ErrorCode::SlowClient);
+    }
+    assert_eq!(terminal.written(), "12345");
+
+    // Once the program reads, the same input number goes through.
+    terminal.stall(false);
+    phone.raw_input("s1", lease, 2, "ok");
+    phone.until(|t| t.screen_text("s1").is_some_and(|s| s.contains("ok")));
+    assert_eq!(terminal.written(), "12345ok");
+}
+
+#[test]
+fn input_is_not_offered_without_terminals() {
+    let terminal = Detached::new(40, 6, 100);
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let typer = Typer::with_capabilities(&f, "odd", vec!["board".into(), wire::INPUT.into()]);
+    let Some(Message::Welcome { capabilities, .. }) = typer.client.welcome.as_ref().map(|w| &w.message) else {
+        panic!("no welcome");
+    };
+    assert_eq!(capabilities, &vec!["board".to_string()], "input needs terminals");
 }

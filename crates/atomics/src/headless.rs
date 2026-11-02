@@ -35,6 +35,10 @@ pub fn run(options: Options) -> i32 {
         }
     };
     crate::crash::install(&home);
+    // This host owns the home, so an advert an earlier run left names a server that is gone. With
+    // `[remote]` on, the protocol server writes a fresh one as it starts.
+    let advert = home.join("protocol.json");
+    let _ = std::fs::remove_file(&advert);
     let socket = paths::socket_path();
     let state = State::build(options, crate::host::Window::default());
     if let Some(error) = state.hook_error() {
@@ -51,7 +55,6 @@ pub fn run(options: Options) -> i32 {
         socket.display(),
         paths::config_file().display()
     ));
-    let advert = home.join("protocol.json");
     // The URL only: the token is in protocol.json (mode 0600) and never in a log.
     match (host.protocol_addr(), host.protocol_error()) {
         (Some(addr), _) => {
@@ -60,8 +63,6 @@ pub fn run(options: Options) -> i32 {
         (None, Some(error)) => {
             // A host clients cannot reach is not healthy: say why and let the service manager see it.
             log(&format!("[remote] is enabled but the protocol server cannot start (port {}): {error}", remote.port));
-            // This host owns the home, so an advert left by an earlier run is stale.
-            let _ = std::fs::remove_file(&advert);
             stop(host, &socket);
             return 1;
         }

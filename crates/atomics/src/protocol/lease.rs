@@ -42,11 +42,14 @@ pub struct Policy {
     pub ttl: Duration,
     /// The least time between two resizes of the holder's; a later one waits and the latest wins.
     pub debounce: Duration,
+    /// The most admitted input a terminal's PTY may not have taken yet. Input beyond it is refused
+    /// with `slow_client` until the program reads.
+    pub max_unwritten: usize,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { ttl: Duration::from_secs(30), debounce: Duration::from_millis(100) }
+        Self { ttl: Duration::from_secs(30), debounce: Duration::from_millis(100), max_unwritten: 1 << 20 }
     }
 }
 
@@ -58,6 +61,11 @@ pub trait TerminalControl: Send + Sync {
     /// Write admitted input. Called with the lease locked, so bytes reach the PTY in the order
     /// they were admitted.
     fn write(&self, bytes: Vec<u8>);
+    /// Bytes written here that the PTY has not taken yet: a program that does not read its input
+    /// leaves them queued.
+    fn unwritten(&self) -> usize {
+        0
+    }
     /// Resize to the holder's `size`, or with `None` to the desktop's own size. Called with the
     /// lease locked.
     fn resize(&self, size: Option<GridSize>);
@@ -149,7 +157,7 @@ fn why_ended(reason: Option<LeaseReason>) -> &'static str {
         Some(LeaseReason::Disconnected) => "its connection ended",
         Some(LeaseReason::Desktop) => "the desktop took the terminal back",
         Some(LeaseReason::TakenOver) => "another client took over",
-        Some(LeaseReason::Granted) | None => "nobody holds this terminal's lease",
+        Some(LeaseReason::Granted | LeaseReason::Unknown) | None => "nobody holds this terminal's lease",
     }
 }
 
@@ -242,7 +250,8 @@ impl dyn TerminalControl + '_ {
         Ok(())
     }
 
-    /// Write `bytes` if they are the next input of `who`'s current lease.
+    /// Write `bytes` if they are the next input of `who`'s current lease and the PTY has taken
+    /// enough of the earlier input. Refused input is not applied and does not use up its number.
     pub fn input(
         &self,
         who: &Client,
@@ -258,6 +267,17 @@ impl dyn TerminalControl + '_ {
             return Err(WireError::new(
                 ErrorCode::OutOfOrder,
                 format!("input {seq} {what}; the next input in lease {token} is {}", holder.next),
+            ));
+        }
+        let queued = self.unwritten();
+        if queued.saturating_add(bytes.len()) > policy.max_unwritten {
+            return Err(WireError::new(
+                ErrorCode::SlowClient,
+                format!(
+                    "the terminal has not read {queued} bytes of earlier input yet (at most {} may wait); \
+                     send input {seq} again once it has",
+                    policy.max_unwritten
+                ),
             ));
         }
         holder.next += 1;
@@ -372,12 +392,14 @@ impl dyn TerminalControl + '_ {
 mod tests {
     use super::*;
 
-    /// A terminal that records what reaches it.
+    /// A terminal that records what reaches it. While `stalled`, its program reads nothing.
     #[derive(Default)]
     struct Probe {
         lease: Lease,
         written: Mutex<Vec<u8>>,
         sizes: Mutex<Vec<Option<GridSize>>>,
+        stalled: AtomicBool,
+        unwritten: std::sync::atomic::AtomicUsize,
     }
 
     impl TerminalControl for Probe {
@@ -385,7 +407,13 @@ mod tests {
             &self.lease
         }
         fn write(&self, bytes: Vec<u8>) {
+            if self.stalled.load(Ordering::Relaxed) {
+                self.unwritten.fetch_add(bytes.len(), Ordering::Relaxed);
+            }
             self.written.lock().unwrap().extend(bytes);
+        }
+        fn unwritten(&self) -> usize {
+            self.unwritten.load(Ordering::Relaxed)
         }
         fn resize(&self, size: Option<GridSize>) {
             self.sizes.lock().unwrap().push(size);
@@ -434,6 +462,25 @@ mod tests {
         t.input(&phone, (token, 3), b"\r".to_vec(), now, &policy).unwrap();
         assert_eq!(probe.written(), "ls\r");
         assert_ne!(probe.lease.input_at(), 0, "input is recorded for the echo");
+    }
+
+    #[test]
+    fn input_the_program_has_not_read_is_bounded_and_refused_input_keeps_its_number() {
+        let (probe, now) = (Probe::default(), Instant::now());
+        let policy = Policy { max_unwritten: 10, ..Policy::default() };
+        let phone = client(1, "phone");
+        probe.control().acquire(&phone, false, now, &policy).unwrap();
+        let token = probe.token(&phone);
+        probe.stalled.store(true, Ordering::Relaxed);
+        probe.control().input(&phone, (token, 1), b"123456".to_vec(), now, &policy).unwrap();
+        let refused = probe.control().input(&phone, (token, 2), b"7890ab".to_vec(), now, &policy);
+        assert_eq!(code(refused), ErrorCode::SlowClient);
+        assert_eq!(probe.written(), "123456", "refused input is not written");
+        // Once the program reads, the same input number is admitted.
+        probe.unwritten.store(0, Ordering::Relaxed);
+        probe.control().input(&phone, (token, 2), b"7890ab".to_vec(), now, &policy).unwrap();
+        assert_eq!(probe.written(), "1234567890ab");
+        assert!(Policy::default().max_unwritten >= 1 << 20);
     }
 
     #[test]
