@@ -151,10 +151,9 @@ impl Desktop<'_> {
                 ui.close();
             }
         }
-        let plan = &self.runtime.plans[self.runtime.selected_plan];
-        let (done, total) = (plan.count(TaskStatus::Done), plan.tasks.len());
+        let plan = self.runtime.backend().plan_row(self.runtime.selected_plan).expect("a plan is selected");
+        let (done, total, attention) = (plan.done, plan.total, plan.attention);
         let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
-        let attention = plan.count(TaskStatus::Review) + plan.count(TaskStatus::Blocked);
         let text = RichText::new(label).color(if attention > 0 {
             self.runtime.palette.warning
         } else {

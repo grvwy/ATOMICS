@@ -1,0 +1,26 @@
+[package]
+name = "highlight-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Measures syntect's regex engines (onig vs fancy-regex) for the wasm highlighter choice, RELAY-11973 C1a"
+
+# Not a member of the ATOMICS workspace: it exists to be built on its own with each engine.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+syntect = { version = "5.3.0", default-features = false }
+two-face = { version = "0.5.2", default-features = false }
+
+[features]
+onig = ["syntect/default-onig", "two-face/syntect-onig"]
+fancy = ["syntect/default-fancy", "two-face/syntect-fancy"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = "z"
+strip = true
