@@ -187,14 +187,17 @@ impl State {
     }
 
     fn session_infos(&self) -> Vec<SessionInfo> {
-        let task_of = |session: &str| {
-            self.plans.iter().find_map(|plan| {
-                plan.tasks
-                    .iter()
-                    .find(|t| t.session.as_deref() == Some(session))
-                    .map(|t| TaskLink { plan: plan.id.clone(), task: t.id.clone() })
-            })
-        };
+        // Each session's task, found in one walk over the plans rather than one per session: the
+        // first plan, in order, with a task on the session, and that plan's first such task.
+        let mut links: HashMap<&str, TaskLink> = HashMap::new();
+        for plan in &self.plans {
+            for task in &plan.tasks {
+                if let Some(session) = task.session.as_deref() {
+                    links.entry(session).or_insert_with(|| TaskLink { plan: plan.id.clone(), task: task.id.clone() });
+                }
+            }
+        }
+        let task_of = |session: &str| links.get(session).cloned();
         self.sessions
             .iter()
             .map(|s| SessionInfo {
@@ -371,6 +374,16 @@ mod tests {
                 let mut plan = Plan { id: "p1".into(), goal: "ship".into(), ..Plan::default() };
                 plan.tasks = vec![task("t1", Some("a")), task("t2", None)];
                 state.plans = vec![plan];
+                // A session's task is the first on it in plan order: a later task in the same plan
+                // or in a later plan does not take its place.
+                let mut later = Plan { id: "p2".into(), ..Plan::default() };
+                later.tasks = vec![task("t9", Some("a"))];
+                state.plans.push(later);
+                state.plans[0].tasks.push(task("t8", Some("a")));
+                let link = state.session_infos()[0].task.clone().map(|t| (t.plan, t.task));
+                assert_eq!(link, Some(("p1".to_string(), "t1".to_string())));
+                state.plans.pop();
+                state.plans[0].tasks.pop();
                 let (out, bodies) = (Projections::default(), DiffBodies::default());
                 let mut cache = DiffSummaries::default();
 
