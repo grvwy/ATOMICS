@@ -123,6 +123,9 @@ pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Opti
     stdout.set_nonblocking(true).ok()?;
     let mut child = Command::new(program)
         .arg("--version")
+        // Not wherever ATOMICS was started: a wrapper that runs the agent elsewhere, such as in a
+        // VM that has only some of this machine's folders, needs a folder it is sure to have.
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(writer)))
         .stderr(Stdio::null())
@@ -262,6 +265,17 @@ mod tests {
             assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(10)), None);
         }
         assert_eq!(codex_supports_hooks("/no/such/codex", Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn version_probe_runs_in_the_root_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        // Like the VM wrapper, it answers only from a folder the other side is sure to have.
+        std::fs::write(&program, "#!/bin/sh\n[ \"$(pwd)\" = / ] || exit 66\nprintf 'codex-cli 0.166.0\\n'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), std::time::Duration::from_secs(10)), Some(true));
     }
 
     #[test]

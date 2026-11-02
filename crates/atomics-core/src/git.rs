@@ -10,6 +10,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use glob::Pattern;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
@@ -887,16 +888,9 @@ pub fn warm_worktree(repo: &Path, worktree: &Path, folders: &[String]) -> bool {
     }
     let Ok(main) = main_checkout(repo).and_then(|main| Ok(main.canonicalize()?)) else { return false };
     let mut warmed = false;
-    for folder in folders {
-        let relative = Path::new(folder);
-        // Refuse absolute paths, traversal and Git metadata. Nested cache folders are fine.
-        if relative.as_os_str().is_empty()
-            || !relative.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
-        {
-            continue;
-        }
-        let source = main.join(relative);
-        let destination = worktree.join(relative);
+    for relative in expand_warm_folders(&main, folders) {
+        let source = main.join(&relative);
+        let destination = worktree.join(&relative);
         if !source.symlink_metadata().is_ok_and(|meta| meta.is_dir())
             || !source.canonicalize().is_ok_and(|path| path.starts_with(&main))
             || destination.symlink_metadata().is_ok()
@@ -914,6 +908,66 @@ pub fn warm_worktree(repo: &Path, worktree: &Path, folders: &[String]) -> bool {
         }
     }
     warmed
+}
+
+/// Expand configured cache directories without walking through symlinks or Git metadata.
+/// Paths remain relative so callers can apply them to a different worktree.
+pub fn expand_warm_folders(root: &Path, folders: &[String]) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    for folder in folders {
+        let path = Path::new(folder);
+        if path.as_os_str().is_empty()
+            || !path.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
+        {
+            continue;
+        }
+        let Some(parts) = path
+            .iter()
+            .map(|part| Pattern::new(&part.to_string_lossy()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()
+        else {
+            continue;
+        };
+        let mut found = Vec::new();
+        expand_warm_pattern(root, Path::new(""), &parts, 0, &mut found);
+        found.sort();
+        for path in found {
+            if !matches.contains(&path) {
+                matches.push(path);
+            }
+        }
+    }
+    matches
+}
+
+fn expand_warm_pattern(root: &Path, relative: &Path, parts: &[Pattern], index: usize, matches: &mut Vec<PathBuf>) {
+    if index == parts.len() {
+        if !relative.as_os_str().is_empty() {
+            matches.push(relative.to_path_buf());
+        }
+        return;
+    }
+    if parts[index].as_str() == "**" {
+        expand_warm_pattern(root, relative, parts, index + 1, matches);
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(relative)) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == ".git" || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if parts[index].as_str() == "**" || parts[index].matches(&name.to_string_lossy()) {
+            let child = relative.join(name);
+            expand_warm_pattern(
+                root,
+                &child,
+                parts,
+                if parts[index].as_str() == "**" { index } else { index + 1 },
+                matches,
+            );
+        }
+    }
 }
 
 /// GNU cp must fail rather than fall back to copying file data.
@@ -1730,6 +1784,87 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(destination.join("target/dependency")).unwrap(), "agent build");
         assert_eq!(std::fs::read_to_string(repo.join("target/dependency")).unwrap(), "from main");
         assert!(probe_cache_clone(&repo, destination.parent().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn warm_globs_expand_directories_and_reject_unsafe_entries() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = &dir.path().join("main");
+        std::fs::create_dir(root).unwrap();
+        std::fs::create_dir(dir.path().join("outside")).unwrap();
+        for path in ["src/a/bin", "src/a/obj", "src/a/nested/bin", "src/b/bin", "target", ".git/objects"] {
+            std::fs::create_dir_all(root.join(path)).unwrap();
+        }
+        std::fs::write(root.join("src/a/bin/file"), "cache").unwrap();
+        let folders = [
+            "src/**/bin",
+            "src/*/obj",
+            "target",
+            "src/**/bin",
+            "src/**/file",
+            "",
+            ".",
+            "../outside",
+            "src/../../outside",
+            "/tmp",
+            ".git",
+            ".git/objects",
+            "**/.git/objects",
+            "src/[broken",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            expand_warm_folders(root, &folders),
+            ["src/a/bin", "src/a/nested/bin", "src/b/bin", "src/a/obj", "target"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn warm_globs_do_not_follow_source_symlinks() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path();
+        let outside = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("src/real/bin")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("src/linked")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("bin"), root.join("src/real/linked-bin")).unwrap();
+        assert_eq!(
+            expand_warm_folders(root, &["src/**/bin".into(), "src/linked/bin".into(), "src/real/linked-bin".into()]),
+            [PathBuf::from("src/real/bin")]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn warm_worktree_globs_do_not_follow_destination_symlinks() {
+        let (dir, repo) = project();
+        let destination = repo.with_file_name("glob-link-new");
+        add_worktree(&repo, &destination, "glob-link-new", "main").unwrap();
+        std::fs::create_dir_all(repo.join("src/a/bin")).unwrap();
+        std::fs::write(repo.join("src/a/bin/cache"), "main").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("src")).unwrap();
+        assert!(!warm_worktree(&repo, &destination, &["src/**/bin".into()]));
+        assert!(!outside.join("a/bin").exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn warm_worktree_clones_glob_matches_from_main() {
+        let (_dir, repo) = project();
+        let destination = repo.with_file_name("glob-new");
+        add_worktree(&repo, &destination, "glob-new", "main").unwrap();
+        for path in ["src/a/bin", "src/a/obj", "src/b/bin"] {
+            std::fs::create_dir_all(repo.join(path)).unwrap();
+            std::fs::write(repo.join(path).join("cache"), path).unwrap();
+        }
+        let supported = probe_cache_clone(&repo, destination.parent().unwrap()).unwrap();
+        assert_eq!(warm_worktree(&repo, &destination, &["src/**/bin".into(), "src/**/obj".into()]), supported);
+        for path in ["src/a/bin", "src/a/obj", "src/b/bin"] {
+            assert_eq!(destination.join(path).join("cache").exists(), supported);
+        }
     }
 
     #[test]

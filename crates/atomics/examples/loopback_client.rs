@@ -3,6 +3,8 @@
 //!
 //!     cargo run -p atomics --example loopback_client            # reads protocol.json
 //!     cargo run -p atomics --example loopback_client -- --follow  # keep printing changes
+//!     cargo run -p atomics --example loopback_client -- --screen SESSION [--follow]  # a terminal
+//!     cargo run -p atomics --example loopback_client -- --screen SESSION --type 'ls\r'  # type into it
 //!     cargo run -p atomics --example loopback_client -- ws://127.0.0.1:PORT TOKEN
 //!
 //! With no arguments it finds `protocol.json` in the ATOMICS state directory (`ATOMICS_HOME`).
@@ -10,13 +12,33 @@
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use atomics_core::lease::Typist;
 use atomics_core::mirror::Mirror;
+use atomics_core::screen::ScreenMirror;
 use atomics_core::wire::{self, CAPABILITIES, Envelope, Message, Seq, VERSION};
 use tungstenite::client::IntoClientRequest;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let follow = args.iter().position(|a| a == "--follow").map(|i| args.remove(i)).is_some();
+    let screen = match args.iter().position(|a| a == "--screen") {
+        Some(i) if i + 1 < args.len() => {
+            args.remove(i);
+            Some(args.remove(i))
+        }
+        Some(_) => return Err("--screen needs a session id (see the board)".into()),
+        None => None,
+    };
+    // `\r`, `\n`, `\t` and `\e` in the text stand for Enter, newline, Tab and Escape.
+    let typed = match args.iter().position(|a| a == "--type") {
+        Some(i) if i + 1 < args.len() && screen.is_some() => {
+            args.remove(i);
+            let text = args.remove(i);
+            Some(text.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t").replace("\\e", "\x1b"))
+        }
+        Some(_) => return Err("--type needs --screen SESSION and the text to type".into()),
+        None => None,
+    };
     let (url, token) = match args.as_slice() {
         [url, token] => (url.clone(), token.clone()),
         [] => {
@@ -26,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let advert: serde_json::Value = serde_json::from_str(&text)?;
             (advert["url"].as_str().ok_or("no url")?.to_string(), advert["token"].as_str().ok_or("no token")?.to_string())
         }
-        _ => return Err("usage: loopback_client [--follow] [URL TOKEN]".into()),
+        _ => return Err("usage: loopback_client [--follow] [--screen SESSION] [URL TOKEN]".into()),
     };
 
     let mut request = url.as_str().into_client_request()?;
@@ -34,6 +56,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     request.headers_mut().insert("Sec-WebSocket-Protocol", wire::SUBPROTOCOL.parse()?);
     let stream = TcpStream::connect(request.uri().authority().ok_or("no host in the url")?.as_str())?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    // Keystrokes leave at once rather than waiting to be coalesced.
+    stream.set_nodelay(true)?;
     let (mut socket, _) = tungstenite::client(request, stream).map_err(|e| format!("upgrade refused: {e}"))?;
 
     let send = |socket: &mut tungstenite::WebSocket<TcpStream>, message: Message| {
@@ -50,6 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prior_cursor: None,
         },
     )?;
+    if let Some(session) = screen {
+        return watch_screen(&mut socket, &session, follow, typed);
+    }
 
     let mut mirror = Mirror::default();
     let mut asked = false;
@@ -83,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {
                         if let Err(gap) = mirror.apply(&envelope) {
                             eprintln!("out of step ({gap:?}); asking for a fresh snapshot");
-                            send(&mut socket, Message::Resync { reason: Some("gap".into()) })?;
+                            send(&mut socket, Message::Resync { reason: Some("gap".into()), screens: Vec::new() })?;
                         } else if follow && asked {
                             print_board(&mirror);
                         }
@@ -117,6 +144,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Print one terminal's screen as text: once, or on every change with `--follow`. With `typed`,
+/// take the terminal's lease (never from another client), type the text, release the lease and
+/// print every change until the terminal has been quiet for the read timeout.
+fn watch_screen(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    session: &str,
+    follow: bool,
+    mut typed: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let send = |socket: &mut tungstenite::WebSocket<TcpStream>, message: Message| {
+        socket.send(tungstenite::Message::text(serde_json::to_string(&Envelope::new(message)).expect("serializes")))
+    };
+    let topics = vec![wire::Topic::Screen { session: session.into(), focused: true }];
+    send(socket, Message::Subscribe { topics })?;
+    let mut screen = ScreenMirror::default();
+    let mut typist = Typist::new(session);
+    let typing = typed.is_some();
+    if typing {
+        send(socket, typist.acquire(false))?;
+    }
+    loop {
+        let text = match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => text,
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            {
+                if typing && typed.is_none() && !follow {
+                    return Ok(()); // typed, and the echo has settled
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let envelope = wire::decode(text.as_str()).map_err(|e| format!("bad frame from the host: {e}"))?;
+        let applied = match &envelope.message {
+            Message::ScreenSnapshot(s) => screen.apply_snapshot(s),
+            Message::ScreenDelta(d) => screen.apply_delta(d),
+            Message::Error { code, message } => return Err(format!("host error {code:?}: {message}").into()),
+            Message::Ping { nonce } => {
+                send(socket, Message::Pong { nonce: nonce.clone() })?;
+                continue;
+            }
+            Message::LeaseState(state) => {
+                typist.apply(state);
+                if typist.may_type()
+                    && let Some(text) = typed.take()
+                {
+                    for frame in typist.input(&text) {
+                        send(socket, frame)?;
+                    }
+                    if let Some(release) = typist.release() {
+                        send(socket, release)?;
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        match applied {
+            Ok(atomics_core::screen::ScreenApplied::Changed) => {
+                let s = screen.screen.as_ref().expect("a changed screen is held");
+                println!(
+                    "--- {session} {}x{} generation {} revision {} ---",
+                    s.cols, s.rows, screen.generation, screen.revision
+                );
+                println!("{}", s.text());
+                if !follow && !typing {
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(gap) => {
+                eprintln!("out of step ({gap:?}); asking for a fresh snapshot");
+                send(socket, Message::Resync { reason: Some("gap".into()), screens: vec![session.into()] })?;
+            }
         }
     }
 }

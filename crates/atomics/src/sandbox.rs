@@ -424,14 +424,8 @@ fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
     }
     let root = real(root);
     let mut mounts = Vec::new();
-    for folder in folders {
-        let relative = Path::new(folder);
-        if relative.as_os_str().is_empty()
-            || !relative.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
-        {
-            continue;
-        }
-        let path = root.join(relative);
+    for relative in git::expand_warm_folders(&root, folders) {
+        let path = root.join(&relative);
         let mut current = root.clone();
         let no_links = relative.components().all(|part| {
             current.push(part);
@@ -768,7 +762,8 @@ fn sbx_command(
 /// The environment every sbx command gets: none of ATOMICS's own, no SSH agent unless it is
 /// forwarded, and the login shell's PATH.
 pub(crate) fn sbx_env(command: &mut Command, ssh_agent: bool) {
-    for name in ["ATOMICS_SOCKET", "ATOMICS_PANE", "ATOMICS_HOME", "ATOMICS_CONFIG"] {
+    for name in ["ATOMICS_SOCKET", "ATOMICS_PANE", "ATOMICS_HOME", "ATOMICS_CONFIG", atomics_core::hook::HOOK_PANE_ENV]
+    {
         command.env_remove(name);
     }
     if !ssh_agent {
@@ -842,6 +837,16 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sbx_commands_carry_none_of_atomics_routing() {
+        let mut command = Command::new("sbx");
+        sbx_env(&mut command, true);
+        let removed: Vec<_> = command.get_envs().filter(|(_, value)| value.is_none()).map(|(name, _)| name).collect();
+        for name in ["ATOMICS_SOCKET", "ATOMICS_PANE", "ATOMICS_HOME", "ATOMICS_CONFIG", "ATOMICS_HOOK_PANE"] {
+            assert!(removed.iter().any(|removed| *removed == name), "{name} reaches sbx");
+        }
+    }
     use atomics_core::isolation::IsolationMode;
 
     #[test]
@@ -894,12 +899,14 @@ mod tests {
         let outside = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
         std::fs::create_dir_all(root.path().join("build/cache")).unwrap();
+        std::fs::create_dir_all(root.path().join("src/a/bin")).unwrap();
         symlink(outside.path(), root.path().join("escape")).unwrap();
         std::fs::create_dir(root.path().join(".git")).unwrap();
         symlink(root.path().join(".git"), root.path().join("git-link")).unwrap();
         let folders = [
             "target",
             "build/cache",
+            "src/**/bin",
             "target",
             "missing",
             "../escape",
@@ -911,7 +918,11 @@ mod tests {
         ]
         .map(String::from);
         assert!(warm_mounts(root.path(), &folders, false).is_empty());
-        let expected = vec![real(root.path()).join("target"), real(root.path()).join("build/cache")];
+        let expected = vec![
+            real(root.path()).join("target"),
+            real(root.path()).join("build/cache"),
+            real(root.path()).join("src/a/bin"),
+        ];
         assert_eq!(warm_mounts(root.path(), &folders, true), expected);
         let spec = Spec {
             name: "atomics-linux".into(),

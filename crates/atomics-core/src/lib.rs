@@ -28,6 +28,7 @@ pub mod heartbeat;
 pub mod hook;
 pub mod isolation;
 pub mod layout;
+pub mod lease;
 pub mod mcp_import;
 #[cfg(feature = "native")]
 pub mod paths;
@@ -36,6 +37,7 @@ pub mod mirror;
 pub mod projection;
 pub mod remote;
 pub mod repo_workflow;
+pub mod screen;
 pub mod selfconfig;
 pub mod session;
 pub mod steer;

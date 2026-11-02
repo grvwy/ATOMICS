@@ -4,15 +4,21 @@
 //! Nothing here does I/O, and nothing here touches the host's `State`. A client's queue is
 //! bounded; when it overflows the client is marked lagged, its backlog is dropped, and its own
 //! thread sends a fresh snapshot instead. A reader that stops reading can therefore never make the
-//! hub (or the runtime thread that publishes) wait.
+//! hub (or the runtime thread that publishes) wait. Terminal screens use the same outbox with a
+//! slot per screen (`screens.rs`), outside the board's queue, so a busy terminal never pushes an
+//! approval out and board events are always sent first. Whatever queues something for a client
+//! wakes its thread, so it is sent at once.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use atomics_core::projection::{Loaded, Projections};
 use atomics_core::wire::{self, Cursor, Disposition, Envelope, Message, Resume, Seq, WireError};
+
+use super::link::Waker;
+use super::screens::Feed;
 
 /// Replay ring bounds: entries, bytes and age. It is an optimisation, not persistence.
 #[derive(Debug, Clone)]
@@ -33,6 +39,29 @@ struct Queue {
     frames: VecDeque<Arc<str>>,
     bytes: usize,
     lagged: bool,
+    screens: HashMap<String, Slot>,
+    /// Delta bytes waiting across all screen slots.
+    screen_bytes: usize,
+}
+
+/// One subscribed screen in one client's outbox: deltas that follow what the client was sent, or
+/// a note that it needs the current snapshot instead.
+struct Slot {
+    feed: Feed,
+    deltas: Vec<Arc<str>>,
+    bytes: usize,
+    snapshot: bool,
+    /// The generation and revision the client will hold once everything queued is sent.
+    at: Option<(u64, u64)>,
+}
+
+impl Slot {
+    fn supersede(&mut self, total: &mut usize) {
+        *total -= self.bytes;
+        self.deltas.clear();
+        self.bytes = 0;
+        self.snapshot = true;
+    }
 }
 
 /// One client's bounded outbound queue. The hub pushes; the client's own thread drains.
@@ -41,55 +70,172 @@ pub struct Outbox {
     max_frames: usize,
     max_bytes: usize,
     closed: AtomicBool,
+    /// Ends the client thread's wait for its next frame.
+    waker: OnceLock<Arc<Waker>>,
 }
 
 impl Outbox {
-    fn new(max_frames: usize, max_bytes: usize) -> Self {
-        Self { queue: Mutex::new(Queue::default()), max_frames, max_bytes, closed: AtomicBool::new(false) }
+    pub(super) fn new(max_frames: usize, max_bytes: usize) -> Self {
+        Self {
+            queue: Mutex::new(Queue::default()),
+            max_frames,
+            max_bytes,
+            closed: AtomicBool::new(false),
+            waker: OnceLock::new(),
+        }
     }
 
     fn queue(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Wake the client's thread whenever something is queued for it.
+    pub fn set_waker(&self, waker: Arc<Waker>) {
+        let _ = self.waker.set(waker);
+    }
+
+    /// Never blocks.
+    fn wake(&self) {
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
+    }
+
     /// Never blocks. A full queue drops the backlog and marks the client lagged.
     fn push(&self, frame: &Arc<str>) {
-        let mut q = self.queue();
-        if q.lagged {
-            return;
+        {
+            let mut q = self.queue();
+            if q.lagged {
+                return;
+            }
+            if q.frames.len() >= self.max_frames || q.bytes + frame.len() > self.max_bytes {
+                q.frames.clear();
+                q.bytes = 0;
+                q.lagged = true;
+            } else {
+                q.bytes += frame.len();
+                q.frames.push_back(frame.clone());
+            }
         }
-        if q.frames.len() >= self.max_frames || q.bytes + frame.len() > self.max_bytes {
-            q.frames.clear();
-            q.bytes = 0;
-            q.lagged = true;
-            return;
-        }
-        q.bytes += frame.len();
-        q.frames.push_back(frame.clone());
+        self.wake();
     }
 
     fn mark_lagged(&self) {
-        let mut q = self.queue();
-        q.frames.clear();
-        q.bytes = 0;
-        q.lagged = true;
+        {
+            let mut q = self.queue();
+            q.frames.clear();
+            q.bytes = 0;
+            q.lagged = true;
+        }
+        self.wake();
     }
 
-    /// Everything queued, and whether the client must be resynchronised instead.
+    /// Everything queued (board events first, then screens), or that the client must be
+    /// resynchronised first. A screen that needs a snapshot gets the one its feed holds now; until
+    /// the first copy is published it waits.
     pub fn take(&self) -> Taken {
         let mut q = self.queue();
         if q.lagged {
             return Taken::Lagged;
         }
         q.bytes = 0;
-        Taken::Frames(q.frames.drain(..).collect())
+        let mut frames: Vec<Arc<str>> = q.frames.drain(..).collect();
+        let mut sent = 0;
+        for slot in q.screens.values_mut() {
+            if !slot.snapshot {
+                sent += slot.bytes;
+                slot.bytes = 0;
+                frames.append(&mut slot.deltas);
+                continue;
+            }
+            let current = slot.feed.read().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(current) = current
+                && let Some(snapshot) = current.frames()
+            {
+                frames.extend(snapshot.iter().cloned());
+                slot.snapshot = false;
+                slot.at = Some((current.generation, current.revision));
+            }
+        }
+        q.screen_bytes -= sent;
+        Taken::Frames(frames)
+    }
+
+    /// Follow a screen, starting with a snapshot from `feed` (also when its terminal was replaced).
+    pub fn watch_screen(&self, session: &str, feed: &Feed) {
+        {
+            let mut q = self.queue();
+            let q = &mut *q;
+            let old = q.screens.insert(
+                session.to_string(),
+                Slot { feed: feed.clone(), deltas: Vec::new(), bytes: 0, snapshot: true, at: None },
+            );
+            q.screen_bytes -= old.map_or(0, |s| s.bytes);
+        }
+        self.wake();
+    }
+
+    pub fn unwatch_screen(&self, session: &str) {
+        let mut q = self.queue();
+        if let Some(slot) = q.screens.remove(session) {
+            q.screen_bytes -= slot.bytes;
+        }
+    }
+
+    /// Replace whatever is queued for this screen with its current snapshot. False when the
+    /// client does not follow it.
+    pub fn want_snapshot(&self, session: &str) -> bool {
+        {
+            let mut q = self.queue();
+            let q = &mut *q;
+            let Some(slot) = q.screens.get_mut(session) else { return false };
+            slot.supersede(&mut q.screen_bytes);
+        }
+        self.wake();
+        true
+    }
+
+    /// Queue the delta from `base` to `revision` if it follows what this client holds. A delta
+    /// that does not follow, or that would overfill the slot, turns the slot into a snapshot.
+    pub fn push_screen(
+        &self,
+        session: &str,
+        (generation, base, revision): (u64, u64, u64),
+        frame: &Arc<str>,
+        max_frames: usize,
+        max_bytes: usize,
+    ) {
+        {
+            let mut q = self.queue();
+            let q = &mut *q;
+            let Some(slot) = q.screens.get_mut(session) else { return };
+            if slot.snapshot {
+                return; // the snapshot it will get already contains this change
+            }
+            match slot.at {
+                Some(at) if at == (generation, base) => {
+                    if slot.deltas.len() >= max_frames || q.screen_bytes + frame.len() > max_bytes {
+                        slot.supersede(&mut q.screen_bytes);
+                    } else {
+                        slot.deltas.push(frame.clone());
+                        slot.bytes += frame.len();
+                        q.screen_bytes += frame.len();
+                        slot.at = Some((generation, revision));
+                    }
+                }
+                // Loaded a snapshot that already includes this delta.
+                Some((g, r)) if g == generation && r >= revision => return,
+                _ => slot.supersede(&mut q.screen_bytes),
+            }
+        }
+        self.wake();
     }
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }
 
-    fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 }

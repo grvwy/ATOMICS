@@ -9,6 +9,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::host::Window;
 use anyhow::{Result, bail};
 use atomics_core::control::{ControlRequest, ControlResponse, describe_diff};
 use atomics_core::hook::{HookEvent, HookReply, HookRequest, context_output};
@@ -134,7 +135,7 @@ impl Hub {
 }
 
 /// Binds the socket, refusing to steal it from another running ATOMICS.
-pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, ctx: egui::Context) -> Result<()> {
+pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, window: Window) -> Result<()> {
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
             bail!("another ATOMICS is already listening on {}", path.display());
@@ -152,9 +153,9 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, ctx: egui::C
     std::thread::Builder::new().name("atomics-hooks".into()).spawn(move || {
         let channels = Arc::new(channels);
         for stream in listener.incoming().flatten() {
-            let (hub, channels, ctx) = (hub.clone(), channels.clone(), ctx.clone());
+            let (hub, channels, window) = (hub.clone(), channels.clone(), window.clone());
             std::thread::spawn(move || {
-                if let Err(err) = handle(stream, &hub, &channels, &ctx) {
+                if let Err(err) = handle(stream, &hub, &channels, &window) {
                     eprintln!("ATOMICS: hook connection failed: {err:#}");
                 }
             });
@@ -164,8 +165,8 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, ctx: egui::C
     Ok(())
 }
 
-fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui::Context) -> Result<()> {
-    handle_with_wait_duration(stream, hub, channels, ctx, Duration::from_secs)
+fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, window: &Window) -> Result<()> {
+    handle_with_wait_duration(stream, hub, channels, window, Duration::from_secs)
 }
 
 // Keep timeout selection identical when tests scale seconds down to milliseconds.
@@ -173,7 +174,7 @@ fn handle_with_wait_duration(
     stream: UnixStream,
     hub: &Mutex<Hub>,
     channels: &Channels,
-    ctx: &egui::Context,
+    window: &Window,
     wait_duration: impl Fn(u64) -> Duration,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -184,7 +185,7 @@ fn handle_with_wait_duration(
         if payload["rate_limits"].is_object() {
             let usage = atomics_core::usage::Usage::claude(payload, crate::usage::now());
             if channels.usage.send(crate::usage::Report::Claude(usage)).is_ok() {
-                ctx.request_repaint();
+                window.request_repaint();
             }
         }
         (&stream).write_all(b"\n")?;
@@ -195,7 +196,7 @@ fn handle_with_wait_duration(
     }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
-            Ok(request) => control(request, channels, ctx, &stream),
+            Ok(request) => control(request, channels, window, &stream),
             Err(err) => ControlResponse::error(format!("bad request: {err}")),
         };
         let mut writer = &stream;
@@ -217,7 +218,7 @@ fn handle_with_wait_duration(
         delivered,
         approval_reply: approval_reply.clone(),
     });
-    ctx.request_repaint();
+    window.request_repaint();
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
         reply = if hub.lock().unwrap().chief_running {
@@ -236,12 +237,12 @@ fn handle_with_wait_duration(
     Ok(())
 }
 
-fn control(request: ControlRequest, channels: &Channels, ctx: &egui::Context, stream: &UnixStream) -> ControlResponse {
+fn control(request: ControlRequest, channels: &Channels, window: &Window, stream: &UnixStream) -> ControlResponse {
     let (reply, outcome) = std::sync::mpsc::channel();
     if channels.control.send(ControlMessage { request, reply }).is_err() {
         return ControlResponse::error("ATOMICS is shutting down");
     }
-    ctx.request_repaint();
+    window.request_repaint();
     match outcome.recv_timeout(Duration::from_secs(300)) {
         Ok(ControlOutcome::Done(response)) => response,
         Ok(ControlOutcome::Diff { root, base_ref, patch, session }) => {
@@ -334,10 +335,10 @@ mod tests {
             hooks: std::sync::mpsc::channel().0.into(),
             control,
             usage: std::sync::mpsc::channel().0,
-            governor: Arc::new(crate::governor::Governor::new(Default::default(), None)),
+            governor: Arc::new(crate::governor::Governor::new(Default::default(), Default::default())),
         };
         let server = std::thread::spawn(move || {
-            handle(server, &Mutex::new(Hub::default()), &channels, &egui::Context::default()).unwrap();
+            handle(server, &Mutex::new(Hub::default()), &channels, &Window::default()).unwrap();
         });
         let runtime = std::thread::spawn(move || {
             // A long deadline makes this fail if the control path stops notifying.
@@ -362,7 +363,7 @@ mod tests {
         let (hooks, hook_rx) = std::sync::mpsc::channel();
         let (control, _) = std::sync::mpsc::channel();
         let (usage, usage_rx) = std::sync::mpsc::channel();
-        let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
+        let governor = Arc::new(crate::governor::Governor::new(Default::default(), Default::default()));
         writeln!(
             client,
             "{}",
@@ -375,7 +376,7 @@ mod tests {
             server,
             &Mutex::new(Hub::default()),
             &Channels { hooks: hooks.into(), control: control.into(), usage, governor },
-            &egui::Context::default(),
+            &Window::default(),
         )
         .unwrap();
         let crate::usage::Report::Claude(usage) = usage_rx.try_recv().unwrap() else { panic!("claude report") };
@@ -394,13 +395,13 @@ mod tests {
         let (hooks, _) = std::sync::mpsc::channel();
         let (control, _) = std::sync::mpsc::channel();
         let (usage, usage_rx) = std::sync::mpsc::channel();
-        let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
+        let governor = Arc::new(crate::governor::Governor::new(Default::default(), Default::default()));
         writeln!(client, "{}", json!({"statusline":{"session_id":"new-session"}})).unwrap();
         handle(
             server,
             &Mutex::new(Hub::default()),
             &Channels { hooks: hooks.into(), control: control.into(), usage, governor },
-            &egui::Context::default(),
+            &Window::default(),
         )
         .unwrap();
         assert!(usage_rx.try_recv().is_err());
@@ -418,8 +419,10 @@ mod tests {
         let (hooks, _) = std::sync::mpsc::channel();
         let (control, requests) = std::sync::mpsc::channel::<ControlMessage>();
         let (finished, then_ran) = std::sync::mpsc::channel();
-        let governor =
-            Arc::new(crate::governor::Governor::new(atomics_core::governor::ResourceConfig::default(), None));
+        let governor = Arc::new(crate::governor::Governor::new(
+            atomics_core::governor::ResourceConfig::default(),
+            Default::default(),
+        ));
         let slots = governor.clone();
         // The app: answers with the job, and hears when it has run.
         let app = std::thread::spawn(move || {
@@ -445,7 +448,7 @@ mod tests {
                 usage: std::sync::mpsc::channel().0,
                 governor,
             };
-            handle(server, &Mutex::new(Hub::default()), &channels, &egui::Context::default()).unwrap();
+            handle(server, &Mutex::new(Hub::default()), &channels, &Window::default()).unwrap();
         });
         let mut line = String::new();
         BufReader::new(&client).read_line(&mut line).unwrap();
@@ -494,7 +497,7 @@ mod tests {
             let hub = Arc::new(Mutex::new(Hub { chief_running, ..Hub::default() }));
             let server_hub = hub.clone();
             let handler = std::thread::spawn(move || {
-                let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
+                let governor = Arc::new(crate::governor::Governor::new(Default::default(), Default::default()));
                 handle_with_wait_duration(
                     server,
                     &server_hub,
@@ -504,7 +507,7 @@ mod tests {
                         governor,
                         usage: std::sync::mpsc::channel().0,
                     },
-                    &egui::Context::default(),
+                    &Window::default(),
                     |seconds| Duration::from_millis(seconds * 5),
                 )
                 .unwrap();

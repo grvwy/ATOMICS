@@ -18,9 +18,9 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::{HandshakeError, WebSocket};
 
 use super::hub::{Hub, RingLimits, Taken};
-use super::{DiffSource, Server, ServerConfig, SessionConfig};
+use super::{DiffSource, Server, ServerConfig, SessionConfig, Terminals};
 
-fn wait(base: Duration) -> Duration {
+pub(crate) fn wait(base: Duration) -> Duration {
     crate::test_support::scaled_timeout(base)
 }
 
@@ -138,7 +138,7 @@ fn start_with(config: ServerConfig) -> Fixture {
     let projections = Arc::new(Projections::default());
     let diffs = Arc::new(FakeDiffs::default());
     diffs.0.lock().unwrap().insert("/w/a".into(), (1, file_diff()));
-    let server = Server::start(config, projections.clone(), diffs).unwrap();
+    let server = Server::start(config, projections.clone(), diffs, Arc::new(Terminals::default())).unwrap();
     Fixture { server, projections }
 }
 
@@ -163,7 +163,7 @@ fn board_matches(m: &Mirror, p: &Projections) -> bool {
 
 /// A native client over a real loopback socket.
 pub(crate) struct TestClient {
-    ws: WebSocket<TcpStream>,
+    pub(crate) ws: WebSocket<TcpStream>,
     pub mirror: Mirror,
     pub welcome: Option<Envelope>,
 }
@@ -475,7 +475,7 @@ fn a_client_can_ask_for_a_resync() {
     client.hello();
     client.sync_until(|m| board_matches(m, &f.projections) && m.cursor > 0);
     client.mirror.sessions.clear();
-    client.send(&Envelope::new(Message::Resync { reason: Some("test".into()) }));
+    client.send(&Envelope::new(Message::Resync { reason: Some("test".into()), screens: Vec::new() }));
     client.sync_until(|m| board_matches(m, &f.projections));
 }
 

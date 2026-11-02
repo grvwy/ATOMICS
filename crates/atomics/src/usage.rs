@@ -27,7 +27,7 @@ pub struct UsagePanel {
 }
 
 impl UsagePanel {
-    pub fn new(ctx: egui::Context) -> (Self, Sender<Report>) {
+    pub fn new(window: crate::host::Window) -> (Self, Sender<Report>) {
         let (tx, reports) = channel();
         let (stop, stopped) = channel();
         let home = std::env::var_os("CODEX_HOME")
@@ -36,7 +36,7 @@ impl UsagePanel {
         let poll_tx = tx.clone();
         std::thread::Builder::new()
             .name("atomics-usage".into())
-            .spawn(move || poll_codex(&home.join("sessions"), poll_tx, stopped, ctx, POLL_INTERVAL))
+            .spawn(move || poll_codex(&home.join("sessions"), poll_tx, stopped, window, POLL_INTERVAL))
             .expect("usage worker");
         (Self { claude: Usage::default(), codex: Usage::default(), reports, stop }, tx)
     }
@@ -112,7 +112,13 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn poll_codex(sessions: &Path, tx: Sender<Report>, stopped: Receiver<()>, ctx: egui::Context, interval: Duration) {
+fn poll_codex(
+    sessions: &Path,
+    tx: Sender<Report>,
+    stopped: Receiver<()>,
+    window: crate::host::Window,
+    interval: Duration,
+) {
     let mut previous = None;
     loop {
         if let Some(usage) = read_codex(sessions)
@@ -122,7 +128,7 @@ fn poll_codex(sessions: &Path, tx: Sender<Report>, stopped: Receiver<()>, ctx: e
             if tx.send(Report::Codex(usage)).is_err() {
                 break;
             }
-            ctx.request_repaint();
+            window.request_repaint();
         }
         if stopped.recv_timeout(interval) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
             break;
@@ -144,7 +150,7 @@ impl SandboxPull {
     }
 
     /// `names` are sandboxes whose agent is attached: `sbx exec` would start a stopped one.
-    pub fn poll(&mut self, sbx: &str, names: Vec<String>, ctx: &egui::Context) {
+    pub fn poll(&mut self, sbx: &str, names: Vec<String>, window: &crate::host::Window) {
         if names.is_empty()
             || self.busy.load(Ordering::Acquire)
             || self.pulled.is_some_and(|at| at.elapsed() < POLL_INTERVAL)
@@ -153,7 +159,7 @@ impl SandboxPull {
         }
         self.pulled = Some(Instant::now());
         self.busy.store(true, Ordering::Release);
-        let (tx, busy, ctx, sbx) = (self.tx.clone(), self.busy.clone(), ctx.clone(), sbx.to_string());
+        let (tx, busy, window, sbx) = (self.tx.clone(), self.busy.clone(), window.clone(), sbx.to_string());
         let spawned = std::thread::Builder::new().name("atomics-sandbox-usage".into()).spawn(move || {
             let sbx = crate::setup::resolve_program(&sbx);
             for name in names {
@@ -163,7 +169,7 @@ impl SandboxPull {
                 }
             }
             busy.store(false, Ordering::Release);
-            ctx.request_repaint();
+            window.request_repaint();
         });
         if spawned.is_err() {
             self.busy.store(false, Ordering::Release);
@@ -280,7 +286,9 @@ mod tests {
         let (tx, rx) = channel();
         let (stop, stopped) = channel();
         let sessions = dir.path().to_path_buf();
-        let worker = std::thread::spawn(move || poll_codex(&sessions, tx, stopped, ctx, Duration::from_millis(20)));
+        let worker = std::thread::spawn(move || {
+            poll_codex(&sessions, tx, stopped, crate::host::Window::attach(ctx), Duration::from_millis(20))
+        });
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Report::Codex(_)));
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "idle polls must not send data");
         let before = repaints.load(std::sync::atomic::Ordering::SeqCst);
@@ -312,7 +320,7 @@ mod tests {
         }
         panel.drain();
         assert_eq!(panel.claude.observed_at, now);
-        let p = Palette::from_config(&ThemeConfig::default());
+        let p = crate::theme::Theme::from_config(&ThemeConfig::default()).palette();
         let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(250.0, 400.0))),
@@ -345,7 +353,7 @@ mod tests {
         let (tx, reports) = channel();
         let (stop, _) = channel();
         let mut panel = UsagePanel { claude: Usage::default(), codex: Usage::default(), reports, stop };
-        let p = Palette::from_config(&ThemeConfig::default());
+        let p = crate::theme::Theme::from_config(&ThemeConfig::default()).palette();
         let mut usage =
             Usage::codex(include_str!("../../atomics-core/tests/fixtures/codex-token-count-weekly-only.json")).unwrap();
         usage.observed_at = now();
@@ -476,7 +484,7 @@ mod tests {
             reports,
             stop,
         };
-        let p = Palette::from_config(&ThemeConfig::default());
+        let p = crate::theme::Theme::from_config(&ThemeConfig::default()).palette();
         let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(250.0, 400.0))),
@@ -524,7 +532,7 @@ mod tests {
 
     #[test]
     fn colors_use_strict_remaining_thresholds_and_missing_is_explicit() {
-        let p = Palette::from_config(&ThemeConfig::default());
+        let p = crate::theme::Theme::from_config(&ThemeConfig::default()).palette();
         for (remaining, expected) in [(30.0, p.success), (29.9, p.warning), (10.0, p.warning), (9.9, p.error)] {
             assert_eq!(remaining_color(&Window { remaining, resets_at: 1 }, &p), expected);
         }

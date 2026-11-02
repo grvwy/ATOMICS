@@ -152,12 +152,12 @@ pub struct Governor {
     restarting: AtomicBool,
     changed: Condvar,
     config: Mutex<ResourceConfig>,
-    repaint: Option<egui::Context>,
+    repaint: crate::host::Window,
     pub cores: usize,
 }
 
 impl Governor {
-    pub fn new(config: ResourceConfig, repaint: Option<egui::Context>) -> Governor {
+    pub fn new(config: ResourceConfig, repaint: crate::host::Window) -> Governor {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         Governor {
             queue: Mutex::default(),
@@ -182,9 +182,7 @@ impl Governor {
         let config = self.config.lock().unwrap().clone();
         self.queue.lock().unwrap().grant(|class| config.slots(class, self.cores));
         self.changed.notify_all();
-        if let Some(ctx) = &self.repaint {
-            ctx.request_repaint();
-        }
+        self.repaint.request_repaint();
     }
 
     pub fn snapshot(&self) -> (Vec<Ticket>, Vec<Ticket>) {
@@ -418,7 +416,7 @@ mod tests {
 
     #[test]
     fn restart_refuses_held_and_waiting_slots_and_force_freezes_admission() {
-        let governor = Governor::new(ResourceConfig::default(), None);
+        let governor = Governor::new(ResourceConfig::default(), Default::default());
         let id = governor.queue.lock().unwrap().enqueue(SlotClass::Test, "full test suite".into(), vec![]);
         assert!(governor.begin_restart(false).is_err(), "waiting work must not be lost");
         governor.grant();
@@ -574,8 +572,10 @@ mod tests {
     fn slots_are_held_until_the_client_hangs_up() {
         let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("s");
-        let governor =
-            Arc::new(Governor::new(ResourceConfig { test_slots: Some(1), ..ResourceConfig::default() }, None));
+        let governor = Arc::new(Governor::new(
+            ResourceConfig { test_slots: Some(1), ..ResourceConfig::default() },
+            Default::default(),
+        ));
         serve_on(&socket, governor.clone());
         let (first, mut first_reader) = client(&socket, "test");
         assert_eq!(next(&mut first_reader)["granted"], true);
@@ -616,7 +616,7 @@ mod tests {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(3));
                 std::fs::remove_file(&socket).unwrap();
-                serve_on(&socket, Arc::new(Governor::new(ResourceConfig::default(), None)));
+                serve_on(&socket, Arc::new(Governor::new(ResourceConfig::default(), Default::default())));
             })
         };
         let started = Instant::now();

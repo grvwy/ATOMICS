@@ -2,8 +2,9 @@
 //!
 //! Browser-safe: serde types and pure functions only, so the same code builds the host's server
 //! and the wasm client. Ordering and tags follow `docs/daemon.md` (Client protocol). This module
-//! carries the read-only slice (board, plans, diffs, approvals, cursors); terminal and mutation
-//! messages join it in later slices, and until then they fail as `unknown_kind`.
+//! carries the read-only slice (board, plans, diffs, approvals, cursors), terminal screens
+//! (`screen` module) and typing into terminals under a controller lease (`lease` module); mutation
+//! messages join it in a later slice, and until then they fail as `unknown_kind`.
 //!
 //! Rules every decoder here applies:
 //! - A frame over `MAX_FRAME_BYTES` is rejected before it is parsed.
@@ -17,7 +18,9 @@ use std::fmt;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::lease::{self, GridSize, LeaseState};
 use crate::projection::{ApprovalInfo, DiffFileBody, DiffSummary, Loaded, PlanInfo, ReportInfo, SessionInfo};
+use crate::screen::{self, HistoryChunk, HistoryGet, ScreenDelta, ScreenSnapshot};
 
 /// The WebSocket subprotocol name.
 pub const SUBPROTOCOL: &str = "atomics.v1";
@@ -33,7 +36,12 @@ pub const MAX_CAPABILITIES: usize = 64;
 pub const MAX_ID_BYTES: usize = 1024;
 
 /// Capabilities this implementation can offer in a `welcome`.
-pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs"];
+pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", TERMINALS, INPUT];
+/// Screen streaming: `screen` topics, `screen_snapshot`/`screen_delta` and `history_get`.
+pub const TERMINALS: &str = "terminals";
+/// Typing into subscribed screens: the `lease_*` messages, `lease_state`, `terminal_input` and
+/// `terminal_resize`. Needs `terminals`.
+pub const INPUT: &str = "input";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -80,6 +88,13 @@ pub enum ErrorCode {
     Unauthorised,
     SlowClient,
     Internal,
+    /// Another client holds the terminal's lease; acquiring it needs `takeover`.
+    LeaseHeld,
+    /// The lease named is not the current one (expired, released, taken over, ended with its
+    /// connection or taken back on the desktop). The input or resize was not applied.
+    Fenced,
+    /// Input whose sequence number is not the next one in its lease. It was not applied.
+    OutOfOrder,
 }
 
 /// Why a frame was refused. Convert with `into_envelope` to answer the sender.
@@ -129,8 +144,10 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// May answer approvals and send commands (when those slices ship).
+    /// May take terminal leases and type, and answer approvals and send commands (when those
+    /// slices ship).
     Controller,
+    /// Follows everything, including who types, but never holds a lease.
     Viewer,
 }
 
@@ -209,11 +226,33 @@ pub enum Disposition {
 }
 
 /// What a client may subscribe to. Diffs are per worktree; the board collections are always sent.
+/// A `screen` topic is a visible terminal pane: it gets a snapshot, then deltas at about 200 ms,
+/// or about 100 ms while `focused`. Subscribing again only updates `focused`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "topic", rename_all = "snake_case")]
 pub enum Topic {
-    Diff { worktree: String },
-    Plan { id: String },
+    Diff {
+        worktree: String,
+    },
+    Plan {
+        id: String,
+    },
+    Screen {
+        session: String,
+        #[serde(default)]
+        focused: bool,
+    },
+}
+
+impl Topic {
+    /// The subscription's identity; `focused` is a hint, not part of it.
+    pub fn key(&self) -> String {
+        match self {
+            Topic::Diff { worktree } => format!("diff:{worktree}"),
+            Topic::Plan { id } => format!("plan:{id}"),
+            Topic::Screen { session, .. } => format!("screen:{session}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,12 +354,55 @@ pub enum Message {
         content: String,
         truncated: bool,
     },
+    ScreenSnapshot(ScreenSnapshot),
+    ScreenDelta(ScreenDelta),
+    HistoryGet(HistoryGet),
+    HistoryChunk(HistoryChunk),
+    /// Ask for a subscribed terminal's lease. Without `takeover` it fails while another client
+    /// holds it; with it the other client's lease ends.
+    LeaseAcquire {
+        session: String,
+        #[serde(default)]
+        takeover: bool,
+    },
+    /// Keep a held lease alive without typing.
+    LeaseRenew {
+        session: String,
+        lease: Seq,
+    },
+    LeaseRelease {
+        session: String,
+        lease: Seq,
+    },
+    /// Who holds a terminal's lease: the reply to a lease request, and sent whenever it changes to
+    /// every client that negotiated `input` and follows the screen.
+    LeaseState(LeaseState),
+    /// Text for the terminal, encoded by the client from the screen's published modes. Applied
+    /// only for the current lease and only as its next sequence number.
+    TerminalInput {
+        session: String,
+        lease: Seq,
+        seq: Seq,
+        data: String,
+    },
+    /// Resize the terminal for the lease holder, or with no `size` return it to the host's own
+    /// size. The size lasts as long as the lease.
+    TerminalResize {
+        session: String,
+        lease: Seq,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<GridSize>,
+    },
     Ack {
         cursor: Cursor,
     },
+    /// With no `screens`, resend the board as a `state_snapshot`. With `screens`, resend only those
+    /// subscribed screens as snapshots (after a `screen_delta` that does not follow).
     Resync {
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        screens: Vec<String>,
     },
     Ping {
         #[serde(default)]
@@ -354,6 +436,16 @@ const KINDS: &[&str] = &[
     "diff_file",
     "file_get",
     "file_content",
+    "screen_snapshot",
+    "screen_delta",
+    "history_get",
+    "history_chunk",
+    "lease_acquire",
+    "lease_renew",
+    "lease_release",
+    "lease_state",
+    "terminal_input",
+    "terminal_resize",
     "ack",
     "resync",
     "ping",
@@ -433,12 +525,38 @@ impl Message {
                     topics.iter().find_map(|t| match t {
                         Topic::Diff { worktree } => long("worktree", worktree),
                         Topic::Plan { id } => long("plan id", id),
+                        Topic::Screen { session, .. } => long("session", session),
                     })
                 })
             }
             Message::DiffGet { worktree, path, .. } | Message::FileGet { worktree, path } => {
                 long("worktree", worktree).or_else(|| long("path", path))
             }
+            Message::Resync { reason, screens } => too_many("screens", screens.len(), MAX_SUBSCRIPTIONS)
+                .or_else(|| reason.as_deref().and_then(|r| long("reason", r)))
+                .or_else(|| screens.iter().find_map(|s| long("session", s))),
+            Message::ScreenSnapshot(s) => long("session", &s.session)
+                .or_else(|| screen::validate_snapshot(s).map(|why| WireError::new(ErrorCode::Malformed, why))),
+            Message::ScreenDelta(d) => long("session", &d.session)
+                .or_else(|| screen::validate_delta(d).map(|why| WireError::new(ErrorCode::Malformed, why))),
+            Message::HistoryGet(h) => long("session", &h.session)
+                .or_else(|| too_many("history lines", h.count as usize, screen::MAX_HISTORY_LINES as usize)),
+            Message::HistoryChunk(h) => long("session", &h.session)
+                .or_else(|| too_many("history lines", h.lines.len(), screen::MAX_HISTORY_LINES as usize)),
+            Message::LeaseAcquire { session, .. }
+            | Message::LeaseRenew { session, .. }
+            | Message::LeaseRelease { session, .. } => long("session", session),
+            Message::LeaseState(state) => {
+                long("session", &state.session).or_else(|| state.holder.as_deref().and_then(|h| long("holder", h)))
+            }
+            Message::TerminalInput { session, data, .. } => long("session", session).or_else(|| {
+                lease::invalid_input(data).map(|why| {
+                    let code = if data.is_empty() { ErrorCode::Malformed } else { ErrorCode::Oversize };
+                    WireError::new(code, why)
+                })
+            }),
+            Message::TerminalResize { session, size, .. } => long("session", session)
+                .or_else(|| size.and_then(|s| s.invalid()).map(|why| WireError::new(ErrorCode::Malformed, why))),
             _ => None,
         };
         failure.map_or(Ok(()), Err)

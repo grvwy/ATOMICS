@@ -368,12 +368,12 @@ mod tests {
             "broken": {"type": "stdio", "args": ["no command"]}
         },
         "projects": {
-            "/Users/max/repos/app": {"allowedTools": [], "mcpServers": {
+            "/Users/alice/repos/app": {"allowedTools": [], "mcpServers": {
                 "postgres": {"type": "stdio", "command": "docker", "args": ["run", "-i", "--rm", "mcp/postgres"],
                              "env": {"DATABASE_URL": "postgres://PRIVATE"}},
                 "github": {"command": "other"}
             }},
-            "/Users/max/repos/other": {"mcpServers": null}
+            "/Users/alice/repos/other": {"mcpServers": null}
         }
     }"#;
 
@@ -417,7 +417,7 @@ env_vars = ["NOTION_ORG"]
         let github = &found[1];
         assert_eq!(github.env, ["GITHUB_PERSONAL_ACCESS_TOKEN"]);
         assert_eq!(found[2].skipped, 1, "the Authorization header is left out");
-        assert_eq!(found[4].project.as_deref(), Some("/Users/max/repos/app"));
+        assert_eq!(found[4].project.as_deref(), Some("/Users/alice/repos/app"));
         let debug = format!("{found:?} {}", serde_json::to_string(&found).unwrap());
         for secret in ["ghp_PRIVATE", "PRIVATE-header", "postgres://PRIVATE", "PRIVATE-account", "sk-ant-api03"] {
             assert!(!debug.contains(secret), "{secret} leaked into {debug}");

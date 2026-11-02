@@ -448,6 +448,7 @@ impl Plan {
 
     /// SHA-256 of canonical JSON (sorted object keys, compact encoding), cut to 12 hex digits.
     /// Runtime progress, branches and the automatically added review task grant no approval scope.
+    #[cfg(feature = "native")]
     pub fn digest(&self) -> String {
         use sha2::{Digest, Sha256};
         let scope = serde_json::json!({
@@ -677,6 +678,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "native")]
     fn digest_tracks_exactly_the_replace_approval_scope() {
         let mut plan = Plan::default();
         plan.replace(

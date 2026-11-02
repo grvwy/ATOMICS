@@ -18,6 +18,9 @@ use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::Result;
+use atomics_core::lease::GridSize;
+
+use crate::protocol::{Lease, TerminalControl};
 
 #[derive(Clone, Copy, Default)]
 struct InputHistory {
@@ -51,6 +54,46 @@ pub struct Shared {
     input: Mutex<InputHistory>,
     /// The theme's 256 colors, foreground, background and cursor, answered to OSC 4/10/11/12.
     colors: Mutex<Vec<Rgb>>,
+    /// The program's current title. `title` above is taken by the host; this one is only read.
+    screen_title: Mutex<Option<String>>,
+    /// Moves with title and theme changes, which do not move `revision`, so a remote screen
+    /// stream knows to copy again. Nothing on the desktop reads it.
+    screen_changes: AtomicU64,
+    /// Which remote client may type into and resize this terminal. Nobody holds it unless the
+    /// protocol server runs and a client asked; until then the desktop never takes its lock to type.
+    lease: Lease,
+    /// The desktop's own size (its pane, or the size the terminal started with). `size` is what is
+    /// in force, which is a lease holder's size while it has one.
+    local: Mutex<WindowSize>,
+}
+
+impl Shared {
+    fn new(wake: crate::host::Wake, size: WindowSize, colors: Vec<Rgb>) -> Self {
+        Self {
+            title: Mutex::new(None),
+            submitted: Mutex::new(None),
+            exited: AtomicBool::new(false),
+            bell: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
+            clipboard: Mutex::new(None),
+            wake,
+            size: Mutex::new(size),
+            shown: Mutex::new(None),
+            input: Mutex::new(InputHistory::default()),
+            colors: Mutex::new(colors),
+            screen_title: Mutex::new(None),
+            screen_changes: AtomicU64::new(0),
+            lease: Lease::default(),
+            local: Mutex::new(size),
+        }
+    }
+
+    fn set_title(&self, title: Option<String>) {
+        *self.screen_title.lock().unwrap() = title.clone();
+        self.screen_changes.fetch_add(1, Ordering::Release);
+        *self.title.lock().unwrap() = title;
+    }
 }
 
 #[derive(Clone)]
@@ -67,8 +110,8 @@ impl EventListener for Listener {
             }
         };
         match event {
-            TermEvent::Title(title) => *self.shared.title.lock().unwrap() = Some(title),
-            TermEvent::ResetTitle => *self.shared.title.lock().unwrap() = None,
+            TermEvent::Title(title) => self.shared.set_title(Some(title)),
+            TermEvent::ResetTitle => self.shared.set_title(None),
             TermEvent::PtyWrite(text) => write(text),
             TermEvent::ColorRequest(index, format) => {
                 let colors = self.shared.colors.lock().unwrap();
@@ -100,8 +143,9 @@ pub struct Terminal {
     pub shared: Arc<Shared>,
 }
 
-/// Remove instance routing from every terminal, including inherited bundle settings.
-pub(super) fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
+/// Remove instance routing from every terminal, including inherited bundle settings. A session's
+/// own hook pane is set again after the inherited one is removed.
+pub(super) fn isolated_args(program: String, args: Vec<String>, hook_pane: Option<String>) -> Vec<String> {
     [
         "-u",
         "ATOMICS_SOCKET",
@@ -115,9 +159,12 @@ pub(super) fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
         "ATOMICS_AZURE_BEARER",
         "-u",
         "ATOMICS_AZURE_RELAY_URL",
+        "-u",
+        atomics_core::hook::HOOK_PANE_ENV,
     ]
     .into_iter()
     .map(str::to_string)
+    .chain(hook_pane.map(|pane| format!("{}={pane}", atomics_core::hook::HOOK_PANE_ENV)))
     .chain([program])
     .chain(args)
     .collect()
@@ -216,11 +263,12 @@ impl Terminal {
         program: String,
         args: Vec<String>,
         cwd: &Path,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         scrollback: usize,
     ) -> Result<Terminal> {
+        let hook_pane = env.remove(atomics_core::hook::HOOK_PANE_ENV);
         let options = tty::Options {
-            shell: Some(tty::Shell::new("/usr/bin/env".into(), isolated_args(program, args))),
+            shell: Some(tty::Shell::new("/usr/bin/env".into(), isolated_args(program, args, hook_pane))),
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: true,
             env,
@@ -228,20 +276,7 @@ impl Terminal {
         let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, size, 0)?;
         let process_id = pty.child().id();
-        let shared = Arc::new(Shared {
-            title: Mutex::new(None),
-            submitted: Mutex::new(None),
-            exited: AtomicBool::new(false),
-            bell: AtomicBool::new(false),
-            changed: AtomicBool::new(false),
-            revision: AtomicU64::new(0),
-            clipboard: Mutex::new(None),
-            wake,
-            size: Mutex::new(size),
-            shown: Mutex::new(None),
-            input: Mutex::new(InputHistory::default()),
-            colors: Mutex::new(colors),
-        });
+        let shared = Arc::new(Shared::new(wake, size, colors));
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
         let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
@@ -255,6 +290,28 @@ impl Terminal {
     /// Colors answered to later color queries, after a theme change.
     pub fn set_colors(&self, colors: Vec<Rgb>) {
         *self.shared.colors.lock().unwrap() = colors;
+        self.shared.screen_changes.fetch_add(1, Ordering::Release);
+    }
+
+    /// The identity of this terminal's screen handles (see `ScreenHandle::identity`).
+    pub fn screen_identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+
+    /// A handle the protocol uses to stream this terminal's screen and, for a lease holder, to
+    /// type into it and resize it.
+    pub fn screen_handle(&self) -> ScreenHandle {
+        ScreenHandle { term: self.term.clone(), shared: self.shared.clone(), input: Input::Pty(self.sender.clone()) }
+    }
+
+    /// Someone typed on the desktop: a remote client's lease on this terminal ends, and its size
+    /// with it. Nothing happens (and no lock is taken) when nobody holds one, which is always so
+    /// with remote access off.
+    pub fn take_back(&self) {
+        if self.shared.lease.held() {
+            let handle = self.screen_handle();
+            (&handle as &dyn TerminalControl).take_back();
+        }
     }
 
     /// Lines kept above the screen; fewer drops the oldest at once.
@@ -380,19 +437,194 @@ impl Terminal {
         let _ = self.sender.send(Msg::Shutdown);
     }
 
+    /// The desktop's pane size. Applied at once, unless a remote lease holder asked for its own
+    /// size; then it is applied when that lease ends.
     pub fn resize(&self, size: WindowSize) {
-        let mut term = self.term.lock();
-        term.resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));
-        self.shared.revision.fetch_add(1, Ordering::Release);
-        drop(term);
-        *self.shared.size.lock().unwrap() = size;
-        let _ = self.sender.send(Msg::Resize(size));
+        let handle = self.screen_handle();
+        (&handle as &dyn TerminalControl).local_resize(|| *self.shared.local.lock().unwrap() = size);
     }
+}
+
+/// Resize the emulator and the PTY, and record the size answered to size queries.
+fn apply_size(term: &FairMutex<Term<Listener>>, shared: &Shared, input: &Input, size: WindowSize) {
+    let mut locked = term.lock();
+    locked.resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));
+    shared.revision.fetch_add(1, Ordering::Release);
+    drop(locked);
+    *shared.size.lock().unwrap() = size;
+    match input {
+        Input::Pty(sender) => {
+            let _ = sender.send(Msg::Resize(size));
+        }
+        #[cfg(test)]
+        Input::Echo(_) => {}
+    }
+}
+
+/// Where a lease holder's input goes.
+#[derive(Clone)]
+enum Input {
+    Pty(EventLoopSender),
+    /// A test emulator with no PTY: input is recorded and parsed as if the program echoed it.
+    #[cfg(test)]
+    Echo(Arc<Echo>),
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// What the protocol thread needs to stream one terminal: the emulator, locked only to copy the
+/// screen, and the counters that say whether there is anything new to copy. Holding one does not
+/// keep the PTY or child alive.
+#[derive(Clone)]
+pub struct ScreenHandle {
+    term: Arc<FairMutex<Term<Listener>>>,
+    shared: Arc<Shared>,
+    input: Input,
+}
+
+impl ScreenHandle {
+    /// The same for every handle to one terminal, different for its replacement.
+    #[cfg(test)]
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+
+    /// The title and theme are cloned before the emulator is locked: the listener takes their
+    /// locks while the emulator is locked, so taking them inside would invert that order.
+    fn inputs(&self) -> (Vec<Rgb>, Option<String>) {
+        (self.shared.colors.lock().unwrap().clone(), self.shared.screen_title.lock().unwrap().clone())
+    }
+}
+
+impl crate::protocol::ScreenSource for ScreenHandle {
+    fn changes(&self) -> u64 {
+        self.shared.revision.load(Ordering::Acquire).wrapping_add(self.shared.screen_changes.load(Ordering::Acquire))
+    }
+
+    fn capture(&self, tracker: &mut super::screen::Tracker, generations: &AtomicU64) -> atomics_core::screen::Screen {
+        let (theme, title) = self.inputs();
+        let term = self.term.lock();
+        super::screen::capture(&term, &theme, title, tracker, generations)
+    }
+
+    fn history(
+        &self,
+        tracker: &mut super::screen::Tracker,
+        generations: &AtomicU64,
+        before: u64,
+        count: u32,
+    ) -> super::screen::HistoryLines {
+        let term = self.term.lock();
+        super::screen::history(&term, tracker, generations, before, count)
+    }
+}
+
+impl TerminalControl for ScreenHandle {
+    fn lease(&self) -> &Lease {
+        &self.shared.lease
+    }
+
+    fn write(&self, bytes: Vec<u8>) {
+        match &self.input {
+            Input::Pty(sender) => {
+                let _ = sender.send(Msg::Input(Cow::Owned(bytes)));
+            }
+            #[cfg(test)]
+            Input::Echo(echo) => {
+                echo.written.lock().unwrap().extend_from_slice(&bytes);
+                echo.feed(&self.term, &self.shared, &bytes);
+            }
+        }
+    }
+
+    fn resize(&self, size: Option<GridSize>) {
+        let local = *self.shared.local.lock().unwrap();
+        let size = size.map_or(local, |s| WindowSize {
+            num_cols: s.cols,
+            num_lines: s.rows,
+            cell_width: s.cell_width.unwrap_or(local.cell_width),
+            cell_height: s.cell_height.unwrap_or(local.cell_height),
+        });
+        apply_size(&self.term, &self.shared, &self.input, size);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct Echo {
+    parser: Mutex<alacritty_terminal::vte::ansi::Processor>,
+    written: Mutex<Vec<u8>>,
+}
+
+#[cfg(test)]
+impl Echo {
+    /// Parse output as the PTY thread would, and say the screen changed.
+    fn feed(&self, term: &FairMutex<Term<Listener>>, shared: &Shared, bytes: &[u8]) {
+        let mut term = term.lock();
+        self.parser.lock().unwrap().advance(&mut *term, bytes);
+        drop(term);
+        shared.revision.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// An emulator without a PTY or child, fed by the test, behind a real `ScreenHandle`. Input a
+/// lease holder sends is recorded and echoed onto the screen.
+#[cfg(test)]
+pub(crate) struct Detached {
+    pub handle: ScreenHandle,
+    echo: Arc<Echo>,
+}
+
+#[cfg(test)]
+impl Detached {
+    pub fn new(cols: usize, rows: usize, scrollback: usize) -> Self {
+        let size = WindowSize { num_lines: rows as u16, num_cols: cols as u16, cell_width: 8, cell_height: 16 };
+        let shared = Arc::new(Shared::new(crate::host::Wake::default(), size, Vec::new()));
+        let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
+        let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
+        let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(cols, rows), listener)));
+        let echo = Arc::new(Echo { parser: Mutex::new(Default::default()), written: Mutex::new(Vec::new()) });
+        Self { handle: ScreenHandle { term, shared, input: Input::Echo(echo.clone()) }, echo }
+    }
+
+    /// Parse output as the PTY thread would, and say the screen changed.
+    pub fn feed(&self, bytes: &[u8]) {
+        self.echo.feed(&self.handle.term, &self.handle.shared, bytes);
+    }
+
+    /// Everything lease holders wrote, in order.
+    pub fn written(&self) -> String {
+        String::from_utf8_lossy(&self.echo.written.lock().unwrap()).into_owned()
+    }
+
+    /// The size in force, as the PTY would report it.
+    pub fn size(&self) -> (u16, u16) {
+        let size = *self.handle.shared.size.lock().unwrap();
+        (size.num_cols, size.num_lines)
+    }
+
+    /// The desktop typed into this terminal.
+    pub fn take_back(&self) -> bool {
+        (&self.handle as &dyn TerminalControl).take_back()
+    }
+
+    /// Say the screen changed without touching the emulator.
+    pub fn touch(&self) {
+        self.handle.shared.revision.fetch_add(1, Ordering::Release);
+    }
+
+    /// The desktop's pane changed size: applied as `Terminal::resize` applies it.
+    pub fn resize(&self, cols: usize, rows: usize) {
+        let size = WindowSize { num_lines: rows as u16, num_cols: cols as u16, cell_width: 8, cell_height: 16 };
+        (&self.handle as &dyn TerminalControl).local_resize(|| *self.handle.shared.local.lock().unwrap() = size);
+    }
+
+    /// Hold the emulator lock, as a busy PTY thread or a painting frame does.
+    pub fn lock(&self) -> impl Drop + '_ {
+        self.handle.term.lock()
     }
 }
 
@@ -459,20 +691,8 @@ mod tests {
     #[test]
     fn listener_exit_wakes_the_host_without_a_client() {
         let wake = crate::host::Wake::default();
-        let shared = Arc::new(Shared {
-            title: Mutex::new(None),
-            submitted: Mutex::new(None),
-            exited: AtomicBool::new(false),
-            bell: AtomicBool::new(false),
-            changed: AtomicBool::new(false),
-            revision: AtomicU64::new(0),
-            clipboard: Mutex::new(None),
-            wake: wake.clone(),
-            size: Mutex::new(WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 }),
-            shown: Mutex::new(None),
-            input: Mutex::new(InputHistory::default()),
-            colors: Mutex::new(Vec::new()),
-        });
+        let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+        let shared = Arc::new(Shared::new(wake.clone(), size, Vec::new()));
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
         listener.send_event(TermEvent::Exit);
         let now = Instant::now();

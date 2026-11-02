@@ -4,21 +4,22 @@ mod test_support;
 
 #[cfg(test)]
 mod platform_tests;
+#[cfg(test)]
+mod test_raster;
 
 mod app;
 mod connections;
 mod crash;
 mod credentials;
-mod diff_view;
-mod markdown;
-mod panel_nav;
 mod diff_worker;
 mod doctor;
 mod github;
 mod governor;
+mod headless;
 mod highlight;
 mod hook_client;
 mod host;
+mod instance;
 mod ipc;
 mod lifecycle;
 mod mcp;
@@ -40,6 +41,9 @@ mod tickets;
 mod usage;
 mod voice;
 mod watcher;
+
+// Drawing code that reads nothing from the host's model; atomics-ui owns it.
+use atomics_ui::{diff_view, markdown, panel_nav};
 
 use std::path::PathBuf;
 
@@ -139,6 +143,13 @@ enum Command {
     },
     /// Send one control request to the running ATOMICS, e.g. '{"cmd":"list"}'
     Ctl { json: String },
+    /// Run the runtime headless, with no window, display or GPU: agents, hooks, ctl, MCP and
+    /// (with `[remote] enabled`) the protocol server. Stays in the foreground, logs to stderr and
+    /// stops cleanly on SIGTERM. Takes ATOMICS_HOME for itself: no desktop may share it.
+    Host {
+        /// Projects (git repositories) to open, as `atomics <path>` does
+        projects: Vec<PathBuf>,
+    },
     /// Run a heavy command, such as a full test run or a QA instance, once ATOMICS has a free slot
     Queue {
         #[arg(long, default_value = "test", value_parser = ["test", "qa"])]
@@ -216,7 +227,7 @@ const PARENT_SESSION_VARS: &[&str] = &[
 fn main() -> eframe::Result {
     let cli = Cli::parse();
     let mut migration_errors = Vec::new();
-    if cli.command.is_none() {
+    if matches!(cli.command, None | Some(Command::Host { .. })) {
         for var in PARENT_SESSION_VARS {
             // SAFETY: runs first thing in main, before any other thread exists.
             unsafe { std::env::remove_var(var) };
@@ -347,6 +358,15 @@ fn main() -> eframe::Result {
                 atomics_core::governor::SlotClass::parse(&class).unwrap_or(atomics_core::governor::SlotClass::Test);
             std::process::exit(governor::run_queued(&atomics_core::paths::socket_path(), class, &command));
         }
+        Some(Command::Host { projects }) => {
+            let options = app::Options {
+                projects: projects.iter().map(|p| atomics_core::paths::expand(&p.to_string_lossy())).collect(),
+                workspace: cli.workspace,
+                migration_errors,
+                ..app::Options::default()
+            };
+            std::process::exit(headless::run(options));
+        }
         Some(Command::Ctl { json }) => {
             let response = serde_json::from_str::<atomics_core::control::ControlRequest>(&json)
                 .map_err(anyhow::Error::from)
@@ -371,6 +391,19 @@ fn main() -> eframe::Result {
     {
         std::process::exit(code);
     }
+    // Shared, so desktops still run side by side; refused only while a headless host owns the home.
+    let _instance = match instance::Lock::desktop(&atomics_core::paths::atomics_home()) {
+        Ok(lock) => Some(lock),
+        Err(refused @ instance::Refused::Host(..)) => {
+            eprintln!("atomics: {refused}");
+            std::process::exit(1);
+        }
+        // A home that cannot be locked (a filesystem without flock) starts as it always has.
+        Err(refused) => {
+            eprintln!("atomics: {refused}");
+            None
+        }
+    };
     crash::install(&atomics_core::paths::atomics_home());
 
     let open = cli
@@ -495,6 +528,22 @@ mod cli_tests {
         let path = cli.path.unwrap();
         assert_eq!(path.to_str(), Some("atomics://open?plan=a"));
         assert!(open_link::is_link(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn host_takes_projects_and_the_workspace_and_plain_atomics_stays_the_desktop() {
+        let cli = Cli::try_parse_from(["atomics", "host", "-w", "daily", "~/repos/a", "/repos/b"]).unwrap();
+        let Some(Command::Host { projects }) = cli.command else { panic!("host command") };
+        assert_eq!(projects, [PathBuf::from("~/repos/a"), PathBuf::from("/repos/b")]);
+        assert_eq!(cli.workspace.as_deref(), Some("daily"));
+        let cli = Cli::try_parse_from(["atomics"]).unwrap();
+        assert!(cli.command.is_none() && cli.path.is_none());
+        // A folder named like the subcommand is still opened through `--` or a path.
+        for (arg, folder) in [(&["--", "host"][..], "host"), (&["./host"], "./host")] {
+            let cli = Cli::try_parse_from(["atomics"].iter().chain(arg)).unwrap();
+            assert!(cli.command.is_none(), "{arg:?}");
+            assert_eq!(cli.path, Some(PathBuf::from(folder)));
+        }
     }
 
     #[test]

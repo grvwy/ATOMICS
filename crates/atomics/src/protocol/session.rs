@@ -3,20 +3,32 @@
 //! The first frame must be a `hello`. After the `welcome` the loop alternates between draining the
 //! client's outbound queue and reading one frame, so a client that stops reading stalls only its
 //! own thread, and that thread gives up after the link's write timeout.
+//!
+//! The wait for the client's next frame ends early whenever something is queued for it (the
+//! outbox wakes the link), so a frame leaves as soon as it is ready.
+//!
+//! A client that negotiated `input` may hold the lease of a screen it follows (`lease.rs`). Its
+//! input is written to the PTY from this thread as soon as the frame is read, and the screens
+//! thread is woken to copy the echo. The loop also tells the client whenever a followed screen's
+//! lease changes hands, and when the connection ends, so does any lease it held.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use atomics_core::diff::FileDiff;
+use atomics_core::lease::LeaseReason;
 use atomics_core::projection::DiffFileBody;
 use atomics_core::wire::{
-    self, CAPABILITIES, Envelope, ErrorCode, Limits, MAX_SUBSCRIPTIONS, Message, Role, Seq, Topic, VERSION, WireError,
+    self, CAPABILITIES, Envelope, ErrorCode, INPUT, Limits, MAX_SUBSCRIPTIONS, Message, Role, Seq, TERMINALS, Topic,
+    VERSION, WireError,
 };
 
-use super::hub::{Hub, Taken};
+use super::hub::{Hub, Outbox, Taken};
+use super::lease::{Client, Policy, TerminalControl};
 use super::link::{Link, LinkError};
+use super::screens::Screens;
 
 /// Where `diff_get` finds hunks. Implemented over data the runtime thread published, never `State`.
 pub trait DiffSource: Send + Sync {
@@ -49,10 +61,15 @@ impl Default for SessionConfig {
 pub struct Shared {
     pub hub: Arc<Mutex<Hub>>,
     pub diffs: Arc<dyn DiffSource>,
+    pub screens: Arc<Screens>,
     pub stop: Arc<AtomicBool>,
     pub config: SessionConfig,
+    pub lease: Policy,
     pub queue_frames: usize,
 }
+
+/// Connection numbers: a lease belongs to one connection and dies with it.
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 fn lock(hub: &Mutex<Hub>) -> MutexGuard<'_, Hub> {
     hub.lock().unwrap_or_else(|e| e.into_inner())
@@ -143,7 +160,7 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
             return Ended::Rejected(code);
         }
     };
-    let Message::Hello { versions, capabilities, prior_epoch, prior_cursor, .. } = &envelope.message else {
+    let Message::Hello { client_id, versions, capabilities, prior_epoch, prior_cursor } = &envelope.message else {
         let _ = out.error(WireError::new(ErrorCode::Malformed, "the first message must be hello"), envelope.request_id);
         return Ended::Rejected(ErrorCode::Malformed);
     };
@@ -162,11 +179,25 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
         }
     };
     let outbox = attached.outbox;
+    if let Some(waker) = out.link.waker() {
+        outbox.set_waker(waker);
+    }
+    let capabilities = wire::common_capabilities(capabilities, CAPABILITIES);
+    let terminals = capabilities.iter().any(|c| c == TERMINALS);
+    let mut follows = Follows {
+        keys: HashSet::new(),
+        screens: HashSet::new(),
+        terminals,
+        input: terminals && capabilities.iter().any(|c| c == INPUT),
+        role,
+        me: Client { id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1, label: client_id.as_str().into() },
+        told: HashMap::new(),
+    };
     let welcome = Envelope::host(
         &attached.epoch,
         Message::Welcome {
             version,
-            capabilities: wire::common_capabilities(capabilities, CAPABILITIES),
+            capabilities,
             limits: Limits { max_queued_frames: shared.queue_frames as u32, ..Limits::default() },
             role,
             resume: attached.resume,
@@ -175,9 +206,16 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
     .reply_to(envelope.request_id.clone());
     let result = (|| {
         out.envelope(&welcome).map_err(link_ended)?;
-        conversation(out, shared, &outbox)
+        conversation(out, shared, &outbox, &mut follows)
     })();
     outbox.close();
+    // Whatever lease this connection held ends with it: input sent on it can no longer land, and
+    // a later connection starts without one.
+    for session in &follows.screens {
+        if let Some((_, control)) = shared.screens.terminals().control(session) {
+            control.disconnect(&follows.me, LeaseReason::Disconnected);
+        }
+    }
     match result {
         Ok(()) => Ended::Closed,
         Err(ended) => ended,
@@ -195,10 +233,34 @@ fn refuse_link(out: &mut Out<'_>, error: LinkError) -> Ended {
     Ended::Rejected(code)
 }
 
-fn conversation(out: &mut Out<'_>, shared: &Shared, outbox: &Arc<super::hub::Outbox>) -> Result<(), Ended> {
+/// What one client follows, what it negotiated, and who it is to a lease.
+struct Follows {
+    keys: HashSet<String>,
+    /// Sessions whose screens it subscribed to.
+    screens: HashSet<String>,
+    terminals: bool,
+    /// It negotiated `input`: it may hold leases and is told who holds them.
+    input: bool,
+    role: Role,
+    me: Client,
+    /// The lease last told for each followed screen: the terminal's identity and lease version.
+    told: HashMap<String, (usize, u64)>,
+}
+
+/// Refusals a well-behaved client meets when another one races it for a lease; they never count
+/// towards disconnecting it.
+fn expected(code: ErrorCode) -> bool {
+    matches!(code, ErrorCode::Fenced | ErrorCode::LeaseHeld)
+}
+
+fn conversation(
+    out: &mut Out<'_>,
+    shared: &Shared,
+    outbox: &Arc<Outbox>,
+    subscriptions: &mut Follows,
+) -> Result<(), Ended> {
     let config = &shared.config;
     let mut errors = 0u32;
-    let mut subscriptions: HashSet<String> = HashSet::new();
     let mut last_heard = Instant::now();
     loop {
         if shared.stop.load(Ordering::Acquire) {
@@ -211,6 +273,9 @@ fn conversation(out: &mut Out<'_>, shared: &Shared, outbox: &Arc<super::hub::Out
                 }
             }
             Taken::Lagged => resync(out, shared, outbox)?,
+        }
+        if subscriptions.input {
+            tell_leases(out, shared, subscriptions).map_err(link_ended)?;
         }
         match out.link.recv(config.tick) {
             Ok(Some(frame)) => {
@@ -227,12 +292,14 @@ fn conversation(out: &mut Out<'_>, shared: &Shared, outbox: &Arc<super::hub::Out
                         continue;
                     }
                 };
-                if let Err(e) = handle(out, shared, outbox, &mut subscriptions, envelope) {
+                if let Err(e) = handle(out, shared, outbox, subscriptions, envelope) {
                     match e {
                         Handled::Link(ended) => return Err(ended),
                         Handled::Refused(error, request_id) => {
-                            errors += 1;
                             let code = error.code;
+                            if !expected(code) {
+                                errors += 1;
+                            }
                             out.error(error, request_id).map_err(link_ended)?;
                             if errors > config.max_errors {
                                 return Err(Ended::Rejected(code));
@@ -257,7 +324,60 @@ fn conversation(out: &mut Out<'_>, shared: &Shared, outbox: &Arc<super::hub::Out
     }
 }
 
-fn resync(out: &mut Out<'_>, shared: &Shared, outbox: &super::hub::Outbox) -> Result<(), Ended> {
+/// Tell the client who holds each screen it follows, when that changed, after the leases'
+/// housekeeping (an expired lease ends, a debounced resize lands).
+fn tell_leases(out: &mut Out<'_>, shared: &Shared, follows: &mut Follows) -> Result<(), LinkError> {
+    let now = Instant::now();
+    for session in &follows.screens {
+        let Some((identity, control)) = shared.screens.terminals().control(session) else { continue };
+        control.tick(now, &shared.lease);
+        if follows.told.get(session) == Some(&(identity, control.lease().version())) {
+            continue;
+        }
+        let (version, state) = control.view(session, &follows.me, &shared.lease);
+        follows.told.insert(session.clone(), (identity, version));
+        out.envelope(&Envelope::host(&out.epoch, Message::LeaseState(state)))?;
+    }
+    Ok(())
+}
+
+/// The terminal of a screen this client follows, if it may type into it.
+fn controllable(
+    shared: &Shared,
+    follows: &Follows,
+    session: &str,
+) -> Result<(usize, Arc<dyn TerminalControl>), WireError> {
+    if !follows.input {
+        return Err(WireError::new(ErrorCode::Unauthorised, "the input capability was not negotiated"));
+    }
+    if follows.role != Role::Controller {
+        return Err(WireError::new(ErrorCode::Unauthorised, "this client is view-only"));
+    }
+    if !follows.screens.contains(session) {
+        return Err(WireError::new(ErrorCode::NotFound, "subscribe to that screen first"));
+    }
+    shared
+        .screens
+        .terminals()
+        .control(session)
+        .ok_or_else(|| WireError::new(ErrorCode::NotFound, "that session has no terminal"))
+}
+
+/// Answer a lease request with the lease as this client now sees it.
+fn reply_lease(
+    out: &mut Out<'_>,
+    shared: &Shared,
+    follows: &mut Follows,
+    session: &str,
+    (identity, control): (usize, Arc<dyn TerminalControl>),
+    request_id: Option<String>,
+) -> Result<(), Handled> {
+    let (version, state) = control.view(session, &follows.me, &shared.lease);
+    follows.told.insert(session.to_string(), (identity, version));
+    Ok(out.envelope(&Envelope::host(&out.epoch, Message::LeaseState(state)).reply_to(request_id))?)
+}
+
+fn resync(out: &mut Out<'_>, shared: &Shared, outbox: &Outbox) -> Result<(), Ended> {
     if let Err(e) = lock(&shared.hub).resync(outbox) {
         // The board no longer fits in one frame; say so rather than leave the client stale.
         let code = e.code;
@@ -281,34 +401,58 @@ impl From<LinkError> for Handled {
 fn handle(
     out: &mut Out<'_>,
     shared: &Shared,
-    outbox: &super::hub::Outbox,
-    subscriptions: &mut HashSet<String>,
+    outbox: &Arc<Outbox>,
+    subscriptions: &mut Follows,
     envelope: Envelope,
 ) -> Result<(), Handled> {
     let id = envelope.request_id.clone();
     let refuse = |code: ErrorCode, message: &str| Handled::Refused(WireError::new(code, message), id.clone());
+    let refused = |error: WireError| Handled::Refused(error, id.clone());
+    let no_terminals = || refuse(ErrorCode::Unauthorised, "the terminals capability was not negotiated");
     match envelope.message {
         Message::Subscribe { topics } => {
             for topic in topics {
-                let key = match &topic {
-                    Topic::Diff { worktree } => format!("diff:{worktree}"),
-                    Topic::Plan { id } => format!("plan:{id}"),
-                };
-                if !subscriptions.contains(&key) && subscriptions.len() >= MAX_SUBSCRIPTIONS {
+                let key = topic.key();
+                if !subscriptions.keys.contains(&key) && subscriptions.keys.len() >= MAX_SUBSCRIPTIONS {
                     return Err(refuse(ErrorCode::TooMany, "too many subscriptions"));
                 }
-                subscriptions.insert(key);
+                if let Topic::Screen { session, focused } = &topic {
+                    if !subscriptions.terminals {
+                        return Err(no_terminals());
+                    }
+                    shared.screens.subscribe(session, outbox, *focused).map_err(refused)?;
+                    subscriptions.screens.insert(session.clone());
+                }
+                subscriptions.keys.insert(key);
             }
             Ok(())
         }
         Message::Unsubscribe { topics } => {
             for topic in topics {
-                subscriptions.remove(&match &topic {
-                    Topic::Diff { worktree } => format!("diff:{worktree}"),
-                    Topic::Plan { id } => format!("plan:{id}"),
-                });
+                if let Topic::Screen { session, .. } = &topic
+                    && subscriptions.screens.remove(session)
+                {
+                    shared.screens.unsubscribe(session, outbox);
+                    subscriptions.told.remove(session);
+                    // Typing needs the screen: no longer following it ends the lease.
+                    if let Some((_, control)) = shared.screens.terminals().control(session) {
+                        control.disconnect(&subscriptions.me, LeaseReason::Disconnected);
+                    }
+                }
+                subscriptions.keys.remove(&topic.key());
             }
             Ok(())
+        }
+        Message::HistoryGet(request) => {
+            if !subscriptions.terminals {
+                return Err(no_terminals());
+            }
+            let chunk = shared
+                .screens
+                .history(&request.session, request.generation.0, request.before.0, request.count)
+                .map_err(refused)?;
+            let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
+            Ok(out.envelope(&reply)?)
         }
         Message::DiffGet { worktree, path, revision } => {
             let Some((current, file)) = shared.diffs.file(&worktree, &path) else {
@@ -325,6 +469,34 @@ fn handle(
             }
         }
         Message::FileGet { .. } => Err(refuse(ErrorCode::NotFound, "this host does not serve file contents yet")),
+        Message::LeaseAcquire { session, takeover } => {
+            let terminal = controllable(shared, subscriptions, &session).map_err(refused)?;
+            terminal.1.acquire(&subscriptions.me, takeover, Instant::now(), &shared.lease).map_err(refused)?;
+            reply_lease(out, shared, subscriptions, &session, terminal, id)
+        }
+        Message::LeaseRenew { session, lease } => {
+            let terminal = controllable(shared, subscriptions, &session).map_err(refused)?;
+            terminal.1.renew(&subscriptions.me, lease.0, Instant::now(), &shared.lease).map_err(refused)?;
+            reply_lease(out, shared, subscriptions, &session, terminal, id)
+        }
+        Message::LeaseRelease { session, lease } => {
+            let terminal = controllable(shared, subscriptions, &session).map_err(refused)?;
+            terminal.1.release(&subscriptions.me, lease.0, Instant::now(), &shared.lease).map_err(refused)?;
+            reply_lease(out, shared, subscriptions, &session, terminal, id)
+        }
+        Message::TerminalInput { session, lease, seq, data } => {
+            let (_, control) = controllable(shared, subscriptions, &session).map_err(refused)?;
+            control
+                .input(&subscriptions.me, (lease.0, seq.0), data.into_bytes(), Instant::now(), &shared.lease)
+                .map_err(refused)?;
+            // The echo is copied as soon as it shows; queueing it wakes this thread to send it.
+            shared.screens.wake();
+            Ok(())
+        }
+        Message::TerminalResize { session, lease, size } => {
+            let (_, control) = controllable(shared, subscriptions, &session).map_err(refused)?;
+            control.resize_for(&subscriptions.me, lease.0, size, Instant::now(), &shared.lease).map_err(refused)
+        }
         Message::Ack { cursor } => {
             let head = lock(&shared.hub).head();
             if cursor.0 > head {
@@ -332,9 +504,13 @@ fn handle(
             }
             Ok(())
         }
-        Message::Resync { .. } => {
-            outbox_resync(shared, outbox).map_err(|e| Handled::Refused(e, id.clone()))
+        Message::Resync { screens, .. } if !screens.is_empty() => {
+            for session in &screens {
+                shared.screens.resync(session, outbox).map_err(refused)?;
+            }
+            Ok(())
         }
+        Message::Resync { .. } => outbox_resync(shared, outbox).map_err(refused),
         Message::Ping { nonce } => {
             let pong = Envelope::host(&out.epoch, Message::Pong { nonce }).reply_to(id);
             Ok(out.envelope(&pong)?)
@@ -345,6 +521,6 @@ fn handle(
     }
 }
 
-fn outbox_resync(shared: &Shared, outbox: &super::hub::Outbox) -> Result<(), WireError> {
+fn outbox_resync(shared: &Shared, outbox: &Outbox) -> Result<(), WireError> {
     lock(&shared.hub).resync(outbox)
 }

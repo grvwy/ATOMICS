@@ -92,8 +92,33 @@ fn file_body() -> DiffFileBody {
     }
 }
 
+fn screen_snapshot() -> crate::screen::ScreenSnapshot {
+    use crate::screen::{Cell, Screen};
+    let mut screen = Screen::blank(6, 2);
+    screen.lines[0].cells[0] = Cell { c: '界', combining: None, width: 2, style: Default::default() };
+    screen.lines[0].cells[1].width = 0;
+    screen.lines[1].cells[0].combining = Some(vec!['\u{301}'].into_boxed_slice());
+    screen.title = Some("vim".into());
+    screen.snapshot("s1", 2, 3, Some).unwrap().remove(0)
+}
+
+fn screen_delta() -> crate::screen::ScreenDelta {
+    use crate::screen::Screen;
+    let old = Screen::blank(6, 2);
+    let mut new = old.clone();
+    new.lines[1].cells[2].c = 'x';
+    new.first_line = 1;
+    new.history = 1;
+    new.modes.bracketed_paste = true;
+    old.delta(&new, "s1", 2, 3, 4).unwrap()
+}
+
 fn every_message() -> Vec<Message> {
-    let topics = vec![Topic::Diff { worktree: "/w/a".into() }, Topic::Plan { id: "p".into() }];
+    let topics = vec![
+        Topic::Diff { worktree: "/w/a".into() },
+        Topic::Plan { id: "p".into() },
+        Topic::Screen { session: "s1".into(), focused: true },
+    ];
     vec![
         Message::Hello {
             client_id: "c".into(),
@@ -143,8 +168,51 @@ fn every_message() -> Vec<Message> {
             content: "fn a() {}\n".into(),
             truncated: false,
         },
+        Message::ScreenSnapshot(screen_snapshot()),
+        Message::ScreenDelta(screen_delta()),
+        Message::HistoryGet(crate::screen::HistoryGet {
+            session: "s1".into(),
+            generation: Seq(2),
+            before: Seq(40),
+            count: 100,
+        }),
+        Message::HistoryChunk(crate::screen::HistoryChunk {
+            session: "s1".into(),
+            generation: Seq(2),
+            cols: 4,
+            first: Seq(30),
+            oldest: Seq(30),
+            evicted: true,
+            styles: vec![crate::screen::Style::default()],
+            lines: vec![crate::screen::WireLine {
+                row: 0,
+                runs: vec![crate::screen::Run { s: 0, t: "ok".into(), w: None }],
+                wrapped: true,
+            }],
+        }),
+        Message::LeaseAcquire { session: "s1".into(), takeover: true },
+        Message::LeaseRenew { session: "s1".into(), lease: Seq(3) },
+        Message::LeaseRelease { session: "s1".into(), lease: Seq(3) },
+        Message::LeaseState(crate::lease::LeaseState {
+            session: "s1".into(),
+            holder: Some("phone".into()),
+            yours: true,
+            lease: Some(Seq(3)),
+            next: Some(Seq(1)),
+            ttl_ms: Some(30_000),
+            resized: true,
+            reason: Some(crate::lease::LeaseReason::TakenOver),
+        }),
+        Message::TerminalInput { session: "s1".into(), lease: Seq(3), seq: Seq(1), data: "ls\r\u{1b}[A".into() },
+        Message::TerminalResize {
+            session: "s1".into(),
+            lease: Seq(3),
+            size: Some(crate::lease::GridSize { cols: 40, rows: 20, cell_width: Some(9), cell_height: None }),
+        },
+        Message::TerminalResize { session: "s1".into(), lease: Seq(3), size: None },
         Message::Ack { cursor: Seq(11) },
-        Message::Resync { reason: Some("gap".into()) },
+        Message::Resync { reason: Some("gap".into()), screens: vec![] },
+        Message::Resync { reason: None, screens: vec!["s1".into()] },
         Message::Ping { nonce: Some("n".into()) },
         Message::Pong { nonce: None },
         Message::Error { code: ErrorCode::StaleRevision, message: "stale".into() },
@@ -418,4 +486,74 @@ fn mutated_frames_never_panic_and_accepted_ones_round_trip() {
         }
     }
     assert!(accepted > 0, "some mutations stay valid");
+}
+
+#[test]
+fn screen_frames_keep_their_bounds() {
+    use crate::screen::{HistoryGet, MAX_HISTORY_LINES, MAX_ROWS, Part, Rgb};
+    let refused = |message: Message| decode(&encode(&Envelope::new(message)).unwrap()).unwrap_err().code;
+    let ok = |message: Message| decode(&encode(&Envelope::new(message)).unwrap()).map(|_| ());
+
+    let snapshot = screen_snapshot();
+    assert_eq!(ok(Message::ScreenSnapshot(snapshot.clone())), Ok(()));
+    for broken in [
+        crate::screen::ScreenSnapshot { rows: MAX_ROWS + 1, ..snapshot.clone() },
+        crate::screen::ScreenSnapshot { cols: 0, ..snapshot.clone() },
+        crate::screen::ScreenSnapshot { palette: vec![Rgb::default(); 3], ..snapshot.clone() },
+        crate::screen::ScreenSnapshot { part: Some(Part { index: 2, count: 2 }), ..snapshot.clone() },
+        crate::screen::ScreenSnapshot { lines: vec![Default::default(); 3], ..snapshot.clone() },
+    ] {
+        assert_eq!(refused(Message::ScreenSnapshot(broken)), ErrorCode::Malformed);
+    }
+    let long = "s".repeat(MAX_ID_BYTES + 1);
+    assert_eq!(
+        refused(Message::ScreenSnapshot(crate::screen::ScreenSnapshot { session: long.clone(), ..snapshot })),
+        ErrorCode::Oversize
+    );
+
+    let delta = screen_delta();
+    assert_eq!(ok(Message::ScreenDelta(delta.clone())), Ok(()));
+    let backwards = crate::screen::ScreenDelta { revision: delta.base, ..delta.clone() };
+    assert_eq!(refused(Message::ScreenDelta(backwards)), ErrorCode::Malformed);
+    let palette = crate::screen::ScreenDelta { palette: Some(vec![Rgb::default()]), ..delta };
+    assert_eq!(refused(Message::ScreenDelta(palette)), ErrorCode::Malformed);
+
+    let get = HistoryGet { session: "s".into(), generation: Seq(1), before: Seq(9), count: MAX_HISTORY_LINES };
+    assert_eq!(ok(Message::HistoryGet(get.clone())), Ok(()));
+    assert_eq!(refused(Message::HistoryGet(HistoryGet { count: MAX_HISTORY_LINES + 1, ..get })), ErrorCode::TooMany);
+    let topics = vec![Topic::Screen { session: long.clone(), focused: false }];
+    assert_eq!(refused(Message::Subscribe { topics }), ErrorCode::Oversize);
+    let resync = Message::Resync { reason: None, screens: vec![long] };
+    assert_eq!(refused(resync), ErrorCode::Oversize);
+    // A colour is "#rrggbb" and nothing else.
+    for bad in [r#""ff0000""#, r##""#ff00""##, r##""#gg0000""##, "16711680"] {
+        assert!(serde_json::from_str::<Rgb>(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn input_frames_keep_their_bounds() {
+    use crate::lease::{GridSize, MAX_INPUT_BYTES};
+    let refused = |message: Message| decode(&encode(&Envelope::new(message)).unwrap()).unwrap_err().code;
+    let ok = |message: Message| decode(&encode(&Envelope::new(message)).unwrap()).map(|_| ());
+    let input = |data: String| Message::TerminalInput { session: "s".into(), lease: Seq(1), seq: Seq(1), data };
+    assert_eq!(ok(input("a".repeat(MAX_INPUT_BYTES))), Ok(()));
+    assert_eq!(refused(input("a".repeat(MAX_INPUT_BYTES + 1))), ErrorCode::Oversize);
+    assert_eq!(refused(input(String::new())), ErrorCode::Malformed);
+    let resize = |size| Message::TerminalResize { session: "s".into(), lease: Seq(1), size: Some(size) };
+    assert_eq!(ok(resize(GridSize::new(80, 24))), Ok(()));
+    assert_eq!(refused(resize(GridSize::new(0, 24))), ErrorCode::Malformed);
+    let long = "s".repeat(MAX_ID_BYTES + 1);
+    assert_eq!(refused(Message::LeaseAcquire { session: long.clone(), takeover: false }), ErrorCode::Oversize);
+    assert_eq!(refused(Message::LeaseRelease { session: long, lease: Seq(1) }), ErrorCode::Oversize);
+    // Tokens and sequence numbers are decimal strings, like cursors.
+    for frame in [
+        r#"{"v":{"major":1,"minor":0},"kind":"terminal_input","session":"s","lease":1,"seq":"1","data":"a"}"#,
+        r#"{"v":{"major":1,"minor":0},"kind":"terminal_input","session":"s","lease":"1","seq":"-1","data":"a"}"#,
+    ] {
+        assert_eq!(decode(frame).unwrap_err().code, ErrorCode::Malformed, "{frame}");
+    }
+    // Acquiring without `takeover` is the default: opening a screen never steals control.
+    let frame = r#"{"v":{"major":1,"minor":0},"kind":"lease_acquire","session":"s"}"#;
+    assert_eq!(decode(frame).unwrap().message, Message::LeaseAcquire { session: "s".into(), takeover: false });
 }

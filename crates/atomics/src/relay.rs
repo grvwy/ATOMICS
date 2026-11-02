@@ -853,7 +853,14 @@ impl Keychain {
     fn output(&self, args: &[&str]) -> std::result::Result<std::process::Output, crate::sandbox::setup::OutputError> {
         let mut command = std::process::Command::new(&self.program);
         command.args(args);
-        for name in ["ATOMICS_SOCKET", "ATOMICS_PANE", "ATOMICS_HOME", "ATOMICS_CONFIG", "SSH_AUTH_SOCK"] {
+        for name in [
+            "ATOMICS_SOCKET",
+            "ATOMICS_PANE",
+            "ATOMICS_HOME",
+            "ATOMICS_CONFIG",
+            atomics_core::hook::HOOK_PANE_ENV,
+            "SSH_AUTH_SOCK",
+        ] {
             command.env_remove(name);
         }
         if let Some(path) = crate::setup::SHELL_PATH.as_ref() {

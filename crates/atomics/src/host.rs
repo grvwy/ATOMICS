@@ -4,7 +4,7 @@ use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::app::State;
 use crate::app::projection::{DiffBodies, DiffSummaries};
@@ -15,6 +15,7 @@ use atomics_core::projection::Projections;
 
 /// Owns runtime state and the thread that services it. The desktop is an
 /// in-process client; closing the whole application still shuts down the host.
+/// `atomics host` runs the same host with no window attached (see `headless`).
 pub struct Host {
     state: Arc<Mutex<State>>,
     wake: Wake,
@@ -24,17 +25,31 @@ pub struct Host {
     projections: Arc<Projections>,
     /// Only when `[remote] enabled`; otherwise there is no thread and no socket.
     protocol: Option<protocol::Server>,
+    /// Why the server is not running although `[remote] enabled` asks for it.
+    protocol_error: Option<String>,
+    /// The terminals the protocol may stream; absent (and never published) without the server.
+    terminals: Option<Arc<protocol::Terminals>>,
 }
 
 impl Host {
-    pub(crate) fn start(state: State, wake: Wake, ctx: egui::Context, commands: Sender<ControlMessage>) -> Self {
+    pub(crate) fn start(state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
         let projections = Arc::new(Projections::default());
         let bodies = Arc::new(DiffBodies::default());
-        let protocol = start_protocol(&state.remote_access(), &projections, &bodies);
+        let (protocol, terminals, protocol_error) = match start_protocol(&state.remote_access(), &projections, &bodies)
+        {
+            Ok(Some((server, terminals))) => (Some(server), Some(terminals), None),
+            Ok(None) => (None, None, None),
+            Err(error) => {
+                // The desktop is useful without it; say why and carry on. `atomics host` stops instead.
+                eprintln!("atomics: the protocol server did not start: {error}");
+                (None, None, Some(error.to_string()))
+            }
+        };
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
         let bodies = bodies.clone();
+        let published_terminals = terminals.clone();
         let thread = std::thread::Builder::new()
             .name("atomics-runtime".into())
             .spawn(move || {
@@ -42,11 +57,20 @@ impl Host {
                 while !stop.load(Ordering::Acquire) {
                     let deadline = {
                         let mut state = runtime.lock().unwrap();
-                        if state.runtime_tick(&ctx) {
-                            ctx.request_repaint();
+                        let window = state.window().clone();
+                        if state.runtime_tick() {
+                            window.request_repaint();
                         }
                         if let Some(delay) = state.take_output_delay() {
-                            ctx.request_repaint_after(delay);
+                            window.request_repaint_after(delay);
+                        }
+                        if !window.is_attached() {
+                            state.drop_client_events();
+                        }
+                        // Only with the protocol server running: otherwise no terminal is ever streamed.
+                        // Before the board, so a client that sees a session can subscribe to its screen.
+                        if let Some(terminals) = &terminals {
+                            state.publish_terminals(terminals);
                         }
                         state.publish_projections(&published, &mut summaries, &bodies);
                         state.runtime_deadline()
@@ -55,7 +79,17 @@ impl Host {
                 }
             })
             .expect("runtime thread");
-        Self { state, wake, stopped, thread: Some(thread), commands, projections, protocol }
+        Self {
+            state,
+            wake,
+            stopped,
+            thread: Some(thread),
+            commands,
+            projections,
+            protocol,
+            protocol_error,
+            terminals: published_terminals,
+        }
     }
 
     /// Borrow the in-process native model. Desktop actions are sent to the host
@@ -81,9 +115,20 @@ impl Host {
     }
 
     /// Where the protocol server listens, when it is on.
-    #[allow(dead_code)] // Read by tests.
     pub fn protocol_addr(&self) -> Option<std::net::SocketAddr> {
         self.protocol.as_ref().map(protocol::Server::addr)
+    }
+
+    /// Why the protocol server failed to start although `[remote] enabled` asked for it. The
+    /// error comes from binding and advertising, so it never holds the token.
+    pub fn protocol_error(&self) -> Option<&str> {
+        self.protocol_error.as_deref()
+    }
+
+    /// Whether the runtime thread publishes terminals for streaming (only with the server on).
+    #[allow(dead_code)] // Read by tests.
+    pub fn streams_terminals(&self) -> bool {
+        self.terminals.is_some()
     }
 
     pub fn stop(&mut self) {
@@ -105,27 +150,82 @@ impl Drop for Host {
     }
 }
 
+/// `Ok(None)` when `[remote]` is off: then there is no thread and no socket.
 fn start_protocol(
     config: &atomics_core::config::RemoteAccessConfig,
     projections: &Arc<Projections>,
     bodies: &Arc<DiffBodies>,
-) -> Option<protocol::Server> {
+) -> std::io::Result<Option<(protocol::Server, Arc<protocol::Terminals>)>> {
     if !config.enabled {
-        return None;
+        return Ok(None);
     }
+    let terminals = Arc::new(protocol::Terminals::default());
     let server_config = protocol::ServerConfig {
         port: config.port,
         allowed_origins: config.allowed_origins.clone(),
         advertise: Some(atomics_core::paths::atomics_home().join("protocol.json")),
         ..protocol::ServerConfig::default()
     };
-    match protocol::Server::start(server_config, projections.clone(), bodies.clone()) {
-        Ok(server) => Some(server),
-        Err(e) => {
-            // The desktop is useful without it; say why and carry on.
-            eprintln!("atomics: the protocol server did not start: {e}");
-            None
+    let server = protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone())?;
+    Ok(Some((server, terminals)))
+}
+
+/// What the runtime may ask of a native window: a repaint, focus, and the size it last had.
+/// The desktop attaches its egui context (`app::State::new`); the headless host attaches nothing,
+/// so no runtime service needs egui, a display or a GPU to make progress.
+pub(crate) trait Surface: Send + Sync {
+    fn repaint(&self);
+    fn repaint_after(&self, delay: Duration);
+    /// Unminimize and focus the window, for a link that names something to show.
+    fn raise(&self);
+    fn viewport(&self) -> Viewport;
+}
+
+/// The window's geometry, as `atomics ctl list` and the restart handoff report it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Viewport {
+    /// The content area, in points.
+    pub content: [f32; 2],
+    pub monitor: Option<[f32; 2]>,
+    /// The window's inner size, where the platform reports it.
+    pub inner: Option<[f32; 2]>,
+    pub maximized: bool,
+}
+
+/// The native window attached to the runtime, if any. The default has none: every request
+/// is then a no-op and `viewport` is `None`.
+#[derive(Clone, Default)]
+pub(crate) struct Window(Option<Arc<dyn Surface>>);
+
+impl Window {
+    pub fn attach(surface: impl Surface + 'static) -> Self {
+        Self(Some(Arc::new(surface)))
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn request_repaint(&self) {
+        if let Some(surface) = &self.0 {
+            surface.repaint();
         }
+    }
+
+    pub fn request_repaint_after(&self, delay: Duration) {
+        if let Some(surface) = &self.0 {
+            surface.repaint_after(delay);
+        }
+    }
+
+    pub fn raise(&self) {
+        if let Some(surface) = &self.0 {
+            surface.raise();
+        }
+    }
+
+    pub fn viewport(&self) -> Option<Viewport> {
+        self.0.as_ref().map(|surface| surface.viewport())
     }
 }
 

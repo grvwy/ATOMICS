@@ -184,7 +184,10 @@ mod tests {
     }
 
     fn governor(test_slots: usize) -> Arc<Governor> {
-        Arc::new(Governor::new(ResourceConfig { test_slots: Some(test_slots), ..Default::default() }, None))
+        Arc::new(Governor::new(
+            ResourceConfig { test_slots: Some(test_slots), ..Default::default() },
+            Default::default(),
+        ))
     }
 
     #[test]

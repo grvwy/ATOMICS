@@ -18,6 +18,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
     prepare_tool_response(&mut payload, chief);
+    let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
     {
@@ -248,6 +249,7 @@ mod tests {
                     .env("ATOMICS_HOOK_TEST_SOCKET", &socket)
                     .env("ATOMICS_PS_LOG", dir.path().join("calls"))
                     .env("PATH", dir.path())
+                    .env_remove(atomics_core::hook::HOOK_PANE_ENV)
                     .stdin(Stdio::piped()),
                 CHILD_TIMEOUT,
             )
@@ -283,5 +285,59 @@ mod tests {
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         }
         assert_eq!(std::fs::read_to_string(dir.path().join("calls")).unwrap(), "called\n");
+    }
+
+    #[test]
+    fn a_pane_from_the_session_environment_replaces_ancestry() {
+        if let Some(socket) = std::env::var_os("ATOMICS_HOOK_PANE_TEST_SOCKET") {
+            run(Some(socket.into()), None, false);
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let socket = dir.path().join("hook.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // A ps that fails proves ancestry is never consulted.
+        let ps = dir.path().join("ps");
+        std::fs::write(&ps, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = TestChild::spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hook_client::tests::a_pane_from_the_session_environment_replaces_ancestry"])
+                .env("ATOMICS_HOOK_PANE_TEST_SOCKET", &socket)
+                .env(atomics_core::hook::HOOK_PANE_ENV, "codex-pane")
+                .env("PATH", dir.path())
+                .stdin(Stdio::piped()),
+            CHILD_TIMEOUT,
+        )
+        .unwrap();
+        child
+            .child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"codex-session", "hook_event_name":"SessionStart"}"#)
+            .unwrap();
+        let (mut stream, _) = loop {
+            child.check_timeout().unwrap();
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("hook connection: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        let remaining = child.remaining().max(Duration::from_millis(1));
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        let request: HookRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(request.pane.as_deref(), Some("codex-pane"));
+        assert!(request.ancestors.is_empty());
+        stream.write_all(b"{\"stdout\":null}\n").unwrap();
+        let output = child.wait_output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 }

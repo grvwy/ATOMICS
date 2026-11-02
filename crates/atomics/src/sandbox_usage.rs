@@ -33,7 +33,7 @@ impl Sampler {
         self.usage.values().fold(Usage::default(), |a, b| Usage { bytes: a.bytes + b.bytes, cpu: a.cpu + b.cpu })
     }
 
-    pub fn poll(&mut self, sandboxes: Vec<(String, PathBuf)>, ctx: &egui::Context) -> bool {
+    pub fn poll(&mut self, sandboxes: Vec<(String, PathBuf)>, window: &crate::host::Window) -> bool {
         let names: Vec<_> = sandboxes.iter().map(|(name, _)| name.clone()).collect();
         let mut changed = false;
         if let Some(rx) = &self.pending {
@@ -69,11 +69,11 @@ impl Sampler {
             self.error = None;
             return changed;
         }
-        ctx.request_repaint_after(Duration::from_secs(2));
+        window.request_repaint_after(Duration::from_secs(2));
         if self.pending.is_none() && self.sampled.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
             let (tx, rx) = mpsc::channel();
             self.pending = Some(rx);
-            let ctx = ctx.clone();
+            let window = window.clone();
             std::thread::spawn(move || {
                 let result = Command::new("ps")
                     .args(["-axo", "pid=,ppid=,rss=,%cpu=,command="])
@@ -90,7 +90,7 @@ impl Sampler {
                         Ok(parse_with_worktrees(&ps, &sandboxes, &open_paths(&pids)))
                     });
                 let _ = tx.send(result);
-                ctx.request_repaint();
+                window.request_repaint();
             });
         }
         changed
@@ -234,7 +234,7 @@ mod tests {
     use super::*;
     #[test]
     fn samples_drop_closed_sessions_and_errors_clear_stale_metrics() {
-        let ctx = egui::Context::default();
+        let window = crate::host::Window::default();
         let (tx, rx) = mpsc::channel();
         let mut sampler = Sampler { pending: Some(rx), ..Default::default() };
         tx.send(Ok(HashMap::from([
@@ -242,15 +242,15 @@ mod tests {
             ("atomics-closed".into(), Usage { bytes: 4096, cpu: 8.0 }),
         ])))
         .unwrap();
-        assert!(sampler.poll(vec![("atomics-live".into(), "/work/live".into())], &ctx));
+        assert!(sampler.poll(vec![("atomics-live".into(), "/work/live".into())], &window));
         assert_eq!(sampler.total(), Usage { bytes: 1024, cpu: 3.0 });
         let (tx, rx) = mpsc::channel();
         sampler.pending = Some(rx);
         tx.send(Err("ps failed".into())).unwrap();
-        assert!(sampler.poll(vec![("atomics-live".into(), "/work/live".into())], &ctx));
+        assert!(sampler.poll(vec![("atomics-live".into(), "/work/live".into())], &window));
         assert!(sampler.usage.is_empty());
         assert_eq!(sampler.error.as_deref(), Some("ps failed"));
-        sampler.poll(vec![], &ctx);
+        sampler.poll(vec![], &window);
         assert!(sampler.error.is_none());
         assert!(sampler.pending.is_none(), "no process sampling without sandbox sessions");
     }

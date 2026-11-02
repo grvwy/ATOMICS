@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 
 pub const PERMISSION_WAIT_SECONDS: u64 = 540;
 
+/// The pane of a session whose hook commands cannot name it. Codex trusts hook definitions by
+/// their text, so its handlers stay identical across panes; ATOMICS sets this in the session's
+/// environment instead, which the handlers inherit even through a wrapper on another machine.
+pub const HOOK_PANE_ENV: &str = "ATOMICS_HOOK_PANE";
+
 use crate::session::AgentStatus;
 
 /// Events ATOMICS subscribes to. Each one either changes a session's status or is a

@@ -1,13 +1,25 @@
-//! The `atomics.v1` protocol server: a thread inside the running app that serves the board and
-//! diffs to clients on this machine. Off unless `[remote] enabled`; see docs/daemon.md.
+//! The `atomics.v1` protocol server: a thread inside the running app that serves the board, diffs
+//! and terminal screens to clients on this machine. Off unless `[remote] enabled`; see
+//! docs/daemon.md.
 //!
-//! It reads only what the runtime thread publishes (`atomics_core::projection`), so it never takes
-//! the `State` lock, and every socket write happens with no lock of any kind held. Each client has
-//! its own thread and a bounded queue; a client that stops reading is resynchronised or dropped and
-//! cannot delay the host or other clients.
+//! It reads only what the runtime thread publishes (`atomics_core::projection`, `Terminals`), so it
+//! never takes the `State` lock, and every socket write happens with no lock of any kind held.
+//! Screens are copied under each emulator's short lock on a thread of their own (`screens.rs`), so
+//! an emulator that is busy parsing or being painted never delays board events. Each client has
+//! its own thread and a bounded queue; a client that stops reading is resynchronised or dropped
+//! and cannot delay the host or other clients. A client holding a terminal's lease (`lease.rs`)
+//! types into it from its own thread, straight to the PTY.
 
+#[cfg(test)]
+mod echo_bench;
 mod hub;
+#[cfg(test)]
+mod input_tests;
+pub mod lease;
 mod link;
+#[cfg(test)]
+mod screen_tests;
+mod screens;
 mod session;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -27,6 +39,8 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::http;
 
 pub use hub::RingLimits;
+pub use lease::{Lease, TerminalControl};
+pub use screens::{ScreenConfig, ScreenSource, TerminalEntry, Terminals};
 pub use session::{DiffSource, SessionConfig};
 
 #[derive(Debug, Clone)]
@@ -37,12 +51,17 @@ pub struct ServerConfig {
     /// Where to write `{url, token}` for local clients; removed on stop.
     pub advertise: Option<PathBuf>,
     pub max_clients: usize,
+    /// What this listener's clients may do. They hold the bearer token from `protocol.json`, so
+    /// on loopback they are controllers; view-only devices arrive with the rendezvous.
+    pub role: Role,
     pub write_timeout: Duration,
     pub poll_interval: Duration,
     pub queue_frames: usize,
     pub queue_bytes: usize,
     pub ring: RingLimits,
     pub session: SessionConfig,
+    pub screens: ScreenConfig,
+    pub lease: lease::Policy,
 }
 
 impl Default for ServerConfig {
@@ -52,12 +71,15 @@ impl Default for ServerConfig {
             allowed_origins: Vec::new(),
             advertise: None,
             max_clients: 4,
+            role: Role::Controller,
             write_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
             queue_frames: MAX_QUEUED_FRAMES,
             queue_bytes: 4 << 20,
             ring: RingLimits::default(),
             session: SessionConfig::default(),
+            screens: ScreenConfig::default(),
+            lease: lease::Policy::default(),
         }
     }
 }
@@ -68,6 +90,7 @@ pub struct Server {
     token: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    screens: Option<JoinHandle<()>>,
     advertise: Option<PathBuf>,
     #[allow(dead_code)] // read by tests
     active: Arc<AtomicUsize>,
@@ -80,8 +103,14 @@ fn random_hex(bytes: usize) -> io::Result<String> {
 }
 
 impl Server {
-    /// Bind 127.0.0.1 and start serving. The caller keeps the returned handle for the server's life.
-    pub fn start(config: ServerConfig, projections: Arc<Projections>, diffs: Arc<dyn DiffSource>) -> io::Result<Self> {
+    /// Bind 127.0.0.1 and start serving. The caller keeps the returned handle for the server's life
+    /// and publishes the terminals it may stream into `terminals`.
+    pub fn start(
+        config: ServerConfig,
+        projections: Arc<Projections>,
+        diffs: Arc<dyn DiffSource>,
+        terminals: Arc<Terminals>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
@@ -91,6 +120,7 @@ impl Server {
             write_advertisement(path, &format!("ws://{addr}"), &token)?;
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let screens = Arc::new(screens::Screens::new(terminals, epoch.clone(), config.screens.clone()));
         let hub = Arc::new(Mutex::new(hub::Hub::new(
             epoch,
             config.ring.clone(),
@@ -103,8 +133,10 @@ impl Server {
             shared: Arc::new(session::Shared {
                 hub: hub.clone(),
                 diffs,
+                screens: screens.clone(),
                 stop: stop.clone(),
                 config: config.session.clone(),
+                lease: config.lease.clone(),
                 queue_frames: config.queue_frames,
             }),
             token: token.clone(),
@@ -128,7 +160,32 @@ impl Server {
                 }
             }
         })?;
-        Ok(Self { addr, token, stop, thread: Some(thread), advertise, active })
+        let polling = screens.clone();
+        let screens_thread = std::thread::Builder::new().name("atomics-protocol-screens".into()).spawn({
+            let (stop, interval, echo) = (stop.clone(), config.poll_interval, config.screens.echo_poll);
+            move || {
+                while !stop.load(Ordering::Acquire) {
+                    // Input unparks this thread so its echo is copied without waiting a whole interval.
+                    let echoing = polling.poll();
+                    std::thread::park_timeout(if echoing { echo } else { interval });
+                }
+            }
+        });
+        let screens = match screens_thread {
+            Ok(handle) => {
+                screens.set_thread(handle.thread().clone());
+                handle
+            }
+            Err(e) => {
+                stop.store(true, Ordering::Release);
+                let _ = thread.join();
+                if let Some(path) = &config.advertise {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(e);
+            }
+        };
+        Ok(Self { addr, token, stop, thread: Some(thread), screens: Some(screens), advertise, active })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -148,7 +205,8 @@ impl Server {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
+        for thread in [self.thread.take(), self.screens.take()].into_iter().flatten() {
+            thread.thread().unpark();
             let _ = thread.join();
         }
         if let Some(path) = self.advertise.take() {
@@ -200,10 +258,11 @@ impl Accept {
         }
         let slot = Slot(self.active.clone());
         let (shared, token, addr) = (self.shared.clone(), self.token.clone(), self.addr);
-        let (origins, write_timeout) = (self.config.allowed_origins.clone(), self.config.write_timeout);
+        let (origins, write_timeout, role) =
+            (self.config.allowed_origins.clone(), self.config.write_timeout, self.config.role);
         let spawned = std::thread::Builder::new().name("atomics-protocol-client".into()).spawn(move || {
             let _slot = slot;
-            let _ = serve_stream(stream, &shared, &token, addr, &origins, write_timeout);
+            let _ = serve_stream(stream, &shared, &token, (addr, role), &origins, write_timeout);
         });
         let _ = spawned;
     }
@@ -213,7 +272,7 @@ fn serve_stream(
     stream: TcpStream,
     shared: &session::Shared,
     token: &str,
-    addr: SocketAddr,
+    (addr, role): (SocketAddr, Role),
     origins: &[String],
     write_timeout: Duration,
 ) -> io::Result<()> {
@@ -222,13 +281,13 @@ fn serve_stream(
     stream.set_write_timeout(Some(write_timeout))?;
     #[allow(clippy::result_large_err)] // the error type is tungstenite's callback contract
     let socket = tungstenite::accept_hdr_with_config(
-        stream,
+        link::Stream::new(stream)?,
         |request: &Request, response: Response| authorise(request, response, token, addr, origins),
         Some(link::socket_config()),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
     let mut link = link::WsLink::new(socket, write_timeout)?;
-    session::serve(&mut link, Role::Controller, shared);
+    session::serve(&mut link, role, shared);
     Ok(())
 }
 

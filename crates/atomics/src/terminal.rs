@@ -1,22 +1,30 @@
-//! Native terminal client: painting, keyboard/pointer input and selection.
+//! Native terminal client: keyboard/pointer input and selection. Painting is the shared painter's
+//! (`atomics_ui::terminal`), over a copy of the cells this view displays.
 
+#[cfg(test)]
+mod frame_bench;
+#[cfg(test)]
+mod legacy_paint;
+#[cfg(test)]
+mod paint_tests;
 mod runtime;
+pub(crate) mod screen;
+#[cfg(test)]
+pub(crate) use runtime::Detached;
 pub use runtime::Terminal;
 
-use crate::theme::{Palette, is_app_chord};
+use crate::theme::{Palette, Theme, is_app_chord};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
-use egui::{Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
-
-pub struct Metrics {
-    pub font: FontId,
-    pub cell: Vec2,
-}
+use alacritty_terminal::vte::ansi::Rgb;
+use atomics_core::screen::{CursorShape, Screen};
+use atomics_core::theme::{parse_color, xterm_color};
+use atomics_ui::terminal as painter;
+pub use atomics_ui::terminal::Metrics;
+use egui::{Key, Modifiers, Pos2, Rect, Sense, vec2};
 
 pub struct TerminalView {
     terminal: Option<std::sync::Weak<runtime::Shared>>,
@@ -26,6 +34,22 @@ pub struct TerminalView {
     selection_revision: u64,
     /// What has been typed since the last Enter.
     line: String,
+    /// The cells last painted; kept so a frame reuses its buffers.
+    screen: Screen,
+    /// What `screen`'s cells were copied at. Output and every resize (the desktop's, a lease
+    /// holder's, a take-back) move the terminal's revision, so while it, the scroll position, the
+    /// history, the emulator's size and the view's rows stay put the cells are still current.
+    copied: Option<Copied>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Copied {
+    revision: u64,
+    offset: usize,
+    history: usize,
+    /// The emulator's columns and rows, which a remote lease holder may set apart from the pane.
+    size: (usize, usize),
+    rows: usize,
 }
 
 impl Default for TerminalView {
@@ -37,6 +61,8 @@ impl Default for TerminalView {
             selection: None,
             selection_revision: 0,
             line: String::new(),
+            screen: Screen::blank(0, 0),
+            copied: None,
         }
     }
 }
@@ -59,6 +85,7 @@ impl TerminalView {
             self.selection = None;
             self.scroll_remainder = 0.0;
             self.line.clear();
+            self.copied = None;
         }
         let response = ui.interact(rect, id, Sense::click_and_drag());
         if response.clicked() || response.drag_started() {
@@ -229,6 +256,8 @@ impl TerminalView {
             }
         }
         if !out.is_empty() {
+            // Typing on the desktop takes back a remote client's lease (a no-op without one).
+            terminal.take_back();
             let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
             self.selection = None;
@@ -246,132 +275,61 @@ impl TerminalView {
         palette: &Palette,
         focused: bool,
     ) {
-        let painter = ui.painter_at(outer);
-        painter.rect_filled(outer, 0.0, palette.terminal);
+        // Copy under the emulator lock; lay out and paint after releasing it.
+        let selection = {
+            let term = terminal.term.lock();
+            self.sync_selection(terminal);
+            self.copy_view(&term, palette, Some(terminal.revision()))
+        };
+        painter::paint(
+            ui.painter(),
+            (outer, rect),
+            &self.screen,
+            selection.as_ref(),
+            metrics,
+            &palette.terminal_theme(),
+            focused,
+        );
+    }
 
-        let term = terminal.term.lock();
-        self.sync_selection(terminal);
-        let selection = self.selection.as_ref().and_then(|s| s.to_range(&*term));
-        let content = term.renderable_content();
-        let colors = content.colors;
-        let offset = content.display_offset as i32;
-        let cell = metrics.cell;
-        let origin = rect.min;
-        let at = |row: i32, col: usize| pos2(origin.x + col as f32 * cell.x, origin.y + row as f32 * cell.y);
-
-        let mut run = Run::default();
-        for indexed in content.display_iter {
-            let point = indexed.point;
-            let c = indexed.cell;
-            if c.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
+    /// Copy the displayed cells into `self.screen`, unless they are unchanged since the copy at
+    /// `revision`, and return the selection in their rows. The cursor shows only on this view's
+    /// rows, as it always has.
+    fn copy_view<T>(
+        &mut self,
+        term: &alacritty_terminal::Term<T>,
+        palette: &Palette,
+        revision: Option<u64>,
+    ) -> Option<painter::Selection> {
+        use alacritty_terminal::grid::Dimensions;
+        let grid = term.grid();
+        let offset = grid.display_offset();
+        let key = revision.map(|revision| Copied {
+            revision,
+            offset,
+            history: grid.history_size(),
+            size: (grid.columns(), grid.screen_lines()),
+            rows: self.grid.1,
+        });
+        let theme = slot_colors(palette);
+        if key.is_some() && key == self.copied {
+            screen::view_palette(term, &theme, &mut self.screen);
+        } else {
+            screen::view(term, &theme, &mut self.screen);
+            if usize::from(self.screen.cursor.row) >= self.grid.1 {
+                self.screen.cursor.shape = CursorShape::Hidden;
             }
-            let row = point.line.0 + offset;
-            let col = point.column.0;
-            let mut fg = palette.resolve(c.fg, colors);
-            let mut bg = palette.resolve(c.bg, colors);
-            if c.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if c.flags.contains(Flags::DIM) {
-                fg = palette.dim(fg);
-            }
-            if c.flags.contains(Flags::HIDDEN) {
-                fg = bg;
-            }
-            if selection.is_some_and(|s| s.contains(point)) {
-                bg = palette.selection;
-            }
-            let width = if c.flags.contains(Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
-            if bg != palette.terminal {
-                painter.rect_filled(Rect::from_min_size(at(row, col), vec2(cell.x * width, cell.y)), 0.0, bg);
-            }
-            if c.flags.intersects(Flags::ALL_UNDERLINES) {
-                let y = at(row, col).y + cell.y - 1.5;
-                let x = at(row, col).x;
-                painter.line_segment([pos2(x, y), pos2(x + cell.x * width, y)], Stroke::new(1.0, fg));
-            }
-
-            let ch = c.c;
-            if ch == ' ' || ch == '\0' {
-                // Blanks extend a run whatever their color, so a line stays one shape.
-                if !run.text.is_empty() && run.row == row && run.next_col == col {
-                    run.text.push(' ');
-                    run.next_col += 1;
-                }
-                continue;
-            }
-            let simple = ch.is_ascii() && width == 1.0;
-            if !run.continues(row, col, fg) || !simple {
-                run.flush(&painter, &at, metrics);
-            }
-            if simple {
-                if run.text.is_empty() {
-                    run = Run { row, col, fg, text: String::new(), next_col: col };
-                }
-                run.text.push(ch);
-                run.next_col = col + 1;
-            } else {
-                let mut text = String::from(ch);
-                if let Some(extra) = c.zerowidth() {
-                    text.extend(extra);
-                }
-                let center = at(row, col) + vec2(cell.x * width / 2.0, cell.y / 2.0);
-                painter.text(center, egui::Align2::CENTER_CENTER, text, metrics.font.clone(), fg);
-            }
+            self.copied = key;
         }
-        run.flush(&painter, &at, metrics);
-
-        let cursor = content.cursor;
-        let cursor_row = cursor.point.line.0 + offset;
-        if cursor.shape != CursorShape::Hidden && cursor_row >= 0 && (cursor_row as usize) < self.grid.1 {
-            let r = Rect::from_min_size(at(cursor_row, cursor.point.column.0), cell);
-            match (focused, cursor.shape) {
-                (true, CursorShape::Beam) => {
-                    painter.rect_filled(r.with_max_x(r.left() + 2.0), 0.0, palette.cursor);
-                }
-                (true, CursorShape::Underline) => {
-                    painter.rect_filled(r.with_min_y(r.bottom() - 2.0), 0.0, palette.cursor);
-                }
-                (true, _) => {
-                    painter.rect_filled(r, 0.0, palette.cursor.gamma_multiply(0.7));
-                }
-                (false, _) => {
-                    painter.rect_stroke(
-                        r,
-                        0.0,
-                        Stroke::new(1.0, palette.cursor.gamma_multiply(0.6)),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-            }
-        }
+        let selection = self.selection.as_ref().and_then(|s| s.to_range(term));
+        selection.map(|range| view_selection(range, offset as i32))
     }
 }
 
-/// Consecutive ASCII cells with the same color, laid out as one text shape.
-#[derive(Default)]
-struct Run {
-    row: i32,
-    col: usize,
-    next_col: usize,
-    fg: Color32,
-    text: String,
-}
-
-impl Run {
-    fn continues(&self, row: i32, col: usize, fg: Color32) -> bool {
-        self.text.is_empty() || (self.row == row && self.next_col == col && self.fg == fg)
-    }
-
-    fn flush(&mut self, painter: &egui::Painter, at: &impl Fn(i32, usize) -> Pos2, metrics: &Metrics) {
-        if self.text.is_empty() {
-            return;
-        }
-        let text = std::mem::take(&mut self.text);
-        let text = text.trim_end().to_string();
-        painter.text(at(self.row, self.col), egui::Align2::LEFT_TOP, text, metrics.font.clone(), self.fg);
-    }
+/// An emulator selection in the rows of the displayed screen.
+fn view_selection(range: SelectionRange, offset: i32) -> painter::Selection {
+    let point = |p: Point| painter::Point { row: p.line.0 + offset, col: p.column.0 as u16 };
+    painter::Selection { start: point(range.start), end: point(range.end), block: range.is_block }
 }
 
 /// Terminal input for keys that don't arrive as text.
@@ -459,47 +417,43 @@ fn ctrl_byte(key: Key) -> Option<u8> {
     }
 }
 
-impl Palette {
-    fn resolve(&self, color: Color, overrides: &alacritty_terminal::term::color::Colors) -> Color32 {
-        let rgb = |rgb: Rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b);
-        match color {
-            Color::Spec(spec) => rgb(spec),
-            Color::Indexed(index) => overrides[index as usize].map(rgb).unwrap_or_else(|| self.indexed(index as usize)),
-            Color::Named(name) => overrides[name].map(rgb).unwrap_or_else(|| self.named(name)),
-        }
-    }
+/// The palette's colours for the cell slots the desktop copy fills: the 256 indexed colours,
+/// then foreground, background and cursor. They are [`Theme::terminal_colors`] as the painter
+/// draws them (`terminals_answer_the_colors_the_painter_draws`).
+fn slot_colors(palette: &Palette) -> Vec<Rgb> {
+    (0..=258)
+        .map(|index| {
+            let color = match index {
+                256 => palette.foreground,
+                257 => palette.terminal,
+                258 => palette.cursor,
+                i => palette.indexed(i),
+            };
+            Rgb { r: color.r(), g: color.g(), b: color.b() }
+        })
+        .collect()
+}
 
-    fn named(&self, name: NamedColor) -> Color32 {
-        match name {
-            NamedColor::Foreground | NamedColor::BrightForeground => self.foreground,
-            NamedColor::Background => self.terminal,
-            NamedColor::Cursor => self.cursor,
-            NamedColor::DimForeground => self.dim(self.foreground),
-            other => {
-                let index = other as usize;
-                if index < 16 {
-                    self.ansi[index]
-                } else {
-                    // Dim variants follow the 16 colors in order, starting at DimBlack.
-                    let base = index.saturating_sub(NamedColor::DimBlack as usize).min(7);
-                    self.dim(self.ansi[base])
-                }
-            }
-        }
-    }
-
+impl Theme {
+    /// The theme's 256 colors, then foreground, background and cursor: what terminals answer to
+    /// OSC 4/10/11/12. The same colors the painter takes from the [`Palette`], read from the tokens.
     pub fn terminal_colors(&self) -> Vec<Rgb> {
-        (0..=258).map(|index| self.indexed_rgb(index)).collect()
-    }
-
-    fn indexed_rgb(&self, index: usize) -> Rgb {
-        let color = match index {
-            256 => self.foreground,
-            257 => self.terminal,
-            258 => self.cursor,
-            i => self.indexed(i),
-        };
-        Rgb { r: color.r(), g: color.g(), b: color.b() }
+        let t = &self.tokens;
+        // A token that does not parse is black, as in the palette.
+        let color = |value: Option<&String>| value.and_then(|value| parse_color(value)).unwrap_or([0; 3]);
+        let ansi = t.ansi.as_deref().unwrap_or_default();
+        (0..=258)
+            .map(|index| {
+                let [r, g, b] = match index {
+                    0..16 => color(ansi.get(index)),
+                    256 => color(t.foreground.as_ref()),
+                    257 => color(t.terminal.as_ref()),
+                    258 => color(t.cursor.as_ref()),
+                    xterm => xterm_color(xterm).expect("colors 16 to 255 are xterm's"),
+                };
+                Rgb { r, g, b }
+            })
+            .collect()
     }
 }
 
@@ -517,7 +471,8 @@ pub(crate) fn color_query_args(query: &str, reply_len: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use egui::{Color32, FontId};
+    use std::{collections::HashMap, time::Duration};
 
     #[test]
     fn chief_input_tracking_follows_keystrokes_pastes_and_enter() {
@@ -590,11 +545,11 @@ mod tests {
 
     #[test]
     fn screen_reader_defers_terminal_lock_to_worker() {
-        let palette = Arc::new(Palette::from_config(&atomics_core::config::ThemeConfig::default()));
+        let theme = Theme::from_config(&atomics_core::config::ThemeConfig::default());
         let dir = crate::test_support::tempdir().unwrap();
         let terminal = Terminal::spawn(
             crate::host::Wake::default(),
-            palette.terminal_colors(),
+            theme.terminal_colors(),
             "/bin/cat".into(),
             vec![],
             dir.path(),
@@ -630,14 +585,72 @@ mod tests {
         terminal.shutdown();
     }
 
+    #[test]
+    fn desktop_typing_reaches_the_pty_as_before_and_takes_a_remote_lease_back() {
+        use crate::protocol::TerminalControl;
+        use crate::protocol::lease::{Client, Policy};
+        use alacritty_terminal::grid::Dimensions;
+        use atomics_core::lease::{GridSize, LeaseReason};
+        use atomics_core::wire::ErrorCode;
+
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/cat".into(),
+            vec![],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut view = TerminalView::default();
+        let type_text = |view: &mut TerminalView, text: &str| {
+            let events = vec![egui::Event::Text(text.into())];
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| view.handle_keys(&terminal, ui))
+                .drop_without_applying_deltas();
+        };
+        let columns = || terminal.term.lock().grid().columns();
+        // Nobody holds a lease, as always with remote access off: typing is what it was.
+        type_text(&mut view, "one");
+        wait_for_text(&terminal, "one");
+
+        // A remote client holds the lease and fitted the terminal to its screen.
+        let handle = terminal.screen_handle();
+        let control: &dyn TerminalControl = &handle;
+        let (phone, policy, now) =
+            (Client { id: u64::MAX, label: "phone".into() }, Policy::default(), std::time::Instant::now());
+        control.acquire(&phone, false, now, &policy).unwrap();
+        let token = control.view("s", &phone, &policy).1.lease.unwrap().0;
+        control.resize_for(&phone, token, Some(GridSize::new(40, 12)), now, &policy).unwrap();
+        assert_eq!(columns(), 40);
+        // The desktop's pane changes meanwhile: its size waits for the lease.
+        let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
+        view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 480.0)), &metrics);
+        assert_eq!(columns(), 40);
+
+        // Typing on the desktop goes through as always, and takes the terminal back with its size.
+        type_text(&mut view, "two");
+        wait_for_text(&terminal, "onetwo");
+        let (_, state) = control.view("s", &phone, &policy);
+        assert_eq!((state.holder, state.reason), (None, Some(LeaseReason::Desktop)));
+        assert_eq!(columns(), 100);
+        let late = control.input(&phone, (token, 1), b"late".to_vec(), now, &policy).unwrap_err();
+        assert_eq!(late.code, ErrorCode::Fenced);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!terminal.screen_text(24).contains("late"));
+        terminal.shutdown();
+    }
+
     fn selected_terminal() -> (Terminal, TerminalView, Metrics, crate::test_support::TempDir) {
         let dir = crate::test_support::tempdir().unwrap();
-        let palette = Palette::from_config(&atomics_core::config::ThemeConfig::default());
+        let theme = Theme::from_config(&atomics_core::config::ThemeConfig::default());
         // The status query is a PTY barrier: the shell sees the terminal's four-byte
         // response only after the initial output has been parsed and its Wakeup sent.
         // Seeing "reviewed" alone can race the newline arriving in a later PTY read,
         // whose revision would discard the selection before the test's first copy.
-        let terminal = Terminal::spawn(crate::host::Wake::default(), palette.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo -icanon min 1 time 0; printf 'reviewed\\r\\n\\033[5n'; dd bs=1 count=4 of=/dev/null 2>/dev/null; stty icanon; : > ready; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
+        let terminal = Terminal::spawn(crate::host::Wake::default(), theme.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo -icanon min 1 time 0; printf 'reviewed\\r\\n\\033[5n'; dd bs=1 count=4 of=/dev/null 2>/dev/null; stty icanon; : > ready; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
         let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
         while !dir.path().join("ready").exists() {
             assert!(std::time::Instant::now() < deadline, "terminal did not answer the initial status query");
@@ -702,8 +715,9 @@ mod tests {
     #[test]
     fn color_queries_answer_the_theme_and_follow_theme_changes() {
         let paper =
-            Palette::from_config(&atomics_core::config::ThemeConfig { name: "paper".into(), ..Default::default() });
-        let claude = Palette::from_config(&atomics_core::config::ThemeConfig::default());
+            Theme::from_config(&atomics_core::config::ThemeConfig { name: "paper".into(), ..Default::default() });
+        let claude = Theme::from_config(&atomics_core::config::ThemeConfig::default());
+        let (paper_colors, claude_colors) = (paper.palette(), claude.palette());
         let answer = |color: Color32| {
             let channel = |v: u8| format!("{v:02x}{v:02x}");
             format!("rgb:{}/{}/{}!", channel(color.r()), channel(color.g()), channel(color.b()))
@@ -711,10 +725,10 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         // OSC 10 foreground, 11 background, 4;1 red, 12 cursor; each answer has a fixed length.
         for (query, length, light, dark) in [
-            ("\\033]10;?\\007", 24, paper.foreground, claude.foreground),
-            ("\\033]11;?\\007", 24, paper.terminal, claude.terminal),
-            ("\\033]4;1;?\\007", 25, paper.ansi[1], claude.ansi[1]),
-            ("\\033]12;?\\007", 24, paper.cursor, claude.cursor),
+            ("\\033]10;?\\007", 24, paper_colors.foreground, claude_colors.foreground),
+            ("\\033]11;?\\007", 24, paper_colors.terminal, claude_colors.terminal),
+            ("\\033]4;1;?\\007", 25, paper_colors.ansi[1], claude_colors.ansi[1]),
+            ("\\033]12;?\\007", 24, paper_colors.cursor, claude_colors.cursor),
         ] {
             let terminal = Terminal::spawn(
                 crate::host::Wake::default(),
@@ -736,6 +750,27 @@ mod tests {
         }
         assert_eq!(paper.colorfgbg(), "0;15");
         assert_eq!(claude.colorfgbg(), "15;0");
+    }
+
+    #[test]
+    fn terminals_answer_the_colors_the_painter_draws() {
+        let mut custom = atomics_core::config::ThemeConfig { name: "tide".into(), ..Default::default() };
+        custom.tokens.cursor = Some("#00ff00".into());
+        custom.tokens.ansi = Some(vec!["#102030".into(), "not a color".into()]);
+        let builtins = atomics_core::theme::builtin_names()
+            .map(|name| atomics_core::config::ThemeConfig { name: name.into(), ..Default::default() });
+        for config in builtins.chain([custom]) {
+            let theme = Theme::from_config(&config);
+            let palette = theme.palette();
+            let painted =
+                (0..256).map(|i| palette.indexed(i)).chain([palette.foreground, palette.terminal, palette.cursor]);
+            let answered = theme.terminal_colors();
+            assert_eq!(answered.len(), 259);
+            assert_eq!(slot_colors(&palette), answered, "{}: the desktop copy's palette", config.name);
+            for (index, (rgb, color)) in answered.iter().zip(painted).enumerate() {
+                assert_eq!([rgb.r, rgb.g, rgb.b], [color.r(), color.g(), color.b()], "{} color {index}", config.name);
+            }
+        }
     }
 
     #[test]
@@ -774,12 +809,13 @@ mod isolation_tests {
 
     #[test]
     fn children_cannot_inherit_instance_routing() {
-        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new());
+        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), None);
         let output = crate::test_support::output(
             std::process::Command::new("/usr/bin/env")
                 .args(args)
                 .env("ATOMICS_SOCKET", "/parent/socket")
                 .env("ATOMICS_PANE", "parent-pane")
+                .env("ATOMICS_HOOK_PANE", "parent-pane")
                 .env("ATOMICS_HOME", "/parent/home")
                 .env("ATOMICS_CONFIG", "/parent/config")
                 .env("ATOMICS_AZURE_BEARER", "parent-placeholder")
@@ -795,9 +831,22 @@ mod isolation_tests {
             "ATOMICS_CONFIG",
             "ATOMICS_AZURE_BEARER",
             "ATOMICS_AZURE_RELAY_URL",
+            "ATOMICS_HOOK_PANE",
         ] {
             assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{env}");
         }
         assert!(env.contains("TERM_PROGRAM=atomics"));
+    }
+
+    #[test]
+    fn a_session_gets_its_own_hook_pane_instead_of_the_parents() {
+        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), Some("own-pane".into()));
+        let output = crate::test_support::output(
+            std::process::Command::new("/usr/bin/env").args(args).env("ATOMICS_HOOK_PANE", "parent-pane"),
+        );
+        assert!(output.status.success());
+        let env = String::from_utf8(output.stdout).unwrap();
+        let panes: Vec<&str> = env.lines().filter(|line| line.starts_with("ATOMICS_HOOK_PANE=")).collect();
+        assert_eq!(panes, ["ATOMICS_HOOK_PANE=own-pane"], "{env}");
     }
 }
