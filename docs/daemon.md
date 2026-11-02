@@ -443,8 +443,9 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
 - **Crashes.** While the server runs the journal is `protocol-ops.jsonl` in the state directory (mode 0600): one
   line when an operation begins and one when it ends. An operation that began without ending when the host stopped
   is `uncertain` from the next start on, and is never run again by itself; a codex delivery whose receipt never came
-  is `uncertain` too. Lines are written, not synced: the journal survives the host process dying, not the machine
-  losing power. Outcomes are kept 30 minutes from when the operation began (at most 4096; past that new work is
+  is `uncertain` too. Each line is synced to disk (`sync_data`) before the work starts and before its outcome is
+  answered, so neither the host process dying nor the machine losing power makes it run an operation again.
+  Outcomes are kept 30 minutes from when the operation began (at most 4096; past that new work is
   refused `too_many` rather than an unexpired outcome forgotten). Clients are told `op_ttl_secs` (15 minutes) and
   resend an unanswered operation only while it is younger (`Pending::resend`): an older one needs the user's fresh
   intent. With `[remote]` off the journal is in memory and there is no file.

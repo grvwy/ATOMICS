@@ -6,9 +6,11 @@
 //! `conflict`, never the old outcome. With a file (while the protocol server runs), each record is
 //! one JSON line, appended before the work starts and after it ends. If the host process dies in
 //! between, the next start finds a beginning without an end and answers `uncertain` for it: the
-//! host never guesses whether a message was typed or a merge ran. Lines are not synced to disk:
-//! this guards against the host process dying, not the machine losing power; an operation whose
-//! lines were lost is one the host no longer knows, which a client treats as too old to resend.
+//! host never guesses whether a message was typed or a merge ran. Each line is synced to disk
+//! (`sync_data`) before the work starts and before the outcome is answered, so neither the process
+//! dying nor the machine losing power can make the host forget an operation it began and run it
+//! again. Mutations are rare, so the sync costs little. Compaction writes and syncs a new file,
+//! renames it into place and syncs the directory.
 //!
 //! Outcomes are kept for `KEEP_SECS` from when the operation began (twice the `op_ttl_secs` that
 //! clients are told), at most `CAPACITY` at once; an operation still running is never forgotten.
@@ -196,8 +198,9 @@ impl Journal {
         Begun::Fresh
     }
 
-    /// Record how the operation ended. A failed write is reported and the outcome is still kept
-    /// in memory; after a crash the operation would then read as `uncertain`, which is true.
+    /// Record how the operation ended, on disk before the caller answers with it. A failed write
+    /// is reported and the outcome is still kept in memory; after a crash the operation would then
+    /// read as `uncertain`, which is true.
     pub fn finish(&mut self, key: &Key, outcome: &Outcome) {
         let Some(entry) = self.entries.get_mut(key) else { return };
         let outcome = kept(outcome);
@@ -220,8 +223,10 @@ impl Journal {
         let Some(log) = &mut self.log else { return Ok(()) };
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
-        // One write per line, so a crash leaves at most the last line cut short.
+        // One write per line, so a crash leaves at most the last line cut short; synced, so a power
+        // cut cannot lose a beginning whose work went ahead.
         log.file.write_all(&line)?;
+        log.file.sync_data()?;
         log.lines += 1;
         Ok(())
     }
@@ -246,8 +251,12 @@ impl Journal {
         }
         let mut file = private_file(&tmp, false)?;
         file.write_all(&out)?;
+        // On disk before it replaces the log, and the rename on disk before the log is written to.
+        file.sync_data()?;
         drop(file);
         std::fs::rename(&tmp, &log.path)?;
+        let dir = log.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(dir)?.sync_all()?;
         log.file = private_file(&log.path, true)?;
         log.lines = lines;
         Ok(())
