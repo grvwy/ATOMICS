@@ -242,6 +242,33 @@ hosting app's `Permissions-Policy` must allow the camera on the pairing page) an
 Android and desktop browsers, where the link opens the same profile. The spike also confirms that an iframe on a
 same-site dedicated origin keeps its storage inside the standalone PWA.
 
+**Spike results (pending device run).** The page is `spikes/wasm` (README, "iPhone test", with the checklist the
+rows below follow). It feeds one egui terminal widget from three paths: **a** eframe's text agent as shipped (an
+`<input>` with only `autocapitalize="off"`), **a+** the same input with `autocorrect`, `autocomplete` and
+`spellcheck` off, set by the page, and **b** a transparent `<textarea>` over the terminal that forwards committed
+text, composition (as preedit) and Backspace/Return. The key bar follows `visualViewport`. Each run's event log is
+saved on the serving machine, not in the repository.
+
+Device: iPhone ___, iOS ___, run on ___.
+
+| Check | Safari a | Safari a+ | Safari b | PWA a+ | PWA b |
+| --- | --- | --- | --- | --- | --- |
+| 1. Tap opens the keyboard; no page jump or zoom | | | | | |
+| 2. No autocapitalise, autocorrect or smart punctuation | | | | | |
+| 3. Backspace (tap and hold) and Return send once each | | | | | |
+| 4. `åäö ÅÄÖ` once and precomposed; emoji sequences intact | | | | | |
+| 4b. IME composition (optional): preedit, then one commit | | | | | |
+| 5. Dictation arrives once; revisions not duplicated | | | | | |
+| 6. Key bar sits on the keyboard, keeps it up; Ctrl then `c` is `^C` | | | | | |
+| 7. Pinch on the terminal changes the font; the page never zooms | | | | | |
+
+Cells: pass, fail with a one-line note, or not run.
+
+Findings: pending.
+
+Decision (pending): stream C uses the egui text agent if **a+** passes every row in Safari and in the PWA (the
+attributes then go upstream to eframe or are set by the client); otherwise the `<textarea>` overlay (**b**).
+
 ### 4.5 The entry point
 
 Where the hosting app shows ATOMICS is its decision; in Relay it is an item in the application switcher, shown on

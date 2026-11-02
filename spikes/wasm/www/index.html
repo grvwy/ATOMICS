@@ -3,71 +3,288 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>ATOMICS soft-keyboard spike</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Keyboard spike">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.png">
+<title>ATOMICS keyboard spike</title>
 <style>
-  body { margin: 0; font: 14px system-ui; background: #111; color: #ddd; }
-  nav { display: flex; gap: 8px; padding: 8px; }
-  nav a { color: #9f9; padding: 6px 10px; border: 1px solid #363; border-radius: 6px; text-decoration: none; }
+  html, body { height: 100%; }
+  body { margin: 0; display: flex; flex-direction: column; font: 13px system-ui; background: #111; color: #ddd;
+         touch-action: pan-x pan-y; -webkit-text-size-adjust: 100%; }
+  nav { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px; padding-top: max(6px, env(safe-area-inset-top)); }
+  nav a, nav button { color: #9f9; background: none; font: inherit; padding: 5px 8px; border: 1px solid #363;
+                      border-radius: 6px; text-decoration: none; }
   nav a.on { background: #242; }
-  #egui { width: 100vw; height: 70vh; display: block; touch-action: none; }
-  #ta-page { padding: 8px; }
-  #term { position: relative; background: #000; color: #9f9; font: 16px ui-monospace, monospace;
-          height: 160px; padding: 6px; white-space: pre-wrap; overflow: auto; border: 1px solid #363; border-radius: 4px; }
-  /* Hidden but focusable: not display:none, or iOS will not raise the keyboard. */
-  #hidden-ta { position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; font-size: 16px; }
-  #log { font: 12px ui-monospace, monospace; white-space: pre-wrap; max-height: 25vh; overflow: auto; padding: 8px; }
+  nav button { color: #ccc; border-color: #444; }
+  #stage { position: relative; flex: none; }
+  #egui { display: block; width: 100%; height: 240px; touch-action: none; }
+  /* Path (b): sits on the egui terminal; its own text is invisible, egui draws what it forwards. */
+  #overlay { position: absolute; z-index: 1; margin: 0; padding: 6px; border: 0; outline: none; resize: none;
+             overflow: hidden; background: transparent; color: transparent; caret-color: transparent;
+             font: 16px ui-monospace, monospace; touch-action: none; -webkit-tap-highlight-color: transparent; }
+  #log { flex: 1; min-height: 0; overflow: auto; padding: 4px 8px 56px; font: 11px/1.35 ui-monospace, monospace;
+         white-space: pre-wrap; word-break: break-all; }
+  #log .dom { color: #8cf; } #log .vv { color: #c9f; } #log .egui { color: #fc6; } #log .pty { color: #9f9; }
+  #log .ta { color: #f99; } #log .bar { color: #fff; } #log .page { color: #888; }
+  /* Follows visualViewport (see placeBar): left/top stay 0, the transform does the work. */
+  #keybar { position: fixed; left: 0; top: 0; z-index: 2; display: flex; gap: 4px; box-sizing: border-box;
+            padding: 4px; background: #222; border-top: 1px solid #444; transform-origin: 0 0; }
+  #keybar.rest { padding-bottom: max(4px, env(safe-area-inset-bottom)); }
+  #keybar button { flex: 1; min-width: 0; height: 38px; font: 15px system-ui; color: #eee; background: #3a3a3a;
+                   border: 0; border-radius: 6px; -webkit-user-select: none; user-select: none; }
+  #keybar button.on { background: #2a6; }
 </style>
 </head>
 <body>
 <nav>
-  <a id="m-egui" href="?mode=egui">egui text agent</a>
-  <a id="m-ta" href="?mode=textarea">hidden &lt;textarea&gt;</a>
+  <a data-input="agent" href="?input=agent">a: agent</a>
+  <a data-input="agent-off" href="?input=agent-off">a+: agent, autocorrect off</a>
+  <a data-input="textarea" href="?input=textarea">b: textarea</a>
+  <button id="mark" tabindex="-1">mark</button>
+  <button id="send" tabindex="-1">send</button>
+  <button id="copy" tabindex="-1">copy</button>
+  <button id="clear" tabindex="-1">clear</button>
 </nav>
-<canvas id="egui" hidden></canvas>
-<div id="ta-page" hidden>
-  <div id="term" tabindex="-1">tap here, then type, dictate or compose
-<textarea id="hidden-ta" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" enterkeyhint="send"></textarea></div>
+<div id="stage">
+  <canvas id="egui"></canvas>
+  <textarea id="overlay" hidden autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false"
+            enterkeyhint="enter" aria-label="Terminal input"></textarea>
 </div>
-<div id="log"></div>
+<div id="log" aria-live="off"></div>
+<div id="keybar" role="toolbar" aria-label="Terminal keys">
+  <button tabindex="-1" data-key="Escape">Esc</button>
+  <button tabindex="-1" data-key="Tab">Tab</button>
+  <button tabindex="-1" data-key="Ctrl" id="ctrl">Ctrl</button>
+  <button tabindex="-1" data-key="ArrowLeft">←</button>
+  <button tabindex="-1" data-key="ArrowUp">↑</button>
+  <button tabindex="-1" data-key="ArrowDown">↓</button>
+  <button tabindex="-1" data-key="ArrowRight">→</button>
+</div>
 <script type="module">
-  const mode = new URLSearchParams(location.search).get("mode") || "egui";
-  document.getElementById(mode === "egui" ? "m-egui" : "m-ta").classList.add("on");
-  const log = document.getElementById("log");
-  const say = (s) => { log.textContent += s + "\n"; log.scrollTop = log.scrollHeight; };
-  say(`ua: ${navigator.userAgent}`);
-  say(`secure context: ${isSecureContext}, WebGPU: ${"gpu" in navigator}`);
+  const PATHS = ["agent", "agent-off", "textarea"];
+  const asked = new URLSearchParams(location.search).get("input");
+  const input = PATHS.includes(asked) ? asked : "agent";
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  document.querySelector(`nav a[data-input="${input}"]`).classList.add("on");
 
-  if (mode === "egui") {
-    const canvas = document.getElementById("egui");
-    canvas.hidden = false;
-    const { default: init, start } = await import("./pkg/atomics_wasm_spike.js");
-    await init();
-    try { await start("egui"); say("eframe started"); } catch (e) { say("eframe failed: " + e); }
-  } else {
-    document.getElementById("ta-page").hidden = false;
-    const term = document.getElementById("term");
-    const ta = document.getElementById("hidden-ta");
-    let screen = "", composing = false;
-    const draw = (pre = "") => { term.firstChild.nodeValue = "$ " + screen + pre + "█"; };
-    term.firstChild.nodeValue = "$ █";
-    term.addEventListener("click", () => ta.focus());
-    // What the host would get as terminal_input: committed text only. Reset the textarea after each commit so it stays empty.
-    const send = (t) => { if (t) { screen += t; say(`terminal_input ${JSON.stringify(t)}`); } draw(); };
-    ta.addEventListener("compositionstart", () => { composing = true; say("compositionstart"); });
-    ta.addEventListener("compositionupdate", (e) => { say(`compositionupdate ${JSON.stringify(e.data)}`); draw(e.data); });
-    ta.addEventListener("compositionend", (e) => { composing = false; say(`compositionend ${JSON.stringify(e.data)}`); send(e.data); ta.value = ""; });
-    ta.addEventListener("beforeinput", (e) => {
-      say(`beforeinput ${e.inputType} ${JSON.stringify(e.data)}`);
-      if (composing) return;
-      if (e.inputType === "deleteContentBackward") { screen = screen.slice(0, -1); draw(); e.preventDefault(); }
-      else if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") { send("\n"); e.preventDefault(); }
-      else if (e.inputType.startsWith("insert") && e.data) { send(e.data); e.preventDefault(); }
+  const canvas = document.getElementById("egui");
+  const ov = document.getElementById("overlay");
+  const bar = document.getElementById("keybar");
+  const logEl = document.getElementById("log");
+
+  // ---- the log: newest first on screen (the top stays visible above the keyboard), all of it for copy/send
+  const lines = [];
+  const t0 = performance.now();
+  const say = (src, msg) => {
+    const line = `${((performance.now() - t0) / 1000).toFixed(3).padStart(8)} ${src.padEnd(4)} ${msg}`;
+    lines.push(line);
+    const div = document.createElement("div");
+    div.className = src;
+    div.textContent = line;
+    logEl.prepend(div);
+    while (logEl.childElementCount > 400) logEl.lastElementChild.remove();
+  };
+  const show = (s) => s == null ? String(s) : JSON.stringify(s) + (/[^\x00-\x7f]/.test(s)
+    ? " " + [...s].slice(0, 12).map((c) => "U+" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")).join(" ")
+    : "");
+  const agentInput = () => { const n = canvas.nextElementSibling; return n && n.tagName === "INPUT" ? n : null; };
+  const label = (t) => t === ov ? "overlay" : t && t === agentInput() ? "agent" : t === canvas ? "canvas"
+    : t && t.tagName ? t.tagName.toLowerCase() + (t.id ? "#" + t.id : "") : String(t);
+
+  // Called from Rust (src/lib.rs).
+  window.spikeLog = (src, msg) => say(src, msg);
+  window.spikeCtrl = (on) => document.getElementById("ctrl").classList.toggle("on", on);
+  window.spikeTerminalRect = (x, y, w, h) => {
+    Object.assign(ov.style, { left: x + "px", top: y + "px", width: w + "px", height: h + "px" });
+  };
+  addEventListener("error", (e) => say("page", `error ${e.message} ${e.filename}:${e.lineno}`));
+  addEventListener("unhandledrejection", (e) => say("page", `unhandled rejection ${e.reason}`));
+
+  say("page", `ua ${navigator.userAgent}`);
+  say("page", `input=${input} standalone=${standalone} secure=${isSecureContext} dpr=${devicePixelRatio} `
+    + `screen=${screen.width}x${screen.height} inner=${innerWidth}x${innerHeight}`);
+
+  // ---- every DOM input event, whoever receives it (capture on document, before the targets' own handlers)
+  const on = (type, fn) => document.addEventListener(type, fn, { capture: true, passive: true });
+  const mods = (e) => ["ctrlKey", "altKey", "metaKey", "shiftKey"].filter((m) => e[m]).map((m) => " " + m.slice(0, -3)).join("");
+  const ranges = (e) => {
+    const r = e.getTargetRanges ? e.getTargetRanges() : [];
+    return r.length ? " ranges=" + r.map((x) => `${x.startOffset}-${x.endOffset}`).join(",") : "";
+  };
+  for (const t of ["keydown", "keyup"]) {
+    on(t, (e) => say("dom", `${t} key=${show(e.key)} code=${e.code || "-"} keyCode=${e.keyCode} `
+      + `composing=${e.isComposing}${e.repeat ? " repeat" : ""}${mods(e)} @${label(e.target)}`));
+  }
+  on("beforeinput", (e) => say("dom", `beforeinput ${e.inputType} data=${show(e.data)} composing=${e.isComposing} `
+    + `cancelable=${e.cancelable}${ranges(e)} @${label(e.target)}`));
+  on("input", (e) => say("dom", `input ${e.inputType} data=${show(e.data)} composing=${e.isComposing} `
+    + `value=${show(e.target.value)} @${label(e.target)}`));
+  for (const t of ["compositionstart", "compositionupdate", "compositionend"]) {
+    on(t, (e) => say("dom", `${t} data=${show(e.data)} @${label(e.target)}`));
+  }
+  for (const t of ["focusin", "focusout"]) on(t, (e) => say("dom", `${t} @${label(e.target)}`));
+  on("paste", (e) => say("dom", `paste ${show(e.clipboardData && e.clipboardData.getData("text/plain"))} @${label(e.target)}`));
+  on("touchstart", (e) => { if (e.touches.length > 1) say("dom", `touchstart touches=${e.touches.length} @${label(e.target)}`); });
+  let gestureRaf = 0, gestureLast = "";
+  for (const t of ["gesturestart", "gesturechange", "gestureend"]) {
+    on(t, (e) => {
+      const msg = `${t} scale=${e.scale.toFixed(3)} @${label(e.target)}`;
+      if (t !== "gesturechange") return say("dom", msg);
+      gestureLast = msg;
+      gestureRaf ||= requestAnimationFrame(() => { gestureRaf = 0; say("dom", gestureLast); });
     });
-    ta.addEventListener("keydown", (e) => say(`keydown ${e.key} code=${e.code}`));
-    ta.addEventListener("input", (e) => { if (!composing) ta.value = ""; });
-    if (window.visualViewport) {
-      visualViewport.addEventListener("resize", () => say(`visualViewport h=${Math.round(visualViewport.height)}`));
+  }
+
+  // ---- key bar: sits on the visual viewport's bottom edge, at a constant size even when the page is zoomed
+  const vv = window.visualViewport;
+  const r = (n) => Math.round(n);
+  let barTop = 0;
+  const placeBar = () => {
+    if (!vv) return;
+    const s = vv.scale;
+    const keyboardUp = innerHeight - vv.height * s > 80;
+    bar.classList.toggle("rest", !keyboardUp);
+    bar.style.width = vv.width * s + "px";
+    barTop = vv.offsetTop + vv.height - bar.offsetHeight / s;
+    bar.style.transform = `translate(${vv.offsetLeft}px, ${barTop}px) scale(${1 / s})`;
+  };
+  const vvState = () => vv
+    ? `h=${r(vv.height)} w=${r(vv.width)} offsetTop=${r(vv.offsetTop)} pageTop=${r(vv.pageTop)} scale=${vv.scale.toFixed(2)} `
+      + `innerH=${innerHeight} scrollY=${r(scrollY)} barTop=${r(barTop)}`
+    : "no visualViewport";
+  let vvWhy = new Set(), vvRaf = 0;
+  const viewportEvent = (why) => {
+    placeBar();
+    vvWhy.add(why);
+    vvRaf ||= requestAnimationFrame(() => { vvRaf = 0; say("vv", `${[...vvWhy].join("+")} ${vvState()}`); vvWhy.clear(); });
+  };
+  if (vv) {
+    vv.addEventListener("resize", () => viewportEvent("vv.resize"));
+    vv.addEventListener("scroll", () => viewportEvent("vv.scroll"));
+  }
+  addEventListener("resize", () => viewportEvent("window.resize"));
+  placeBar();
+  say("vv", `initial ${vvState()}`);
+
+  // ---- into the app; a microtask so a DOM event raised during a wasm call never re-enters it
+  let wasm = null;
+  const send = (kind, data) => queueMicrotask(() => wasm ? wasm.inject(kind, data) : say("page", `wasm not loaded, dropped ${kind}`));
+
+  // Pressing a bar or nav button must not move focus, or the soft keyboard closes.
+  const noFocus = (el, act) => {
+    el.addEventListener("pointerdown", (e) => e.preventDefault());
+    el.addEventListener("mousedown", (e) => e.preventDefault());
+    el.addEventListener("touchstart", (e) => { e.preventDefault(); act(); }, { passive: false });
+    el.addEventListener("click", act); // mouse; a prevented touchstart produces no click
+  };
+  for (const b of bar.querySelectorAll("button")) {
+    noFocus(b, () => {
+      say("bar", `${b.dataset.key} (focus stays @${label(document.activeElement)})`);
+      send("key", b.dataset.key);
+    });
+  }
+  let marks = 0;
+  noFocus(document.getElementById("mark"), () => say("page", `──────── mark ${++marks} ────────`));
+  document.getElementById("clear").addEventListener("click", () => { lines.length = 0; logEl.textContent = ""; });
+  const report = () => [`# ATOMICS keyboard spike log, ${new Date().toISOString()}`, ...lines].join("\n") + "\n";
+  document.getElementById("copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(report()); say("page", "log copied"); }
+    catch (e) { say("page", `copy failed: ${e}`); }
+  });
+  document.getElementById("send").addEventListener("click", async () => {
+    try {
+      const res = await fetch("log", { method: "POST", headers: { "X-Spike-Tag": `${input}-${standalone ? "pwa" : "safari"}` }, body: report() });
+      say("page", res.ok ? `log sent: ${await res.text()}` : `send failed: HTTP ${res.status}`);
+    } catch (e) { say("page", `send failed: ${e}`); }
+  });
+
+  // ---- path (b): the textarea overlay forwards committed text, composition as preedit, and named keys
+  if (input === "textarea") {
+    ov.hidden = false;
+    let composing = false;
+    ov.addEventListener("focus", () => send("focus", "1"));
+    ov.addEventListener("blur", () => send("focus", "0"));
+    ov.addEventListener("compositionstart", () => { composing = true; });
+    ov.addEventListener("compositionupdate", (e) => send("preedit", e.data || ""));
+    ov.addEventListener("compositionend", (e) => {
+      composing = false;
+      if (e.data) send("text", e.data); else send("preedit", "");
+      ov.value = "";
+      say("ta", `commit ${show(e.data)}, textarea cleared`);
+    });
+    ov.addEventListener("beforeinput", (e) => {
+      if (composing || e.isComposing) return;
+      const t = e.inputType;
+      if (t.startsWith("delete") && ov.value === "") {
+        // Nothing to delete locally: it is the terminal's backspace.
+        if (e.cancelable) e.preventDefault();
+        send("key", "Backspace");
+        return say("ta", `${t} → Backspace`);
+      }
+      let fwd = null;
+      if (t === "insertLineBreak" || t === "insertParagraph") fwd = ["key", "Enter"];
+      else if ((t === "insertFromPaste" || t === "insertFromDrop") && e.dataTransfer) fwd = ["text", e.dataTransfer.getData("text/plain")];
+      else if (t.startsWith("insert") && e.data) fwd = ["text", e.data];
+      if (fwd && e.cancelable) {
+        e.preventDefault();
+        send(...fwd);
+        say("ta", `${t} → ${fwd[0]} ${show(fwd[1])} (prevented)`);
+      } else {
+        say("ta", `${t} left to the browser${e.cancelable ? "" : " (not cancelable)"}; the input event forwards it`);
+      }
+    });
+    ov.addEventListener("input", (e) => {
+      if (composing || e.isComposing || !ov.value) return;
+      say("ta", `input fallback: forwarding ${show(ov.value)}`);
+      send("text", ov.value);
+      ov.value = "";
+    });
+    ov.addEventListener("keydown", (e) => {
+      // A hardware keyboard's named keys (the soft keyboard has none of these).
+      if (composing || e.isComposing) return;
+      if (["Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+        e.preventDefault();
+        send("key", e.key);
+      }
+    });
+    // Pinch over the overlay: two-finger distance ratio, sent to the app once per frame.
+    let pinch = 0, pending = 1, pinchRaf = 0;
+    const dist = (ts) => Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+    ov.addEventListener("touchstart", (e) => { if (e.touches.length === 2) pinch = dist(e.touches); }, { passive: true });
+    ov.addEventListener("touchmove", (e) => {
+      if (e.touches.length !== 2 || !pinch) return;
+      e.preventDefault();
+      const d = dist(e.touches);
+      pending *= d / pinch;
+      pinch = d;
+      pinchRaf ||= requestAnimationFrame(() => { pinchRaf = 0; send("zoom", String(pending)); pending = 1; });
+    }, { passive: false });
+    ov.addEventListener("touchend", (e) => { if (e.touches.length < 2) pinch = 0; }, { passive: true });
+    // Safari's own pinch events: only stop the page zoom; the touches above drive the font size.
+    for (const t of ["gesturestart", "gesturechange", "gestureend"]) ov.addEventListener(t, (e) => e.preventDefault());
+  }
+
+  // ---- start eframe
+  try {
+    const mod = await import("./pkg/atomics_wasm_spike.js");
+    await mod.default();
+    wasm = mod;
+    await mod.start("egui", input === "textarea" ? "textarea" : "agent");
+    say("page", "eframe started");
+  } catch (e) {
+    say("page", `eframe failed: ${e}`);
+  }
+  const agent = agentInput();
+  if (agent && input === "agent-off") {
+    for (const [k, v] of [["autocorrect", "off"], ["autocomplete", "off"], ["spellcheck", "false"], ["autocapitalize", "off"]]) {
+      agent.setAttribute(k, v);
     }
+  }
+  if (agent) {
+    say("page", `text agent <input ${[...agent.attributes].filter((a) => a.name !== "style").map((a) => `${a.name}="${a.value}"`).join(" ")}>`);
   }
 </script>
 </body>
