@@ -479,7 +479,7 @@ Open and completed plans get tabs; archived plans are hidden. Select a tab to se
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All, Ungrouped and the Repos dropdown. Each plan has
 its own approval and automatic final review. Use `atomics_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
-**Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
+**Closed plans** beside the plan tabs; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `atomics_wait` events include `plan` and `task` ids for sessions belonging to a task.
 
@@ -584,7 +584,8 @@ ATOMICS clones the folders in `[worktrees] warm` (default `["target"]`) from the
 when you start from another linked worktree. The clone runs on the background worktree job. Only copy-on-write
 clones are used: unsupported filesystems, missing folders and clone errors are skipped without retrying as a full
 copy or blocking launch on a fallback. macOS uses the native clone-only `clonefile` API
-(`cp -c` can silently fall back to full copying); Linux uses `cp -R --reflink=always`.
+(`cp -c` can silently fall back to full copying); Linux uses `cp -a --reflink=always`.
+Both preserve file modification times so warm build caches remain reusable.
 On btrfs and reflink-enabled XFS, caches on the same filesystem can be cloned. Filesystems without reflinks (including
 ordinary ext4), cross-filesystem clones and unsupported files skip warming and launch cold. A failed clone leaves no
 partial cache, and ATOMICS never retries it as a full copy. Use `atomics doctor` to check the actual filesystem pair.

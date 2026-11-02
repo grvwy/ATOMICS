@@ -50,7 +50,16 @@ impl State {
             | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
             _ => None,
         };
-        let target = if let Some(id) = target {
+        // plan_set may also name a completed plan, which it reopens once the request is known to be valid.
+        let completed = match &request {
+            ControlRequest::PlanSet { plan: Some(id), .. } => {
+                self.plans.iter().position(|p| p.id == *id && p.status == plan::PlanStatus::Completed)
+            }
+            _ => None,
+        };
+        let target = if let Some(index) = completed {
+            index
+        } else if let Some(id) = target {
             match plan::resolve_plan(&self.plans, id) {
                 Ok(index) => index,
                 Err(err) => {
@@ -176,6 +185,15 @@ impl State {
                 }
             },
             ControlRequest::PlanSet { plan, goal, mut tasks, integration, ticket } => {
+                // Ids first: they must be unique, and newer links supersede pending creates of the slots
+                // tasks will have, not of the ids sent.
+                Plan::assign_task_ids(&mut tasks);
+                let mut seen = std::collections::HashSet::new();
+                if let Some(task) = tasks.iter().find(|task| !seen.insert(task.id.as_str())) {
+                    let error = format!("Task id {} appears more than once: give each task its own id", task.id);
+                    let _ = reply.send(done(ControlResponse::error(error)));
+                    return;
+                }
                 let new = plan.is_none();
                 let index = if plan.is_some() {
                     target
@@ -185,8 +203,6 @@ impl State {
                     self.plans.len() - 1
                 };
                 let plan_id = self.plans[index].id.clone();
-                // Newer links supersede pending creates of the slots tasks will have, not of the ids sent.
-                Plan::assign_task_ids(&mut tasks);
                 for task in tasks.iter().filter(|t| t.ticket.is_some()) {
                     self.relinked((plan_id.clone(), Some(task.id.clone())));
                 }
@@ -195,6 +211,11 @@ impl State {
                 }
                 let tasks =
                     tasks.into_iter().map(|t| Task { ticket: self.stamp_system(t.ticket.clone()), ..t }).collect();
+                // Writing a plan that finished reopens it: tasks, progress and branch stay, and the plan is
+                // approved again only if the edit leaves its approved tasks as they were.
+                if self.plans[index].status == plan::PlanStatus::Completed {
+                    self.plans[index].reopen();
+                }
                 self.plans[index].replace(goal, tasks);
                 let ticket = self.stamp_system(ticket);
                 if ticket

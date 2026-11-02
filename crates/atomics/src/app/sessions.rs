@@ -836,8 +836,9 @@ impl State {
             if session.sandbox.is_none() && session.status == AgentStatus::NeedsInput {
                 continue;
             }
-            let screen = terminal.screen_text(12);
-            let busy = screen_busy(&screen, &busy_text);
+            let full = terminal.screen_text(60);
+            let screen = screen_tail(&full, 12);
+            let busy = view_busy(&full, &screen, &busy_text);
             if !busy && session.sandbox.is_some() {
                 if screen.trim().is_empty() && session.status == AgentStatus::Starting {
                     continue;
@@ -1132,6 +1133,53 @@ const LONG_PROMPT: usize = 700;
 /// cannot reach ATOMICS.
 const SANDBOX_BUSY: &str = "esc to interrupt";
 const SCREEN_QUIET: Duration = Duration::from_millis(800);
+
+/// The last `lines` lines of `screen`.
+fn screen_tail(screen: &str, lines: usize) -> String {
+    let all: Vec<_> = screen.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Busy by the footer, or, in an agent view scrolled up from its live end (it shows a "Jump to
+/// bottom" pill instead of its footer), by the most recent spinner or status line on the screen: busy
+/// text the transcript quotes never counts there. The terminal's own scroll position never matters:
+/// the screen read is always the live one.
+fn view_busy(full: &str, tail: &str, busy: &str) -> bool {
+    if !screen_busy(tail, "jump to bottom") {
+        return screen_busy(tail, busy);
+    }
+    let lines: Vec<_> = full.lines().collect();
+    let Some(at) = lines.iter().rposition(|line| status_line(line)) else { return false };
+    let mut status = lines[at].to_string();
+    // A status too long for the screen wraps onto the next line.
+    if status.rfind('(') > status.rfind(')')
+        && let Some(next) = lines.get(at + 1)
+    {
+        status.push_str(next);
+    }
+    screen_busy(&status, busy)
+}
+
+/// A spinner or status line, as Claude Code and Codex draw them below the transcript: a glyph, a word, then
+/// an ellipsis or a status in parentheses (`✻ Building… (5m · esc to interrupt)`, `• Working (5s • esc to
+/// interrupt)`), or what a finished turn leaves (`✻ Worked for 5m 3s`, `─ Worked for 1m 05s ─`).
+fn status_line(line: &str) -> bool {
+    let mut chars = line.trim().chars();
+    let Some(glyph) = chars.next() else { return false };
+    if glyph.is_alphanumeric() || glyph.is_ascii() && glyph != '*' {
+        return false;
+    }
+    let Some(rest) = chars.as_str().strip_prefix(' ') else { return false };
+    let word = rest.split(|c: char| !c.is_alphabetic()).next().unwrap_or_default();
+    if !word.starts_with(char::is_uppercase) {
+        return false;
+    }
+    let after = &rest[word.len()..];
+    after.starts_with('…')
+        || after.starts_with("...")
+        || after.starts_with(" (")
+        || after.strip_prefix(" for ").is_some_and(|time| time.starts_with(|c: char| c.is_ascii_digit()))
+}
 
 /// Footers can wrap or change case, including Codex's `esc to interrupt` and Claude's `Esc to interrupt`.
 fn screen_busy(screen: &str, busy: &str) -> bool {
@@ -2038,5 +2086,42 @@ esac
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn busy_survives_a_scrolled_up_agent_view() {
+        let busy = "esc to interrupt";
+        let spinner = "✻ Building… (5m · esc to interrupt)";
+        let filler = "transcript\n".repeat(30);
+        let live = format!("{filler}{spinner}\n> ");
+        assert!(view_busy(&live, &screen_tail(&live, 12), busy));
+        // Scrolled up: the spinner sits above the tail, under a "Jump to bottom" pill.
+        let scrolled = format!("{spinner}\n{filler}Jump to bottom");
+        assert!(view_busy(&scrolled, &screen_tail(&scrolled, 12), busy));
+        // Quoted busy text in a live transcript is still not busy.
+        let quoted = format!("the footer says {busy}\n{filler}> ");
+        assert!(!view_busy(&quoted, &screen_tail(&quoted, 12), busy));
+    }
+
+    #[test]
+    fn a_scrolled_up_view_is_busy_only_by_its_most_recent_status_line() {
+        let busy = "esc to interrupt";
+        let view = |lines: &[&str]| {
+            let full = format!("{}\n{}Jump to bottom", lines.join("\n"), "transcript\n".repeat(3));
+            view_busy(&full, &screen_tail(&full, 12), busy)
+        };
+        // Quoted busy text, here or in the last lines, is transcript, not a status.
+        assert!(!view(&["⏺ The sandbox footer reads esc to interrupt", "> SANDBOX_BUSY = \"esc to interrupt\""]));
+        // The spinner of a turn that has since finished is history.
+        assert!(!view(&["✻ Building… (5m · esc to interrupt)", "⏺ Done.", "✻ Worked for 5m 3s"]));
+        assert!(!view(&["• Working (12s • esc to interrupt)", "─ Worked for 1m 05s ─────"]));
+        // The latest status still counts below quoted text, in Codex's form, and wrapped.
+        assert!(view(&["⏺ Bash(cargo test)", "⏺ It printed esc to interrupt", "✻ Building… (5m · esc to interrupt)"]));
+        assert!(view(&["• Working (12s • esc to interrupt)"]));
+        assert!(view(&["✻ Building… (5m 12s · ↑ 1.2k tokens · esc to", "interrupt)"]));
+        for line in ["⏺ Update(src/main.rs)", "> Building… (2m · esc to interrupt)", "✻ building… (esc to interrupt)"]
+        {
+            assert!(!status_line(line), "{line}");
+        }
     }
 }

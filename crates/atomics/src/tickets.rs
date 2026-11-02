@@ -587,7 +587,7 @@ impl Worker {
             let vars = write.vars.clone().with("nonce", Some(&write.nonce));
             let result = self.call(config, &write.op, &vars);
             // A server assigning sequences itself can race over one: a conflict on a post sent
-            // without a sequence is transient.
+            // without a sequence is transient. An event id reused for other content never is.
             if self.refusal == Some(RemoteError::Conflict)
                 && write.op == "conversation_post"
                 && config.operation(&write.op).is_some_and(|op| !op.uses_placeholder("seq"))
@@ -662,6 +662,19 @@ impl Worker {
         reset: bool,
         peers: &[String],
     ) -> Result<TicketOutput, String> {
+        // The previous owners are recorded before the open, which may fail, wait out its backoff
+        // or be interrupted by a restart; the plan they hand over from may be closed by then.
+        let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
+        let before = state.takeover.len();
+        for from in peers {
+            if from != plan && !state.takeover.contains(from) {
+                state.takeover.push(from.clone());
+            }
+        }
+        if state.takeover.len() != before {
+            state.save(home, plan).map_err(|e| e.to_string())?;
+        }
+        let peers = state.takeover.clone();
         let nonce = uuid::Uuid::new_v4().to_string();
         let title = Some(tickets::conversation_title(title))
             .filter(|title| !title.is_empty())
@@ -673,7 +686,6 @@ impl Worker {
             .typed("owners", Value::from(owners));
         let value = self.call(config, "conversation_open", &vars)?;
         let conversation = config.operation("conversation_open").expect("called").conversation(&value)?;
-        let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
         let mut messages = Vec::new();
         if recover && !state.delivering.is_empty() {
             // Recorded intent without a recorded outcome: the paste may or may not have
@@ -686,8 +698,12 @@ impl Worker {
             }
         }
         // Another open plan on the same ticket may have followed this conversation: one conversation per ticket.
+        // A plan whose sidecar already names the conversation counts every sidecar on it.
+        let every = state.conversation.as_deref() == Some(conversation.id.as_str());
         let (their_cursor, their_seen) =
-            RemoteState::used_cursor(home, plan, &conversation.id, peers).map_err(|e| e.to_string())?;
+            RemoteState::used_cursor(home, plan, &conversation.id, &peers, every).map_err(|e| e.to_string())?;
+        // A reset recovers from the server's cursor: no other sidecar's cursor pushes it back.
+        let their_cursor = their_cursor.filter(|_| !reset);
         if state.conversation.as_deref() != Some(conversation.id.as_str()) {
             // A new conversation starts at the server's newest revision: nothing written
             // before remote was on, or before a lost sidecar, is ever delivered. Taken over from
@@ -719,6 +735,7 @@ impl Worker {
             state.next_seq = next.max(reserved);
         }
         let requested = state.requested_digest.clone();
+        state.takeover.clear();
         state.save(home, plan).map_err(|e| e.to_string())?;
         if let TicketOutput::Outbox(mut drained) = self.drain_outbox(config, home, plan)? {
             messages.append(&mut drained);
@@ -957,8 +974,12 @@ impl Worker {
                     self.client = None;
                 }
                 Err(err) => {
-                    if let McpError::Server(message) = &err {
-                        self.refusal = config.remote.errors.classify(message);
+                    match &err {
+                        McpError::Server(message) => self.refusal = config.remote.errors.classify(message),
+                        McpError::Tool { message, details } => {
+                            self.refusal = config.remote.errors.classify(&format!("{message} {details}"))
+                        }
+                        _ => {}
                     }
                     return Err(self.broken(&config.server, err));
                 }
@@ -2366,6 +2387,7 @@ pub(crate) mod tests {
             conflict: vec!["sequence_conflict".into()],
             invalid: vec!["validation".into()],
             unreadable: vec!["item_unreadable".into()],
+            reused: vec!["event_id_reused".into()],
         }
     }
 
@@ -2407,6 +2429,8 @@ pub(crate) mod tests {
         });
         let messages = outbox(&mut worker, &config, home, Some(post(&config, "sequenced")));
         assert!(messages[0].starts_with("Remote write dropped"), "{messages:?}");
+        assert_eq!(messages[0].matches("Another event already holds").count(), 1, "said once: {messages:?}");
+        assert!(!messages[0].contains("sequence_conflict"), "no JSON in the toast: {messages:?}");
         assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
         // Without a sequence the server assigns it, and its conflict is a race to retry.
         let mut unsequenced = config.clone();
@@ -2431,6 +2455,120 @@ pub(crate) mod tests {
         assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
         let last = posts().pop().unwrap();
         assert_eq!((last["eventId"].as_str(), last.get("sequence")), (Some(nonce.as_str()), None), "the same event");
+        // An event id reused for other content is final, even without a sequence.
+        set(&path, |state| {
+            state["fail"] = json!(["conversation_post"]);
+            state["fail_message"] = json!("This event id was already used for other content.");
+            state["fail_code"] = json!("event_id_reused");
+        });
+        let messages = outbox(&mut worker, &unsequenced, home, Some(post(&config, "reused")));
+        assert!(messages[0].starts_with("Remote write dropped"), "{messages:?}");
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
+    }
+
+    #[test]
+    fn remote_a_reused_event_id_is_final_by_profile_code_and_by_message() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let mut coded = remote_profile("", &path);
+        coded.remote.errors = reference_codes();
+        // Without a sequence a conflict is retried, so only the reused class can make this final.
+        coded.operations.conversation_post = Some(
+            serde_json::from_value(json!({"tool":"conversation_post",
+                "arguments":{"conversation":"{conversation}", "eventId":"{nonce}", "text":"{body}"}}))
+            .unwrap(),
+        );
+        let mut message = coded.clone();
+        message.remote.errors = tickets::RemoteErrors::default();
+        let mut relay = coded.clone();
+        relay.remote.errors = tickets::RemoteErrors {
+            code: "code".into(),
+            conflict: vec!["sequence_conflict".into()],
+            ..Default::default()
+        };
+        let mut worker = Worker::default();
+        worker.prepare(&coded);
+        for (config, fail_message, code) in [
+            (&coded, "nothing a message fragment matches", Some("event_id_reused")),
+            (&message, "This event id was already used for other content.", None),
+            // A server's shape: the race's code with the reuse message.
+            (&relay, "This event id was already used for other content; use a new id.", Some("sequence_conflict")),
+        ] {
+            set(&path, |state| {
+                state["fail"] = json!(["conversation_post"]);
+                state["fail_message"] = json!(fail_message);
+                state["fail_code"] = json!(code);
+            });
+            let messages = outbox(&mut worker, config, home, Some(post(config, "reused")));
+            assert!(messages[0].starts_with("Remote write dropped"), "{code:?}: {messages:?}");
+            assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty(), "{code:?}");
+        }
+        // The plain race with the same code is still retried.
+        set(&path, |state| {
+            state["fail_message"] = json!("Another event took this event's id or sequence at the same time; retry it.");
+        });
+        assert!(outbox(&mut worker, &relay, home, Some(post(&relay, "raced"))).is_empty());
+        assert_eq!(RemoteState::load(home, "lanes").unwrap().outbox.len(), 1, "kept for a retry");
+    }
+
+    #[test]
+    fn remote_open_hands_over_from_a_plan_recorded_before_a_failed_open_and_a_restart() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let item = |id: &str, revision: u64| json!({"id":id, "revision":revision, "author_id":"human-1", "author_kind":"Human", "author":"Example human", "text":id, "at":"now"});
+        set(&path, |state| state["steering"] = json!([item("old", 1)]));
+        let config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let open = |worker: &mut Worker, plan: &str, peers: Vec<String>| {
+            let op = TicketOp::RemoteOpen {
+                home: home.into(),
+                plan: plan.into(),
+                link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+                title: "Goal".into(),
+                owners: vec!["human-1".into()],
+                recover: false,
+                reset: false,
+                peers,
+            };
+            worker.run(&config, op)
+        };
+        open(&mut worker, "owner", Vec::new()).unwrap();
+        set(&path, |state| state["steering"].as_array_mut().unwrap().push(item("s-2", 2)));
+        let poll = |worker: &mut Worker, plan: &str| -> Vec<String> {
+            let op = TicketOp::RemotePoll {
+                home: home.into(),
+                plan: plan.into(),
+                whoami: Box::new(tickets::Whoami {
+                    id: "agent-1".into(),
+                    kind: "personalAgent".into(),
+                    ..Default::default()
+                }),
+                owners: vec!["human-1".into()],
+            };
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver, .. }) = worker.run(&config, op).unwrap() else {
+                panic!("poll")
+            };
+            deliver.into_iter().map(|item| item.id).collect()
+        };
+        // The successor's first open fails while the owner is still a peer.
+        set(&path, |state| state["fail"] = json!(["conversation_open"]));
+        assert!(open(&mut worker, "successor", vec!["owner".into()]).is_err());
+        assert_eq!(RemoteState::load(home, "successor").unwrap().takeover, ["owner"]);
+        // The owner closes and the process restarts: the next open names no peer at all.
+        set(&path, |state| {
+            state["fail"] = json!([]);
+            state["steering"].as_array_mut().unwrap().push(item("gap", 3));
+        });
+        let mut restarted = Worker::default();
+        restarted.prepare(&config);
+        open(&mut restarted, "successor", Vec::new()).unwrap();
+        let state = RemoteState::load(home, "successor").unwrap();
+        assert_eq!(state.cursor, Some(json!(1)), "from where the owner stopped");
+        assert!(state.takeover.is_empty(), "cleared once open");
+        assert_eq!(poll(&mut restarted, "successor"), ["s-2", "gap"], "nothing in the gap is skipped");
     }
 
     #[test]
@@ -2500,6 +2638,8 @@ pub(crate) mod tests {
                 owners: vec!["human-1".into()],
                 recover: false,
                 reset: false,
+                // Each is the other's peer as the app passes them: the plan that owned the
+                // conversation until now, whether it is still open or already closed.
                 peers: vec![if plan == "older" { "newer" } else { "older" }.to_string()],
             };
             worker.run(&config, op).unwrap();
@@ -2606,5 +2746,38 @@ pub(crate) mod tests {
         assert!(poll(&mut worker, "fresh").is_empty(), "steering written while remote was off is not pasted");
         add("after", 3);
         assert_eq!(poll(&mut worker, "fresh"), ["after"]);
+    }
+
+    #[test]
+    fn remote_a_reset_open_ignores_other_sidecars_cursors() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let item = |id: &str, revision: u64| json!({"id":id, "revision":revision, "author_id":"human-1", "author_kind":"Human", "author":"Example human", "text":id, "at":"now"});
+        set(&path, |state| state["steering"] = json!([item("old", 1)]));
+        let config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let open = |worker: &mut Worker, plan: &str, reset: bool| {
+            let op = TicketOp::RemoteOpen {
+                home: home.into(),
+                plan: plan.into(),
+                link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+                title: "Goal".into(),
+                owners: vec!["human-1".into()],
+                recover: false,
+                reset,
+                peers: Vec::new(),
+            };
+            worker.run(&config, op).unwrap();
+        };
+        open(&mut worker, "current", false);
+        open(&mut worker, "stale", false);
+        // A closed plan's sidecar on the same conversation holds a cursor beyond the server's.
+        let mut stale = RemoteState::load(home, "stale").unwrap();
+        stale.cursor = Some(json!(9));
+        stale.save(home, "stale").unwrap();
+        open(&mut worker, "current", true);
+        assert_eq!(RemoteState::load(home, "current").unwrap().cursor, Some(json!(1)), "the server's cursor");
     }
 }

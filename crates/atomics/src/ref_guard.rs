@@ -39,6 +39,17 @@ fn shown(value: Option<&RefValue>) -> String {
     }
 }
 
+/// The git command that puts `name` back at `value`, what a check found and restored: an object, or absent.
+/// A restore cannot tell who wrote it: git run on this machine in a sandboxed worktree, or moving a branch
+/// no checkout here has checked out, leaves no trace a check trusts, and is put back like an agent's.
+fn keep_command(name: &str, value: Option<&RefValue>) -> Option<String> {
+    match value {
+        Some(RefValue::Object(object)) => Some(format!("git update-ref {name} {object}")),
+        None => Some(format!("git update-ref -d {name}")),
+        Some(RefValue::Symbolic(_)) => None,
+    }
+}
+
 /// Refs no check puts back: the stash every checkout shares.
 const UNGUARDED: [&str; 1] = ["refs/stash"];
 const QUARANTINE: &str = "refs/atomics/quarantine/";
@@ -485,7 +496,8 @@ impl RefGuard {
             {
                 self.refs.insert(kept.clone(), value.clone());
             }
-            alerts.push(match (result, before, kept) {
+            let restored = result.is_ok();
+            let alert = match (result, before, kept) {
                 (Ok(()), None, Some(kept)) => format!("Restored {name}: moved it to {kept} (it pointed to {found})"),
                 (Ok(()), None, None) => format!("Restored {name}: removed it (it was {found})"),
                 (Ok(()), _, _) if after.is_none() => format!("Restored {name}: recreated it at {expected}"),
@@ -496,6 +508,14 @@ impl RefGuard {
                 (Err(error), _, _) => {
                     format!("RESTORE FAILED for {name}: {error:#}; expected {expected}, found {found}")
                 }
+            };
+            // Quarantine refs are ATOMICS's own record, never a change of yours to keep.
+            alerts.push(match keep_command(&name, after).filter(|_| restored && !name.starts_with(QUARANTINE)) {
+                Some(command) => format!(
+                    "{alert}. It may have been written on this machine, not in the sandbox: to keep it, close this \
+                     repository's sandboxed sessions, then run `{command}`"
+                ),
+                None => alert,
             });
         }
         // Do not change the pinned branch if the agent switches HEAD to another task's branch.
