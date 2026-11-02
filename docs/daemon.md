@@ -186,6 +186,46 @@ Terminal contents, diffs, prompts and reports are private data; use no-store res
 The Unix socket stays private to the host user with a mode-0700 parent and mode-0600 socket.
 Agent hooks and MCP use that socket inside the user's environment; do not publish it through ingress.
 
+## Protocol server (in the desktop app)
+
+Stream H1 of `docs/decisions/2026-11-02-embedded-atomics.md`. The desktop can serve `atomics.v1` to clients on
+the same machine from a thread inside the running app (`crates/atomics/src/protocol/`). **Off by default**:
+without `[remote] enabled = true` there is no thread, no socket and no file.
+
+```toml
+[remote]
+enabled = true
+port = 0                 # 0 picks a free port
+allowed_origins = []     # exact Origin values; a native client sends none
+```
+
+- **Where it listens.** `127.0.0.1` only. On start the app writes `protocol.json` (`{url, token, pid}`, mode 0600) in its
+  state directory and removes it on exit; the token is new on every start and is never logged.
+- **Upgrade.** Refused with 403/401/400 unless the `Host` header is the loopback address and port, any `Origin` is
+  listed, `Authorization: Bearer <token>` matches (constant-time) and the client offers the `atomics.v1` subprotocol.
+  At most four clients at once.
+- **No locks across I/O.** The runtime thread publishes `Arc` projections (and the accepted diff content) and the
+  protocol thread only reads them; it never takes the `State` mutex. `hub.rs` turns published changes into numbered
+  events and keeps a replay ring (200 events, 8 MiB, 5 minutes); its mutex guards memory only. Every socket has its own
+  thread, so a socket write blocks nothing but that client.
+- **Slow readers.** Each client has a bounded queue (256 frames, 4 MiB). On overflow the backlog is dropped and the
+  client's thread sends a current `state_snapshot` instead (a resync). A client whose socket stays unwritable for the
+  write timeout (5 s) is disconnected. Neither case reaches the runtime thread or other clients.
+- **Reconnect.** `hello` carries the prior epoch and cursor. The host replies `welcome` with `replay` (events after the
+  cursor follow) or `reset` with a reason (`new_client`, `epoch_changed`, `cursor_too_old`, `cursor_ahead`) and a
+  snapshot. A client can also send `resync` at any time. `atomics_core::mirror::Mirror` is the reference client model.
+- **Bad input.** Malformed JSON, unknown kinds, a wrong major version, an oversize frame (over 256 KiB, refused before
+  it is buffered) and binary frames get a typed `error` frame; oversize frames and a ninth error end the connection.
+  A first message other than `hello` ends it. Idle clients are pinged every 25 s and dropped after 60 s of silence.
+- **Not yet.** Chunked transfers (a board or diff over one frame fails with `oversize`), `file_get` (answers
+  `not_found`), terminals, and every mutation (H2 to H4). A removed diff is sent as a `diff_summary` with no files and
+  no base (a tombstone), and a vanished approval as `approval_resolved` with `withdrawn`.
+
+The M1 demo is a native client: `cargo run -p atomics --example loopback_client` prints the board and the first diff
+file of a running app (`--follow` keeps printing). The decoder has a fuzz target:
+`cd crates/atomics-core && cargo +nightly fuzz run envelope_decode`; a seeded mutation test in `wire/tests.rs` runs
+in the normal suite.
+
 ## Rendezvous
 
 Specification only; no code yet (stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-7).

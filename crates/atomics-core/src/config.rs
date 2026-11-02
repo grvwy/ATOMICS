@@ -408,6 +408,13 @@ toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
 plan_with_chief = "cmd+enter"   # in a ticket the Tickets panel reads
 voice = "cmd+shift+space"
 github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
+
+[remote]
+# The atomics.v1 protocol server for other clients on this machine (see docs/daemon.md). Off by default.
+# It listens on 127.0.0.1 only; clients present the token in protocol.json in the ATOMICS state directory.
+# enabled = false
+# port = 0                  # 0 picks a free port
+# allowed_origins = []      # exact Origin values a browser may use; native clients send none
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +442,20 @@ pub struct Config {
     pub keys: KeyConfig,
     pub tickets: crate::tickets::TicketConfig,
     pub github: crate::github::GithubConfig,
+    pub remote: RemoteAccessConfig,
+}
+
+/// The `atomics.v1` protocol server inside the running app. Off unless `enabled`: with it off there
+/// is no thread and no socket. When on, it binds 127.0.0.1 only and every client needs the token the
+/// app writes to `protocol.json` in its state directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteAccessConfig {
+    pub enabled: bool,
+    /// 0 picks a free port; the address is in `protocol.json`.
+    pub port: u16,
+    /// Exact `Origin` values a browser upgrade may carry. A native client sends none.
+    pub allowed_origins: Vec<String>,
 }
 
 /// Automatic cleanup on plan completion and archival. Dirty worktrees are always kept.
@@ -817,6 +838,7 @@ impl Default for Config {
             keys: KeyConfig::default(),
             tickets: crate::tickets::TicketConfig::default(),
             github: crate::github::GithubConfig::default(),
+            remote: RemoteAccessConfig::default(),
         }
     }
 }
@@ -1360,6 +1382,19 @@ dock = "other""#
         let config: Config = toml::from_str("[layout]\ndiff_split = \"never\"").unwrap();
         assert_eq!(config.layout.diff_split, DiffSplit::Never);
         assert!(toml::from_str::<Config>("[layout]\ndiff_split = \"sometimes\"").is_err());
+    }
+
+    #[test]
+    fn remote_access_is_off_unless_configured() {
+        assert!(!Config::default().remote.enabled);
+        assert!(!toml::from_str::<Config>("").unwrap().remote.enabled);
+        assert!(!toml::from_str::<Config>("[remote]\nport = 9000").unwrap().remote.enabled);
+        let on: Config = toml::from_str("[remote]\nenabled = true\nallowed_origins = [\"https://a.example\"]").unwrap();
+        assert!(on.remote.enabled);
+        assert_eq!((on.remote.port, on.remote.allowed_origins), (0, vec!["https://a.example".to_string()]));
+        // The commented template changes nothing.
+        let template: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(template.remote, RemoteAccessConfig::default());
     }
 
     #[test]

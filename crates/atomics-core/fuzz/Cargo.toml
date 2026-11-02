@@ -1,0 +1,22 @@
+[package]
+name = "atomics-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+atomics-core = { path = "..", default-features = false }
+
+# Its own workspace: the fuzz build must not change the main lockfile.
+[workspace]
+
+[[bin]]
+name = "envelope_decode"
+path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
+bench = false

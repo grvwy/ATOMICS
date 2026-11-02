@@ -357,3 +357,65 @@ fn errors_are_frames_that_echo_the_request_id() {
     assert_eq!(envelope.request_id.as_deref(), Some("r9"));
     assert!(matches!(envelope.message, Message::Error { code: ErrorCode::Malformed, .. }));
 }
+
+/// A stand-in for the fuzz target (`fuzz/fuzz_targets/envelope_decode.rs`) that runs with the suite:
+/// mutate valid frames at random and require that decoding never panics and that whatever it
+/// accepts survives a round trip.
+#[test]
+fn mutated_frames_never_panic_and_accepted_ones_round_trip() {
+    let p = Projections::default();
+    p.publish_sessions(vec![session()]);
+    p.publish_plans(vec![plan()]);
+    let seeds: Vec<String> = [
+        Envelope::snapshot("boot", &p.load()),
+        Envelope::new(Message::Hello {
+            client_id: "c".into(),
+            versions: vec![VERSION],
+            capabilities: vec!["board".into()],
+            prior_epoch: Some("boot".into()),
+            prior_cursor: Some(Seq(3)),
+        }),
+        Envelope::new(Message::DiffGet { worktree: "/w".into(), path: "a.rs".into(), revision: Some(Seq(2)) }),
+        Envelope::new(Message::Subscribe { topics: vec![Topic::Diff { worktree: "/w".into() }, Topic::Plan { id: "p".into() }] }),
+        Envelope::new(Message::Ping { nonce: Some("n".into()) }).reply_to(Some("r".into())),
+    ]
+    .iter()
+    .map(|e| encode(e).unwrap())
+    .collect();
+
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let mut accepted = 0;
+    for round in 0..4000 {
+        let mut bytes = seeds[round % seeds.len()].clone().into_bytes();
+        for _ in 0..=next(4) {
+            match next(5) {
+                0 if !bytes.is_empty() => {
+                    let i = next(bytes.len());
+                    bytes[i] ^= 1 << next(8);
+                }
+                1 if !bytes.is_empty() => bytes.truncate(next(bytes.len())),
+                2 if !bytes.is_empty() => {
+                    let (a, b) = (next(bytes.len()), next(bytes.len()));
+                    let chunk = bytes[a.min(b)..a.max(b)].to_vec();
+                    bytes.splice(a.min(b)..a.min(b), chunk);
+                }
+                3 => bytes.insert(next(bytes.len() + 1), b"{}[]\":,\\0123456789"[next(18)]),
+                _ => {}
+            }
+        }
+        let frame = String::from_utf8_lossy(&bytes);
+        if let Ok(envelope) = decode(&frame) {
+            accepted += 1;
+            if let Ok(again) = encode(&envelope) {
+                assert_eq!(decode(&again).as_ref(), Ok(&envelope), "{frame}");
+            }
+        }
+    }
+    assert!(accepted > 0, "some mutations stay valid");
+}
