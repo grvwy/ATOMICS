@@ -21,6 +21,8 @@ pub struct Client {
     pub expanded_tasks: HashSet<(String, String)>,
     /// A plan waiting for the user to confirm closing it, and the status it would close with.
     pub confirm_plan_close: Option<(String, PlanStatus)>,
+    /// Permission requests decided here that the host has not answered yet, by session and request id.
+    pub approval_decisions: HashSet<(String, String)>,
 }
 
 impl Default for Client {
@@ -32,6 +34,7 @@ impl Default for Client {
             intents: Vec::new(),
             expanded_tasks: HashSet::new(),
             confirm_plan_close: None,
+            approval_decisions: HashSet::new(),
         }
     }
 }

@@ -77,6 +77,7 @@ impl Desktop<'_> {
                     }
                 }),
                 Intent::CleanUpPlan(plan) => self.open_plan_cleanup(plan),
+                Intent::Decide { session, approval, decision } => self.approve_request(session, approval, decision),
             }
         }
     }

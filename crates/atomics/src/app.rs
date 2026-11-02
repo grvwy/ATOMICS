@@ -653,7 +653,6 @@ struct Client {
     /// The host's theme in egui colors and fonts, with the theme it was made from.
     palette_cache: std::cell::RefCell<Option<(Arc<Theme>, Arc<Palette>)>>,
     project_picker: Option<PathBuf>,
-    approval_decisions: HashSet<(String, String)>,
     focus_terminal: Option<String>,
     cleanup_open: bool,
     cleanup_selected: HashSet<PathBuf>,
@@ -722,7 +721,6 @@ impl Client {
             ctx: ctx.clone(),
             palette_cache: Default::default(),
             project_picker: None,
-            approval_decisions: HashSet::new(),
             focus_terminal: None,
             cleanup_open: false,
             cleanup_selected: HashSet::new(),

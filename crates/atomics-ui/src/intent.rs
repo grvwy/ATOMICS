@@ -4,6 +4,7 @@
 //! task by id, or by its position in the plan the board read. Slice S8 turns intents into the protocol's
 //! commands.
 
+use atomics_core::approvals::Decision;
 use atomics_core::plan::TaskStatus;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,4 +53,11 @@ pub enum Intent {
     ArchivePlan(usize),
     /// Preview what a completed plan's cleanup would remove.
     CleanUpPlan(usize),
+    /// Answer a permission request of the session at `session` of the last session list read. The request
+    /// is named, so the host refuses a decision made for an earlier one.
+    Decide {
+        session: usize,
+        approval: String,
+        decision: Decision,
+    },
 }

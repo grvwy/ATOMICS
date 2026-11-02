@@ -12,3 +12,8 @@ description = "The ATOMICS UI's view of a host: the Backend trait and the data i
 atomics-core = { version = "0.1.0", path = "../atomics-core", default-features = false }
 # egui's own fonts stay behind a theme's for missing glyphs, so the web UI bundles them.
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+
+[features]
+# Records where some widgets were drawn, for the desktop's layout and interaction tests (its dev-dependency
+# turns it on).
+test-support = []

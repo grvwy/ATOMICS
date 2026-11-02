@@ -232,6 +232,11 @@ Commits, one per file group:
    compare against. The completed-task tiles (fleet, not moved yet) call `task_result` through a desktop
    wrapper that works these out as before. `expanded_tasks` and `confirm_plan_close` move to the client.
    `plan_with_chief_names_the_auto_decision_in_the_board_header` moved with the labels it tests.
+2. **Approvals** (`fleet.rs`). `atomics_ui::approvals::banner` is the permission banner of a session's tile:
+   it reads the session's `ApprovalRow` itself and records `Intent::Decide`, which runs `approve_request` as
+   before. `approval_decisions` moves to the client. The tile around it stays in the desktop until fleet moves.
+   The `cfg(test)` record of the banner's buttons is `cfg(feature = "test-support")` in `atomics-ui`; the
+   desktop's dev-dependency turns the feature on, as it does `atomics-core`'s.
 
 ## 5. The dependency test
 

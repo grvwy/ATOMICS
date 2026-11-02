@@ -4,11 +4,12 @@
 //! reads nothing from the host's model lives here: the diff view, the keyboard navigation it shares with
 //! the Tickets panel, the ticket markdown reader, chords, the top bar's layout helpers and the terminal
 //! painter, which draws the screens `atomics.v1` streams (the desktop paints through it too). So do the
-//! views that draw from a [`Backend`] into a [`Client`]: the plan board. It records what the user asks for
-//! as [`Intent`]s, which the host carries out after the draw.
+//! views that draw from a [`Backend`] into a [`Client`]: the plan board and the approval banner. They
+//! record what the user asks for as [`Intent`]s, which the host carries out after the draw.
 //!
 //! This crate must stay free of desktop-only dependencies; `tests/dependencies.rs` enforces it.
 
+pub mod approvals;
 mod backend;
 pub mod board;
 mod client;
