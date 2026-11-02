@@ -78,6 +78,9 @@ pub enum ApiError {
     },
     Status(u16, String),
     Transport(String),
+    /// Any Azure DevOps failure: its status (0 when there was no answer) and a message worded to
+    /// follow "Azure DevOps ". A refused token is 401.
+    Azure(u16, String),
 }
 
 impl fmt::Display for ApiError {
@@ -90,6 +93,8 @@ impl fmt::Display for ApiError {
             ApiError::Status(status, message) if message.is_empty() => write!(f, "GitHub answered {status}"),
             ApiError::Status(status, message) => write!(f, "GitHub answered {status}: {message}"),
             ApiError::Transport(error) => write!(f, "GitHub could not be reached: {error}"),
+            ApiError::Azure(0 | 200, message) => write!(f, "Azure DevOps {message}"),
+            ApiError::Azure(status, message) => write!(f, "Azure DevOps answered {status}: {message}"),
         }
     }
 }
@@ -115,13 +120,17 @@ struct Reply {
     body: String,
 }
 
-/// Where the APIs are: GitHub's own endpoints, or one local base for every host in tests.
+/// Where the APIs are: GitHub's and Azure DevOps's own endpoints, or one local base for every
+/// host in tests.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Endpoints {
-    /// Replaces `https://api.github.com`, `https://<host>/api/v3` and the web host alike.
+    /// Replaces `https://api.github.com`, `https://<host>/api/v3`, `https://dev.azure.com` and the
+    /// web host alike.
     pub base: Option<String>,
     /// The `gh` program; `None` looks it up on the user's PATH.
     pub gh: Option<PathBuf>,
+    /// The `az` program; `None` looks it up on the login shell's PATH.
+    pub az: Option<PathBuf>,
 }
 
 impl Endpoints {
@@ -700,6 +709,85 @@ impl Signed {
     }
 }
 
+/// A signed-in host of either kind, for the controls' actions.
+pub enum Client {
+    Github(Signed),
+    Azure(azure::Client),
+}
+
+impl Client {
+    /// The client for `host`: GitHub's stored token, or for dev.azure.com the Azure CLI's;
+    /// `None` when there is none.
+    pub fn open(
+        endpoints: &Endpoints,
+        store: &Store,
+        session: &azure::Shared,
+        host: &str,
+    ) -> Result<Option<Client>, ApiError> {
+        if host == atomics_core::github::AZURE_HOST {
+            return Ok(
+                azure::Client::open(session, endpoints.base.as_deref(), endpoints.az.clone())?.map(Client::Azure)
+            );
+        }
+        Ok(Signed::open(endpoints, store, host)?.map(Client::Github))
+    }
+
+    pub fn merge(
+        &mut self,
+        repo: &RepoId,
+        number: u64,
+        method: MergeMethod,
+        sha: &str,
+        admin: bool,
+    ) -> Result<String, ApiError> {
+        match self {
+            Client::Github(signed) => signed.call(|api| api.merge(repo, number, method, sha)),
+            Client::Azure(client) => client.merge(repo, number, method, sha, admin),
+        }
+    }
+
+    pub fn head(&mut self, repo: &RepoId, number: u64) -> Result<String, ApiError> {
+        match self {
+            Client::Github(signed) => signed.call(|api| api.head(repo, number)),
+            Client::Azure(client) => client.head(repo, number),
+        }
+    }
+
+    pub fn diff(&mut self, repo: &RepoId, number: u64) -> Result<String, ApiError> {
+        match self {
+            Client::Github(signed) => signed.call(|api| api.diff(repo, number)),
+            Client::Azure(client) => client.diff(repo, number),
+        }
+    }
+
+    pub fn default_branch(&mut self, repo: &RepoId) -> Result<String, ApiError> {
+        match self {
+            Client::Github(signed) => signed.call(|api| api.default_branch(repo)),
+            Client::Azure(client) => client.default_branch(repo),
+        }
+    }
+
+    pub fn dispatch(
+        &mut self,
+        repo: &RepoId,
+        workflow: &str,
+        git_ref: &str,
+        inputs: &BTreeMap<String, String>,
+    ) -> Result<(), ApiError> {
+        match self {
+            Client::Github(signed) => signed.call(|api| api.dispatch(repo, workflow, git_ref, inputs)),
+            Client::Azure(client) => client.dispatch(repo, workflow, git_ref, inputs),
+        }
+    }
+
+    pub fn latest_run(&mut self, repo: &RepoId, workflow: &str) -> Result<Option<Run>, ApiError> {
+        match self {
+            Client::Github(signed) => signed.call(|api| api.latest_run(repo, workflow)),
+            Client::Azure(client) => client.latest_run(repo, workflow),
+        }
+    }
+}
+
 /// The GraphQL query behind the modal: allowed merge methods, and per open pull request its
 /// mergeability, review decision, admin bypass and the head commit's checks.
 const DETAILS_QUERY: &str = "query($owner: String!, $name: String!) {
@@ -867,6 +955,7 @@ pub struct PollRequest {
     pub viewers: BTreeSet<String>,
     pub details: bool,
     pub ruleset_cache: Arc<Mutex<RulesetCache>>,
+    pub azure: azure::Shared,
 }
 
 #[derive(Debug, Default)]
@@ -895,6 +984,10 @@ pub fn poll(endpoints: &Endpoints, store: &Store, request: &PollRequest) -> Poll
     };
     let hosts: BTreeSet<String> = polled.repos.iter().map(|repo| repo.host.clone()).collect();
     for host in hosts {
+        if host == atomics_core::github::AZURE_HOST {
+            poll_azure(endpoints, request, &mut polled);
+            continue;
+        }
         let mut signed = match Signed::open(endpoints, store, &host) {
             Ok(Some(signed)) => signed,
             Ok(None) | Err(ApiError::Unauthorized) => {
@@ -937,6 +1030,58 @@ pub fn poll(endpoints: &Endpoints, store: &Store, request: &PollRequest) -> Poll
     }
     polled
 }
+
+/// The Azure DevOps half of a poll: no ETags (the API has none), and details in the same pass.
+/// The viewer is the signed-in user's display name, which the lists name authors and reviewers by.
+fn poll_azure(endpoints: &Endpoints, request: &PollRequest, polled: &mut Polled) {
+    let host = atomics_core::github::AZURE_HOST.to_string();
+    let repos: Vec<RepoId> = polled.repos.iter().filter(|repo| repo.is_azure()).cloned().collect();
+    let client = match azure::Client::open(&request.azure, endpoints.base.as_deref(), endpoints.az.clone()) {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            polled.signed_out.insert(host);
+            return;
+        }
+        Err(error) => {
+            polled.viewers.insert(host, Err(error));
+            return;
+        }
+    };
+    let Some(first) = repos.first() else { return };
+    match client.viewer(first) {
+        Ok(viewer) => {
+            polled.viewers.insert(host.clone(), Ok(viewer.name));
+        }
+        Err(error) => {
+            let refused = matches!(error, ApiError::Azure(401, _));
+            polled.viewers.insert(host.clone(), Err(error));
+            if refused {
+                polled.signed_out.insert(host);
+            }
+            return;
+        }
+    }
+    for repo in &repos {
+        match client.listing(repo, request.details) {
+            Ok((pulls, details)) => {
+                polled.lists.push((repo.clone(), Ok(Some((pulls, None)))));
+                if let Some(details) = details {
+                    polled.details.push((repo.clone(), Ok(details)));
+                }
+            }
+            Err(error) => {
+                let refused = matches!(error, ApiError::Azure(401, _));
+                polled.lists.push((repo.clone(), Err(error)));
+                if refused {
+                    polled.signed_out.insert(host);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pub mod azure;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -1072,7 +1217,7 @@ mod tests {
         fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
         fake.branch_rules(&repo(), "main", 200, json!([{"ruleset_id":42}]));
         fake.ruleset(&repo(), 42, 200, json!({"current_user_can_bypass":"always"}));
-        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None };
+        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None, az: None };
         let request = PollRequest {
             config: GithubConfig { repos: vec![repo().full_name()], ..GithubConfig::default() },
             details: true,
@@ -1234,7 +1379,7 @@ mod tests {
     fn github_expired_or_refused_tokens_sign_out() {
         let (dir, _, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
         let fake = FakeGithub::start(TOKEN);
-        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None };
+        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None, az: None };
         // Past its expiry: never sent, and removed.
         let expired = AppGrant { token: "ghu_PRIVATE-expired".into(), expires: Some(unix_now() - 1) };
         store.put_github_app_grant("github.com", &expired).unwrap();
@@ -1285,7 +1430,7 @@ mod tests {
         let uncovered: Vec<String> = api.uncovered(&repos).unwrap().iter().map(ToString::to_string).collect();
         assert_eq!(uncovered, ["octo/gears", "other/thing"]);
         // The poll checks coverage only with a GitHub App user token and the modal open.
-        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None };
+        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None, az: None };
         let mut request = PollRequest {
             config: GithubConfig { repos: vec!["octo/widgets".into(), "octo/gears".into()], ..GithubConfig::default() },
             details: true,

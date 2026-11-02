@@ -401,6 +401,7 @@ impl Risk {
                 "github.repos",
                 "github.client_id",
                 "github.app_slug",
+                "github.azure_devops",
                 "tickets.server.token_env",
                 "tickets.server.oauth",
                 "voice.provider",

@@ -1,6 +1,7 @@
-# GitHub in ATOMICS
+# GitHub and Azure DevOps in ATOMICS
 
-ATOMICS shows the open pull requests of the repositories you have loaded. You can review a pull request's
+ATOMICS shows the open pull requests of the repositories you have loaded, on GitHub and on
+[Azure DevOps](#azure-devops). You can review a pull request's
 diff in the diff viewer, merge it, and run your release workflows without leaving the window. This
 works with any GitHub repository and any GitHub Enterprise Server host. The design is recorded in
 [decisions/2026-10-31-github-integration.md](decisions/2026-10-31-github-integration.md).
@@ -174,6 +175,61 @@ inputs = { sha = "{head_sha}", pr = "{pr}", version = "" }
 action, or a workflow that is not a file name is reported in the top bar. An input left empty is asked
 for in the confirmation. The confirmation shows the ref and every input before the workflow runs.
 
-In the configuration tools, `github.hosts`, `github.repos`, `github.client_id` and `github.app_slug` are labelled
+In the configuration tools, `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug` and `github.azure_devops` are labelled
 "sends credentials" and `github.actions` is labelled "runs commands", so the chief cannot change them
 without you seeing it.
+
+## Azure DevOps
+
+Azure DevOps Services repositories show in the same counter and controls. Nothing is configured per
+organization: a loaded project whose remote is on Azure DevOps is listed, in any of its URL shapes
+(`https://dev.azure.com/<org>/<project>/_git/<repo>`, `https://<org>.visualstudio.com/…`, and the
+`ssh.dev.azure.com:v3/…` and `vs-ssh.visualstudio.com:v3/…` SSH forms). `[github] repos` adds others as
+`"<org>/<project>/<repo>"` or `"dev.azure.com/<org>/<project>/<repo>"`. `[github] azure_devops = false`
+leaves Azure DevOps out.
+
+**Sign-in is the Azure CLI's.** Run `az login` once; ATOMICS asks `az account get-access-token` for an Azure
+DevOps token when it needs one, keeps it in memory until two minutes before it expires, and sends it only to
+dev.azure.com. Nothing is stored, and no agent gets it. The controls show an **Azure DevOps · <name>** chip,
+or, when az is missing or signed out, a line saying to run `az login` with **Check again**. `az logout` signs
+out.
+
+**Groups.** A team lists many pull requests, so each Azure DevOps repository shows:
+
+- **Assigned to me**: you are a reviewer, directly or through one of your teams in that project (a team listed
+  as a reviewer assigns the pull request to its members, as in Azure DevOps's own "Assigned to me");
+- **My pull requests**: you opened them;
+- **Other**: everyone else's. It starts folded when you have pull requests in the groups above and there are
+  more than eight others; click it to open or fold it. Folded rows are skipped by the arrow keys.
+
+The counter's `filter` works as on GitHub: `mine` counts your pull requests, `review` those assigned to you.
+
+**Details.** For your own and assigned pull requests, ATOMICS reads the policy evaluations: build policies are
+the checks, the minimum-reviewers policy and the votes give the review state, and any blocking policy that is
+not approved makes it `blocked`. The branch's merge strategy policy decides the methods offered (squash, merge
+commit, rebase; semi-linear merge is not offered). Other people's pull requests show the list's state only and
+offer no merge. Up to 1000 active pull requests are read per repository.
+
+**Merge** completes the pull request with `lastMergeSourceCommit` set to the head whose diff you loaded (or the
+listed head), so Azure DevOps refuses it if the branch moved since. It does not delete the source branch or
+transition work items. **Admin merge** completes past the policies (`bypassPolicy`) and shows only when you hold
+the repository's "Bypass policies when completing pull requests" permission and the pull request is blocked.
+
+**View diff** builds the diff from the two sides' blobs against the merge-base, through the API; no local
+repository is fetched or changed. Files over 2 MB and binary files show as binary.
+
+**Pipelines.** `[[github.actions]]` entries run Azure Pipelines on Azure DevOps repositories: `workflow` is the
+pipeline's numeric id, `ref` its branch, and `inputs` its template parameters. The latest run's status comes
+from the builds of that pipeline.
+
+```toml
+[[github.actions]]
+label = "Deploy to test"
+repo = "contoso/Platform/api"
+workflow = "42"
+scope = "pr"
+inputs = { environment = "test" }
+```
+
+Azure DevOps Server (on premises) is not supported yet.
+

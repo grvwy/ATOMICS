@@ -19,7 +19,7 @@ fn store(app: &Desktop<'_>) -> CredentialStore {
 
 /// Points the app at `fake` and lists `octo/widgets`.
 fn connect_to(app: &mut Desktop<'_>, fake: &FakeGithub, dir: &Path) {
-    app.runtime.github.endpoints = Endpoints { base: Some(fake.url.clone()), gh: Some(fake::gh(dir, None)) };
+    app.runtime.github.endpoints = Endpoints { base: Some(fake.url.clone()), gh: Some(fake::gh(dir, None)), az: None };
     app.runtime.github.browser = Some(browser(dir));
     app.runtime.config.github.repos = vec!["octo/widgets".into()];
     app.runtime.repos.clear();
@@ -999,4 +999,64 @@ fn github_config_problems_are_reported_while_the_config_still_loads() {
         assert_eq!(got["running_on_last_good_config"], json!(false), "the chief is not told it failed to load");
         assert!(got["load_error"].is_null());
     });
+}
+
+#[test]
+fn azure_devops_lists_assigned_and_own_pull_requests_first_and_folds_the_rest() {
+    with_app(
+        "app::github::tests::azure_devops_lists_assigned_and_own_pull_requests_first_and_folds_the_rest",
+        |app, ctx| {
+            use crate::github::azure::tests::{FakeAzure, ME, pull, ready, waiting};
+            let dir = crate::test_support::tempdir().unwrap();
+            let fake = FakeAzure::start();
+            fake.add_pull(pull(4102, ("x", "Robin Roe"), &[(ME, "Alex Doe", 0)], "succeeded"), ready());
+            fake.add_pull(pull(4101, (ME, "Alex Doe"), &[("y", "Sam Poe", 0)], "succeeded"), waiting());
+            for number in 0..10 {
+                fake.add_pull(pull(3000 + number, ("x", "Robin Roe"), &[], "succeeded"), Vec::new());
+            }
+            app.runtime.github.endpoints = Endpoints {
+                base: Some(fake.url.clone()),
+                gh: None,
+                az: Some(crate::relay::azure::tests::fake(dir.path())),
+            };
+            app.runtime.config.github.repos = vec!["contoso/Platform/api".into()];
+            app.runtime.repos.clear();
+            poll(app);
+            assert_eq!(
+                app.runtime.github.counter(&app.runtime.config.github),
+                Counter::Count { count: 1, failing: false }
+            );
+            app.runtime.github_set_modal(true);
+            poll(app);
+            let texts = show(app, ctx);
+            for text in [
+                "Azure DevOps · Alex Doe",
+                "contoso/Platform/api",
+                "Assigned to me",
+                "My pull requests",
+                "▸ Other (10)",
+            ] {
+                assert!(has(&texts, text), "{text} in {texts:?}");
+            }
+            assert!(has(&texts, "Robin Roe · approved · clean"), "{texts:?}");
+            assert!(!texts.iter().any(|(text, _)| text.starts_with("#3000")), "the others are folded: {texts:?}");
+            let y = |text: &str| texts.iter().find(|(shown, _)| shown.starts_with(text)).unwrap().1.y;
+            assert!(
+                y("Assigned to me") < y("#4102") && y("#4102") < y("My pull requests") && y("#4101") < y("▸ Other")
+            );
+            // The folded rows are out of the keyboard's way too; opening the group lists them.
+            let (rows, _) = app.github_rows();
+            assert_eq!(rows.iter().map(|row| row.pull.number).collect::<Vec<_>>(), [4102, 4101]);
+            click(app, ctx, "▸ Other (10)");
+            assert!(has(&show(app, ctx), "▾ Other (10)"));
+            assert_eq!(app.github_rows().0.len(), 12);
+            // Signed out of the Azure CLI: no Connect GitHub, a hint to run az login instead.
+            std::fs::write(dir.path().join("az-fail"), "").unwrap();
+            app.runtime.github.azure = Default::default();
+            poll(app);
+            let texts = show(app, ctx);
+            assert!(texts.iter().any(|(text, _)| text.contains("run az login")), "{texts:?}");
+            assert!(has(&texts, "Check again") && !has(&texts, "Connect GitHub"), "{texts:?}");
+        },
+    );
 }

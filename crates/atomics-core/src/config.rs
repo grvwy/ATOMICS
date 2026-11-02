@@ -382,7 +382,9 @@ client_id = ""              # OAuth app or GitHub App for Connect GitHub; empty 
 app_slug = ""               # the GitHub App's slug: offers "Install ATOMICS on <owner>" where it is missing
 filter = "mine"             # what the counter counts: "mine", "review" (requested from you) or "all"
 poll_seconds = 60
+azure_devops = true         # Azure DevOps remotes count too, signed in with the Azure CLI (az login)
 # Workflows the modal can run; placeholders {repo} {pr} {head_sha} {head} {base}.
+# For an Azure DevOps repository, workflow is a pipeline's numeric id and inputs its parameters.
 # [[github.actions]]
 # label = "Release"
 # repo = "owner/name"       # empty = every listed repository

@@ -163,7 +163,7 @@ diff:
 | Label | Settings |
 | --- | --- |
 | runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
-| sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `tickets.server.token_env`, `tickets.server.oauth`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
+| sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
 A theme change also shows the theme itself above the diff: bars, agent rows, a terminal with its ANSI colors, a

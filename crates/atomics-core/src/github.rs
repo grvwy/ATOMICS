@@ -1,12 +1,17 @@
-//! The UI-free half of the GitHub integration: `[github]` in the config, which git remotes are
-//! GitHub repositories, workflow placeholders, the counter's filter, which merge buttons a pull
-//! request gets, and how long to wait after a rate limit. Nothing here names a repository.
+//! The UI-free half of the pull request controls: `[github]` in the config, which git remotes are
+//! GitHub or Azure DevOps repositories, workflow placeholders, the counter's filter, which merge
+//! buttons a pull request gets, and how long to wait after a rate limit. Nothing here names a
+//! repository.
 use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HOST: &str = "github.com";
+
+/// The host of every Azure DevOps Services repository, whichever URL its remote uses. Its
+/// `RepoId::owner` is `organization/project`.
+pub const AZURE_HOST: &str = "dev.azure.com";
 
 /// The public client ID of the ATOMICS GitHub App, which Connect GitHub's device flow signs in with.
 /// It is no secret; `[github] client_id` replaces it for GitHub Enterprise or a fork.
@@ -36,6 +41,8 @@ pub struct GithubConfig {
     pub filter: Filter,
     pub poll_seconds: u64,
     pub actions: Vec<Action>,
+    /// Azure DevOps remotes count too, signed in through the Azure CLI (`az login`).
+    pub azure_devops: bool,
 }
 
 impl Default for GithubConfig {
@@ -49,6 +56,7 @@ impl Default for GithubConfig {
             filter: Filter::Mine,
             poll_seconds: 60,
             actions: Vec::new(),
+            azure_devops: true,
         }
     }
 }
@@ -78,6 +86,39 @@ impl Filter {
             Filter::Mine => "yours",
             Filter::Review => "waiting for your review",
             Filter::All => "open",
+        }
+    }
+}
+
+/// Where a pull request is listed in the controls, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Group {
+    /// The viewer's review is requested, directly or through one of their teams.
+    Assigned,
+    /// The viewer opened it.
+    Mine,
+    #[default]
+    Other,
+}
+
+impl Group {
+    pub fn of(pull: &Pull, viewer: &str) -> Group {
+        if viewer.is_empty() {
+            Group::Other
+        } else if Filter::Mine.matches(pull, viewer) {
+            Group::Mine
+        } else if Filter::Review.matches(pull, viewer) {
+            Group::Assigned
+        } else {
+            Group::Other
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::Assigned => "Assigned to me",
+            Group::Mine => "My pull requests",
+            Group::Other => "Other",
         }
     }
 }
@@ -207,7 +248,14 @@ impl RepoId {
         let parts: Vec<&str> = text.trim().split('/').collect();
         let (host, owner, name) = match parts.as_slice() {
             [owner, name] => (DEFAULT_HOST, *owner, *name),
+            // Azure DevOps written as it is displayed: organization/project/repository.
+            [organization, project, name] if !organization.contains('.') => {
+                return RepoId::azure(organization, project, name);
+            }
             [host, owner, name] => (*host, *owner, *name),
+            [host, organization, project, name] if host.eq_ignore_ascii_case(AZURE_HOST) => {
+                return RepoId::azure(organization, project, name);
+            }
             _ => return None,
         };
         RepoId::new(host, owner, name)
@@ -226,8 +274,69 @@ impl RepoId {
 
     /// The repository a git remote URL points at, when it is on a known GitHub host.
     /// Understands `https://`, `ssh://` and scp-style `git@host:owner/name.git` URLs.
+    /// An Azure DevOps repository; the names are as the API spells them, not percent-encoded.
+    pub fn azure(organization: &str, project: &str, name: &str) -> Option<RepoId> {
+        let segment = |text: &str| {
+            !text.is_empty()
+                && text.chars().count() <= 128
+                && text != "."
+                && text != ".."
+                && !text.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | '?' | '#'))
+        };
+        (valid_owner(organization) && segment(project) && segment(name)).then(|| RepoId {
+            host: AZURE_HOST.into(),
+            owner: format!("{organization}/{project}"),
+            name: name.to_string(),
+        })
+    }
+
+    /// An Azure DevOps remote, in any of its URL shapes: `https://dev.azure.com/org/project/_git/repo`
+    /// (with or without a user), `https://org.visualstudio.com[/DefaultCollection]/project/_git/repo`,
+    /// and the SSH forms `git@ssh.dev.azure.com:v3/org/project/repo` and
+    /// `org@vs-ssh.visualstudio.com:v3/org/project/repo`.
+    fn azure_remote(url: &str) -> Option<RepoId> {
+        let (authority, path) = match url.split_once("://") {
+            Some(("https" | "http" | "ssh", rest)) => rest.split_once('/')?,
+            Some(_) => return None,
+            None => url.split_once(':')?,
+        };
+        let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host).to_ascii_lowercase();
+        let host = host.split_once(':').map_or(host.as_str(), |(host, _port)| host).to_string();
+        let segments: Vec<String> = path.trim_matches('/').split('/').map(percent_decode).collect();
+        let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+        match (host.as_str(), segments.as_slice()) {
+            ("dev.azure.com", [organization, project, "_git", name]) => RepoId::azure(organization, project, name),
+            ("ssh.dev.azure.com", ["v3", organization, project, name]) => RepoId::azure(organization, project, name),
+            (host, ["v3", organization, project, name]) if host.ends_with("vs-ssh.visualstudio.com") => {
+                RepoId::azure(organization, project, name)
+            }
+            (host, rest) if host.ends_with(".visualstudio.com") => {
+                let organization = host.strip_suffix(".visualstudio.com")?;
+                match rest {
+                    ["DefaultCollection", project, "_git", name] | [project, "_git", name] => {
+                        RepoId::azure(organization, project, name)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_azure(&self) -> bool {
+        self.host == AZURE_HOST
+    }
+
+    /// An Azure DevOps repository's organization and project.
+    pub fn azure_parts(&self) -> Option<(&str, &str)> {
+        self.owner.split_once('/').filter(|_| self.is_azure())
+    }
+
     pub fn from_remote(url: &str, config: &GithubConfig) -> Option<RepoId> {
         let url = url.trim();
+        if let Some(repo) = RepoId::azure_remote(url) {
+            return config.azure_devops.then_some(repo);
+        }
         let (authority, path) = if let Some((scheme, rest)) = url.split_once("://") {
             if !matches!(scheme, "https" | "http" | "ssh" | "git" | "git+ssh" | "ssh+git") {
                 return None;
@@ -267,7 +376,15 @@ impl RepoId {
     }
 
     pub fn web_url(&self) -> String {
-        format!("https://{}/{}/{}", self.host, self.owner, self.name)
+        match self.azure_parts() {
+            Some((organization, project)) => format!(
+                "https://{AZURE_HOST}/{}/{}/_git/{}",
+                percent_encode(organization),
+                percent_encode(project),
+                percent_encode(&self.name)
+            ),
+            None => format!("https://{}/{}/{}", self.host, self.owner, self.name),
+        }
     }
 
     /// Where the GitHub App `slug` is installed on this repository's host.
@@ -282,7 +399,7 @@ impl RepoId {
 
 impl fmt::Display for RepoId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_default_host() {
+        if self.is_default_host() || self.is_azure() {
             write!(f, "{}/{}", self.owner, self.name)
         } else {
             write!(f, "{}/{}/{}", self.host, self.owner, self.name)
@@ -292,6 +409,37 @@ impl fmt::Display for RepoId {
 
 /// The REST base and the GraphQL endpoint of `host`: api.github.com for github.com, and
 /// GitHub Enterprise Server's `/api/v3` and `/api/graphql` otherwise.
+/// Decodes `%XX` escapes, as remote URLs spell spaces and other characters in Azure DevOps names.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(high), Some(low)) =
+                (bytes.get(i + 1).and_then(|&b| hex(b)), bytes.get(i + 2).and_then(|&b| hex(b)))
+        {
+            out.push((high * 16 + low) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Encodes one URL path segment: everything but unreserved characters.
+pub fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 pub fn api_urls(host: &str) -> (String, String) {
     if host.eq_ignore_ascii_case(DEFAULT_HOST) {
         ("https://api.github.com".into(), "https://api.github.com/graphql".into())
@@ -562,6 +710,49 @@ mod tests {
         assert_eq!(enterprise.api().1, "https://git.example.com/api/graphql");
         assert_eq!(RepoId::parse("owner/name").unwrap().api().0, "https://api.github.com");
         assert!(RepoId::parse("a/b/c/d").is_none() && RepoId::parse("owner/na me").is_none());
+    }
+
+    #[test]
+    fn azure_devops_remotes_of_every_url_shape() {
+        let config = GithubConfig::default();
+        let api = RepoId::azure("contoso", "Platform", "api");
+        for url in [
+            "https://contoso@dev.azure.com/contoso/Platform/_git/api",
+            "https://dev.azure.com/contoso/Platform/_git/api/",
+            "https://contoso.visualstudio.com/Platform/_git/api",
+            "https://contoso.visualstudio.com/DefaultCollection/Platform/_git/api",
+            "git@ssh.dev.azure.com:v3/contoso/Platform/api",
+            "ssh://git@ssh.dev.azure.com/v3/contoso/Platform/api",
+            "contoso@vs-ssh.visualstudio.com:v3/contoso/Platform/api",
+        ] {
+            assert_eq!(RepoId::from_remote(url, &config), api, "{url}");
+        }
+        let spaced = RepoId::from_remote("https://dev.azure.com/org/My%20Project/_git/A%20Repo", &config).unwrap();
+        assert_eq!((spaced.azure_parts(), spaced.name.as_str()), (Some(("org", "My Project")), "A Repo"));
+        assert_eq!(spaced.web_url(), "https://dev.azure.com/org/My%20Project/_git/A%20Repo");
+        assert_eq!(spaced.to_string(), "org/My Project/A Repo");
+        let api = api.unwrap();
+        assert_eq!(RepoId::parse("contoso/Platform/api").as_ref(), Some(&api));
+        assert_eq!(RepoId::parse("dev.azure.com/contoso/Platform/api").as_ref(), Some(&api));
+        assert!(RepoId::parse("git.example.com/team/tool").is_some_and(|repo| !repo.is_azure()));
+        assert_eq!(RepoId::from_remote("https://dev.azure.com/contoso/Platform/_git", &config), None);
+        assert_eq!(RepoId::from_remote("https://dev.azure.com/con%2Ftoso/Platform/_git/x", &config), None);
+        let off = GithubConfig { azure_devops: false, ..GithubConfig::default() };
+        assert_eq!(RepoId::from_remote("https://dev.azure.com/contoso/Platform/_git/api", &off), None);
+    }
+
+    #[test]
+    fn pull_requests_group_assigned_before_mine_before_the_rest() {
+        let pull = |author: &str, requested: &[&str]| Pull {
+            author: author.into(),
+            requested: requested.iter().map(|name| name.to_string()).collect(),
+            ..Pull::default()
+        };
+        assert_eq!(Group::of(&pull("Ana", &["Alex Doe"]), "alex doe"), Group::Assigned);
+        assert_eq!(Group::of(&pull("Alex Doe", &["Alex Doe"]), "Alex Doe"), Group::Mine);
+        assert_eq!(Group::of(&pull("Ana", &["Bo"]), "Alex Doe"), Group::Other);
+        assert_eq!(Group::of(&pull("Ana", &[""]), ""), Group::Other);
+        assert!(Group::Assigned < Group::Mine && Group::Mine < Group::Other);
     }
 
     #[test]

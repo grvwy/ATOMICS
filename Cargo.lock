@@ -502,6 +502,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "similar",
  "syntect",
  "tempfile",
  "toml",

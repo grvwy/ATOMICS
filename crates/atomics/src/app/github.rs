@@ -1,13 +1,14 @@
-//! The GitHub controls: the top-bar counter, the controls modal, Connect GitHub, merges, workflow
-//! dispatches and pull request diffs in the diff viewer. The network, `gh` and the keychain are
-//! used on worker threads (`crate::github`); the state keeps what they report, never a token except
-//! the one `gh` offered while "Use your gh account?" waits for an answer.
+//! The pull request controls for GitHub and Azure DevOps: the top-bar counter, the controls modal,
+//! Connect GitHub, merges, workflow and pipeline runs, and pull request diffs in the diff viewer.
+//! The network, `gh`, `az` and the keychain are used on worker threads (`crate::github`); the state
+//! keeps what they report, never a token except the one `gh` offered while "Use your gh account?"
+//! waits for an answer.
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::credentials::Store as CredentialStore;
 use crate::github::{self as gh, ApiError, Endpoints, RepoDetails, Run, Token};
-use atomics_core::github::{Action, CheckState, MergeMethod, PrContext, Pull, RepoId, Scope};
+use atomics_core::github::{AZURE_HOST, Action, CheckState, Group, MergeMethod, PrContext, Pull, RepoId, Scope};
 
 /// A workflow's latest run, `None` when it never ran, or why it could not be read.
 type RunStatus = Result<Option<Run>, String>;
@@ -26,6 +27,8 @@ pub(super) struct Github {
     backoff: Option<u64>,
     polling: bool,
     ruleset_cache: Arc<Mutex<gh::RulesetCache>>,
+    /// Azure DevOps's token, viewer and team memberships, shared by polls and actions.
+    azure: gh::azure::Shared,
     /// The modal is open: polls fetch details, and it shows.
     pub(super) modal: bool,
     jobs: Vec<Receiver<Done>>,
@@ -125,6 +128,7 @@ pub(super) struct Row {
     pub pull: Pull,
     pub details: Option<atomics_core::github::Details>,
     pub counted: bool,
+    pub group: Group,
 }
 
 impl Github {
@@ -133,12 +137,13 @@ impl Github {
     }
 
     /// The host Connect GitHub signs in to: the first listed repository's that has no token.
+    /// Azure DevOps signs in with `az login` instead.
     pub(super) fn connect_host(&self) -> String {
         self.signed_out
             .iter()
-            .next()
+            .find(|host| *host != AZURE_HOST)
             .cloned()
-            .or_else(|| self.repos.first().map(|repo| repo.host.clone()))
+            .or_else(|| self.repos.iter().find(|repo| !repo.is_azure()).map(|repo| repo.host.clone()))
             .unwrap_or_else(|| atomics_core::github::DEFAULT_HOST.into())
     }
 
@@ -150,8 +155,14 @@ impl Github {
         self.viewers.iter().map(|(host, login)| (host.clone(), login.clone())).collect()
     }
 
+    /// Connect GitHub is offered: a GitHub host has no token, or nothing is listed yet.
     pub(super) fn needs_connect(&self) -> bool {
-        !self.signed_out.is_empty() || (self.repos.is_empty() && self.viewers.is_empty())
+        self.signed_out.iter().any(|host| host != AZURE_HOST) || (self.repos.is_empty() && self.viewers.is_empty())
+    }
+
+    /// Azure DevOps repositories are listed, but the Azure CLI is not signed in.
+    pub(super) fn needs_az_login(&self) -> bool {
+        self.signed_out.contains(AZURE_HOST)
     }
 
     pub(super) fn error(&self) -> Option<&str> {
@@ -210,20 +221,25 @@ impl Github {
         self.dispatching.contains(&(repo.clone(), label.to_string()))
     }
 
-    /// Every open pull request, by repository, with what the counter's filter says of it.
+    /// Every open pull request, by repository, with what the counter's filter says of it. Azure
+    /// DevOps repositories, where a team lists many, are grouped: assigned to the viewer, the
+    /// viewer's own, then the rest.
     pub(super) fn rows(&self, filter: atomics_core::github::Filter) -> Vec<Row> {
         let mut rows = Vec::new();
         for repo in &self.repos {
             let Some(listing) = self.lists.get(repo) else { continue };
             let viewer = self.viewers.get(&repo.host).map(String::as_str).unwrap_or_default();
+            let start = rows.len();
             for pull in &listing.pulls {
                 rows.push(Row {
                     repo: repo.clone(),
                     pull: pull.clone(),
                     details: listing.details.as_ref().and_then(|details| details.pulls.get(&pull.number).cloned()),
                     counted: !viewer.is_empty() && filter.matches(pull, viewer),
+                    group: if repo.is_azure() { Group::of(pull, viewer) } else { Group::Other },
                 });
             }
+            rows[start..].sort_by_key(|row| row.group);
         }
         rows
     }
@@ -248,14 +264,19 @@ impl State {
         std::thread::spawn(move || job(&tx));
     }
 
-    /// For a worker: the host's API with the stored token. An expired or refused token is removed,
-    /// and the next poll shows Connect GitHub.
-    fn github_api(&self, host: &str) -> impl FnOnce() -> Result<gh::Signed, String> + Send + 'static {
+    /// For a worker: the host's client, with GitHub's stored token or the Azure CLI's. An expired
+    /// or refused GitHub token is removed, and the next poll shows Connect GitHub.
+    fn github_api(&self, host: &str) -> impl FnOnce() -> Result<gh::Client, String> + Send + 'static {
         let (endpoints, store, host) = (self.github.endpoints.clone(), Github::store(&self.relay), host.to_string());
+        let azure = self.github.azure.clone();
         move || {
-            gh::Signed::open(&endpoints, &store, &host)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "GitHub is not connected; press Connect GitHub".to_string())
+            gh::Client::open(&endpoints, &store, &azure, &host).map_err(|error| error.to_string())?.ok_or_else(|| {
+                if host == AZURE_HOST {
+                    "Azure DevOps is not signed in; run az login".to_string()
+                } else {
+                    "GitHub is not connected; press Connect GitHub".to_string()
+                }
+            })
         }
     }
 
@@ -293,6 +314,7 @@ impl State {
             viewers: self.github.viewers.keys().cloned().collect(),
             details: self.github.modal,
             ruleset_cache: self.github.ruleset_cache.clone(),
+            azure: self.github.azure.clone(),
         };
         let (endpoints, store) = (self.github.endpoints.clone(), Github::store(&self.relay));
         self.github_job(move |tx| {
@@ -616,8 +638,8 @@ impl State {
         }
         let api = self.github_api(&repo.host);
         self.github_job(move |tx| {
-            let result = api().and_then(|mut signed| {
-                signed.call(|api| api.merge(&repo, number, method, &sha)).map_err(|error| error.to_string())
+            let result = api().and_then(|mut client| {
+                client.merge(&repo, number, method, &sha, admin).map_err(|error| error.to_string())
             });
             let _ = tx.send(Done::Merged { repo, number, admin, result });
         });
@@ -638,15 +660,13 @@ impl State {
         let api = self.github_api(&repo.host);
         self.github_job(move |tx| {
             let key = (repo.clone(), action.label.clone());
-            let result = api().and_then(|mut signed| {
+            let result = api().and_then(|mut client| {
                 let git_ref = match git_ref {
                     Some(git_ref) => git_ref,
-                    None => signed.call(|api| api.default_branch(&repo)).map_err(|error| error.to_string())?,
+                    None => client.default_branch(&repo).map_err(|error| error.to_string())?,
                 };
-                signed
-                    .call(|api| api.dispatch(&repo, &action.workflow, &git_ref, &inputs))
-                    .map_err(|error| error.to_string())?;
-                let run = signed.call(|api| api.latest_run(&repo, &action.workflow)).map_err(|error| error.to_string());
+                client.dispatch(&repo, &action.workflow, &git_ref, &inputs).map_err(|error| error.to_string())?;
+                let run = client.latest_run(&repo, &action.workflow).map_err(|error| error.to_string());
                 let _ = tx.send(Done::Runs(vec![(key, run)]));
                 Ok(git_ref)
             });
@@ -667,13 +687,11 @@ impl State {
         for (host, actions) in wanted {
             let api = self.github_api(&host);
             self.github_job(move |tx| {
-                let Ok(mut signed) = api() else { return };
+                let Ok(mut client) = api() else { return };
                 let runs = actions
                     .into_iter()
                     .map(|(repo, action)| {
-                        let run = signed
-                            .call(|api| api.latest_run(&repo, &action.workflow))
-                            .map_err(|error| error.to_string());
+                        let run = client.latest_run(&repo, &action.workflow).map_err(|error| error.to_string());
                         ((repo, action.label), run)
                     })
                     .collect();
@@ -682,8 +700,8 @@ impl State {
         }
     }
 
-    /// Loads a pull request's diff from GitHub into the diff viewer, read-only. No fetch, ref or
-    /// worktree is touched.
+    /// Loads a pull request's diff from GitHub or Azure DevOps into the diff viewer, read-only. No
+    /// fetch, ref or worktree is touched.
     pub(super) fn github_view_diff(&mut self, repo: RepoId, pull: &Pull) {
         self.github.pr_diff = Some(PrDiff {
             repo: repo.clone(),
@@ -699,11 +717,11 @@ impl State {
         self.panel = PanelMode::Diff;
         let (api, highlighter, number) = (self.github_api(&repo.host), self.highlighter.clone(), pull.number);
         self.github_job(move |tx| {
-            let result = api().and_then(|mut signed| {
+            let result = api().and_then(|mut client| {
                 // The head first, then the diff: a push in between leaves the diff newer than the
                 // recorded head, so a merge of that head fails instead of merging unreviewed code.
-                let sha = signed.call(|api| api.head(&repo, number)).map_err(|error| error.to_string())?;
-                let text = signed.call(|api| api.diff(&repo, number)).map_err(|error| error.to_string())?;
+                let sha = client.head(&repo, number).map_err(|error| error.to_string())?;
+                let text = client.diff(&repo, number).map_err(|error| error.to_string())?;
                 let mut files = atomics_core::diff::parse_unified(&text);
                 files.sort_by(|a, b| a.path().cmp(b.path()));
                 let diff = atomics_core::diff::WorktreeDiff {
@@ -769,6 +787,24 @@ pub(super) struct GithubUi {
     pub scroll_to_selected: bool,
     /// The host whose chip was clicked: "Disconnect GitHub?" shows until answered.
     pub disconnect: Option<String>,
+    /// Per repository, whether its Other group was opened or closed by hand.
+    pub others: BTreeMap<RepoId, bool>,
+}
+
+/// Other people's pull requests start folded when the viewer has their own or assigned ones to
+/// look at and there are more than this many others.
+const FOLD_OTHERS: usize = 8;
+
+impl GithubUi {
+    /// Whether `repo`'s Other group shows its rows.
+    fn others_open(&self, repo: &RepoId, rows: &[Row]) -> bool {
+        if let Some(open) = self.others.get(repo) {
+            return *open;
+        }
+        let of_repo = || rows.iter().filter(|row| row.repo == *repo);
+        let others = of_repo().filter(|row| row.group == Group::Other).count();
+        others <= FOLD_OTHERS || of_repo().all(|row| row.group == Group::Other)
+    }
 }
 
 /// The action `action` on the pull request `pull` of `repo`, ready to confirm: its ref and
@@ -927,7 +963,12 @@ impl Desktop<'_> {
         let (label, color, hover) = match &counter {
             Counter::Hidden => return,
             Counter::SignedOut => {
-                ("–".to_string(), self.runtime.palette.muted, "GitHub: connect to see pull requests".to_string())
+                let hover = if self.runtime.github.needs_connect() {
+                    "GitHub: connect to see pull requests"
+                } else {
+                    "Azure DevOps: run az login to see pull requests"
+                };
+                ("–".to_string(), self.runtime.palette.muted, hover.to_string())
             }
             Counter::Count { count, failing } => (
                 count.to_string(),
@@ -967,7 +1008,8 @@ impl Desktop<'_> {
         }
         let p = self.runtime.palette.clone();
         let mut open = true;
-        egui::Window::new("GitHub")
+        let title = if self.runtime.github.repos().iter().any(RepoId::is_azure) { "Pull requests" } else { "GitHub" };
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -1003,6 +1045,12 @@ impl Desktop<'_> {
         let mut reopen = None;
         ui.horizontal(|ui| {
             for (host, login) in self.runtime.github.signed_in_hosts() {
+                if host == AZURE_HOST {
+                    let chip = RichText::new(format!("Azure DevOps · {login}")).color(p.on_accent);
+                    ui.add(egui::Button::new(chip).fill(p.accent).sense(Sense::hover()))
+                        .on_hover_text("Signed in with the Azure CLI; az logout signs out");
+                    continue;
+                }
                 let chip = if host == atomics_core::github::DEFAULT_HOST {
                     format!("GitHub · {login}")
                 } else {
@@ -1078,6 +1126,12 @@ impl Desktop<'_> {
             Connect::Failed(error) => {
                 ui.label(RichText::new(error).color(p.error));
                 connect = ui.button("Connect GitHub").clicked();
+            }
+        }
+        if self.runtime.github.needs_az_login() {
+            ui.label("Azure DevOps uses the Azure CLI's sign-in: run az login in a terminal, then check again.");
+            if ui.button("Check again").clicked() {
+                self.runtime.github_poll_now();
             }
         }
         if let Connect::Device { copied, .. } = &mut self.runtime.github.connect {
@@ -1233,7 +1287,12 @@ impl Desktop<'_> {
 
     /// The rows the modal lists, in order, and the selected one (the first by default).
     pub(super) fn github_rows(&mut self) -> (Vec<Row>, Option<usize>) {
-        let rows = self.runtime.github.rows(self.runtime.config.github.filter);
+        let all = self.runtime.github.rows(self.runtime.config.github.filter);
+        let ui = &self.client.github;
+        let folded: BTreeSet<&RepoId> =
+            all.iter().map(|row| &row.repo).filter(|repo| !ui.others_open(repo, &all)).collect();
+        let rows: Vec<Row> =
+            all.iter().filter(|row| row.group != Group::Other || !folded.contains(&row.repo)).cloned().collect();
         let index = self
             .client
             .github
@@ -1257,10 +1316,33 @@ impl Desktop<'_> {
                     }
                 });
                 let mine: Vec<(usize, &Row)> = rows.iter().enumerate().filter(|(_, row)| row.repo == repo).collect();
-                if mine.is_empty() {
+                let all = self.runtime.github.rows(self.runtime.config.github.filter);
+                let others = all.iter().filter(|row| row.repo == repo && row.group == Group::Other).count();
+                let grouped = all.iter().any(|row| row.repo == repo && row.group != Group::Other);
+                if mine.is_empty() && others == 0 {
                     ui.label(RichText::new("No open pull requests").color(p.muted).size(11.5));
                 }
-                for (i, row) in mine {
+                // Headings only when the viewer has pull requests of their own or assigned here; the
+                // last pass (`None`) heads a folded Other group, whose rows are not listed.
+                let mut heading = None;
+                for row in mine.into_iter().map(Some).chain([None]) {
+                    let group = row.map_or(Group::Other, |(_, row)| row.group);
+                    if grouped && heading != Some(group) && (group != Group::Other || others > 0) {
+                        heading = Some(group);
+                        if group == Group::Other {
+                            let open = self.client.github.others_open(&repo, &all);
+                            let label = format!("{} {} ({others})", if open { "▾" } else { "▸" }, group.label());
+                            let toggle = ui.add(
+                                egui::Label::new(RichText::new(label).color(p.muted).size(11.5)).sense(Sense::click()),
+                            );
+                            if toggle.on_hover_text("Show or hide other people's pull requests").clicked() {
+                                self.client.github.others.insert(repo.clone(), !open);
+                            }
+                        } else {
+                            ui.label(RichText::new(group.label()).color(p.muted).size(11.5));
+                        }
+                    }
+                    let Some((i, row)) = row else { break };
                     let pull = &row.pull;
                     let (symbol, color) = match row.details.as_ref().map(|d| d.checks) {
                         Some(CheckState::Passing) => ("✓", p.success),
@@ -1425,7 +1507,8 @@ impl Desktop<'_> {
     ) {
         let busy = self.runtime.github.is_dispatching(repo, &action.label);
         let response = ui.add_enabled(!busy, egui::Button::new(&action.label));
-        let response = response.on_hover_text(format!("Run {} on GitHub Actions", action.workflow));
+        let runner = if repo.is_azure() { "pipeline" } else { "GitHub Actions workflow" };
+        let response = response.on_hover_text(format!("Run {runner} {}", action.workflow));
         if response.clicked() {
             match dispatch_confirm(repo, action, pull) {
                 Ok(confirm) => self.client.github.confirm = Some(confirm),

@@ -78,7 +78,9 @@ says what to take along and what to set up again.
   its checks, review state and mergeability. For the selected PR you can open it in the browser, review its diff
   read-only in the diff viewer, merge it, or admin merge it when GitHub lets you bypass the rules. Workflows you
   configure run from there too. **Connect GitHub** reuses the `gh` CLI's account after one confirmation, else signs
-  in through the browser. The token stays in the OS keychain and never reaches an agent. See [docs/github.md](docs/github.md).
+  in through the browser. The token stays in the OS keychain and never reaches an agent. Azure DevOps repositories
+  are listed in the same controls, grouped into those assigned to you and your own, and signed in with the Azure CLI.
+  See [docs/github.md](docs/github.md).
 - **Remote control and MCP.** Other agents can start, read, review and steer agents in ATOMICS (see below).
 
 ## Run
