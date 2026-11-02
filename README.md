@@ -479,7 +479,7 @@ Open and completed plans get tabs; archived plans are hidden. Select a tab to se
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All, Ungrouped and the Repos dropdown. Each plan has
 its own approval and automatic final review. Use `atomics_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
-**Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
+**Closed plans** beside the plan tabs; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `atomics_wait` events include `plan` and `task` ids for sessions belonging to a task.
 

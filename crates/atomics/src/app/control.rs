@@ -50,6 +50,14 @@ impl State {
             | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
             _ => None,
         };
+        // Writing a plan that finished reopens it: tasks, progress and branch stay, and the plan is
+        // approved again only if the edit leaves its approved tasks as they were.
+        if let ControlRequest::PlanSet { plan: Some(id), .. } = &request
+            && let Some(done_plan) =
+                self.plans.iter_mut().find(|p| p.id == *id && p.status == plan::PlanStatus::Completed)
+        {
+            done_plan.reopen();
+        }
         let target = if let Some(id) = target {
             match plan::resolve_plan(&self.plans, id) {
                 Ok(index) => index,

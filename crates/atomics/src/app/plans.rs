@@ -1787,6 +1787,43 @@ mod tests {
     }
 
     #[test]
+    fn plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks() {
+        with_app(
+            "app::plans::tests::plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks",
+            |app, _| {
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Ship", "integration":"ship-branch", "tasks":[{"id":"a"}]}),
+                )
+                .result["plan"]
+                    .clone();
+                assert!(request(app, json!({"cmd":"plan_approve", "plan":plan})).ok);
+                assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
+                assert!(request(app, json!({"cmd":"plan_close", "plan":plan, "status":"completed"})).ok);
+                app.runtime.sync_plan();
+                assert_eq!(request(app, json!({"cmd":"plan_get", "plan":plan})).result["status"], "completed");
+                let set = request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":plan, "goal":"Ship",
+                        "tasks":[{"id":"a"}, {"id":"followup", "title":"Follow-up", "depends_on":["a"]}]}),
+                );
+                assert!(set.ok, "{:?}", set.error);
+                assert_eq!(set.result["approved"], false, "a new task needs approval");
+                assert_eq!(set.result["integration"], "ship-branch");
+                let full = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                assert_eq!(full.result["status"], "open");
+                let tasks = full.result["tasks"].as_array().unwrap();
+                assert_eq!(tasks.iter().find(|t| t["id"] == "a").unwrap()["status"], "done");
+                assert_eq!(tasks.iter().find(|t| t["id"] == "followup").unwrap()["status"], "planned");
+                // Archived plans stay closed.
+                assert!(request(app, json!({"cmd":"plan_close", "plan":plan, "status":"archived"})).ok);
+                let archived = request(app, json!({"cmd":"plan_set", "plan":plan, "goal":"Ship", "tasks":[]}));
+                assert!(!archived.ok);
+            },
+        );
+    }
+
+    #[test]
     fn plan_close_persists_status_and_restores_implicit_single_plan_selection() {
         with_app(
             "app::plans::tests::plan_close_persists_status_and_restores_implicit_single_plan_selection",
