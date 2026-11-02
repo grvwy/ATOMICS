@@ -6,9 +6,26 @@ let
   toml = pkgs.formats.toml { };
   hasSeed = cfg.settings != { };
   user = lib.attrByPath [ cfg.user ] null config.users.users;
-  userGroup = if user.group == null then "users" else user.group;
+  # users.users.<name>.group is "" when unset.
+  userGroup = if user.group == "" then "users" else user.group;
   configDir = "${user.home}/.config/atomics";
   seedFile = toml.generate "atomics-config.toml" cfg.settings;
+
+  # Text settings whose names suggest a credential, which the Nix store would show every local user.
+  # Names of variables, files or commands that hold one (`api_key_env`) are fine.
+  secretLike = name:
+    let lower = lib.toLower name; in
+    builtins.match ".*(token|secret|password|passwd|credential|bearer|authorization|api_?key|private_?key).*" lower != null
+    && builtins.match ".*_(env|file|path|cmd|command)" lower == null;
+  secretPaths = prefix: value:
+    lib.concatLists (lib.mapAttrsToList (name: inner:
+      let path = prefix ++ [ name ]; in
+      lib.optional (builtins.isString inner && secretLike name) (lib.concatStringsSep "." path)
+      ++ lib.optionals (builtins.isAttrs inner) (secretPaths path inner)
+      ++ lib.optionals (builtins.isList inner)
+        (lib.concatMap (item: lib.optionals (builtins.isAttrs item) (secretPaths path item)) inner))
+      value);
+  suspicious = secretPaths [ ] cfg.settings;
 in
 {
   imports = [ ./mac-desktop.nix ];
@@ -32,7 +49,11 @@ in
     settings = lib.mkOption {
       type = toml.type;
       default = { };
-      description = "Initial TOML configuration copied only when the user's config.toml does not exist.";
+      description = ''
+        Initial TOML configuration copied only when the user's config.toml does not exist.
+        The seed is a file in the Nix store, which every user of this machine can read: keep tokens,
+        passwords and other secrets out of it and sign in inside the machine instead.
+      '';
     };
   };
 
@@ -42,8 +63,14 @@ in
       assertion = !hasSeed || (cfg.user != "" && user != null);
       message = "programs.atomics.user must name an existing NixOS user when programs.atomics.settings is non-empty";
     } ];
+    warnings = lib.optional (suspicious != [ ]) ''
+      programs.atomics.settings is copied into the world-readable Nix store, and these settings look like
+      secrets: ${lib.concatStringsSep ", " suspicious}. Keep credentials out of it; sign in inside the machine.
+    '';
+    # The `:` prefix applies a mode or owner only when tmpfiles creates the folder, so an existing
+    # ~/.config keeps the mode and owner its user gave it. ATOMICS's own folder and seed are private.
     systemd.tmpfiles.rules = lib.optionals (hasSeed && user != null) [
-      "d ${user.home}/.config 0700 ${cfg.user} ${userGroup} - -"
+      "d ${user.home}/.config :0700 :${cfg.user} :${userGroup} - -"
       "d ${configDir} 0700 ${cfg.user} ${userGroup} - -"
       "C ${configDir}/config.toml 0600 ${cfg.user} ${userGroup} - ${seedFile}"
     ];

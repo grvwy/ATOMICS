@@ -1,5 +1,5 @@
-{ lib, rustPlatform, pkg-config, makeWrapper, alsa-lib, wayland, libxkbcommon
-, vulkan-loader, mesa, fontconfig, git, libx11, libxcursor, libxrandr, libxi }:
+{ lib, rustPlatform, pkg-config, patchelf, alsa-lib, wayland, libxkbcommon
+, vulkan-loader, mesa, fontconfig, git, libx11, libxcursor, libxrandr, libxi, makeWrapper }:
 
 let
   runtimeLibraries = [
@@ -14,28 +14,40 @@ let
     libxrandr
     libxi
   ];
+  root = ../.;
+  # Git-tracked files only, so build output, local state and anything untracked beside a checkout
+  # never reach the store. A flake's source is already a store copy of the tracked files, without
+  # .git, and a path: flake copies the whole folder; there the untracked folders are dropped by name.
+  tracked =
+    if builtins.pathExists (root + "/.git") then
+      lib.fileset.gitTracked root
+    else
+      lib.fileset.difference root
+        (lib.fileset.unions (map (name: lib.fileset.maybeMissing (root + "/${name}")) [ ".git" ".atomics" "target" ]));
 in
 rustPlatform.buildRustPackage {
   pname = "atomics";
   version = "0.1.0";
-  src = lib.cleanSourceWith {
-    src = ../.;
-    filter = path: type:
-      let name = baseNameOf path;
-      in !(builtins.elem name [ ".git" ".atomics" "target" ]);
-  };
+  src = lib.fileset.toSource { inherit root; fileset = tracked; };
 
   cargoLock.lockFile = ../Cargo.lock;
   cargoBuildFlags = [ "-p" "atomics" ];
   doCheck = false;
 
-  nativeBuildInputs = [ pkg-config makeWrapper ];
+  nativeBuildInputs = [ pkg-config patchelf makeWrapper ];
   buildInputs = runtimeLibraries;
 
+  # The window, audio and font libraries ATOMICS opens at runtime go in its own RUNPATH, not in
+  # LD_LIBRARY_PATH: agent terminals inherit ATOMICS's environment, and a library path there would
+  # load these libraries into every program an agent runs. After fixup, which shrinks the RUNPATH
+  # to the libraries the binary links directly.
+  postFixup = ''
+    patchelf --add-rpath "${lib.makeLibraryPath runtimeLibraries}" "$out/bin/.atomics-wrapped"
+  '';
+
+  # git is a fallback after the user's own PATH, so agent terminals keep finding their git first.
   postInstall = ''
-    wrapProgram "$out/bin/atomics" \
-      --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath runtimeLibraries}" \
-      --prefix PATH : "${lib.makeBinPath [ git ]}"
+    wrapProgram "$out/bin/atomics" --suffix PATH : "${lib.makeBinPath [ git ]}"
   '';
 
   meta = {
