@@ -219,6 +219,11 @@ impl State {
                 return true;
             }
         }
+        while let Ok(request) = self.op_rx.try_recv() {
+            changed = true;
+            self.serve_op(request);
+        }
+        changed |= self.poll_ops();
         for session in &mut self.sessions {
             let Some(terminal) = &session.terminal else { continue };
             if terminal.shared.changed.swap(false, Ordering::AcqRel) {

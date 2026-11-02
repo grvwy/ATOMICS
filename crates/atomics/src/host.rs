@@ -32,11 +32,10 @@ pub struct Host {
 }
 
 impl Host {
-    pub(crate) fn start(state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
+    pub(crate) fn start(mut state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
         let projections = Arc::new(Projections::default());
         let bodies = Arc::new(DiffBodies::default());
-        let (protocol, terminals, protocol_error) = match start_protocol(&state.remote_access(), &projections, &bodies)
-        {
+        let (protocol, terminals, protocol_error) = match start_protocol(&mut state, &projections, &bodies) {
             Ok(Some((server, terminals))) => (Some(server), Some(terminals), None),
             Ok(None) => (None, None, None),
             Err(error) => {
@@ -150,24 +149,35 @@ impl Drop for Host {
     }
 }
 
-/// `Ok(None)` when `[remote]` is off: then there is no thread and no socket.
+/// `Ok(None)` when `[remote]` is off: then there is no thread, no socket and no journal file.
 fn start_protocol(
-    config: &atomics_core::config::RemoteAccessConfig,
+    state: &mut State,
     projections: &Arc<Projections>,
     bodies: &Arc<DiffBodies>,
 ) -> std::io::Result<Option<(protocol::Server, Arc<protocol::Terminals>)>> {
+    let config = state.remote_access();
     if !config.enabled {
         return Ok(None);
     }
+    let home = atomics_core::paths::atomics_home();
     let terminals = Arc::new(protocol::Terminals::default());
     let server_config = protocol::ServerConfig {
         port: config.port,
         allowed_origins: config.allowed_origins.clone(),
-        advertise: Some(atomics_core::paths::atomics_home().join("protocol.json")),
+        advertise: Some(home.join("protocol.json")),
         ..protocol::ServerConfig::default()
     };
-    let server = protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone())?;
+    let commands = state.serve_commands(&home.join("protocol-ops.jsonl"));
+    let server =
+        protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone(), commands)?;
     Ok(Some((server, terminals)))
+}
+
+/// The runtime thread carries out protocol mutations: the sender wakes it.
+impl protocol::Commands for Sender<protocol::OpRequest> {
+    fn submit(&self, request: protocol::OpRequest) -> bool {
+        self.send(request).is_ok()
+    }
 }
 
 /// What the runtime may ask of a native window: a repaint, focus, and the size it last had.

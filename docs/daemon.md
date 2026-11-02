@@ -78,7 +78,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Direction | Tags | Payload and meaning |
 | --- | --- | --- |
 | Client → host | `hello` | Supported versions, capabilities, client ID, prior epoch and last applied event cursor. |
-| Host → client | `welcome` | Chosen version, capabilities, limits, epoch, client role and resume/reset decision. |
+| Host → client | `welcome` | Chosen version, capabilities, limits, epoch, client role, what it may change (`may`) and resume/reset decision. |
 | Client → host | `subscribe`, `unsubscribe` | Session screens, worktree diffs/files and plans of interest; visible/focused hints. |
 | Host → client | `state_snapshot` | Sessions, projects, plan summaries and pending approvals at a single event cursor. |
 | Host → client | `skipped` | An event cursor the client's `diff`/`plan` topics left out, so cursors stay consecutive. |
@@ -95,7 +95,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch and report. |
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. |
-| Client → host | `approval_decide` | Approval ID and expected revision, decision and optional message. |
+| Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |
 
@@ -256,8 +256,10 @@ allowed_origins = []     # exact Origin values; a native client sends none
   stay consecutive (`Mirror` only advances), and the client's copy of that diff or plan goes stale. Widening the set
   (adding a topic to a narrowed kind, or removing its last one) means the client missed events, so the host answers
   with a fresh `state_snapshot`. A client that subscribes to nothing gets everything, as before topics existed.
-- **Not yet.** `file_get` (answers `not_found`) and every mutation (H4). A removed diff is sent as a `diff_summary`
-  with no files and no base (a tombstone), and a vanished approval as `approval_resolved` with `withdrawn`.
+- **Not yet.** `file_get` (answers `not_found`). A removed diff is sent as a `diff_summary` with no files and no base
+  (a tombstone). An approval that leaves the board says how it ended in `approval_resolved` (`allowed`,
+  `allowed_always`, `denied`, `expired`), or `withdrawn` when it was not answered through ATOMICS (the hook gave up,
+  the agent moved on, someone answered in the terminal).
 
 ### Terminal screens
 
@@ -415,6 +417,63 @@ were loading.
 The remote figures leave out the client's own paint; the desktop's include the app's frame cadence. A first version
 that polled every 1 ms on both the screens thread and the client's thread measured 2.67 ms p50. The wake pipe and the
 250 µs echo poll removed that. Debug builds measure about 1.1 ms.
+
+### Mutations
+
+Stream H4. A client that negotiated `mutations` sends `approval_decide`, `plan_command`, `review_command` and
+`session_command`; each is answered by `command_result` echoing its `request_id`. The types and the reference
+client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `protocol/ops.rs` (the hand-off),
+`protocol/journal.rs` and `app/mutations.rs`.
+
+- **Who may.** `welcome` lists what the client may change in `may`: `type` (with `input`), and `approve`, `session`,
+  `plan` and `review` (with `mutations`). It comes from the client's `Role`: a controller gets all of them, a viewer
+  none. Loopback clients hold the bearer token, so until pairing (H5) they are controllers; a paired device's entry
+  in the allowlist will be a role, "view only" or "may type and approve". A mutation without the capability or the
+  grant is refused `unauthorised` in a `command_result`, never forwarded, and counts towards disconnecting.
+- **One at a time, on the runtime thread.** The protocol thread never runs a mutation: it hands it over a channel
+  that wakes the runtime thread, which carries mutations out under the `State` lock in turn with the desktop's
+  actions and ctl's commands. The desktop's own approve and steer go through the same code (`State::mutate`,
+  the journal and `State::decide`), so a client and the desktop race exactly as two clients do.
+- **Operations.** Every mutation carries an operation ID (`op`) the client chose. The journal records it, keyed by
+  the client's `client_id` and `op` with a fingerprint of the command, before any side effect, and its outcome
+  after. The same `op` again returns the known outcome (from another connection too, as after a reconnect); while
+  it still runs the repeat is answered `accepted` and hears the end. The same `op` with a different command is
+  `conflict`. Outcomes are `accepted` (journaled, under way: a delivery to confirm, a worktree, a merge), then
+  `done` with a result, `refused` with a code, or `uncertain`.
+- **Crashes.** While the server runs the journal is `protocol-ops.jsonl` in the state directory (mode 0600): one
+  line when an operation begins and one when it ends. An operation that began without ending when the host stopped
+  is `uncertain` from the next start on, and is never run again by itself; a codex delivery whose receipt never came
+  is `uncertain` too. Lines are written, not synced: the journal survives the host process dying, not the machine
+  losing power. Outcomes are kept 30 minutes from when the operation began (at most 4096; past that new work is
+  refused `too_many` rather than an unexpired outcome forgotten). Clients are told `op_ttl_secs` (15 minutes) and
+  resend an unanswered operation only while it is younger (`Pending::resend`): an older one needs the user's fresh
+  intent. With `[remote]` off the journal is in memory and there is no file.
+- **Approvals.** An approval's ID is minted for that one request, and `approval_decide` names it. The first valid
+  decision answers it and is recorded; a later one for the same ID, from any client or the desktop, is refused
+  `already_resolved` with how it ended, and every client gets `approval_resolved` with the disposition. A decision
+  for an answered request never answers the session's next one; one for a request queued behind another is
+  `rejected`; one for an ID the host never had is `not_found`. Expiry and hook timeouts are as before.
+- **Plans.** `plan_command` names the plan and an `action`: `set`, `approve`, `dispatch`, `update`, `integrate`,
+  `archive`, as ctl's `plan_*` do. `approve`, and `set` of an existing plan, carry the plan's `digest` from the board
+  (`PlanInfo.digest`, the approval scope the remote conversation's `/approve` uses, published for open plans): a plan
+  whose scope changed since is `stale_revision`, so the user approves or replaces exactly what they read.
+- **Reviews.** `review_command` adds, removes or sends comments on a worktree's diff. The comments waiting to be sent
+  are in its `diff_summary` (`comments`), shared by every client. `add` names the diff revision it was written
+  against and a file in that diff; a diff that moved on is `stale_revision`, and the client anchors the comment
+  again. `remove` names the comment's fields; `send` delivers them all to the worktree's agent as ctl's does.
+- **Sessions.** `session_command` steers (`steer`: the steer bar's delivery, with its `sent`, `held` and
+  `queued_until_next_hook` results), starts a configured agent (`start`, in a folder, a new worktree or a scratch
+  folder) or closes one (`close`). IDs are matched exactly; ctl's title and prefix matching is not used.
+- **Bounds.** At most 64 operations under way per connection (`max_pending_ops`; more are `too_many`), 64 KiB of
+  text in a field and 256 tasks in a `set`.
+- **Tests.** `ops.rs` and `wire/tests.rs` cover the frames and bounds, `journal.rs` retries, conflicts, a crash in the
+  middle and expiry, `protocol/mutation_tests.rs` the gates (view-only and capability refusals), routing and bounds
+  over loopback sockets. `app::host_tests` runs the real host: two clients racing one approval get exactly one winner
+  and both see how it ended; the desktop racing a client likewise; a decision for an answered request does not answer
+  the next; a retried steer is delivered once; an operation an earlier host died during is `uncertain`; and a plan
+  approval with an outdated digest is refused.
+- **Not yet.** Opening an editor (its terminal is not streamed yet), and attributing a decision to a device name
+  (the journal names the `client_id` until pairing).
 
 ### Terminal painter
 
@@ -683,8 +742,8 @@ History Reopen persisted the open status. The QA process then exited cleanly.
   native input/resize channel behind the protocol adapter, with control leases.
 - Implement the versioned loopback WebSocket protocol and authenticated pairing,
   subscriptions, bounded queues, reconnect/reset handling and slow-client tests.
-- Add operation acceptance/outcome journaling, duplicate-command and uncertain
-  crash recovery behavior while preserving hook, ctl and MCP adapter formats.
+- Done for the protocol (H4, "Mutations" above): operation acceptance/outcome journaling, duplicate-command and
+  uncertain crash recovery, with hook, ctl and MCP formats unchanged.
 - Change shutdown ownership: closing/reopening the desktop must preserve child
   PIDs, emulator state and plan progress. Today exiting the entire application
   still joins the host and shuts down its terminals, as before.

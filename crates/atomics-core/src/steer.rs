@@ -1,6 +1,8 @@
 //! Turning review comments and typed messages into input for an agent.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A review comment on a worktree's diff. The protocol shows the comments waiting to be sent in
+/// the worktree's diff summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReviewComment {
     pub path: String,
     /// Line in the new file, or in the old file for removed lines.

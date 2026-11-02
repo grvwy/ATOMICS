@@ -755,11 +755,16 @@ impl State {
             }
             if terminal.exited() || pending.attempts >= DELIVERY_ATTEMPTS {
                 if let Some(reply) = pending.reply.take() {
-                    let _ = reply.send(ControlOutcome::Done(ControlResponse::error(if pending.codex {
+                    let mut response = ControlResponse::error(if pending.codex {
                         "message delivery unconfirmed: no receipt from the agent; check its terminal"
                     } else {
                         "message not delivered: no receipt from the agent; check its terminal"
-                    })));
+                    });
+                    // The paste may have landed: the protocol answers `uncertain`, not refused.
+                    if pending.codex {
+                        response.result = json!({ "unconfirmed": true });
+                    }
+                    let _ = reply.send(ControlOutcome::Done(response));
                 }
                 warnings.push(session.title.clone());
                 session.pending = None;
@@ -1277,19 +1282,24 @@ impl Desktop<'_> {
         }
         let targets: Vec<String> = targets.into_iter().map(|i| self.runtime.sessions[i].id.clone()).collect();
         self.client.steer_text.clear();
+        // Each target is one steer operation, through the journal as a protocol client's is.
         self.post(move |state| {
+            use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
             let mut typed = 0;
             let mut queued = 0;
             let mut held = 0;
             let mut verifying = 0;
             for id in targets {
-                let Some(i) = state.find(&id) else { continue };
-                match state.deliver(i, &text) {
-                    Delivery::Sent => typed += 1,
-                    Delivery::Pending => verifying += 1,
-                    Delivery::Queued => queued += 1,
-                    Delivery::Held => held += 1,
-                    Delivery::Unavailable => {}
+                let steer = |op| {
+                    let action = SessionAction::Steer { session: id.clone(), text: text.clone() };
+                    Command::SessionCommand(SessionCommand { op, action })
+                };
+                match state.mutate_desktop(steer) {
+                    Outcome::Accepted => verifying += 1,
+                    Outcome::Done { result } if result["held"] == true => held += 1,
+                    Outcome::Done { result } if result["queued_until_next_hook"] == true => queued += 1,
+                    Outcome::Done { .. } => typed += 1,
+                    _ => {}
                 }
             }
             let mut parts = Vec::new();

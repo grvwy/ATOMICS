@@ -98,6 +98,8 @@ impl State {
     pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
         out.publish_sessions(self.session_infos());
         out.publish_plans(self.plan_infos());
+        // How answered approvals ended goes first, so the event for one leaving says how.
+        out.publish_resolutions(&self.resolved);
         out.publish_approvals(self.approval_infos());
         self.publish_diffs(out, cache, bodies);
     }
@@ -162,6 +164,8 @@ impl State {
                         }),
                     })
                     .collect(),
+                // Only an open plan can be approved or replaced, so only its scope is hashed.
+                digest: if p.status == atomics_core::plan::PlanStatus::Open { p.digest() } else { String::new() },
             })
             .collect()
     }
@@ -197,7 +201,7 @@ impl State {
                     summary
                 }
             };
-            diffs.push(entry);
+            diffs.push(DiffSummary { comments: data.comments.clone(), ..entry });
         }
         diffs.sort_by(|a, b| a.worktree.cmp(&b.worktree));
         // Bodies first: a client told about a revision can always fetch it.
@@ -313,8 +317,7 @@ mod tests {
                 for _ in 0..3 {
                     state.publish_projections(&out, &mut cache, &bodies);
                 }
-                state.plans[0].tasks[0].brief = "not on the wire".into();
-                state.plans[0].tasks[0].notes.push("nor this".into());
+                state.plans[0].tasks[0].notes.push("not on the wire".into());
                 state.publish_projections(&out, &mut cache, &bodies);
                 assert_eq!(revisions(&out), quiet, "a pass with nothing to tell moved a revision");
 
@@ -330,6 +333,8 @@ mod tests {
                     ("approval removed", change(|s| s.sessions[1].approvals.clear())),
                     ("session removed", change(|s| drop(s.sessions.pop()))),
                     ("plan goal", change(|s| s.plans[0].goal = "ship it".into())),
+                    // Not a field of its own, but part of the approval scope the digest covers.
+                    ("task brief", change(|s| s.plans[0].tasks[1].brief = "and the lexer".into())),
                     ("plan approved", change(|s| s.plans[0].approved = true)),
                     ("plan status", change(|s| s.plans[0].status = PlanStatus::Completed)),
                     ("plan integration", change(|s| s.plans[0].integration = Some("int".into()))),

@@ -435,7 +435,7 @@ impl Hub {
         }
         let loaded = projections.load();
         self.seen = loaded.cursor;
-        let events = self.diff(&loaded);
+        let events = self.diff(&loaded, |id| projections.resolution(id));
         self.snapshot = None;
         if events.is_empty() {
             // Only the order or the revisions moved: no event, but the next snapshot shows them.
@@ -484,8 +484,9 @@ impl Hub {
         }
     }
 
-    /// Events (cursor placeholders, filled in by the caller) for the change from `self.state` to `new`.
-    fn diff(&self, new: &Loaded) -> Vec<Message> {
+    /// Events (cursor placeholders, filled in by the caller) for the change from `self.state` to
+    /// `new`. `resolution` says how an approval that left ended, when it was answered.
+    fn diff(&self, new: &Loaded, resolution: impl Fn(&str) -> Option<Disposition>) -> Vec<Message> {
         let old = &self.state;
         let mut out = Vec::new();
         let zero = Seq(0);
@@ -521,9 +522,11 @@ impl Hub {
                     out.push(Message::ApprovalPending { cursor: zero, approval: (*a).clone() });
                 }
             }
-            // The projection says an approval is gone, not how it ended; H4 carries the real outcome.
+            // An answered approval says how; one that went otherwise (the hook gave up, the agent
+            // moved on, it was answered in the terminal) is withdrawn.
             for id in before.keys().filter(|id| !after.contains_key(*id)) {
-                out.push(Message::ApprovalResolved { cursor: zero, id: (*id).clone(), disposition: Disposition::Withdrawn });
+                let disposition = resolution(id).unwrap_or(Disposition::Withdrawn);
+                out.push(Message::ApprovalResolved { cursor: zero, id: (*id).clone(), disposition });
             }
         }
         if new.diffs.revision != old.diffs.revision {

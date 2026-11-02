@@ -50,7 +50,9 @@ fn start_with(config: ServerConfig, published: &[(&str, &Detached)]) -> Fixture 
     let terminals = Arc::new(Terminals::default());
     terminals.publish(published.iter().map(|(s, t)| entry(s, t)).collect());
     let projections = Arc::new(Projections::default());
-    let server = Server::start(config, projections.clone(), Arc::new(NoDiffs), terminals.clone()).unwrap();
+    let server =
+        Server::start(config, projections.clone(), Arc::new(NoDiffs), terminals.clone(), Arc::new(super::NoCommands))
+            .unwrap();
     Fixture { server, terminals, projections }
 }
 

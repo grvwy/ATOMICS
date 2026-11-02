@@ -1,0 +1,366 @@
+//! The operation journal. A mutation is recorded before it takes effect and its outcome once it
+//! has one, so sending the same operation ID again returns what happened instead of doing it twice.
+//!
+//! An operation is known by who sent it (`desktop`, or `client:` and the client's ID) and its
+//! `op`. Its command's fingerprint is kept with it: the same ID with a different command is a
+//! `conflict`, never the old outcome. With a file (while the protocol server runs), each record is
+//! one JSON line, appended before the work starts and after it ends. If the host process dies in
+//! between, the next start finds a beginning without an end and answers `uncertain` for it: the
+//! host never guesses whether a message was typed or a merge ran. Lines are not synced to disk:
+//! this guards against the host process dying, not the machine losing power; an operation whose
+//! lines were lost is one the host no longer knows, which a client treats as too old to resend.
+//!
+//! Outcomes are kept for `KEEP_SECS` from when the operation began (twice the `op_ttl_secs` that
+//! clients are told), at most `CAPACITY` at once; an operation still running is never forgotten.
+//! Beyond that, a new operation is refused rather than an unexpired one forgotten.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+use atomics_core::ops::{Command, OP_TTL_SECS, Outcome};
+use serde::{Deserialize, Serialize};
+
+pub const KEEP_SECS: u64 = 2 * OP_TTL_SECS as u64;
+pub const CAPACITY: usize = 4096;
+/// A `done` result kept for a retry is cut to this size; the first answer carries it whole.
+const KEPT_RESULT_BYTES: usize = 8 * 1024;
+
+/// Who sent an operation, and its ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Key {
+    pub origin: String,
+    pub op: String,
+}
+
+impl Key {
+    pub fn desktop(op: String) -> Self {
+        Self { origin: "desktop".into(), op }
+    }
+
+    pub fn client(client_id: &str, op: &str) -> Self {
+        Self { origin: format!("client:{client_id}"), op: op.into() }
+    }
+}
+
+/// What `begin` found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Begun {
+    /// New: recorded; carry it out and `finish` it.
+    Fresh,
+    /// Done before; this is how it ended.
+    Known(Outcome),
+    /// Still running in this process; its outcome follows.
+    Running,
+    /// The ID was used for a different command.
+    Conflict,
+    /// Too many operations are remembered to take another now.
+    Full,
+    /// The record could not be written, so the work was not started.
+    Unwritable(String),
+}
+
+struct Entry {
+    fingerprint: String,
+    began: u64,
+    outcome: Option<Outcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "record", rename_all = "snake_case")]
+enum Record {
+    Begin {
+        #[serde(flatten)]
+        key: Key,
+        fingerprint: String,
+        at: u64,
+    },
+    End {
+        #[serde(flatten)]
+        key: Key,
+        outcome: Outcome,
+    },
+}
+
+struct Log {
+    path: PathBuf,
+    file: File,
+    lines: usize,
+}
+
+pub struct Journal {
+    entries: HashMap<Key, Entry>,
+    log: Option<Log>,
+}
+
+/// A command's fingerprint: FNV-1a over its JSON. It tells a reused ID apart from a retry; it is
+/// not a security boundary (the ID's owner is the only one who could make the two collide).
+pub fn fingerprint(command: &Command) -> String {
+    let bytes = serde_json::to_vec(command).unwrap_or_default();
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016x}")
+}
+
+fn kept(outcome: &Outcome) -> Outcome {
+    match outcome {
+        Outcome::Done { result } if atomics_core::wire::json_len(result) > KEPT_RESULT_BYTES => {
+            Outcome::done(serde_json::json!({ "trimmed": true }))
+        }
+        other => other.clone(),
+    }
+}
+
+fn private_file(path: &Path, append: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).mode(0o600);
+    if append {
+        options.append(true);
+    } else {
+        options.write(true).truncate(true);
+    }
+    options.open(path)
+}
+
+impl Journal {
+    /// A journal with no file: the desktop's own operations while the protocol server is off.
+    pub fn memory() -> Self {
+        Self { entries: HashMap::new(), log: None }
+    }
+
+    /// Load the journal at `path` (mode 0600). An operation that began without ending is
+    /// `uncertain` from now on, and forgotten ones are left out of the file written back.
+    pub fn open(path: &Path, now: u64) -> io::Result<Self> {
+        let mut entries: HashMap<Key, Entry> = HashMap::new();
+        match File::open(path) {
+            Ok(file) => {
+                for line in BufReader::new(file).split(b'\n') {
+                    // A line cut short by a crash (even inside a character) is skipped like any
+                    // other unreadable one.
+                    let Ok(record) = serde_json::from_slice::<Record>(&line?) else { continue };
+                    match record {
+                        Record::Begin { key, fingerprint, at } => {
+                            entries.insert(key, Entry { fingerprint, began: at, outcome: None });
+                        }
+                        Record::End { key, outcome } => {
+                            if let Some(entry) = entries.get_mut(&key) {
+                                entry.outcome = Some(outcome);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        for entry in entries.values_mut() {
+            entry.outcome.get_or_insert_with(|| Outcome::Uncertain {
+                message: "the host stopped while this ran; check the board before trying again".into(),
+            });
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Opened first only so that `compact` has a log to replace.
+        let file = private_file(path, true)?;
+        let mut journal = Self { entries, log: Some(Log { path: path.to_path_buf(), file, lines: 0 }) };
+        journal.expire(now);
+        journal.compact()?;
+        Ok(journal)
+    }
+
+    /// Operations remembered, for tests and diagnostics.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Look the operation up, or record its beginning. Only `Fresh` means "carry it out".
+    pub fn begin(&mut self, key: &Key, fingerprint: &str, now: u64) -> Begun {
+        self.expire(now);
+        if let Some(entry) = self.entries.get(key) {
+            if entry.fingerprint != fingerprint {
+                return Begun::Conflict;
+            }
+            return entry.outcome.clone().map_or(Begun::Running, Begun::Known);
+        }
+        if self.entries.len() >= CAPACITY {
+            return Begun::Full;
+        }
+        let record = Record::Begin { key: key.clone(), fingerprint: fingerprint.into(), at: now };
+        if let Err(e) = self.append(&record) {
+            return Begun::Unwritable(e.to_string());
+        }
+        self.entries.insert(key.clone(), Entry { fingerprint: fingerprint.into(), began: now, outcome: None });
+        Begun::Fresh
+    }
+
+    /// Record how the operation ended. A failed write is reported and the outcome is still kept
+    /// in memory; after a crash the operation would then read as `uncertain`, which is true.
+    pub fn finish(&mut self, key: &Key, outcome: &Outcome) {
+        let Some(entry) = self.entries.get_mut(key) else { return };
+        let outcome = kept(outcome);
+        entry.outcome = Some(outcome.clone());
+        if let Err(e) = self.append(&Record::End { key: key.clone(), outcome }) {
+            eprintln!("atomics: the operation journal could not record an outcome: {e}");
+        }
+        if self.log.as_ref().is_some_and(|log| log.lines > 2 * self.entries.len() + 64)
+            && let Err(e) = self.compact()
+        {
+            eprintln!("atomics: the operation journal could not be compacted: {e}");
+        }
+    }
+
+    fn expire(&mut self, now: u64) {
+        self.entries.retain(|_, e| e.outcome.is_none() || now.saturating_sub(e.began) < KEEP_SECS);
+    }
+
+    fn append(&mut self, record: &Record) -> io::Result<()> {
+        let Some(log) = &mut self.log else { return Ok(()) };
+        let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
+        line.push(b'\n');
+        // One write per line, so a crash leaves at most the last line cut short.
+        log.file.write_all(&line)?;
+        log.lines += 1;
+        Ok(())
+    }
+
+    /// Write what is remembered to a new file and put it in place of the log.
+    fn compact(&mut self) -> io::Result<()> {
+        let Some(log) = &mut self.log else { return Ok(()) };
+        let tmp = log.path.with_extension("jsonl.tmp");
+        let mut out = Vec::new();
+        let mut lines = 0;
+        for (key, entry) in &self.entries {
+            let begin = Record::Begin { key: key.clone(), fingerprint: entry.fingerprint.clone(), at: entry.began };
+            serde_json::to_writer(&mut out, &begin).map_err(io::Error::other)?;
+            out.push(b'\n');
+            lines += 1;
+            if let Some(outcome) = &entry.outcome {
+                serde_json::to_writer(&mut out, &Record::End { key: key.clone(), outcome: outcome.clone() })
+                    .map_err(io::Error::other)?;
+                out.push(b'\n');
+                lines += 1;
+            }
+        }
+        let mut file = private_file(&tmp, false)?;
+        file.write_all(&out)?;
+        drop(file);
+        std::fs::rename(&tmp, &log.path)?;
+        log.file = private_file(&log.path, true)?;
+        log.lines = lines;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomics_core::ops::{SessionAction, SessionCommand};
+    use atomics_core::wire::ErrorCode;
+
+    fn steer(op: &str, text: &str) -> Command {
+        Command::SessionCommand(SessionCommand {
+            op: op.into(),
+            action: SessionAction::Steer { session: "a".into(), text: text.into() },
+        })
+    }
+
+    fn begin(journal: &mut Journal, command: &Command, now: u64) -> Begun {
+        journal.begin(&Key::client("phone", command.op()), &fingerprint(command), now)
+    }
+
+    #[test]
+    fn a_retry_returns_the_known_outcome_and_a_reused_id_is_a_conflict() {
+        let mut journal = Journal::memory();
+        let command = steer("o1", "go on");
+        assert_eq!(begin(&mut journal, &command, 10), Begun::Fresh);
+        assert_eq!(begin(&mut journal, &command, 11), Begun::Running, "a retry while it runs waits for it");
+        let done = Outcome::done(serde_json::json!({"sent": true}));
+        journal.finish(&Key::client("phone", "o1"), &done);
+        assert_eq!(begin(&mut journal, &command, 12), Begun::Known(done));
+        assert_eq!(begin(&mut journal, &steer("o1", "something else"), 12), Begun::Conflict);
+        // Another client's operation with the same ID is its own.
+        let other = journal.begin(&Key::client("laptop", "o1"), &fingerprint(&command), 12);
+        assert_eq!(other, Begun::Fresh);
+    }
+
+    #[test]
+    fn an_operation_the_host_died_during_is_uncertain_after_a_restart() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        let (ran, crashed) = (steer("ran", "a"), steer("crashed", "b"));
+        let refused = Outcome::Refused { code: ErrorCode::NotFound, message: "no such session".into() };
+        {
+            let mut journal = Journal::open(&path, 100).unwrap();
+            assert_eq!(begin(&mut journal, &ran, 100), Begun::Fresh);
+            journal.finish(&Key::client("phone", "ran"), &refused);
+            assert_eq!(begin(&mut journal, &crashed, 101), Begun::Fresh);
+            // The process dies here: `crashed` never finishes.
+        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let mut journal = Journal::open(&path, 200).unwrap();
+        assert_eq!(begin(&mut journal, &ran, 200), Begun::Known(refused), "a finished one is known across restarts");
+        assert!(
+            matches!(begin(&mut journal, &crashed, 200), Begun::Known(Outcome::Uncertain { .. })),
+            "never run again, never guessed"
+        );
+        // A crash in the middle of writing a line loses only that line.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"record":"end","origin":"client:phone","op":"cra"#).unwrap();
+        drop(file);
+        let mut journal = Journal::open(&path, 300).unwrap();
+        assert!(matches!(begin(&mut journal, &crashed, 300), Begun::Known(Outcome::Uncertain { .. })));
+    }
+
+    #[test]
+    fn outcomes_are_kept_for_twice_the_client_ttl_and_running_ones_always() {
+        let mut journal = Journal::memory();
+        let (finished, running) = (steer("finished", "a"), steer("running", "b"));
+        begin(&mut journal, &finished, 0);
+        journal.finish(&Key::client("phone", "finished"), &Outcome::done(serde_json::Value::Null));
+        begin(&mut journal, &running, 0);
+        let later = KEEP_SECS - 1;
+        assert!(matches!(begin(&mut journal, &finished, later), Begun::Known(_)));
+        assert_eq!(begin(&mut journal, &finished, KEEP_SECS), Begun::Fresh, "forgotten after KEEP_SECS");
+        assert_eq!(begin(&mut journal, &running, 10 * KEEP_SECS), Begun::Running);
+    }
+
+    #[test]
+    fn a_full_journal_refuses_new_work_rather_than_forget_what_it_owes() {
+        let mut journal = Journal::memory();
+        for i in 0..CAPACITY {
+            assert_eq!(begin(&mut journal, &steer(&i.to_string(), "x"), 0), Begun::Fresh);
+        }
+        assert_eq!(begin(&mut journal, &steer("one more", "x"), 1), Begun::Full);
+        assert_eq!(begin(&mut journal, &steer("0", "x"), 1), Begun::Running, "known ones still answer");
+    }
+
+    #[test]
+    fn the_file_is_compacted_and_a_large_result_is_kept_trimmed() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        let mut journal = Journal::open(&path, 0).unwrap();
+        let big = Outcome::done(serde_json::json!({ "text": "x".repeat(KEPT_RESULT_BYTES) }));
+        let run = |journal: &mut Journal, ops: std::ops::Range<usize>, now: u64| {
+            for i in ops {
+                let command = steer(&i.to_string(), "x");
+                assert_eq!(begin(journal, &command, now), Begun::Fresh);
+                journal.finish(&Key::client("phone", command.op()), &big);
+            }
+        };
+        run(&mut journal, 0..200, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 400);
+        // Later those are forgotten, and the next operation's end rewrites the file without them.
+        run(&mut journal, 200..210, KEEP_SECS);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 20, "two lines per remembered operation");
+        let mut reopened = Journal::open(&path, KEEP_SECS).unwrap();
+        assert_eq!(reopened.len(), 10);
+        assert_eq!(
+            begin(&mut reopened, &steer("205", "x"), KEEP_SECS),
+            Begun::Known(Outcome::done(serde_json::json!({ "trimmed": true })))
+        );
+    }
+}
