@@ -33,6 +33,8 @@ oauth_account() {
   done
 }
 case "$*" in *atomics-mcp-oauth-v1*) file="$dir/keychain-oauth-$(oauth_account "$@")" ;; esac
+# Rendezvous device keys: one file per account (an ATOMICS home's digest).
+case "$*" in *atomics-rendezvous-v1*) file="$dir/keychain-device-$(oauth_account "$@")" ;; esac
 # The catalog's item from before the rename to ATOMICS.
 case "$*" in *imacs-credentials-v1*) file="$dir/keychain-catalog-imacs" ;; esac
 case "$1" in
@@ -40,6 +42,7 @@ case "$1" in
     read -r command
     case "$command" in *atomics-credentials-v1*) file="$dir/keychain-catalog" ;; esac
     case "$command" in *atomics-mcp-oauth-v1*) file="$dir/keychain-oauth-$(oauth_account $command)" ;; esac
+    case "$command" in *atomics-rendezvous-v1*) file="$dir/keychain-device-$(oauth_account $command)" ;; esac
     printf '%s\n' "${command##* -w }" > "$file"
     ;;
   store)

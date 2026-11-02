@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use crate::app::State;
 use crate::app::projection::{DiffBodies, DiffSummaries};
-use crate::protocol;
 use crate::ipc::{ControlMessage, ControlOutcome};
+use crate::protocol;
+use crate::protocol::rendezvous::{self, Rendezvous, StatusCell, issuer::Published};
 use atomics_core::control::ControlRequest;
 use atomics_core::projection::Projections;
+use atomics_core::tickets::TicketConfig;
 
 /// Owns runtime state and the thread that services it. The desktop is an
 /// in-process client; closing the whole application still shuts down the host.
@@ -29,14 +31,26 @@ pub struct Host {
     protocol_error: Option<String>,
     /// The terminals the protocol may stream; absent (and never published) without the server.
     terminals: Option<Arc<protocol::Terminals>>,
+    /// Only with `[remote.rendezvous] enabled` beside a running protocol server.
+    rendezvous: Option<Rendezvous>,
+}
+
+/// What the desktop and `atomics ctl` show of remote access.
+#[derive(Clone, Default)]
+pub(crate) struct RemoteView {
+    pub enabled: bool,
+    pub addr: Option<std::net::SocketAddr>,
+    pub error: Option<String>,
+    /// With `[remote.rendezvous] enabled`, whether or not it could start.
+    pub rendezvous: Option<Arc<StatusCell>>,
 }
 
 impl Host {
-    pub(crate) fn start(state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
+    pub(crate) fn start(mut state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
         let projections = Arc::new(Projections::default());
         let bodies = Arc::new(DiffBodies::default());
-        let (protocol, terminals, protocol_error) = match start_protocol(&state.remote_access(), &projections, &bodies)
-        {
+        let remote = state.remote_access();
+        let (protocol, terminals, protocol_error) = match start_protocol(&remote, &projections, &bodies) {
             Ok(Some((server, terminals))) => (Some(server), Some(terminals), None),
             Ok(None) => (None, None, None),
             Err(error) => {
@@ -45,6 +59,14 @@ impl Host {
                 (None, None, Some(error.to_string()))
             }
         };
+        let (rendezvous, profile, status) =
+            start_rendezvous(&remote, protocol.as_ref(), state.window().clone(), state.rendezvous_profile());
+        state.set_remote_view(RemoteView {
+            enabled: remote.enabled,
+            addr: protocol.as_ref().map(protocol::Server::addr),
+            error: protocol_error.clone(),
+            rendezvous: status,
+        });
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
@@ -72,6 +94,10 @@ impl Host {
                         if let Some(terminals) = &terminals {
                             state.publish_terminals(terminals);
                         }
+                        // The profile the rendezvous registers through, as the workspace now has it.
+                        if let Some(profile) = &profile {
+                            profile.set(state.rendezvous_profile());
+                        }
                         state.publish_projections(&published, &mut summaries, &bodies);
                         state.runtime_deadline()
                     };
@@ -89,6 +115,7 @@ impl Host {
             protocol,
             protocol_error,
             terminals: published_terminals,
+            rendezvous,
         }
     }
 
@@ -131,7 +158,16 @@ impl Host {
         self.terminals.is_some()
     }
 
+    /// The rendezvous's status, when `[remote.rendezvous]` is enabled.
+    pub fn rendezvous_status(&self) -> Option<rendezvous::Status> {
+        self.state.lock().unwrap().remote_view().rendezvous.as_ref().map(|cell| cell.get())
+    }
+
     pub fn stop(&mut self) {
+        // The tunnel first: its channels are sessions of the server.
+        if let Some(rendezvous) = &mut self.rendezvous {
+            rendezvous.stop();
+        }
         if let Some(server) = &mut self.protocol {
             server.stop();
         }
@@ -168,6 +204,60 @@ fn start_protocol(
     };
     let server = protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone())?;
     Ok(Some((server, terminals)))
+}
+
+type Started = (Option<Rendezvous>, Option<Arc<Published<TicketConfig>>>, Option<Arc<StatusCell>>);
+
+/// The rendezvous, when `[remote.rendezvous] enabled`. Without the protocol server it cannot
+/// serve a channel, so it does not start, and its status says why. Its keys are read, and made if
+/// need be, on its own thread: the keychain may wait to be unlocked. `profile` is the ticket
+/// profile as it is now; the runtime thread publishes its changes.
+fn start_rendezvous(
+    config: &atomics_core::config::RemoteAccessConfig,
+    server: Option<&protocol::Server>,
+    window: Window,
+    profile: Option<Arc<TicketConfig>>,
+) -> Started {
+    let settings = &config.rendezvous;
+    if !settings.enabled {
+        return (None, None, None);
+    }
+    let status = StatusCell::new(move || window.request_repaint());
+    let stopped = |note: &str| {
+        status.update(|s| {
+            s.phase = rendezvous::Phase::Stopped;
+            s.note = Some(note.to_string());
+        })
+    };
+    let Some(server) = server else {
+        stopped(if config.enabled {
+            "the protocol server did not start, so the rendezvous cannot serve a channel"
+        } else {
+            "the rendezvous needs [remote] enabled = true"
+        });
+        return (None, None, Some(status));
+    };
+    let published = Arc::new(Published::default());
+    published.set(profile);
+    let issuer = rendezvous::issuer::ProfileIssuer::new(published.clone(), crate::mcp_client::OAuth::current());
+    let keys: rendezvous::KeySource = Box::new(|| {
+        let store = crate::credentials::Store::new(crate::relay::Keychain::current());
+        rendezvous::keys::DeviceKeys::load_or_create(&store, &atomics_core::paths::atomics_home())
+    });
+    let started = Rendezvous::start(
+        rendezvous::Settings::new(&settings.url, &settings.name),
+        server.sessions(),
+        Box::new(issuer),
+        keys,
+        status.clone(),
+    );
+    match started {
+        Ok(rendezvous) => (Some(rendezvous), Some(published), Some(status)),
+        Err(error) => {
+            stopped(&format!("could not start the rendezvous thread: {error}"));
+            (None, None, Some(status))
+        }
+    }
 }
 
 /// What the runtime may ask of a native window: a repaint, focus, and the size it last had.

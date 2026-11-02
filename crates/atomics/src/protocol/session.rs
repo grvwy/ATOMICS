@@ -162,14 +162,15 @@ pub fn serve(link: &mut dyn Link, role: Role, shared: &Shared) -> Ended {
     let epoch = lock(&shared.hub).epoch().to_string();
     let mut out = Out { link, epoch, last_sent: Instant::now() };
     let ended = run(&mut out, role, shared);
-    let reason = match &ended {
-        Ended::Stopped => "host is shutting down",
-        Ended::Rejected(_) => "protocol error",
-        Ended::Slow => "client is too slow",
-        Ended::Idle => "idle",
-        Ended::Closed => "closed",
+    use atomics_core::tunnel::close;
+    let (code, reason) = match &ended {
+        Ended::Stopped => (close::NORMAL, "host is shutting down"),
+        Ended::Rejected(_) => (close::REFUSED, "protocol error"),
+        Ended::Slow => (close::SLOW, "client is too slow"),
+        Ended::Idle => (close::IDLE, "idle"),
+        Ended::Closed => (close::NORMAL, "closed"),
     };
-    out.link.close(reason);
+    out.link.close_with(code, reason);
     ended
 }
 

@@ -47,6 +47,7 @@ pub mod store;
 pub mod theme;
 pub mod tickets;
 pub mod trace;
+pub mod tunnel;
 pub mod usage;
 #[cfg(feature = "native")]
 pub mod voice;

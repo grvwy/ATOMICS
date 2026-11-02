@@ -820,8 +820,8 @@ keys for menus), `atomics_read` (screen text), `atomics_diff`, `atomics_comment`
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
 `atomics ctl '<json>'` sends the same requests from a shell, e.g. `atomics ctl '{"cmd":"list"}'`. A few extras exist for
-scripting and testing: `show_diff`, `show_chief`, `show_settings` (the Settings menu and its theme picker), `resize`
-and `screenshot`. For example,
+scripting and testing: `show_diff`, `show_chief`, `show_settings` (the Settings menu and its theme picker), `resize`,
+`screenshot` and `remote` (the protocol server and the rendezvous: registered, online, channels). For example,
 `atomics ctl '{"cmd":"show_chief","open":true,"dock":"docked","width":720}'` shows the dock and remembers its width.
 
 ## Shortcuts

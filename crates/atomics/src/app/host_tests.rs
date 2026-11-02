@@ -669,6 +669,62 @@ fn the_protocol_server_is_off_by_default() {
     });
 }
 
+/// This process's threads whose name starts with `prefix` (Linux keeps 15 bytes of a name); `None`
+/// where threads cannot be listed. Each `with_state` test is a process of its own.
+fn threads_named(prefix: &str) -> Option<usize> {
+    let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+    Some(
+        tasks
+            .flatten()
+            .filter(|task| std::fs::read_to_string(task.path().join("comm")).is_ok_and(|n| n.trim().starts_with(prefix)))
+            .count(),
+    )
+}
+
+#[test]
+fn nothing_of_the_rendezvous_starts_or_dials_unless_it_is_enabled() {
+    with_state("app::host_tests::nothing_of_the_rendezvous_starts_or_dials_unless_it_is_enabled", |mut state, _| {
+        assert!(!state.config.remote.rendezvous.enabled, "off by default");
+        // A service that would see any dial: the URL is set and the protocol server runs; only
+        // `[remote.rendezvous] enabled` is not.
+        let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        service.set_nonblocking(true).unwrap();
+        state.config.remote.enabled = true;
+        state.config.remote.rendezvous.url = format!("ws://{}/tunnel", service.local_addr().unwrap());
+        let host = state.into_host();
+        assert!(host.protocol_addr().is_some(), "the protocol server runs");
+        assert!(host.rendezvous_status().is_none(), "no rendezvous, so no indicator either");
+        std::thread::sleep(crate::test_support::scaled_timeout(Duration::from_millis(500)));
+        assert!(matches!(service.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "nothing dialed");
+        assert_ne!(threads_named("atomics-protoco"), Some(0), "the thread listing works here");
+        assert!(matches!(threads_named("atomics-rendez"), Some(0) | None), "no rendezvous or issuer thread");
+        let remote = host.state().remote_json();
+        assert!(remote["rendezvous"].is_null() && remote["protocol"]["url"].is_string(), "{remote}");
+    });
+}
+
+#[test]
+fn an_enabled_rendezvous_without_the_protocol_server_says_why_and_starts_nothing() {
+    with_state(
+        "app::host_tests::an_enabled_rendezvous_without_the_protocol_server_says_why_and_starts_nothing",
+        |mut state, _| {
+            let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            service.set_nonblocking(true).unwrap();
+            state.config.remote.rendezvous.enabled = true;
+            state.config.remote.rendezvous.url = format!("ws://{}/tunnel", service.local_addr().unwrap());
+            let host = state.into_host();
+            assert!(host.protocol_addr().is_none());
+            let status = host.rendezvous_status().expect("shown, to say why");
+            assert_eq!(status.phase, crate::protocol::rendezvous::Phase::Stopped);
+            assert!(status.note.as_deref().unwrap().contains("[remote] enabled"), "{status:?}");
+            std::thread::sleep(crate::test_support::scaled_timeout(Duration::from_millis(500)));
+            assert!(matches!(service.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            assert!(matches!(threads_named("atomics-rendez"), Some(0) | None));
+            assert_eq!(host.state().remote_json()["rendezvous"]["phase"], "stopped");
+        },
+    );
+}
+
 #[test]
 fn the_protocol_streams_a_session_terminal_while_the_state_lock_is_held() {
     with_state(

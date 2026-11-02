@@ -1,6 +1,6 @@
 //! The byte-moving half of the protocol server. A `Link` carries whole text frames between the
 //! server and one client; everything above it (handshake, queues, replay) is transport-agnostic, so
-//! the loopback WebSocket and the later rendezvous transport serve the same session code.
+//! the loopback WebSocket and a rendezvous channel (`rendezvous::channel`) serve the same session code.
 //!
 //! A link waiting for the client's next frame can be woken from another thread ([`Waker`]): the
 //! client's outbox wakes it when something is queued, so a frame (an input echo above all) leaves
@@ -36,6 +36,11 @@ pub trait Link: Send {
     /// Wait up to `wait` for one frame. `Ok(None)` means nothing arrived, or the link was woken.
     fn recv(&mut self, wait: Duration) -> Result<Option<String>, LinkError>;
     fn close(&mut self, reason: &str);
+    /// Close with a code: 1000, or one of ATOMICS's in 4000-4999 (`atomics_core::tunnel::close`).
+    /// A link without codes of its own closes as `close` does.
+    fn close_with(&mut self, _code: u16, reason: &str) {
+        self.close(reason);
+    }
     /// What ends a `recv` wait early, for a link that supports it.
     fn waker(&self) -> Option<Arc<Waker>> {
         None
@@ -56,6 +61,59 @@ impl Waker {
             let _ = (&self.tx).write(&[1]);
         }
     }
+
+    /// A waker and the end of its pipe that a wait polls.
+    fn pair() -> io::Result<(Arc<Waker>, UnixStream)> {
+        let (tx, rx) = UnixStream::pair()?;
+        tx.set_nonblocking(true)?;
+        rx.set_nonblocking(true)?;
+        Ok((Arc::new(Waker { tx, pending: AtomicBool::new(false) }), rx))
+    }
+
+    /// Empty the pipe, then clear `pending`, in that order. While `pending` is set no waker
+    /// writes, so the drain ends, and every wake is either:
+    /// - after the clear: it sees `pending` unset and writes, so the next wait ends at once; or
+    /// - before it: its byte is in the pipe (drained here, or left to end the next wait), or it
+    ///   saw `pending` already set. Either way the clear, an acquiring swap that reads the end
+    ///   of the wakers' chain of swaps, makes everything queued before that wake visible to the
+    ///   read that follows this wait.
+    ///
+    /// Clearing first would lose a wake landing between the clear and the drain: its byte would
+    /// be drained and `pending` left set with the pipe empty, so no later wake would write again.
+    fn drain(&self, mut rx: &UnixStream) {
+        let mut sink = [0u8; 64];
+        while matches!(rx.read(&mut sink), Ok(n) if n > 0) {}
+        self.pending.swap(false, Ordering::AcqRel);
+    }
+}
+
+/// A wait that only a [`Waker`] (or its timeout) ends: what a link that is not a socket of its
+/// own waits on, such as a rendezvous channel, whose frames another thread hands it.
+pub struct Wait {
+    rx: UnixStream,
+    waker: Arc<Waker>,
+}
+
+impl Wait {
+    pub fn new() -> io::Result<Self> {
+        let (waker, rx) = Waker::pair()?;
+        Ok(Self { rx, waker })
+    }
+
+    pub fn waker(&self) -> Arc<Waker> {
+        self.waker.clone()
+    }
+
+    /// Wait up to `timeout` for a wake; anything queued before the wake is visible after it.
+    pub fn wait(&mut self, timeout: Duration) {
+        let mut fds = [libc::pollfd { fd: self.rx.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let timeout = timeout.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        // SAFETY: `fds` is a valid array of one pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout) };
+        if ready > 0 {
+            self.waker.drain(&self.rx);
+        }
+    }
 }
 
 /// A loopback TCP stream whose reads, once `wait` is set, wait for data or a [`Waker`], whichever
@@ -72,10 +130,7 @@ pub struct Stream {
 
 impl Stream {
     pub fn new(tcp: TcpStream) -> io::Result<Self> {
-        let (tx, rx) = UnixStream::pair()?;
-        tx.set_nonblocking(true)?;
-        rx.set_nonblocking(true)?;
-        let waker = Arc::new(Waker { tx, pending: AtomicBool::new(false) });
+        let (waker, rx) = Waker::pair()?;
         Ok(Self { tcp, rx, waker, wait: None, deadline: None })
     }
 
@@ -85,20 +140,22 @@ impl Stream {
         self
     }
 
-    /// Empty the pipe, then clear `pending`, in that order. While `pending` is set no waker
-    /// writes, so the drain ends, and every wake is either:
-    /// - after the clear: it sees `pending` unset and writes, so the next wait ends at once; or
-    /// - before it: its byte is in the pipe (drained here, or left to end the next wait), or it
-    ///   saw `pending` already set. Either way the clear, an acquiring swap that reads the end
-    ///   of the wakers' chain of swaps, makes everything queued before that wake visible to the
-    ///   outbox read that follows this wait.
-    ///
-    /// Clearing first would lose a wake landing between the clear and the drain: its byte would
-    /// be drained and `pending` left set with the pipe empty, so no later wake would write again.
+    /// How long a read waits for data or a wake; `None` makes reads plain blocking ones, cut off
+    /// at the deadline if there is one. For a stream used outside `WsLink` (the rendezvous socket).
+    pub fn set_wait(&mut self, wait: Option<Duration>) {
+        self.wait = wait;
+    }
+
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    pub fn waker(&self) -> Arc<Waker> {
+        self.waker.clone()
+    }
+
     fn drain_wakes(&mut self) {
-        let mut sink = [0u8; 64];
-        while matches!(self.rx.read(&mut sink), Ok(n) if n > 0) {}
-        self.waker.pending.swap(false, Ordering::AcqRel);
+        self.waker.drain(&self.rx);
     }
 }
 

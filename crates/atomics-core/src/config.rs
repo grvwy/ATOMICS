@@ -167,6 +167,24 @@ close_done_agents = true
 # # arguments = { conversationId = "{conversation}" }
 # # result = { steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 #
+# # Phone and browser access through Relay's rendezvous; see docs/daemon.md, "Rendezvous". Uncomment it with
+# # [remote.rendezvous] in the main config: url = "wss://relay.atomisk.ai/api/v1/atomics/tunnel".
+# # [tickets.rendezvous]
+# # label = "Relay"
+# # errors = { code = "code", owner = ["atomics.owner_required"], unknown = ["atomics.host_unknown"], revoked = ["atomics.host_revoked"], challenge = ["atomics.nonce_invalid", "atomics.signature_invalid"], throttled = ["atomics.rate_limited"] }
+# # [tickets.operations.rendezvous_register]
+# # tool = "register_atomics_host"
+# # arguments = { idempotencyKey = "{nonce}", signingPublicKey = "{signing_key}", noisePublicKey = "{noise_key}", displayName = "{host_name}", protocolMajor = "{protocol_major}" }
+# # result = { host_id = "hostId" }
+# # [tickets.operations.rendezvous_challenge]
+# # tool = "atomics_tunnel_pass"
+# # arguments = { hostId = "{host_id}" }
+# # result = { challenge = "nonce" }
+# # [tickets.operations.rendezvous_pass]
+# # tool = "atomics_tunnel_pass"
+# # arguments = { hostId = "{host_id}", nonce = "{challenge}", signature = "{signature}" }
+# # result = { pass = "pass" }
+#
 # [tickets.operations.get]
 # tool = "get_ticket"
 # arguments = { ticket = "{key}" }
@@ -415,6 +433,13 @@ github = "primary+g"        # the GitHub controls; primary = Command on macOS, C
 # enabled = false
 # port = 0                  # 0 picks a free port
 # allowed_origins = []      # exact Origin values a browser may use; native clients send none
+#
+# [remote.rendezvous]
+# Reach this host from a phone or browser through a rendezvous service (see docs/daemon.md, "Rendezvous").
+# Needs enabled = true above, and a ticket profile that maps the rendezvous_* operations. Off by default.
+# enabled = false
+# url = ""                  # the service's wss:// address
+# name = ""                 # how the service lists this host; empty = this machine's name
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +481,21 @@ pub struct RemoteAccessConfig {
     pub port: u16,
     /// Exact `Origin` values a browser upgrade may carry. A native client sends none.
     pub allowed_origins: Vec<String>,
+    pub rendezvous: RendezvousConfig,
+}
+
+/// `[remote.rendezvous]`: the host dials out to a rendezvous service, which pairs its socket with
+/// the user's browsers. Off unless `enabled`, and it needs `[remote] enabled` too. The service's
+/// register and pass operations come from the ticket profile (`rendezvous_*`); the device keys
+/// live in the OS credential store, never here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RendezvousConfig {
+    pub enabled: bool,
+    /// The service's `wss://` address. `ws://` is accepted for a loopback host only.
+    pub url: String,
+    /// How the service lists this host; empty: this machine's name.
+    pub name: String,
 }
 
 /// Automatic cleanup on plan completion and archival. Dirty worktrees are always kept.
@@ -1389,6 +1429,15 @@ dock = "other""#
         assert!(!Config::default().remote.enabled);
         assert!(!toml::from_str::<Config>("").unwrap().remote.enabled);
         assert!(!toml::from_str::<Config>("[remote]\nport = 9000").unwrap().remote.enabled);
+        let rendezvous: Config = toml::from_str(
+            "[remote]\nenabled = true\n[remote.rendezvous]\nenabled = true\nurl = \"wss://r.example/t\"",
+        )
+        .unwrap();
+        assert_eq!(
+            rendezvous.remote.rendezvous,
+            RendezvousConfig { enabled: true, url: "wss://r.example/t".into(), name: String::new() }
+        );
+        assert!(!Config::default().remote.rendezvous.enabled, "off by default");
         let on: Config = toml::from_str("[remote]\nenabled = true\nallowed_origins = [\"https://a.example\"]").unwrap();
         assert!(on.remote.enabled);
         assert_eq!((on.remote.port, on.remote.allowed_origins), (0, vec!["https://a.example".to_string()]));

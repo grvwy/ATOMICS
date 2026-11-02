@@ -330,6 +330,9 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
             "conversation_read",
             "conversation_ack",
             "conversation_steerers",
+            "rendezvous_register",
+            "rendezvous_challenge",
+            "rendezvous_pass",
         ]
         .into_iter()
         .filter_map(|name| {

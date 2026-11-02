@@ -31,8 +31,15 @@ uuid = { version = "1.29.0", features = ["v4"] }
 # The ticket layer's MCP client speaks streamable HTTP too.
 # Browser sign-in for those servers (MCP authorization spec): S256 PKCE, URLs and base64url.
 ring = "0.17.14"
-# The protocol server's loopback WebSocket; blocking, on its own threads, no TLS (loopback only).
+# The protocol server's loopback WebSocket, and the rendezvous's outbound one; blocking, on their own
+# threads. The rendezvous does its own TLS with the rustls ureq already builds (same features).
 tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+webpki-roots = "1.0.11"
+# The rendezvous device's X25519 Noise static key (ring signs with its Ed25519 key but cannot load a
+# stored X25519 key). Version 4 is the one snow, the Noise library, builds on.
+curve25519-dalek = "4.1.3"
+zeroize = "1.9.1"
 url = "2.5.8"
 base64 = "0.22.1"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }

@@ -220,6 +220,9 @@ pub struct TicketConfig {
     pub operations: Operations,
     /// `[tickets.remote]`; follows the same workspace precedence as the rest of `[tickets]`.
     pub remote: RemoteConfig,
+    /// `[tickets.rendezvous]`: how this profile's rendezvous service is named and refuses.
+    #[serde(skip_serializing_if = "RendezvousProfile::is_unset")]
+    pub rendezvous: RendezvousProfile,
     /// Tabs of the Tickets panel beside the query box, each a `browse` listing.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<TicketView>,
@@ -266,10 +269,90 @@ impl Default for TicketConfig {
             states: StateMap::default(),
             operations: Operations::default(),
             remote: RemoteConfig::default(),
+            rendezvous: RendezvousProfile::default(),
             views: Vec::new(),
             filters: Vec::new(),
         }
     }
+}
+
+/// `[tickets.rendezvous]`: the profile's side of `[remote.rendezvous]`, beside its three
+/// `rendezvous_*` operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RendezvousProfile {
+    /// How the desktop names the service; empty: "the rendezvous service".
+    pub label: String,
+    pub errors: RendezvousErrors,
+}
+
+impl RendezvousProfile {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The service's name in the desktop and in `atomics ctl`.
+    pub fn label(&self) -> &str {
+        Some(self.label.trim()).filter(|label| !label.is_empty()).unwrap_or("the rendezvous service")
+    }
+}
+
+/// The codes a rendezvous service refuses with, read like `[tickets.remote] errors`: `code` is the
+/// JSON path of the code in a tool error's structured content. An unlisted code, or a refusal
+/// without one, is an ordinary failure, retried after a backoff.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RendezvousErrors {
+    pub code: String,
+    /// The connection is not a person's own agent, so it cannot register a host.
+    pub owner: Vec<String>,
+    /// The host id is not registered, or not yet: register again.
+    pub unknown: Vec<String>,
+    /// The host was revoked: only a new device key registers again.
+    pub revoked: Vec<String>,
+    /// The challenge expired or was spent, or its signature did not verify: start over.
+    pub challenge: Vec<String>,
+    /// Too many calls: wait a minute.
+    pub throttled: Vec<String>,
+}
+
+/// A rendezvous refusal `RendezvousErrors` recognises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendezvousRefusal {
+    Owner,
+    Unknown,
+    Revoked,
+    Challenge,
+    Throttled,
+}
+
+impl RendezvousErrors {
+    pub fn classify(&self, message: &str) -> Option<RendezvousRefusal> {
+        let code = error_code(message, &self.code)?;
+        [
+            (RendezvousRefusal::Owner, &self.owner),
+            (RendezvousRefusal::Unknown, &self.unknown),
+            (RendezvousRefusal::Revoked, &self.revoked),
+            (RendezvousRefusal::Challenge, &self.challenge),
+            (RendezvousRefusal::Throttled, &self.throttled),
+        ]
+        .into_iter()
+        .find(|(_, codes)| codes.iter().any(|c| c.trim() == code))
+        .map(|(class, _)| class)
+    }
+}
+
+/// The code at `path` in the first JSON object of `message` that has one. The code may follow
+/// text with braces of its own. `None` without a path.
+fn error_code(message: &str, path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    message.match_indices('{').find_map(|(at, _)| {
+        let value = serde_json::Deserializer::from_str(&message[at..]).into_iter::<Value>().next()?.ok()?;
+        json_path(&value, path).and_then(scalar)
+    })
 }
 
 /// An MCP server: a stdio command, or a streamable HTTP endpoint.
@@ -432,6 +515,17 @@ pub struct Operations {
     /// Optional. Placeholders: {title}, {body}, {board}, {board_key}, {nonce}.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create: Option<Operation>,
+    /// `[remote.rendezvous]`: register this host's public device keys. Placeholders: {nonce},
+    /// {signing_key}, {noise_key}, {host_name}, {protocol_major}. `result` maps `host_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendezvous_register: Option<Operation>,
+    /// A fresh challenge to sign for a pass. Placeholders: {host_id}. `result` maps `challenge`.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
+    pub rendezvous_challenge: Option<Operation>,
+    /// The pass a signed challenge buys. Placeholders: {host_id}, {challenge}, {signature}.
+    /// `result` maps `pass`.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
+    pub rendezvous_pass: Option<Operation>,
 }
 
 /// One generic operation: which tool to call, its arguments, and where its result
@@ -445,8 +539,10 @@ pub struct Operation {
     /// For `list`: the JSON path of the ticket array in the result.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub items: String,
-    /// JSON paths of the link fields in the result (in each item for `list`).
-    pub result: FieldPaths,
+    /// JSON paths of the link fields in the result (in each item for `list`). Boxed: a profile
+    /// holds every operation inline, and a debug build's config parsing keeps several copies of
+    /// it on the stack, which a 2 MiB thread stack must hold.
+    pub result: Box<FieldPaths>,
     /// Markdown body and per-item paths for a full reading card.
     pub body: String,
     pub comments: CommentPaths,
@@ -786,13 +882,7 @@ pub const ERROR_MESSAGES: &[(RemoteError, &str)] = &[
 
 impl RemoteErrors {
     pub fn classify(&self, message: &str) -> Option<RemoteError> {
-        // The code may follow text that has braces of its own: the first object holding one wins.
-        if !self.code.trim().is_empty()
-            && let Some(code) = message.match_indices('{').find_map(|(at, _)| {
-                let value = serde_json::Deserializer::from_str(&message[at..]).into_iter::<Value>().next()?.ok()?;
-                json_path(&value, self.code.trim()).and_then(scalar)
-            })
-        {
+        if let Some(code) = error_code(message, &self.code) {
             let lists = [
                 (RemoteError::ContentRefused, &self.content_refused),
                 (RemoteError::Ended, &self.ended),
@@ -1265,6 +1355,12 @@ pub struct FieldPaths {
     pub author: String,
     pub text: String,
     pub at: String,
+    /// `rendezvous_register`: the id the service gave this host.
+    pub host_id: String,
+    /// `rendezvous_challenge`: the text to sign.
+    pub challenge: String,
+    /// `rendezvous_pass`: the pass itself.
+    pub pass: String,
 }
 
 impl Default for FieldPaths {
@@ -1296,6 +1392,9 @@ impl Default for FieldPaths {
             author: String::new(),
             text: String::new(),
             at: String::new(),
+            host_id: String::new(),
+            challenge: String::new(),
+            pass: String::new(),
         }
     }
 }
@@ -1325,7 +1424,17 @@ pub const PLACEHOLDERS: &[&str] = &[
     "after",
     "owners",
     "ids",
+    "host_id",
+    "signing_key",
+    "noise_key",
+    "host_name",
+    "protocol_major",
+    "challenge",
+    "signature",
 ];
+
+/// Placeholders that keep their JSON type when an argument's whole string is one of them.
+const TYPED_PLACEHOLDERS: &[&str] = &["seq", "after", "owners", "ids", "protocol_major"];
 
 /// Values for an operation's placeholders. A placeholder whose value is unknown fails
 /// the operation with a message naming it, rather than sending an empty argument.
@@ -1345,7 +1454,7 @@ impl Vars {
         self
     }
 
-    /// Preserve JSON types for the four typed placeholders.
+    /// Preserve JSON types for the typed placeholders (`TYPED_PLACEHOLDERS`).
     pub fn typed(mut self, name: &str, value: Value) -> Self {
         self.values.insert(name.to_string(), Some(value));
         self
@@ -1526,6 +1635,9 @@ impl TicketConfig {
             "related" => self.operations.related.as_ref(),
             "read" => self.operations.read.as_ref(),
             "read_comments" => self.operations.read_comments.as_ref(),
+            "rendezvous_register" => self.operations.rendezvous_register.as_ref(),
+            "rendezvous_challenge" => self.operations.rendezvous_challenge.as_ref(),
+            "rendezvous_pass" => self.operations.rendezvous_pass.as_ref(),
             _ => None,
         }
         .filter(|op| !op.tool.trim().is_empty())
@@ -1856,7 +1968,7 @@ impl Operation {
             Ok(match value {
                 Value::String(text) => {
                     if let Some(name) = text.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
-                        && ["seq", "after", "owners", "ids"].contains(&name)
+                        && TYPED_PLACEHOLDERS.contains(&name)
                     {
                         vars.get(name).cloned().ok_or_else(|| format!("needs {{{name}}}, which is unknown here"))?
                     } else {
@@ -1902,6 +2014,12 @@ impl Operation {
 
 fn mapped_field(value: &Value, path: &str) -> Option<String> {
     if path.trim().is_empty() { None } else { json_path(value, path).and_then(scalar) }
+}
+
+/// The text at a result path, as every operation reads its fields; `None` for an empty path or
+/// one the result does not have.
+pub fn result_path(value: &Value, path: &str) -> Option<String> {
+    mapped_field(value, path)
 }
 
 impl FieldPaths {
@@ -4174,5 +4292,70 @@ arguments = { type = "bug" }
         assert!(!plain.has_views(), "views need a browse operation");
         let saved = toml::to_string(&TicketConfig { system: "demo".into(), ..TicketConfig::default() }).unwrap();
         assert!(!saved.contains("views") && !saved.contains("filters") && !saved.contains("paging"));
+    }
+
+    #[test]
+    fn rendezvous_operations_fill_typed_keys_and_read_their_result_paths() {
+        let config: TicketConfig = toml::from_str(
+            r#"[rendezvous]
+label = "Example"
+errors = { code = "error.code", unknown = ["host_unknown"], revoked = ["host_revoked"], challenge = ["nonce_invalid", "signature_invalid"], owner = ["owner_required"], throttled = ["rate_limited"] }
+[operations.rendezvous_register]
+tool = "register_host"
+arguments = { key = "{nonce}", signing = "{signing_key}", noise = "{noise_key}", name = "{host_name}", major = "{protocol_major}", label = "v{protocol_major}" }
+result = { host_id = "hostId" }
+[operations.rendezvous_challenge]
+tool = "host_pass"
+arguments = { hostId = "{host_id}" }
+result = { challenge = "nonce" }
+[operations.rendezvous_pass]
+tool = "host_pass"
+arguments = { hostId = "{host_id}", nonce = "{challenge}", signature = "{signature}" }
+result = { pass = "pass" }"#,
+        )
+        .unwrap();
+        let vars = Vars::default()
+            .with("nonce", Some("n-1"))
+            .with("signing_key", Some("c2lnbg"))
+            .with("noise_key", Some("bm9pc2U"))
+            .with("host_name", Some("laptop"))
+            .typed("protocol_major", serde_json::json!(1));
+        let register = config.operation("rendezvous_register").unwrap();
+        assert_eq!(
+            register.arguments(&vars).unwrap(),
+            serde_json::json!({"key": "n-1", "signing": "c2lnbg", "noise": "bm9pc2U", "name": "laptop", "major": 1, "label": "v1"}),
+            "a whole-string protocol major stays a number, inside text it is text"
+        );
+        assert_eq!(register.result.host_id, "hostId");
+        assert_eq!(config.operation("rendezvous_challenge").unwrap().result.challenge, "nonce");
+        let pass = config.operation("rendezvous_pass").unwrap();
+        let vars = Vars::default().with("host_id", Some("h")).with("challenge", Some("c")).with("signature", Some("s"));
+        assert_eq!(pass.arguments(&vars).unwrap(), serde_json::json!({"hostId": "h", "nonce": "c", "signature": "s"}));
+        assert_eq!(pass.result.pass, "pass");
+        assert!(pass.arguments(&Vars::default()).unwrap_err().contains("{host_id}"));
+        assert_eq!(config.rendezvous.label(), "Example");
+        assert_eq!(TicketConfig::default().rendezvous.label(), "the rendezvous service");
+        // The challenge and the pass are reads: an idempotency nonce there is a mistake.
+        for name in ["rendezvous_challenge", "rendezvous_pass"] {
+            let text = format!("[operations.{name}]\ntool = \"t\"\narguments = {{ k = \"{{nonce}}\" }}");
+            assert!(toml::from_str::<TicketConfig>(&text).unwrap_err().to_string().contains("{nonce}"), "{name}");
+        }
+        let errors = &config.rendezvous.errors;
+        let refusal =
+            |code: &str| errors.classify(&format!("host_pass failed: no {{\"error\":{{\"code\":\"{code}\"}}}}"));
+        assert_eq!(refusal("host_unknown"), Some(RendezvousRefusal::Unknown));
+        assert_eq!(refusal("host_revoked"), Some(RendezvousRefusal::Revoked));
+        assert_eq!(refusal("signature_invalid"), Some(RendezvousRefusal::Challenge));
+        assert_eq!(refusal("owner_required"), Some(RendezvousRefusal::Owner));
+        assert_eq!(refusal("rate_limited"), Some(RendezvousRefusal::Throttled));
+        assert_eq!(refusal("invalid_request"), None, "an unlisted code is an ordinary failure");
+        assert_eq!(
+            RendezvousErrors::default().classify(r#"{"error":{"code":"host_unknown"}}"#),
+            None,
+            "no path, no code"
+        );
+        // A profile without the section saves without it.
+        let saved = toml::to_string(&TicketConfig { system: "demo".into(), ..TicketConfig::default() }).unwrap();
+        assert!(!saved.contains("rendezvous"), "{saved}");
     }
 }

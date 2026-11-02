@@ -449,6 +449,8 @@ struct Screenshot {
 pub(crate) struct State {
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
+    /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
+    remote: crate::host::RemoteView,
     wake: crate::host::Wake,
     control_tx: crate::host::Sender<ControlMessage>,
     client_commands: Vec<ControlRequest>,
@@ -982,6 +984,7 @@ impl State {
         });
         let mut app = State {
             window,
+            remote: crate::host::RemoteView::default(),
             wake: wake.clone(),
             control_tx,
             client_commands: Vec::new(),

@@ -10,6 +10,9 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
     List,
+    /// The protocol server's address and the rendezvous's status: phase, registered, online,
+    /// channels and why it waits. Never a token or pass.
+    Remote,
     /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
     TraceGet {
         #[serde(default)]

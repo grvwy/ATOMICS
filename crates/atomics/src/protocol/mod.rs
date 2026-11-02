@@ -8,7 +8,8 @@
 //! an emulator that is busy parsing or being painted never delays board events. Each client has
 //! its own thread and a bounded queue; a client that stops reading is resynchronised or dropped
 //! and cannot delay the host or other clients. A client holding a terminal's lease (`lease.rs`)
-//! types into it from its own thread, straight to the PTY.
+//! types into it from its own thread, straight to the PTY. Clients that arrive through a
+//! rendezvous service (`rendezvous/`) are served by the same session code ([`Sessions`]).
 
 #[cfg(test)]
 mod echo_bench;
@@ -17,6 +18,7 @@ mod hub;
 mod input_tests;
 pub mod lease;
 mod link;
+pub mod rendezvous;
 #[cfg(test)]
 mod screen_tests;
 mod screens;
@@ -102,6 +104,7 @@ pub struct Server {
     addr: SocketAddr,
     #[allow(dead_code)] // read by tests; clients get the token from protocol.json
     token: String,
+    shared: Arc<session::Shared>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     screens: Option<JoinHandle<()>>,
@@ -144,17 +147,18 @@ impl Server {
         let advertise = config.advertise.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let pending = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(session::Shared {
+            hub: hub.clone(),
+            diffs,
+            screens: screens.clone(),
+            stop: stop.clone(),
+            config: config.session.clone(),
+            lease: config.lease.clone(),
+            queue_frames: config.queue_frames,
+            frame_budget: config.frame_budget,
+        });
         let accept = Accept {
-            shared: Arc::new(session::Shared {
-                hub: hub.clone(),
-                diffs,
-                screens: screens.clone(),
-                stop: stop.clone(),
-                config: config.session.clone(),
-                lease: config.lease.clone(),
-                queue_frames: config.queue_frames,
-                frame_budget: config.frame_budget,
-            }),
+            shared: shared.clone(),
             token: token.clone(),
             addr,
             config: config.clone(),
@@ -202,11 +206,16 @@ impl Server {
                 return Err(e);
             }
         };
-        Ok(Self { addr, token, stop, thread: Some(thread), screens: Some(screens), advertise, active, pending })
+        Ok(Self { addr, token, shared, stop, thread: Some(thread), screens: Some(screens), advertise, active, pending })
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Serves clients that arrive some other way than this server's listener.
+    pub fn sessions(&self) -> Sessions {
+        Sessions { shared: self.shared.clone() }
     }
 
     #[allow(dead_code)]
@@ -242,6 +251,24 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Serves clients whose link was made elsewhere, such as a rendezvous channel: each on a thread
+/// of its own, with the same session code, queues and limits as a loopback client after its
+/// upgrade. The server's stop ends them too.
+#[derive(Clone)]
+pub struct Sessions {
+    shared: Arc<session::Shared>,
+}
+
+impl Sessions {
+    pub(crate) fn serve(&self, mut link: Box<dyn link::Link>, role: Role) -> io::Result<()> {
+        let shared = self.shared.clone();
+        std::thread::Builder::new().name("atomics-protocol-channel".into()).spawn(move || {
+            session::serve(link.as_mut(), role, &shared);
+        })?;
+        Ok(())
     }
 }
 

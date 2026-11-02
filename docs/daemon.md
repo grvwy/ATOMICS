@@ -501,11 +501,69 @@ desktop exactly as before.
 
 ## Rendezvous
 
-Specification only; no code yet (stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-7).
+Stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-7. The host side of registration, passes
+and the tunnel is built (H5a, `crates/atomics/src/protocol/rendezvous/`); Noise, pairing and the device allowlist
+are H5b, so for now a channel carries `atomics.v1` in plaintext and is view-only.
 The rendezvous lets a browser reach a host that cannot accept inbound connections. The host dials out to a
 broker; a browser dials the same broker; the broker pairs the sockets and relays opaque frames. The protocol
 above (`atomics.v1`) runs unchanged inside an end-to-end encrypted channel, so the broker is never a protocol peer.
 Nothing here names a product: the broker, the profile operations and the pass format belong to the deployment.
+
+### The host side (H5a)
+
+```toml
+[remote]
+enabled = true                 # the rendezvous serves its channels through the protocol server
+
+[remote.rendezvous]
+enabled = true
+url = "wss://rendezvous.example/atomics/tunnel"   # ws:// only to a loopback host
+name = ""                      # how the service lists this host; empty = the machine's name
+```
+
+The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rendezvous_pass` (and `whoami`), and
+`[tickets.rendezvous]` names the service and its refusal codes (`docs/tickets.md`, "Operations"). Off unless both
+`enabled`; with `[remote.rendezvous] enabled` but the protocol server off, nothing starts and the status says why.
+
+- **Device keys.** An Ed25519 signing key and an X25519 Noise static key, made on first use and kept in the OS
+  credential store as one item (`atomics-rendezvous-v1`) per ATOMICS home, named by a digest of the home's path: two
+  homes on one machine are two hosts. Only public keys leave the host, as base64url without padding.
+- **Registration and passes.** On start, `whoami` must be the profile's personal-agent kind with an owner; then
+  `rendezvous_register` (a fresh `{nonce}` as idempotency key) gives the host id. To dial, `rendezvous_challenge`
+  gives a challenge, the host signs `atomics-tunnel-pass-v1\n<host id>\n<challenge>`, and `rendezvous_pass` gives a
+  single-use pass. Each dial and each renewal buys a new pass. The calls run on a thread of their own
+  (`atomics-rendezvous-issuer`), on the issuer's own MCP connection with the profile's saved sign-in.
+- **Dialing.** Blocking `tungstenite` on the `atomics-rendezvous` thread, TLS by rustls with the web PKI's roots,
+  subprotocol `atomics.rendezvous.v1`, `Authorization: Bearer <pass>` and no `Origin`. The pass is never in a URL,
+  a log, a status line or `atomics ctl`.
+- **Frames.** Every binary message is `[kind u8][channel u32 BE][body]` (`atomics_core::tunnel`). Data (0) on a
+  channel of 1 or more carries one `atomics.v1` text frame; control (1) is an operation byte: `joined` (1), `left` (2,
+  then the close code), `close` (3, host to service, 1000 or 4000-4999 only), `renew` (4, the new pass as ASCII, on
+  channel 0) and `expiry` (5, the admission's end in Unix ms, on channel 0). Unknown kinds and operations from the
+  service are ignored, data for a channel that never joined is dropped, and malformed frames are skipped.
+- **Channels.** Each `joined` becomes one `atomics.v1` session on a thread of its own, served by the protocol
+  server's session code with its queues and limits (`protocol::Sessions`), as a viewer. At most four at once; one
+  more is closed with `quota` (4429). A session ends its channel with 1000, `refused` (4000) for a protocol error,
+  `idle` (4001) or `slow` (4408); one the host cannot start gets `unavailable` (4002). Each channel may queue 1 MiB
+  toward the service (a session waits up to 5 s for room, then ends as slow), and a channel whose session stops
+  reading 1 MiB of what arrives is closed as slow.
+- **Renewal.** After each `expiry` the host renews at half the remaining admission, between 15 s and 150 s, so a
+  skewed clock still renews in time. The renewal's MCP calls never stall the frames; a failed one is retried after
+  15 s (a minute when throttled), and a revoked answer stops the host.
+- **Reconnect.** Jittered exponential backoff, 1 s to 60 s, reset once a tunnel has stayed up 30 s. `unauthorised`
+  (4401), `host_offline` (4404), `slow` (4408), any other code, a dropped socket, a refused upgrade, or 75 s with
+  nothing from the service (it pings every 25 s): dial again with a new pass. `quota` (4429): wait 5 minutes.
+  `revoked` (4403) and `replaced` (4409): stop until restart. Profile, sign-in and owner problems are retried
+  every 30 s; an `unknown` host id a minute after registering registers again.
+- **Status.** A "Remote" indicator in the top bar while `[remote.rendezvous]` is enabled (online in the success
+  colour, waiting or stopped with a dot, connecting muted; the hover says why), and `atomics ctl '{"cmd":"remote"}'`:
+  the protocol server's URL and the rendezvous's `phase`, `service`, `host`, `registered`, `host_id`, `online`,
+  `channels` and `note`. The headless host logs whether it started.
+- **Tests.** `protocol::rendezvous::tests` runs the host against an in-process service that admits only unused
+  passes from a fake issuer: registration, the upgrade's headers, a channel's `hello` and `welcome`, renewal at
+  half-life, every close code, a dropped socket and a silent service, refused upgrades, the channel limit and
+  refused clients, issuer refusals, and a stop. The profile issuer is tested against an in-process MCP server
+  (whoami, signatures, refusal codes, no secret in messages); `atomics_core::tunnel` tests the framing.
 
 **Roles.** Host (this program, off by default), broker (untrusted relay of bytes), client (browser).
 

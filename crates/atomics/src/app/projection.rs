@@ -32,7 +32,9 @@ impl DiffBodies {
         let same = {
             let current = self.0.read().unwrap_or_else(|e| e.into_inner());
             current.len() == entries.len()
-                && entries.iter().all(|(k, (r, p))| current.get(k).is_some_and(|(cr, cp)| cr == r && Arc::ptr_eq(cp, p)))
+                && entries
+                    .iter()
+                    .all(|(k, (r, p))| current.get(k).is_some_and(|(cr, cp)| cr == r && Arc::ptr_eq(cp, p)))
         };
         if !same {
             let before = std::mem::replace(&mut *self.0.write().unwrap_or_else(|e| e.into_inner()), entries);
@@ -91,6 +93,37 @@ impl State {
     /// The `[remote]` settings, for the host to decide whether to start the protocol server.
     pub(crate) fn remote_access(&self) -> atomics_core::config::RemoteAccessConfig {
         self.config.remote.clone()
+    }
+
+    pub(crate) fn set_remote_view(&mut self, view: crate::host::RemoteView) {
+        self.remote = view;
+    }
+
+    pub(crate) fn remote_view(&self) -> &crate::host::RemoteView {
+        &self.remote
+    }
+
+    /// The ticket profile in effect, which the rendezvous registers and buys passes through.
+    pub(crate) fn rendezvous_profile(&self) -> Option<std::sync::Arc<atomics_core::tickets::TicketConfig>> {
+        self.ticket_config()
+    }
+
+    /// The rendezvous's status, when `[remote.rendezvous]` is enabled; read under its own short lock.
+    pub(crate) fn rendezvous_status(&self) -> Option<crate::protocol::rendezvous::Status> {
+        self.remote.rendezvous.as_ref().map(|cell| cell.get())
+    }
+
+    /// `atomics ctl '{"cmd":"remote"}'`: the protocol server and the rendezvous. Never a token or pass.
+    pub(crate) fn remote_json(&self) -> serde_json::Value {
+        let view = &self.remote;
+        serde_json::json!({
+            "protocol": {
+                "enabled": view.enabled,
+                "url": view.addr.map(|addr| format!("ws://{addr}")),
+                "error": view.error,
+            },
+            "rendezvous": self.rendezvous_status(),
+        })
     }
 
     /// Publish sessions, plans, approvals and diff summaries. Every pass rebuilds them; each

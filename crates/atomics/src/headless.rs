@@ -68,6 +68,14 @@ pub fn run(options: Options) -> i32 {
         }
         (None, None) => log("protocol server off ([remote] enabled = false)"),
     }
+    // Its progress (registered, online, channels) is in `atomics ctl '{"cmd":"remote"}'`; a pass never is.
+    match host.rendezvous_status() {
+        Some(status) if status.phase == crate::protocol::rendezvous::Phase::Stopped => {
+            log(&format!("rendezvous enabled but not started: {}", status.note.unwrap_or_default()))
+        }
+        Some(_) => log("rendezvous on; atomics ctl '{\"cmd\":\"remote\"}' shows its status"),
+        None => {}
+    }
     let signal = signals.wait();
     log(&format!("{} received; stopping", signal_name(signal)));
     stop(host, &socket);

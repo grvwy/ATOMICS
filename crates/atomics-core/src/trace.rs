@@ -710,7 +710,7 @@ mod tests {
         config.operations.search = Some(Operation {
             tool: "find".into(),
             items: "$.result.rows".into(),
-            result: FieldPaths { id: "id".into(), title: "subject".into(), ..Default::default() },
+            result: Box::new(FieldPaths { id: "id".into(), title: "subject".into(), ..Default::default() }),
             ..Default::default()
         });
         config

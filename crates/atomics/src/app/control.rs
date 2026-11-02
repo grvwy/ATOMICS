@@ -108,6 +108,7 @@ impl State {
                 }
             }
             ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
+            ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {
                     let approval =

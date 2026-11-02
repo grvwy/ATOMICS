@@ -113,6 +113,47 @@ impl Desktop<'_> {
         ui.separator();
     }
 
+    /// Phone and browser access through a rendezvous service, when `[remote.rendezvous]` is
+    /// enabled: "Remote" in the success colour while online, with a dot in the warning colour while
+    /// it waits or has stopped, muted while it connects. The hover says why.
+    fn rendezvous_indicator(&mut self, ui: &mut egui::Ui) {
+        use crate::protocol::rendezvous::Phase;
+        let Some(status) = self.runtime.rendezvous_status() else { return };
+        let palette = self.palette();
+        let (text, color) = match status.phase {
+            Phase::Online => ("Remote".to_string(), palette.success),
+            Phase::Waiting | Phase::Stopped => ("Remote ●".to_string(), palette.warning),
+            Phase::Starting | Phase::Registering | Phase::Connecting => ("Remote …".to_string(), palette.muted),
+        };
+        let service = if status.host.is_empty() {
+            status.service.clone()
+        } else {
+            format!("{} ({})", status.service, status.host)
+        };
+        let state = match status.phase {
+            Phase::Online => match status.channels {
+                0 => "online, no browser connected".to_string(),
+                1 => "online, 1 browser connected".to_string(),
+                n => format!("online, {n} browsers connected"),
+            },
+            Phase::Starting => "starting".into(),
+            Phase::Registering => "registering this host".into(),
+            Phase::Connecting => "connecting".into(),
+            Phase::Waiting => "waiting to try again".into(),
+            Phase::Stopped => "stopped".into(),
+        };
+        let mut hover = format!("Phone and browser access through {service}: {state}");
+        if !status.registered && status.phase != Phase::Online {
+            hover.push_str("\nThis host is not registered yet.");
+        }
+        if let Some(note) = &status.note {
+            hover.push('\n');
+            hover.push_str(note);
+        }
+        let response = ui.label(RichText::new(text).color(color)).on_hover_text(hover);
+        record_item(ui, "Remote", &response);
+    }
+
     fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool, in_menu: bool) {
         let response = ui.button(if self.runtime.diff_open { "Hide diff" } else { "Show diff" });
         record_item(ui, "diff", &response);
@@ -162,11 +203,16 @@ impl Desktop<'_> {
             }
         }
         self.github_counter(ui, in_menu);
+        self.rendezvous_indicator(ui);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
             let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)
                 && !self.runtime.tickets.panel.signin;
-            let label = if signed_in { format!("Tickets: sign out of {system}") } else { format!("Tickets: sign in to {system}") };
+            let label = if signed_in {
+                format!("Tickets: sign out of {system}")
+            } else {
+                format!("Tickets: sign in to {system}")
+            };
             if ui.button(label).clicked() {
                 if signed_in {
                     self.runtime.start_sign_out();

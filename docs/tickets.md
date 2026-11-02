@@ -349,6 +349,9 @@ result = { id = "id", key = "id", url = "url", title = "title", state = "status.
 | `update_state` (optional) | Moving a ticket as its task moves. | `{id}`, `{key}`, `{uuid}`, `{state}`, `{nonce}` |
 | `comment` (optional) | Lifecycle comments and `atomics_ticket_comment`. | `{id}`, `{key}`, `{uuid}`, `{body}`, `{nonce}` |
 | `create` (optional) | `atomics_ticket_link` with `create`. `result` must map `id`. | `{title}`, `{body}`, `{board}`, `{board_key}`, `{nonce}` |
+| `rendezvous_register` (optional) | `[remote.rendezvous]`: register this host's public device keys, as the connection's personal agent. `result` must map `host_id`. | `{nonce}`, `{signing_key}`, `{noise_key}`, `{host_name}`, `{protocol_major}` |
+| `rendezvous_challenge` (optional) | A fresh challenge for a tunnel pass. `result` must map `challenge`. | `{host_id}` |
+| `rendezvous_pass` (optional) | The pass the signed challenge buys. `result` must map `pass`. | `{host_id}`, `{challenge}`, `{signature}` |
 
 `{system}` works everywhere. `{key}` is the ticket's key when known, otherwise its id. `{board}` is the
 plan's link: the board in board mode, the plan's ticket in ticket mode. Placeholders work anywhere in an argument
@@ -385,10 +388,32 @@ when the result has it, the plan's next post uses it, after any sequences alread
 `{seq}` is optional: a server that assigns sequences itself and replays a retried event id, as Relay does,
 needs only `{nonce}`. The Relay profile sends no sequence and maps `next_sequence = "nextSequence"`.
 
-When an argument's entire string is exactly `{seq}`, `{after}`, `{owners}` or `{ids}`, substitution preserves
-its JSON type: sequence is a number, cursor retains the server's type, and owners and ids are arrays of
-strings. Inside longer text they render as text. For example `sequence = "{seq}"` sends a number, while
-`label = "event {seq}"` sends text. Existing placeholders, including `{key_number}`, keep sending strings.
+When an argument's entire string is exactly `{seq}`, `{after}`, `{owners}`, `{ids}` or `{protocol_major}`,
+substitution preserves its JSON type: sequence and protocol major are numbers, cursor retains the server's
+type, and owners and ids are arrays of strings. Inside longer text they render as text. For example
+`sequence = "{seq}"` sends a number, while `label = "event {seq}"` sends text. Existing placeholders,
+including `{key_number}`, keep sending strings.
+
+The three rendezvous operations serve `[remote.rendezvous]` (`docs/daemon.md`, "Rendezvous"); all three, and
+`whoami`, must be mapped for it to register. `{signing_key}` and `{noise_key}` are the host's Ed25519 and
+X25519 public keys in base64url without padding, `{host_name}` is `[remote.rendezvous] name` (else the machine's
+name) and `{protocol_major}` the `atomics.v1` major. `{host_id}` is what `rendezvous_register` returned (a UUID
+in lowercase with hyphens), `{challenge}` what `rendezvous_challenge` returned, and `{signature}` the host's
+Ed25519 signature, base64url, over `atomics-tunnel-pass-v1`, LF, the host id, LF, the challenge. Registering
+first reads `whoami`: the connection must be `[tickets.remote] personal_agent_kind` (default `personalAgent`)
+with an owner, or nothing is registered. `[tickets.rendezvous]` names the service and its refusals:
+
+```toml
+[tickets.rendezvous]
+label = "Example"   # how the desktop names the service
+errors = { code = "code", owner = ["…"], unknown = ["…"], revoked = ["…"], challenge = ["…"], throttled = ["…"] }
+```
+
+`code` is read as in `[tickets.remote] errors`. `owner`: the connection is not a person's own agent (wait for a
+change). `unknown`: the host id is not registered, or not yet (retry, and register again a minute after
+registering). `revoked`: stop until new device keys. `challenge`: an expired or spent challenge, or a signature
+that did not verify (one fresh challenge at once, then a backoff). `throttled`: wait a minute. Anything else is
+retried after a backoff.
 
 Main-comment paths additionally map `id`, `seq`, `author_id` and `author_kind`. These fields pass through
 the job's Cleaner along with the author's display name and text, and appear in chief ticket reads. Main
@@ -1214,6 +1239,24 @@ result = { id = "userId", kind = "kind", name = "displayName", owner_id = "owner
 # tool = "list_item_conversation_steerers"
 # arguments = { conversationId = "{conversation}" }
 # result = { steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+
+# Phone and browser access through Relay's rendezvous; see docs/daemon.md, "Rendezvous". Uncomment it with
+# [remote.rendezvous] in the main config: url = "wss://relay.atomisk.ai/api/v1/atomics/tunnel".
+# [tickets.rendezvous]
+# label = "Relay"
+# errors = { code = "code", owner = ["atomics.owner_required"], unknown = ["atomics.host_unknown"], revoked = ["atomics.host_revoked"], challenge = ["atomics.nonce_invalid", "atomics.signature_invalid"], throttled = ["atomics.rate_limited"] }
+# [tickets.operations.rendezvous_register]
+# tool = "register_atomics_host"
+# arguments = { idempotencyKey = "{nonce}", signingPublicKey = "{signing_key}", noisePublicKey = "{noise_key}", displayName = "{host_name}", protocolMajor = "{protocol_major}" }
+# result = { host_id = "hostId" }
+# [tickets.operations.rendezvous_challenge]
+# tool = "atomics_tunnel_pass"
+# arguments = { hostId = "{host_id}" }
+# result = { challenge = "nonce" }
+# [tickets.operations.rendezvous_pass]
+# tool = "atomics_tunnel_pass"
+# arguments = { hostId = "{host_id}", nonce = "{challenge}", signature = "{signature}" }
+# result = { pass = "pass" }
 
 [tickets.operations.get]
 tool = "get_ticket"

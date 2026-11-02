@@ -2,6 +2,7 @@
 //! status leave this module; malformed entries are counted, never quoted. No plaintext fallback.
 //! Besides relay credentials it holds MCP servers' environments (`mcp-env:<server>`), stored with
 //! the user's consent when a connection is imported and read by `atomics mcp-host` as sbx starts it.
+//! MCP sign-ins and the rendezvous device keys are items of their own, outside the catalog.
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
@@ -450,6 +451,57 @@ impl Store {
         Ok(())
     }
 
+    /// The device item `slot` (the rendezvous device keys of one ATOMICS home, as text), made by
+    /// `make` and stored first when there is none. Two processes that both find none agree on one:
+    /// the second waits for the first's write and returns it.
+    pub fn device_item(&self, slot: &str, make: impl FnOnce() -> Result<String>) -> Result<String> {
+        check_slot(slot)?;
+        if let Some(text) = self.read_device(slot)? {
+            return Ok(text);
+        }
+        let _lock = self.keychain.catalog_lock()?;
+        if let Some(text) = self.read_device(slot)? {
+            return Ok(text);
+        }
+        let text = make()?;
+        let encoded = text.bytes().fold(String::new(), |mut hex, b| {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+            hex
+        });
+        self.keychain.write_item(DEVICE, slot, DEVICE_LABEL, &encoded)?;
+        Ok(text)
+    }
+
+    /// Removes device item `slot`; nothing stored is fine. The next `device_item` makes a new one.
+    #[allow(dead_code)] // Key rotation is the pairing UI's (H5b); tests use it now.
+    pub fn remove_device_item(&self, slot: &str) -> Result<()> {
+        check_slot(slot)?;
+        let _lock = self.keychain.catalog_lock()?;
+        self.keychain.remove_item(DEVICE, slot)
+    }
+
+    fn read_device(&self, slot: &str) -> Result<Option<String>> {
+        let invalid =
+            || anyhow::anyhow!("OS credential item is malformed (contents hidden); remove it to make new keys");
+        let Some(encoded) = self.keychain.read_item(DEVICE, slot)? else { return Ok(None) };
+        if encoded.len() > OAUTH_CHUNK || !encoded.len().is_multiple_of(2) {
+            return Err(invalid());
+        }
+        let bytes: Vec<u8> = encoded
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+                Some(digit(pair[0])? * 16 + digit(pair[1])?)
+            })
+            .collect::<Option<_>>()
+            .ok_or_else(invalid)?;
+        String::from_utf8(bytes).map(Some).map_err(|_| invalid())
+    }
+
     /// Holds off every other ATOMICS process's sign-in, refresh and sign-out of the server `key`
     /// names until the returned file is dropped.
     pub fn oauth_lock(&self, key: &str) -> Result<std::fs::File> {
@@ -539,6 +591,12 @@ const OAUTH_LABEL: &str = "ATOMICS MCP sign-in";
 const OAUTH_CHUNK: usize = 2048;
 /// 16 KiB of JSON per slot.
 const OAUTH_MAX_CHUNKS: usize = 16;
+
+/// The keychain service of device items: the rendezvous device keys, one item per ATOMICS home
+/// (`[remote.rendezvous]`). Outside the catalog, so no credential edit rewrites them. Hex-encoded,
+/// like every value here; one item holds them (well under `OAUTH_CHUNK`).
+const DEVICE: &str = "atomics-rendezvous-v1";
+const DEVICE_LABEL: &str = "ATOMICS device keys";
 
 /// A head that names chunks. Generations alternate between `a` and `b`, so a write never touches the
 /// chunks the current head names.
