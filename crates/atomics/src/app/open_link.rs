@@ -4,7 +4,10 @@
 use super::*;
 use crate::open_link::{Incoming, OpenLink};
 use crate::tickets::{TicketOp, TicketOutput};
-use atomics_core::tickets::TicketLink;
+use atomics_core::tickets::{TicketLink, is_plain_key};
+
+/// How long a link waits for the ticket state before it is dropped with a toast.
+const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl State {
     /// Handles a link, toasting why when it cannot be opened.
@@ -37,14 +40,13 @@ impl State {
         if self.plan_needs_sign_in(&config) {
             return Err(format!("Sign in to {system} first"));
         }
-        // A bare key is only trusted once the read confirms it; an address names its ticket itself.
-        let mut confirm = None;
+        // What the link names is only trusted once the read confirms it: a bare key, or the key or
+        // id an address held where the profile's template has one.
         let ticket = if reference.contains("://") {
             config.link_from_url(&reference).ok_or_else(|| format!("That address is not a {system} ticket"))?
-        } else if reference.chars().any(|c| c.is_whitespace() || "/\\?&#".contains(c)) || reference.len() > 128 {
+        } else if !is_plain_key(&reference) {
             return Err(format!("That is not a {system} ticket key"));
         } else {
-            confirm = Some(reference.clone());
             TicketLink {
                 system: config.system.clone(),
                 id: reference.clone(),
@@ -52,6 +54,7 @@ impl State {
                 ..Default::default()
             }
         };
+        let confirm = ticket.key.clone().filter(|key| !key.is_empty()).unwrap_or_else(|| ticket.id.clone());
         let linked = self.plans.iter().position(|plan| {
             let names = |t: &TicketLink| {
                 t.same_ticket(&ticket) || ticket.url.as_deref().is_some_and(|url| t.url.as_deref() == Some(url))
@@ -68,10 +71,39 @@ impl State {
         let panel = &mut self.tickets.panel;
         panel.seq += 1;
         let seq = panel.seq;
-        panel.open_link = Some((seq, confirm));
+        panel.open_link = Some((seq, Some(confirm)));
         let tag = self.panel_tag(&config, super::tickets_panel::Job::Link, seq);
         self.send_ticket(&config, TicketOp::ReadCard(ticket), tag);
         Ok(())
+    }
+
+    /// Keeps a link until the ticket state is known; a newer one replaces an older.
+    pub(super) fn hold_link(&mut self, incoming: Incoming) {
+        self.pending_link = Some(incoming);
+        self.pending_link_since = None;
+    }
+
+    /// Opens the held link once the ticket state is known, or gives up on it with a toast after
+    /// `LINK_WAIT`, when the state never comes (a sign-in check that hangs). Whether anything changed.
+    pub(super) fn release_pending_link(&mut self) -> bool {
+        if self.pending_link.is_none() {
+            self.pending_link_since = None;
+            return false;
+        }
+        let since = *self.pending_link_since.get_or_insert_with(Instant::now);
+        if self.ticket_state_known() {
+            self.pending_link_since = None;
+            if let Some(link) = self.pending_link.take() {
+                let _ = self.open_link(link);
+            }
+        } else if since.elapsed() >= LINK_WAIT {
+            self.pending_link = None;
+            self.pending_link_since = None;
+            self.toast("Could not open the link: the ticket system did not answer in time");
+        } else {
+            return false;
+        }
+        true
     }
 
     /// Whether the ticket config is applied and, for a server that signs in, its sign-in state read.
@@ -89,7 +121,10 @@ impl State {
     pub(super) fn link_card_read(&mut self, result: Result<TicketOutput, (bool, String)>, confirm: Option<String>) {
         match result {
             Ok(TicketOutput::Card(card))
-                if confirm.is_some_and(|wanted| !card.link.label().eq_ignore_ascii_case(&wanted)) =>
+                if confirm.is_some_and(|wanted| {
+                    let names = |text: &str| text.eq_ignore_ascii_case(&wanted);
+                    !(names(&card.link.id) || card.link.key.as_deref().is_some_and(names))
+                }) =>
             {
                 self.toast("No such ticket");
             }

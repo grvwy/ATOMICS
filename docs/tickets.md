@@ -640,11 +640,14 @@ allowed with `ticket`.
 How `ticket=` resolves:
 
 1. A value containing `://` must match the profile's `link_url` template: each `{key}`, `{id}` or `{uuid}` in it
-   is read back from the address. Any other value is taken as a key; one with spaces, slashes or other address characters is refused.
+   is read back from the address. A capture stops at the next `/`, `?`, `#` or `&`, so an address with more after the
+   ticket (a path, a query) does not match. Any other value is taken as a key. A key or id, from either source, with
+   spaces, `/ \ ? & #` or more than 128 characters is refused.
 2. An open plan whose ticket (or one of whose tasks' tickets) is that ticket is selected, and its board shows.
 3. Otherwise ATOMICS reads the ticket for its title, starts the chief if needed, shows it, and types
-   `Plan <KEY>: <title>` into its prompt without pressing Enter. Nothing is sent and no plan is created until you
-   send the message.
+   `Plan <KEY>: <title>` into its prompt without pressing Enter. The draft is appended to whatever is already typed in
+   the chief's prompt. Nothing is sent and no plan is created until you send the message. If the read returns another
+   ticket than the link named (by key or id), nothing is drafted.
 
 If `system` differs from `[tickets] system`, or the configured system needs a sign-in, a toast asks you to sign in
 and nothing else happens. A link is refused, with a toast, if its scheme is not `atomics`, its host not `open`, it has
@@ -653,6 +656,9 @@ both `plan` and `ticket`. A link never does more than open and focus.
 
 When ATOMICS is running, `atomics '<link>'` (which is what the operating system runs) forwards the link over the
 control socket (`{"cmd":"open_link",…}`) and exits; otherwise it starts ATOMICS and handles the link after loading.
+`atomics -- 'atomics://open'` is the same for a link that would otherwise read as an option. A ticket link that arrives
+before the ticket configuration and sign-in state are known waits for them; if they are not known within about 30
+seconds, it is dropped with a toast.
 
 ### Registering the scheme
 
@@ -662,8 +668,9 @@ control socket (`{"cmd":"open_link",…}`) and exits; otherwise it starts ATOMIC
   `xdg-open 'atomics://open'` to try it.
 - **macOS:** `scripts/macos-app.sh` adds `CFBundleURLTypes` with the `atomics` scheme to `Info.plist`; the app takes
   the link from the open-URL event. Open ATOMICS.app once after building so Launch Services learns the scheme.
-- **Windows:** the installer does not register it. For the current user, create these keys (replace the path with your
-  `atomics` build; the `%1` is the link):
+- **Windows:** the installer does not register it, and the Windows build has no control-socket forwarding: each
+  link starts a new ATOMICS instance rather than reaching a running one. For the current user, create these keys
+  (replace the path with your `atomics` build; the `%1` is the link):
 
   ```
   [HKEY_CURRENT_USER\Software\Classes\atomics]
