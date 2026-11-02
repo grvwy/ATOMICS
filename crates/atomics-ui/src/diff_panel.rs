@@ -7,11 +7,11 @@ use atomics_core::layout::DiffSplit;
 use egui::Rect;
 
 use crate::diff_view::{self, DiffAction, Header};
-use crate::{Backend, Client, Intent};
+use crate::{Backend, Client, Command};
 
 /// The diff of the worktree at `root` under its header: its session's title and branch, whether an agent
 /// there can take a review, and the diff view. Review comments, Send review, Refresh, Close and Edit record
-/// intents; the side-by-side toggle stays with the client.
+/// commands; the side-by-side toggle stays with the client.
 pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, client: &mut Client) {
     let heading = backend.diff_heading(root);
     let config = backend.ui_config();
@@ -30,14 +30,14 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, c
     let action = diff_view::show(ui, rect, state, header, &palette, &font);
     let after = state.comments.clone();
     if before != after {
-        client.act(Intent::EditComments { root: root.to_path_buf(), before, after });
+        client.send(Command::EditComments { root: root.to_path_buf(), before, after });
     }
     match action {
         DiffAction::None => {}
-        DiffAction::SendReview => client.act(Intent::SendReview(root.to_path_buf())),
-        DiffAction::Refresh => client.act(Intent::RefreshDiff(root.to_path_buf())),
-        DiffAction::Close => client.act(Intent::CloseDiff),
+        DiffAction::SendReview => client.send(Command::SendReview(root.to_path_buf())),
+        DiffAction::Refresh => client.send(Command::RefreshDiff(root.to_path_buf())),
+        DiffAction::Close => client.send(Command::CloseDiff),
         DiffAction::Split(on) => client.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never }),
-        DiffAction::Edit { path, line } => client.act(Intent::Edit { root: root.to_path_buf(), path, line }),
+        DiffAction::Edit { path, line } => client.send(Command::Edit { root: root.to_path_buf(), path, line }),
     }
 }

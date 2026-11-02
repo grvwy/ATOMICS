@@ -9,7 +9,7 @@ use atomics_core::config::AgentKind;
 use egui::{Rect, RichText, Sense, vec2};
 
 use crate::keys::shortcut_label;
-use crate::{Backend, Client, Intent, PanelMode};
+use crate::{Backend, Client, Command, PanelMode};
 
 /// Measure with the same fonts, padding and widgets that will actually be drawn.
 /// The disabled, invisible child cannot activate controls or take space from the bar.
@@ -87,7 +87,7 @@ pub fn diff_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
     let response = ui.button(if backend.view_hints().diff_open { "Hide diff" } else { "Show diff" });
     record_item(ui, "diff", &response);
     if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_diff)).clicked() {
-        client.act(Intent::ToggleDiff);
+        client.send(Command::ToggleDiff);
         if in_menu {
             ui.close();
         }
@@ -99,7 +99,7 @@ pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clien
     let response = ui.button("+ New");
     record_item(ui, "+ New", &response);
     if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.new_session)).clicked() {
-        client.act(Intent::NewSession);
+        client.send(Command::NewSession);
         if in_menu {
             ui.close();
         }
@@ -117,7 +117,7 @@ pub fn plan_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
     let response = ui.selectable_label(hints.panel == PanelMode::Plan && hints.diff_open, text);
     record_item(ui, "Plan", &response);
     if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_plan)).clicked() {
-        client.act(Intent::TogglePlan);
+        client.send(Command::TogglePlan);
         if in_menu {
             ui.close();
         }
@@ -128,7 +128,7 @@ pub fn plan_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
 pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if ui.button("Open project…").clicked() {
         ui.close();
-        client.act(Intent::PickProject);
+        client.send(Command::PickProject);
     }
     let menu = backend.project_menu();
     if !menu.recent.is_empty() {
@@ -136,7 +136,7 @@ pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
         ui.label(RichText::new("Recent projects").size(11.0).color(client.palette.muted));
         for (root, display) in menu.recent {
             if ui.button(display).clicked() {
-                client.act(Intent::OpenProject(root));
+                client.send(Command::OpenProject(root));
                 ui.close();
             }
         }
@@ -146,7 +146,7 @@ pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
     for name in menu.workspaces {
         let current = menu.current.as_deref() == Some(name.as_str());
         if ui.selectable_label(current, &name).clicked() {
-            client.act(Intent::OpenWorkspace(name));
+            client.send(Command::OpenWorkspace(name));
             ui.close();
         }
     }
@@ -154,7 +154,7 @@ pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
         ui.add(egui::TextEdit::singleline(&mut client.workspace_input).hint_text("name").desired_width(120.0));
         let name = client.workspace_input.trim().to_string();
         if ui.add_enabled(!name.is_empty() && menu.can_save, egui::Button::new("Save workspace")).clicked() {
-            client.act(Intent::SaveWorkspace(name));
+            client.send(Command::SaveWorkspace(name));
             client.workspace_input.clear();
             ui.close();
         }
@@ -206,6 +206,6 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if response.on_hover_text(text).clicked()
         && let Some(session) = sessions.iter().find(|s| s.status.needs_attention())
     {
-        client.act(Intent::Activate { session: session.id.clone(), open_diff: true });
+        client.send(Command::Activate { session: session.id.clone(), open_diff: true });
     }
 }

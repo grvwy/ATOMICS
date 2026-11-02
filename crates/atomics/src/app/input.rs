@@ -336,11 +336,7 @@ impl Desktop<'_> {
                                 [("Complete plan", PlanStatus::Completed), ("Archive plan", PlanStatus::Archived)]
                             {
                                 if ui.button(label).clicked() {
-                                    self.post_plan(index, move |state, index| {
-                                        if let Err(error) = state.close_plan(index, status) {
-                                            state.toast(error);
-                                        }
-                                    });
+                                    self.send(Command::ClosePlan { plan: index, status });
                                     self.client.confirm_plan_close = None;
                                 }
                             }

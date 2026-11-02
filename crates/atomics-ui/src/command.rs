@@ -1,21 +1,22 @@
-//! What the user asks the host to do. The draw code records intents on the [`Client`](crate::Client)
-//! instead of changing the host's model; the host carries them out right after the draw returns, in the
-//! order they were recorded. A plan is addressed like a read, by its position in the last list read; a
-//! task by id, or by its position in the plan the board read. Slice S8 turns intents into the protocol's
-//! commands.
+//! What the user asks for. The draw code records commands on the [`Client`](crate::Client) instead of
+//! changing the host's model; after the draw the platform carries them out in the order they were
+//! recorded: a host's command through [`Backend::send`](crate::Backend::send), a view command on the UI
+//! itself. A plan is addressed like a read, by its position in the last list read; a task by id, or by
+//! its position in the plan the board read.
+//!
+//! Commands are grouped by domain. Approvals, plans, review comments and sessions are the domains of
+//! atomics.v1's `approval_decide`, `plan_command`, `review_command` and `session_command`.
 
 use std::path::PathBuf;
 
 use atomics_core::approvals::Decision;
-use atomics_core::plan::TaskStatus;
+use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::steer::ReviewComment;
 use atomics_core::store::SessionRecord;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Intent {
-    /// A task brief on the board has the keyboard this frame: the host holds off a restart until the edit
-    /// is done.
-    EditingPlan,
+pub enum Command {
+    // ── Plans ────────────────────────────────────────────────────────────────────────────────────────
     /// A planned task's brief, as edited on its card.
     EditBrief {
         plan: usize,
@@ -32,11 +33,15 @@ pub enum Intent {
         plan: usize,
         task: String,
     },
-    /// A task card's `diff`, `resume` or `acknowledge_refs` button; `task` is its position in the plan.
-    TaskAction {
+    /// Start a finished task's agent again in its worktree; `task` is its position in the plan.
+    ResumeTask {
         plan: usize,
         task: usize,
-        action: &'static str,
+    },
+    /// Dismiss the alert that a task's references moved; `task` is its position in the plan.
+    AcknowledgeRefs {
+        plan: usize,
+        task: usize,
     },
     /// Move a task to another column.
     SetTaskStatus {
@@ -51,12 +56,37 @@ pub enum Intent {
     SyncTickets(usize),
     /// Start every task whose dependencies are done.
     DispatchReady(usize),
-    /// Show a task's session, with its diff.
-    OpenTaskSession(String),
     ReopenPlan(usize),
     ArchivePlan(usize),
+    /// Close a plan as completed or archived, as the user confirmed.
+    ClosePlan {
+        plan: usize,
+        status: PlanStatus,
+    },
+    /// Archive a plan that is no longer open; one reopened meanwhile stays open.
+    ArchiveFinished(usize),
     /// Preview what a completed plan's cleanup would remove.
     CleanUpPlan(usize),
+    /// Read the open cleanup preview again.
+    ReloadPlanCleanup,
+    /// Remove the branches the user picked in the cleanup preview of the completed plan with this id,
+    /// with their worktrees; each by its repository and branch.
+    RemovePlanBranches {
+        plan: String,
+        branches: Vec<(PathBuf, String)>,
+    },
+
+    // ── Not sent yet: the desktop carries these out itself ──────────────────────────────────────────
+    /// A task brief on the board has the keyboard this frame: the host holds off a restart until the edit
+    /// is done.
+    EditingPlan,
+    /// Show a finished task's worktree in the diff panel; `task` is its position in the plan.
+    ShowTaskDiff {
+        plan: usize,
+        task: usize,
+    },
+    /// Show a task's session, with its diff.
+    OpenTaskSession(String),
     /// Answer a permission request of the session at `session` of the last session list read. The request
     /// is named, so the host refuses a decision made for an earlier one.
     Decide {
@@ -135,4 +165,17 @@ pub enum Intent {
     OpenWorkspace(String),
     /// Save the open projects as a workspace.
     SaveWorkspace(String),
+}
+
+impl Command {
+    /// A task card's `diff`, `resume` or `acknowledge_refs` button, for the task at position `task` of the
+    /// plan at `plan`; `None` for any other action.
+    pub fn task(plan: usize, task: usize, action: &str) -> Option<Command> {
+        match action {
+            "diff" => Some(Command::ShowTaskDiff { plan, task }),
+            "resume" => Some(Command::ResumeTask { plan, task }),
+            "acknowledge_refs" => Some(Command::AcknowledgeRefs { plan, task }),
+            _ => None,
+        }
+    }
 }

@@ -7,8 +7,9 @@ use atomics_ui::{
 
 use super::*;
 
-/// A short-lived read of the model; build it with [`State::backend`].
-pub(super) struct Local<'a>(&'a State);
+/// A short-lived read of the model; build it with [`State::backend`]. Commands sent to it run as actions
+/// (`commands.rs`).
+pub(super) struct Local<'a>(pub(super) &'a State);
 
 impl State {
     pub(super) fn backend(&self) -> Local<'_> {
@@ -61,6 +62,10 @@ impl Local<'_> {
 }
 
 impl Backend for Local<'_> {
+    fn send(&self, command: atomics_ui::Command) {
+        self.run(command);
+    }
+
     fn plan_list(&self) -> Vec<PlanRow> {
         self.0.plans.iter().enumerate().map(|(index, plan)| self.row(index, plan)).collect()
     }

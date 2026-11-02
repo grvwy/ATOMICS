@@ -423,8 +423,8 @@ impl Desktop<'_> {
                 task_action = Some((plan, task, action));
             }
         }
-        if let Some((plan, task, action)) = task_action {
-            self.task_action(plan, task, action);
+        if let Some(command) = task_action.and_then(|(plan, task, action)| Command::task(plan, task, action)) {
+            self.send(command);
         }
 
         if let Some((id, open)) = activate {

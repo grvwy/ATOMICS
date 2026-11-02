@@ -9,7 +9,7 @@ use egui::{Color32, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::status::PULSE_STEP;
 use crate::topbar::{measure, record_item};
-use crate::{Backend, Client, Intent, PlanRow, PlanState, SessionRow, ViewHints};
+use crate::{Backend, Client, Command, PlanRow, PlanState, SessionRow, ViewHints};
 
 #[derive(Clone)]
 enum ViewTab {
@@ -490,7 +490,7 @@ impl Nav<'_> {
             }
             close_clicked = hit.clicked() || response.clicked() && over_close;
             if close_clicked {
-                self.client.act(Intent::ClosePlanTab(*index));
+                self.client.send(Command::ClosePlanTab(*index));
                 if width.is_none() {
                     ui.close();
                 }
@@ -498,15 +498,15 @@ impl Nav<'_> {
         }
         if response.clicked() && !close_clicked && !over_close {
             match tab {
-                ViewTab::All => self.client.act(Intent::SetView(None)),
-                ViewTab::Ungrouped => self.client.act(Intent::ShowUngrouped),
-                ViewTab::Project(root) => self.client.act(Intent::SetView(Some(root.clone()))),
+                ViewTab::All => self.client.send(Command::SetView(None)),
+                ViewTab::Ungrouped => self.client.send(Command::ShowUngrouped),
+                ViewTab::Project(root) => self.client.send(Command::SetView(Some(root.clone()))),
                 ViewTab::Repos => unreachable!(),
                 ViewTab::Plan(index) => {
                     if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Open) {
-                        self.client.act(Intent::ShowPlan(*index));
+                        self.client.send(Command::ShowPlan(*index));
                     } else {
-                        self.client.act(Intent::ViewPlanHistory(*index));
+                        self.client.send(Command::ViewPlanHistory(*index));
                     }
                 }
             }
@@ -522,7 +522,7 @@ impl Nav<'_> {
                         .on_hover_text("Idle or exited sessions no plan task uses")
                         .clicked()
                     {
-                        self.client.act(Intent::CloseIdle(root.clone()));
+                        self.client.send(Command::CloseIdle(root.clone()));
                         ui.close();
                     }
                 });
@@ -530,7 +530,7 @@ impl Nav<'_> {
             ViewTab::Plan(index) if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Completed) => {
                 response.context_menu(|ui| {
                     if ui.button("Archive plan").clicked() {
-                        self.client.act(Intent::ClosePlanTab(*index));
+                        self.client.send(Command::ClosePlanTab(*index));
                         ui.close();
                     }
                 });
@@ -581,10 +581,10 @@ impl Nav<'_> {
             .response;
         record_item(ui, "History", &response);
         if let Some(index) = view {
-            self.client.act(Intent::ViewPlanHistory(index));
+            self.client.send(Command::ViewPlanHistory(index));
         }
         if let Some(index) = reopen {
-            self.client.act(Intent::ReopenPlan(index));
+            self.client.send(Command::ReopenPlan(index));
         }
     }
 }

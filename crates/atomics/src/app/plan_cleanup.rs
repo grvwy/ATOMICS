@@ -52,6 +52,75 @@ impl State {
         });
     }
 
+    /// Reads the open cleanup preview again.
+    pub(super) fn reload_plan_cleanup(&mut self) {
+        if let Some(mut dialog) = self.plan_cleanup.take() {
+            self.load_plan_cleanup(&mut dialog);
+            self.plan_cleanup = Some(dialog);
+        }
+    }
+
+    /// Removes the branches picked in the open cleanup preview of the completed plan `plan`, each named by
+    /// its repository and branch, with their worktrees and the sandboxes working there.
+    pub(super) fn remove_plan_branches(&mut self, plan: &str, branches: &[(PathBuf, String)]) {
+        let Some(dialog) = &self.plan_cleanup else { return };
+        let Some(plan) = self.plans.iter().find(|p| p.id == plan && p.status == PlanStatus::Completed).cloned() else {
+            return;
+        };
+        let targets: Vec<_> = dialog
+            .rows
+            .iter()
+            .filter(|row| branches.contains(&(row.repo.clone(), row.branch.clone())))
+            .cloned()
+            .collect();
+        let (tx, base) = (dialog.tx.clone(), self.plan_base_ref(&plan));
+        let sbx = resolve_program(&self.sbx);
+        // The sandboxes it stops are those working in these worktrees.
+        let scope = Scope {
+            sandboxes: Vec::new(),
+            worktrees: Some(targets.iter().filter_map(|e| e.worktree.clone()).collect()),
+        };
+        self.lifecycle(scope, move || {
+            for entry in targets {
+                // Which sandboxes work there is asked while the worktree is still on disk.
+                let sandboxes = match &entry.worktree {
+                    Some(path) if crate::sandbox::installed(&sbx) => {
+                        match crate::sandbox::in_worktree(&paths::atomics_home(), &sbx, path) {
+                            Ok(names) => names,
+                            Err(err) => {
+                                let _ = tx.send(Event::Note(format!(
+                                    "Kept {}: listing sandboxes failed: {err:#}",
+                                    entry.branch
+                                )));
+                                continue;
+                            }
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                if let Some(error) =
+                    sandboxes.iter().find_map(|name| crate::sandbox::stop(&paths::atomics_home(), &sbx, name).err())
+                {
+                    let _ = tx.send(Event::Note(format!("Kept {}: stopping sandbox failed: {error:#}", entry.branch)));
+                    continue;
+                }
+                let write = crate::ref_guard::host_write(&entry.repo, [&entry.branch]);
+                let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
+                drop(write);
+                let removed = result.is_ok();
+                let _ = tx.send(Event::Removed(entry, result));
+                for name in sandboxes.into_iter().filter(|_| removed) {
+                    let note = match crate::sandbox::remove(&paths::atomics_home(), &sbx, &name) {
+                        Ok(()) => format!("Removed sandbox {name}"),
+                        Err(err) => format!("Kept sandbox {name}: {err:#}"),
+                    };
+                    let _ = tx.send(Event::Note(note));
+                }
+            }
+            let _ = tx.send(Event::Finished);
+        });
+    }
+
     pub(super) fn poll_plan_cleanup(&mut self) -> bool {
         let Some(mut dialog) = self.plan_cleanup.take() else { return false };
         let mut changed = false;
@@ -188,79 +257,17 @@ impl Desktop<'_> {
             if let Some(plan) = self.runtime.plans.iter().find(|plan| plan.id == dialog.plan.id) {
                 dialog.plan = plan.clone();
             }
-            self.post(|state| {
-                if let Some(mut dialog) = state.plan_cleanup.take() {
-                    state.load_plan_cleanup(&mut dialog);
-                    state.plan_cleanup = Some(dialog);
-                }
-            });
+            self.send(Command::ReloadPlanCleanup);
         }
-        if remove
-            && let Some(plan) = self
-                .plans
-                .iter()
-                .find(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed)
-                .cloned()
-        {
+        if remove && self.plans.iter().any(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed) {
             dialog.busy = true;
-            let targets: Vec<_> = dialog
+            let branches = dialog
                 .rows
                 .iter()
-                .filter(|row| self.client.plan_cleanup_selected.contains(&(row.repo.clone(), row.branch.clone())))
-                .cloned()
+                .map(|row| (row.repo.clone(), row.branch.clone()))
+                .filter(|key| self.client.plan_cleanup_selected.contains(key))
                 .collect();
-            let (tx, plan, base) = (dialog.tx.clone(), plan.clone(), self.runtime.plan_base_ref(&plan));
-            let sbx = resolve_program(&self.runtime.sbx);
-            // The sandboxes it stops are those working in these worktrees.
-            let scope = Scope {
-                sandboxes: Vec::new(),
-                worktrees: Some(targets.iter().filter_map(|e| e.worktree.clone()).collect()),
-            };
-            self.post(move |state| {
-                state.lifecycle(scope, move || {
-                    for entry in targets {
-                        // Which sandboxes work there is asked while the worktree is still on disk.
-                        let sandboxes = match &entry.worktree {
-                            Some(path) if crate::sandbox::installed(&sbx) => {
-                                match crate::sandbox::in_worktree(&paths::atomics_home(), &sbx, path) {
-                                    Ok(names) => names,
-                                    Err(err) => {
-                                        let _ = tx.send(Event::Note(format!(
-                                            "Kept {}: listing sandboxes failed: {err:#}",
-                                            entry.branch
-                                        )));
-                                        continue;
-                                    }
-                                }
-                            }
-                            _ => Vec::new(),
-                        };
-                        if let Some(error) = sandboxes
-                            .iter()
-                            .find_map(|name| crate::sandbox::stop(&paths::atomics_home(), &sbx, name).err())
-                        {
-                            let _ = tx.send(Event::Note(format!(
-                                "Kept {}: stopping sandbox failed: {error:#}",
-                                entry.branch
-                            )));
-                            continue;
-                        }
-                        let write = crate::ref_guard::host_write(&entry.repo, [&entry.branch]);
-                        let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
-                        drop(write);
-                        let removed = result.is_ok();
-                        let _ = tx.send(Event::Removed(entry, result));
-                        for name in sandboxes.into_iter().filter(|_| removed) {
-                            let note = match crate::sandbox::remove(&paths::atomics_home(), &sbx, &name) {
-                                Ok(()) => format!("Removed sandbox {name}"),
-                                Err(err) => format!("Kept sandbox {name}: {err:#}"),
-                            };
-                            let _ = tx.send(Event::Note(note));
-                        }
-                    }
-                    let _ = tx.send(Event::Finished);
-                });
-            });
+            self.send(Command::RemovePlanBranches { plan: dialog.plan.id.clone(), branches });
         }
         self.client.plan_cleanup_open = open;
         self.runtime.plan_cleanup = Some(dialog);

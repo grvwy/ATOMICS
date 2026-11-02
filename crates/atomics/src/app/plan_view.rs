@@ -49,13 +49,7 @@ impl Desktop<'_> {
         if self.runtime.plans[index].status == PlanStatus::Open {
             self.client.confirm_plan_close = Some((self.runtime.plans[index].id.clone(), PlanStatus::Completed));
         } else {
-            self.post_plan(index, |state, index| {
-                if state.plans[index].status != PlanStatus::Open
-                    && let Err(error) = state.close_plan(index, PlanStatus::Archived)
-                {
-                    state.toast(error);
-                }
-            });
+            self.send(Command::ArchiveFinished(index));
         }
     }
 }

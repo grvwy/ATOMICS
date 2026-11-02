@@ -14,6 +14,7 @@ use atomics_core::store::SessionRecord;
 use atomics_core::tickets::TicketConfig;
 use egui::Color32;
 
+use crate::Command;
 use crate::theme::Palette;
 
 /// What a plan is doing, for its tab. Selection is independent of activity.
@@ -271,9 +272,13 @@ pub struct WorktreeRow {
     pub branch: Option<String>,
 }
 
-/// Everything the UI reads from a host. Methods take `&self` and return owned or shared data, so an
-/// implementation can sit over a lock, a snapshot or a socket. Writes are added as their own slices.
+/// Everything the UI reads from a host, and the way its commands reach the host. Methods take `&self` and
+/// return owned or shared data, so an implementation can sit over a lock, a snapshot or a socket.
 pub trait Backend {
+    /// Carries out a host's command: at once, or queued to run in order with the host's other work. What
+    /// becomes of it shows in later reads. A view command is the UI's own and never comes here.
+    fn send(&self, command: Command);
+
     /// Every plan, in the host's order. The UI addresses a plan by its position in this list.
     fn plan_list(&self) -> Vec<PlanRow>;
 

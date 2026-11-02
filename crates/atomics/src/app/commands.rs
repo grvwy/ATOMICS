@@ -1,7 +1,13 @@
-//! Desktop actions are in-process commands. IDs are resolved when the host runs
-//! them, so a session or plan disappearing between paint and execution is safe.
+//! Commands, as the desktop carries them out. The draw code, moved or not, says what the user asks for
+//! with [`Command`]s; [`Desktop::send`] hands a host's command to the in-process [`Backend`], whose
+//! [`Local::run`] posts it as an action that runs on the runtime thread, in turn with the host's other
+//! work. IDs are resolved when the host runs them, so a session or plan disappearing between paint and
+//! execution is safe.
+use atomics_core::ops::{self, ApprovalDecide, Outcome};
+use atomics_ui::Command;
+
+use super::backend::Local;
 use super::*;
-use atomics_core::ops::{ApprovalDecide, Command, Outcome};
 
 pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
 
@@ -14,15 +20,14 @@ impl State {
         }
         changed
     }
-}
 
-impl Desktop<'_> {
     pub(super) fn post(&self, action: impl FnOnce(&mut State) + Send + 'static) {
-        let _ = self.runtime.action_tx.send(Box::new(action));
+        let _ = self.action_tx.send(Box::new(action));
     }
 
+    /// Posts `action` for the plan at `index`, found again by its id when it runs.
     pub(super) fn post_plan(&self, index: usize, action: impl FnOnce(&mut State, usize) + Send + 'static) {
-        let id = self.runtime.plans[index].id.clone();
+        let id = self.plans[index].id.clone();
         self.post(move |state| {
             if let Some(index) = state.plans.iter().position(|p| p.id == id) {
                 action(state, index);
@@ -31,12 +36,186 @@ impl Desktop<'_> {
     }
 
     pub(super) fn post_session(&self, index: usize, action: impl FnOnce(&mut State, usize) + Send + 'static) {
-        let id = self.runtime.sessions[index].id.clone();
+        let id = self.sessions[index].id.clone();
         self.post(move |state| {
             if let Some(index) = state.find(&id) {
                 action(state, index);
             }
         });
+    }
+
+    /// Posts a task card's `action` for the task at `task` of the plan at `plan`, both found again by
+    /// id when it runs.
+    fn post_task(&self, plan: usize, task: usize, action: &'static str) {
+        let (plan, task) = (self.plans[plan].id.clone(), self.plans[plan].tasks[task].id.clone());
+        self.post(move |state| {
+            if let Some(plan) = state.plans.iter().position(|p| p.id == plan)
+                && let Some(task) = state.plans[plan].tasks.iter().position(|t| t.id == task)
+            {
+                state.task_action(plan, task, action);
+            }
+        });
+    }
+}
+
+impl Local<'_> {
+    /// Carries out a host's command with the posts and `State` methods the desktop's code used before
+    /// commands.
+    pub(super) fn run(&self, command: Command) {
+        let state = self.0;
+        match command {
+            Command::EditBrief { plan, task, brief } => {
+                state.post_plan(plan, move |state, index| state.edit_task_brief(index, &task, brief))
+            }
+            Command::StartTask { plan, task } => {
+                state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
+            }
+            Command::IntegrateTask { plan, task } => {
+                state.post_plan(plan, move |state, index| state.integrate(index, &task, None))
+            }
+            Command::ResumeTask { plan, task } => state.post_task(plan, task, "resume"),
+            Command::AcknowledgeRefs { plan, task } => state.post_task(plan, task, "acknowledge_refs"),
+            Command::SetTaskStatus { plan, task, status } => state.post_plan(plan, move |state, index| {
+                if state.plans[index].status != PlanStatus::Open {
+                    return;
+                }
+                let old = state.plans[index].task_mut(&task).map(|task| {
+                    let old = task.status;
+                    task.set_status(status);
+                    old
+                });
+                state.finish_plan_agents();
+                state.save_plan(index);
+                if let Some(old) = old {
+                    let author = atomics_core::tickets::Author::User;
+                    state.ticket_status_changed(index, &task, old, status, None, author);
+                }
+            }),
+            Command::ApprovePlan(plan) => state.post_plan(plan, |state, index| {
+                state.approve_plan(index);
+                state.toast("Plan approved: the orchestrator can dispatch it now");
+            }),
+            Command::IntegrateAccepted(plan) => state.post_plan(plan, |state, index| {
+                let ids: Vec<_> = state.plans[index].pending_integrations().iter().map(|t| t.id.clone()).collect();
+                for id in ids {
+                    state.integrate(index, &id, None);
+                }
+            }),
+            Command::SyncTickets(plan) => state.post_plan(plan, |state, index| {
+                let id = state.plans[index].id.clone();
+                state.resync_tickets(&id);
+            }),
+            Command::DispatchReady(plan) => {
+                state.post_plan(plan, |state, index| state.dispatch_when_checked(index, None, None))
+            }
+            Command::ReopenPlan(plan) => state.post_plan(plan, |state, index| {
+                if let Err(error) = state.reopen_plan(index) {
+                    state.toast(error);
+                }
+            }),
+            Command::ArchivePlan(plan) => state.post_plan(plan, |state, index| {
+                if let Err(error) = state.close_plan(index, PlanStatus::Archived) {
+                    state.toast(error);
+                }
+            }),
+            Command::ClosePlan { plan, status } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.close_plan(index, status) {
+                    state.toast(error);
+                }
+            }),
+            Command::ArchiveFinished(plan) => state.post_plan(plan, |state, index| {
+                if state.plans[index].status != PlanStatus::Open
+                    && let Err(error) = state.close_plan(index, PlanStatus::Archived)
+                {
+                    state.toast(error);
+                }
+            }),
+            Command::CleanUpPlan(plan) => state.post_plan(plan, |state, index| state.open_plan_cleanup(index)),
+            Command::ReloadPlanCleanup => state.post(State::reload_plan_cleanup),
+            Command::RemovePlanBranches { plan, branches } => {
+                state.post(move |state| state.remove_plan_branches(&plan, &branches))
+            }
+            // Not sent to the backend yet: `Desktop::send` carries these out itself.
+            _ => {}
+        }
+    }
+}
+
+impl Desktop<'_> {
+    /// Draws with atomics-ui code: the client's palette is the host's theme, reads go through the
+    /// in-process backend, and the commands the draw recorded run when it returns.
+    pub(super) fn draw<R>(&mut self, draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client) -> R) -> R {
+        self.client.ui.palette = self.palette();
+        let result = draw(&self.runtime.backend(), &mut self.client.ui);
+        for command in std::mem::take(&mut self.client.ui.commands) {
+            self.send(command);
+        }
+        result
+    }
+
+    /// Carries out a command now: a plan command through the in-process backend, the others with the
+    /// posts and view-hint writes the desktop's code made, until their domains reach the backend too.
+    pub(super) fn send(&mut self, command: Command) {
+        match command {
+            Command::EditingPlan => self.runtime.plan_edit_open = true,
+            Command::ShowTaskDiff { plan, task } => self.runtime.task_action(plan, task, "diff"),
+            Command::OpenTaskSession(session) => {
+                self.activate(&session, true);
+                self.runtime.panel = PanelMode::Diff;
+            }
+            Command::Decide { session, approval, decision } => self.approve_request(session, approval, decision),
+            Command::EditComments { root, before, after } => self.post(move |runtime| {
+                runtime.diffs.entry(root).or_default().edit_comments(before, after);
+            }),
+            Command::SendReview(root) => self.send_review(&root),
+            Command::RefreshDiff(root) => {
+                self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default()))
+            }
+            Command::CloseDiff => self.runtime.diff_open = false,
+            Command::Edit { root, path, line } => {
+                let ctx = self.client.ctx.clone();
+                self.edit(&ctx, &root, path.as_deref(), line);
+            }
+            Command::Activate { session, open_diff } => self.activate(&session, open_diff),
+            Command::Rename(session) => self.begin_rename(&session),
+            Command::Resume(record) => self.post(move |state| state.resume.push(record)),
+            Command::PickProject => self.pick_project(),
+            Command::StartAgent { agent, folder } => self.runtime.pending_open.push((agent, folder)),
+            Command::NewWorktree(root) => {
+                self.open_new_dialog(Some(root.clone()));
+                if let Some(dialog) = &mut self.client.new_dialog {
+                    dialog.place = Place::Worktree;
+                    dialog.repo = paths::display(&root);
+                }
+            }
+            Command::CloseProject(root) => self.close_project(&root),
+            Command::ShowRoot(root) => {
+                self.runtime.active = None;
+                self.runtime.diff_root = Some(root);
+                self.runtime.diff_open = true;
+            }
+            Command::OpenCleanup { repo, preselect } => self.open_cleanup(repo, preselect),
+            Command::OpenFile { root, path } => self.open_file(&root, &path),
+            Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
+            Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
+            Command::SetView(view) => self.runtime.set_view(view),
+            Command::ShowUngrouped => self.runtime.show_ungrouped(),
+            Command::ShowPlan(plan) => {
+                self.runtime.selected_plan = plan;
+                self.runtime.show_plan_fleet();
+            }
+            Command::CloseIdle(root) => self.post(move |state| {
+                let closed = state.close_idle(&root);
+                state.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
+            }),
+            Command::ToggleDiff => self.runtime.diff_open = !self.runtime.diff_open,
+            Command::NewSession => self.open_new_dialog(None),
+            Command::TogglePlan => self.runtime.toggle_plan(),
+            Command::OpenProject(root) => self.open_project(&root),
+            Command::OpenWorkspace(name) => self.open_workspace(&name),
+            Command::SaveWorkspace(name) => self.save_workspace(&name),
+            command => self.runtime.backend().send(command),
+        }
     }
 
     /// The desktop's decision goes through the journal and `State::decide` like a protocol
@@ -48,7 +227,7 @@ impl Desktop<'_> {
         }
         self.post(move |state| {
             let outcome = state.mutate_desktop(|op| {
-                Command::ApprovalDecide(ApprovalDecide { op, approval: approval.clone(), decision, message: None })
+                ops::Command::ApprovalDecide(ApprovalDecide { op, approval: approval.clone(), decision, message: None })
             });
             if let Outcome::Refused { message, .. } = outcome {
                 state.toast(message);
@@ -138,30 +317,5 @@ impl Desktop<'_> {
 
     pub(super) fn open_cleanup(&self, repo: PathBuf, preselect: Option<PathBuf>) {
         self.post(move |state| state.open_cleanup(repo, preselect));
-    }
-
-    pub(super) fn open_plan_cleanup(&self, index: usize) {
-        let plan = self.runtime.plans[index].id.clone();
-        self.post(move |state| {
-            if let Some(index) = state.plans.iter().position(|p| p.id == plan) {
-                state.open_plan_cleanup(index);
-            }
-        });
-    }
-
-    pub(super) fn task_action(&mut self, plan: usize, task: usize, action: &str) {
-        if action == "diff" {
-            self.runtime.task_action(plan, task, action);
-            return;
-        }
-        let (plan, task, action) =
-            (self.runtime.plans[plan].id.clone(), self.runtime.plans[plan].tasks[task].id.clone(), action.to_string());
-        self.post(move |state| {
-            if let Some(plan) = state.plans.iter().position(|p| p.id == plan)
-                && let Some(task) = state.plans[plan].tasks.iter().position(|t| t.id == task)
-            {
-                state.task_action(plan, task, &action);
-            }
-        });
     }
 }
