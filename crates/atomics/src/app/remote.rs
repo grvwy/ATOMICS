@@ -95,7 +95,8 @@ pub(super) struct RemotePlan {
     turn: String,
     entries: Vec<atomics_core::trace::TraceEntry>,
     activity: Option<String>,
-    blocked: HashSet<String>,
+    // Task id and whether its latest report is a question.
+    blocked: HashSet<(String, bool)>,
 }
 
 impl RemotePlan {
@@ -328,13 +329,24 @@ impl State {
                 .tasks
                 .iter()
                 .filter(|t| t.status == TaskStatus::Blocked)
-                .map(|t| t.id.clone())
+                .map(|t| (t.id.clone(), t.report.as_ref().is_some_and(|report| report.status == "question")))
                 .collect();
             if let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) {
-                let changed = !blocked.is_empty() && blocked != entry.blocked;
+                let changed = blocked != entry.blocked;
+                let activity = if !changed {
+                    None
+                } else if blocked.iter().any(|(_, question)| !question) {
+                    Some(("blocked", "A task is blocked"))
+                } else if !blocked.is_empty() {
+                    Some(("input", "A worker asked a question"))
+                } else if self.plans[index].tasks.iter().any(|task| task.status == TaskStatus::Running) {
+                    Some(("working", "Work continues"))
+                } else {
+                    None
+                };
                 entry.blocked = blocked;
-                if changed {
-                    self.remote_activity(index, "blocked", "A task is blocked");
+                if let Some((state, body)) = activity {
+                    self.remote_activity(index, state, body);
                 }
             }
         }
@@ -1242,8 +1254,8 @@ mod tests {
     }
 
     #[test]
-    fn mirror_permission_input_is_once_then_working_blocked_and_done() {
-        with_app("app::remote::tests::mirror_permission_input_is_once_then_working_blocked_and_done", |app, _| {
+    fn remote_activity_transitions_are_once() {
+        with_app("app::remote::tests::remote_activity_transitions_are_once", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
             let path = remote_app(app, dir.path(), |_| {});
             let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
@@ -1264,9 +1276,22 @@ mod tests {
             app.runtime.plans[index].tasks.push(atomics_core::plan::Task {
                 id: "blocked-task".into(),
                 status: TaskStatus::Blocked,
+                report: Some(atomics_core::plan::Report { status: "question".into(), ..Default::default() }),
                 ..Default::default()
             });
-            settle(app, 2);
+            settle(app, 3);
+            let task = app.runtime.plans[index].tasks.last_mut().unwrap();
+            task.report.as_mut().unwrap().status = "blocked".into();
+            settle(app, 3);
+            app.runtime.plans[index].tasks.last_mut().unwrap().status = TaskStatus::Running;
+            settle(app, 3);
+            // Clearing a blocker without any running tasks must not announce work.
+            app.runtime.plans[index].tasks.last_mut().unwrap().status = TaskStatus::Blocked;
+            settle(app, 3);
+            for task in &mut app.runtime.plans[index].tasks {
+                task.status = TaskStatus::Done;
+            }
+            settle(app, 3);
             app.runtime.plans[index].status = PlanStatus::Completed;
             // Queue final activity before the per-plan remote state leaves the poll set.
             app.runtime.remote_tick();
@@ -1291,7 +1316,13 @@ mod tests {
                 .filter_map(|p| p["activity"].as_str())
                 .filter(|s| !s.is_empty())
                 .collect();
-            assert_eq!(activities, ["WaitingForInput", "Working", "blocked", "done"]);
+            assert_eq!(
+                activities,
+                ["WaitingForInput", "Working", "WaitingForInput", "blocked", "Working", "blocked", "done"]
+            );
+            let texts = posts(&path);
+            assert_eq!(texts.iter().filter(|text| *text == "A worker asked a question").count(), 1);
+            assert_eq!(texts.iter().filter(|text| *text == "Work continues").count(), 1);
             assert_eq!(state["posts"].as_array().unwrap().last().unwrap()["text"], "Plan finished");
             assert!(!app.runtime.tickets.remote.plans.contains_key("remote-plan"));
             assert!(!state["posts"].to_string().contains("PRIVATE PERMISSION"));
