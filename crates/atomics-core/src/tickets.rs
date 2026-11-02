@@ -406,6 +406,11 @@ pub struct Operations {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "read_operation")]
     pub read: Option<Operation>,
+    /// The comments of a read, for systems that list them with a tool of their own; only its
+    /// `comments` paths are read. Placeholders: {id}, {key}, {key_number}, {uuid}.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
+    pub read_comments: Option<Operation>,
     /// Read one ticket. Placeholders: {id}, {key}, {system}.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "read_operation")]
@@ -1477,7 +1482,7 @@ impl TicketConfig {
 
     /// Whether any operation that addresses a ticket can't use this link's id.
     pub fn id_unfit(&self, link: &TicketLink) -> bool {
-        ["conversation_open", "get", "read", "children", "related", "update_state", "comment"]
+        ["conversation_open", "get", "read", "read_comments", "children", "related", "update_state", "comment"]
             .iter()
             .any(|operation| self.unfit_id(operation, link).is_some())
     }
@@ -1508,6 +1513,7 @@ impl TicketConfig {
             "children" => self.operations.children.as_ref(),
             "related" => self.operations.related.as_ref(),
             "read" => self.operations.read.as_ref(),
+            "read_comments" => self.operations.read_comments.as_ref(),
             _ => None,
         }
         .filter(|op| !op.tool.trim().is_empty())
@@ -1654,7 +1660,6 @@ impl Operation {
         let field = |path: &str| mapped_field(result, path);
         let items =
             |path: &str| (!path.is_empty()).then(|| json_path(result, path)).flatten().and_then(Value::as_array);
-        let comments = &self.comments;
         let links = &self.links;
         Ok(TicketCard {
             link,
@@ -1669,20 +1674,7 @@ impl Operation {
             kind: field(&self.result.kind),
             author_kind: field(&self.result.author_kind),
             body: field(&self.body),
-            comments: items(&comments.items)
-                .into_iter()
-                .flatten()
-                .map(|item| Comment {
-                    id: mapped_field(item, &comments.id),
-                    seq: mapped_field(item, &comments.seq),
-                    author_id: mapped_field(item, &comments.author_id),
-                    author_kind: mapped_field(item, &comments.author_kind),
-                    author: mapped_field(item, &comments.author),
-                    text: mapped_field(item, &comments.text).unwrap_or_default(),
-                    at: mapped_field(item, &comments.at),
-                    kind: mapped_field(item, &comments.kind),
-                })
-                .collect(),
+            comments: self.comment_items(items(&self.comments.items)),
             links: items(&links.items)
                 .into_iter()
                 .flatten()
@@ -1695,6 +1687,34 @@ impl Operation {
                 .collect(),
             ..TicketCard::default()
         })
+    }
+
+    fn comment_items(&self, items: Option<&Vec<Value>>) -> Vec<Comment> {
+        let paths = &self.comments;
+        items
+            .into_iter()
+            .flatten()
+            .map(|item| Comment {
+                id: mapped_field(item, &paths.id),
+                seq: mapped_field(item, &paths.seq),
+                author_id: mapped_field(item, &paths.author_id),
+                author_kind: mapped_field(item, &paths.author_kind),
+                author: mapped_field(item, &paths.author),
+                text: mapped_field(item, &paths.text).unwrap_or_default(),
+                at: mapped_field(item, &paths.at),
+                kind: mapped_field(item, &paths.kind),
+            })
+            .collect()
+    }
+
+    /// A `read_comments` result: the comments its `comments.items` path selects.
+    pub fn comment_list(&self, result: &Value) -> Result<Vec<Comment>, String> {
+        match json_path(result, &self.comments.items) {
+            Some(Value::Array(items)) => Ok(self.comment_items(Some(items))),
+            _ => {
+                Err(format!("{} returned no comment list at {:?}: {}", self.tool, self.comments.items, snippet(result)))
+            }
+        }
     }
 
     pub fn cards(&self, result: &Value, system: &str) -> Result<Vec<TicketCard>, String> {

@@ -228,19 +228,63 @@ close_done_agents = true
 # END RELAY PROFILE
 #
 # BEGIN LINEAR PROFILE
-# Linear: verify with doctor; tool names, schemas and result paths are unverified.
+# Linear: checked against Linear's MCP server on 2026-11-02. Sign in from the Tickets panel.
 # [tickets]
 # system = "linear"
 # mode = "ticket"
 # comments = "chief"
 # workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
-# server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
+# server = { url = "https://mcp.linear.app/mcp", oauth = true }
 # states = { planned = "Todo", running = "In Progress" }
+# branch = "{branch}"
+#
+# [tickets.operations.whoami]
+# tool = "whoami"
+# result = { id = "user.id", name = "user.name", kind = "workspace.name" }
 #
 # [tickets.operations.get]
 # tool = "get_issue"
 # arguments = { id = "{key}" }
-# result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
+#
+# [tickets.operations.read]
+# tool = "get_issue"
+# arguments = { id = "{key}" }
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName", assignee = "assignee" }
+# body = "description"
+# links = { items = "attachments", label = "title", url = "url" }
+#
+# [tickets.operations.read_comments]
+# tool = "list_comments"
+# arguments = { issueId = "{key}", orderBy = "createdAt", limit = 50 }
+# comments = { items = "comments", id = "id", author = "author.name", author_id = "author.id", text = "body", at = "createdAt" }
+#
+# [tickets.operations.search]
+# tool = "list_issues"
+# arguments = { query = "{query}", limit = 25 }
+# items = "issues"
+# accepts = ["assignee", "team", "state"]
+# paging = { cursor = "cursor", next = "cursor" }
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status", assignee = "assignee" }
+#
+# [tickets.operations.browse]
+# tool = "list_issues"
+# arguments = { limit = 25 }
+# items = "issues"
+# paging = { cursor = "cursor", next = "cursor" }
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status", assignee = "assignee", updated_at = "updatedAt" }
+#
+# [tickets.operations.children]
+# tool = "list_issues"
+# arguments = { parentId = "{key}", limit = 50 }
+# items = "issues"
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status", assignee = "assignee" }
+#
+# [tickets.operations.related]
+# tool = "get_issue"
+# arguments = { id = "{key}", includeRelations = true, fields = ["id", "relations"] }
+# items = "relations.relatedTo"
+# result = { id = "id", key = "id", title = "title" }
 #
 # [tickets.operations.update_state]
 # tool = "save_issue"
@@ -253,25 +297,23 @@ close_done_agents = true
 # [tickets.operations.create]
 # tool = "save_issue"
 # arguments = { team = "ENG", title = "{title}", description = "{body}" }
-# result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status", branch = "gitBranchName" }
 #
-# [tickets.operations.search]
-# tool = "list_issues"
-# arguments = { query = "{query}", limit = 25 }
-# items = "issues"
-# result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", assignee = "assignee.name" }
+# [[tickets.views]]
+# label = "Mine"
+# default = true
+# arguments = { assignee = "me" }
 #
-# [tickets.operations.children]
-# tool = "list_issues"
-# arguments = { parentId = "{id}", limit = 25 }
-# items = "issues"
-# result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", parent = "parentId" }
+# [[tickets.views]]
+# label = "Started"
+# arguments = { state = "started" }
 #
-# [tickets.operations.read]
-# tool = "get_issue"
-# arguments = { id = "{key}" }
-# result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName", assignee = "assignee.name" }
-# body = "description"
+# [[tickets.views]]
+# label = "Recent"
+#
+# [[tickets.filters]]
+# label = "Mine"
+# arguments = { assignee = "me" }
 # END LINEAR PROFILE
 
 [resources]
@@ -970,6 +1012,63 @@ mod tests {
         assert!(!custom.cleanup.completed_plans && !custom.cleanup.archived_plans);
         let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert!(config.cleanup.completed_plans && config.cleanup.archived_plans);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn commented_ticket_profiles_parse_when_uncommented() {
+        let profile = |name: &str| -> Config {
+            let (begin, end) = (format!("# BEGIN {name} PROFILE"), format!("# END {name} PROFILE"));
+            let block = &DEFAULT_CONFIG[DEFAULT_CONFIG.find(&begin).unwrap()..DEFAULT_CONFIG.find(&end).unwrap()];
+            let toml: String = block
+                .lines()
+                .filter_map(|line| line.strip_prefix("# ").or(line.strip_prefix('#')))
+                .filter(|line| line.is_empty() || line.starts_with(['[', '#']) || line.contains(" = "))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            toml::from_str(&toml).unwrap_or_else(|error| panic!("{name}: {error}\n{toml}"))
+        };
+        assert!(profile("RELAY").tickets.operation("get").is_some());
+        let linear = profile("LINEAR").tickets;
+        assert!(linear.server.oauth && linear.has_views());
+        assert_eq!(linear.operation("read_comments").unwrap().comments.items, "comments");
+        assert_eq!(linear.operation("related").unwrap().items, "relations.relatedTo");
+
+        // Results as Linear's MCP server returned them on 2026-11-02, shortened.
+        let issue = serde_json::json!({
+            "id": "ENG-480", "uuid": "6f1c2a3b-0000-4000-8000-000000000480", "title": "Usage dashboard",
+            "description": "## Backend\n\nNew endpoint.", "url": "https://linear.app/example/issue/ENG-480/usage",
+            "gitBranchName": "feature/eng-480-usage", "updatedAt": "2026-10-29T09:21:42.994Z", "status": "Done",
+            "assignee": "Robin Roe",
+            "attachments": [{"id": "bb2f", "title": "#ENG-480 Usage dashboard endpoint",
+                "url": "https://github.com/example/api/pull/730"}]
+        });
+        let card = linear.operation("read").unwrap().card(&issue, "linear").unwrap();
+        assert_eq!(card.link.id, "ENG-480");
+        assert_eq!(card.link.label(), "ENG-480");
+        assert_eq!(card.link.state.as_deref(), Some("Done"));
+        assert_eq!(card.link.branch.as_deref(), Some("feature/eng-480-usage"));
+        assert_eq!(card.assignee, Some(Some("Robin Roe".into())));
+        assert!(card.body.unwrap().starts_with("## Backend"));
+        assert!(card.links[0].url.as_deref().unwrap().ends_with("/pull/730"));
+        let unassigned = serde_json::json!({"issues": [{"id": "ENG-350", "uuid": "6f1c2a3b-0000-4000-8000-000000000350",
+            "title": "Scaffold", "status": "Todo", "assignee": null}], "hasNextPage": true, "cursor": "page-2"});
+        let browse = linear.operation("browse").unwrap();
+        let cards = browse.cards(&unassigned, "linear").unwrap();
+        assert_eq!((cards[0].link.label(), cards[0].assignee.clone()), ("ENG-350", Some(None)));
+        assert_eq!(browse.next_cursor(&unassigned).as_deref(), Some("page-2"));
+        let comments = serde_json::json!({"comments": [{"id": "7a5e", "body": "PR created",
+            "createdAt": "2026-10-30T22:54:30.104Z", "author": {"id": "u-2", "name": "ci-bot"}}],
+            "hasNextPage": false});
+        let comments = linear.operation("read_comments").unwrap().comment_list(&comments).unwrap();
+        assert_eq!((comments[0].author.as_deref(), comments[0].text.as_str()), (Some("ci-bot"), "PR created"));
+        let relations = serde_json::json!({"id": "ENG-497", "relations": {"blocks": [], "relatedTo":
+            [{"id": "ENG-498", "title": "Record why imports fail"}]}});
+        let related = linear.operation("related").unwrap().cards(&relations, "linear").unwrap();
+        assert_eq!(related[0].link.label(), "ENG-498");
+        let whoami = serde_json::json!({"user": {"id": "u-1", "name": "Alex Doe"}, "workspace": {"name": "example"}});
+        let whoami = crate::tickets::Whoami::read(linear.operation("whoami").unwrap(), &whoami).unwrap();
+        assert_eq!(whoami.label(), "Alex Doe (example)");
     }
 
     #[test]

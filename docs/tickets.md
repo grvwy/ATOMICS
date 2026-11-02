@@ -331,7 +331,7 @@ Each operation names a tool, its arguments, and where its result keeps the ticke
 [tickets.operations.get]
 tool = "get_issue"
 arguments = { id = "{key}" }
-result = { id = "uuid", key = "id", url = "url", title = "title", state = "status.name", updated_at = "updatedAt" }
+result = { id = "id", key = "id", url = "url", title = "title", state = "status.name", updated_at = "updatedAt" }
 ```
 
 | Operation | Used for | Placeholders |
@@ -343,6 +343,7 @@ result = { id = "uuid", key = "id", url = "url", title = "title", state = "statu
 | `children` (optional) | Direct children; also used when board mode has no `list` mapping. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `related` (optional) | Related matches, with optional scores. These are never treated as children. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
+| `read_comments` (optional) | The comments of a read, for systems that list them with their own tool. Only its `comments` paths are read, and `comments.items` is relative to the whole result. When it fails, the card shows without comments and says why. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `list` (optional if `children` is mapped) | Board mode: reading a plan's whole board in one call. `items` is the JSON path of the ticket array. | `{board}`, `{board_key}` |
 | `update_state` (optional) | Moving a ticket as its task moves. | `{id}`, `{key}`, `{uuid}`, `{state}`, `{nonce}` |
@@ -1216,12 +1217,20 @@ arguments = { assignee = "owner" }
 
 ### Linear: an issue per plan
 
-**Verify with doctor.** On 2026-11-01 a live, unauthenticated `tools/list` request to
-`https://mcp.linear.app/mcp` returned HTTP 401 with an OAuth challenge. No Linear authorization is
-available in this sandbox, so no tool schemas were verified. These tool names, argument schemas and
-result paths remain unverified, including the `parentId` filter for children. Check live `tools/list` and
-`inputSchema` before using the profile, then check result paths with sync. Linear has no mapped semantic
-search or related operation here. `read` shows the description only: comments require a second tool call.
+**Checked against Linear's MCP server on 2026-11-02**: the tool names, the argument schemas from
+`tools/list`, and the result paths of `whoami`, `get_issue`, `list_issues`, `list_comments` and
+`get_issue` with relations, read live. The write tools (`save_issue`, `save_comment`) were checked
+against their schemas only, so check them once with sync on a test issue.
+
+What Linear returns, so you can adapt the paths: `id` is the issue key (`ENG-123`) and `uuid` its UUID;
+`status` is the state's name and `assignee` a display name (null when unassigned); `attachments` are the
+linked PRs and links; `list_issues` and `list_comments` page with `cursor`. Every tool takes the key or
+the UUID as an issue id, so the profile links issues by their key. Comments come from `list_comments`, a second call, mapped as `read_comments`.
+Related issues come with their key and title only. Linear has no meaning search, so the panel has no
+*meaning / keyword* toggle.
+
+`https://mcp.linear.app/mcp` follows the MCP authorization spec, so the profile uses ATOMICS's own
+sign-in (Tickets → **Sign in**) and needs no bridge. Replace `ENG` in `create` with your team's key.
 
 ```toml
 [tickets]
@@ -1229,13 +1238,57 @@ system = "linear"
 mode = "ticket"
 comments = "chief"
 workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
-server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
+server = { url = "https://mcp.linear.app/mcp", oauth = true }
 states = { planned = "Todo", running = "In Progress" }
+branch = "{branch}"
+
+[tickets.operations.whoami]
+tool = "whoami"
+result = { id = "user.id", name = "user.name", kind = "workspace.name" }
 
 [tickets.operations.get]
 tool = "get_issue"
 arguments = { id = "{key}" }
-result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
+result = { id = "id", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
+
+[tickets.operations.read]
+tool = "get_issue"
+arguments = { id = "{key}" }
+result = { id = "id", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName", assignee = "assignee" }
+body = "description"
+links = { items = "attachments", label = "title", url = "url" }
+
+[tickets.operations.read_comments]
+tool = "list_comments"
+arguments = { issueId = "{key}", orderBy = "createdAt", limit = 50 }
+comments = { items = "comments", id = "id", author = "author.name", author_id = "author.id", text = "body", at = "createdAt" }
+
+[tickets.operations.search]
+tool = "list_issues"
+arguments = { query = "{query}", limit = 25 }
+items = "issues"
+accepts = ["assignee", "team", "state"]
+paging = { cursor = "cursor", next = "cursor" }
+result = { id = "id", key = "id", url = "url", title = "title", state = "status", assignee = "assignee" }
+
+[tickets.operations.browse]
+tool = "list_issues"
+arguments = { limit = 25 }
+items = "issues"
+paging = { cursor = "cursor", next = "cursor" }
+result = { id = "id", key = "id", url = "url", title = "title", state = "status", assignee = "assignee", updated_at = "updatedAt" }
+
+[tickets.operations.children]
+tool = "list_issues"
+arguments = { parentId = "{key}", limit = 50 }
+items = "issues"
+result = { id = "id", key = "id", url = "url", title = "title", state = "status", assignee = "assignee" }
+
+[tickets.operations.related]
+tool = "get_issue"
+arguments = { id = "{key}", includeRelations = true, fields = ["id", "relations"] }
+items = "relations.relatedTo"
+result = { id = "id", key = "id", title = "title" }
 
 [tickets.operations.update_state]
 tool = "save_issue"
@@ -1248,26 +1301,27 @@ arguments = { issueId = "{key}", body = "{body}" }
 [tickets.operations.create]
 tool = "save_issue"
 arguments = { team = "ENG", title = "{title}", description = "{body}" }
-result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
+result = { id = "id", key = "id", url = "url", title = "title", state = "status", branch = "gitBranchName" }
 
-[tickets.operations.search]
-tool = "list_issues"
-arguments = { query = "{query}", limit = 25 }
-items = "issues"
-result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", assignee = "assignee.name" }
+[[tickets.views]]
+label = "Mine"
+default = true
+arguments = { assignee = "me" }
 
-[tickets.operations.children]
-tool = "list_issues"
-arguments = { parentId = "{id}", limit = 25 }
-items = "issues"
-result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", parent = "parentId" }
+[[tickets.views]]
+label = "Started"
+arguments = { state = "started" }
 
-[tickets.operations.read]
-tool = "get_issue"
-arguments = { id = "{key}" }
-result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName", assignee = "assignee.name" }
-body = "description"
+[[tickets.views]]
+label = "Recent"
+
+[[tickets.filters]]
+label = "Mine"
+arguments = { assignee = "me" }
 ```
+
+`branch = "{branch}"` names task branches after Linear's suggestion (`feature/eng-123-title`). Teams with
+their own convention write it instead, for example `branch = "issue/{key_number}-{slug}"`.
 
 ### Let PR automation own review and done
 
@@ -1283,9 +1337,7 @@ state should follow ATOMICS. Backlog and cancellation remain user decisions.
 The profile uses `comments = "chief"`; change it to `"agents"` to post signed agent reports and enable
 scoped agent tools. Link the issue to the plan with `ticket = { id = "ENG-123" }`. The optional create
 operation needs your real team in place of `ENG`. Check tool names and result paths against your
-server version: doctor validates offered tool names, and sync validates results. For a server returning
-`identifier` separately from a UUID `id`, set `result = { id = "id", key = "identifier", url = "url",
-title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }` on get and create.
+server version: doctor validates offered tool names, and sync validates results.
 
 ### Checking a profile
 
@@ -1324,29 +1376,23 @@ use `atomics_ticket_sync` on a linked plan to verify the latter.
 
 ### Step by step: Linear
 
-1. **Install Node.js**, so `npx` runs the bridge.
-2. **Copy the profile.** Put the [Linear block](#linear-an-issue-per-plan) in the workspace or
+1. **Copy the profile.** Put the [Linear block](#linear-an-issue-per-plan) in the workspace or
    `config.toml` (commented out between `BEGIN LINEAR PROFILE` and `END LINEAR PROFILE` in a new
    `config.toml`). Replace `ENG` in the `create` operation with your team's key.
-3. **Sign in through the bridge once**, in a terminal:
-
-   ```sh
-   npx -y mcp-remote https://mcp.linear.app/mcp
-   ```
-
-   It opens Linear's sign-in in your browser (through `xdg-open` on Linux) and keeps the token for later
-   runs; stop it once it has connected. ATOMICS then starts the same command with no browser and no
-   `token_env`. See [Linear's MCP setup](https://linear.app/docs/mcp).
-4. **Check.** `atomics --workspace <name> doctor` prints `linear ticket MCP server starts and offers all
-   mapped tools`. A bridge that was never signed in fails here, with the hint to authenticate it in a
-   terminal first.
-5. **Use it.** Restart the chief, link an issue to a plan with `ticket = { id = "ENG-123" }`, and run
-   `atomics_ticket_sync` once to check the result paths.
-6. **Optionally, Linear's own tools in sandboxes.** With a Linear profile configured, `atomics setup`
+2. **Sign in.** Open Tickets (`cmd+k`; Ctrl+Shift+K on Linux/Windows) and choose **Sign in**, or run
+   `atomics tickets login`. Linear asks you to authorize ATOMICS in the browser.
+3. **Check.** `atomics --workspace <name> doctor` prints `linear ticket MCP server starts and offers all
+   mapped tools`.
+4. **Use it.** The panel opens on your issues. Restart the chief, then read an issue and use **Plan with
+   chief**, or link one to a plan with `ticket = { id = "ENG-123" }` and run `atomics_ticket_sync` once.
+5. **Optionally, Linear's own tools in sandboxes.** With a Linear profile configured, `atomics setup`
    registers and authorizes sbx's Linear server (`sbx mcp add linear --url https://mcp.linear.app/mcp`,
    `sbx mcp auth linear`). Add `mcp = ["linear"]` to `[isolation.sandbox]` to load it into new sandboxes.
    Agents then use Linear with your authorization, through sbx's gateway; see [Tickets and direct Linear
    access](isolation.md#tickets-and-direct-linear-access).
+
+The bridge from earlier versions, `server = { command = ["npx", "-y", "mcp-remote",
+"https://mcp.linear.app/mcp"] }`, still works with the same operations; it keeps its own sign-in.
 
 The Linear profile has `comments = "chief"`, which gives agents no ticket tools. Set `"agents"` to let
 them read their ticket and comment on it (see below).

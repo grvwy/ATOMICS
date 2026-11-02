@@ -445,11 +445,23 @@ impl Worker {
                 let name = if config.operation("read").is_some() { "read" } else { "get" };
                 let output = self.call(config, name, &Vars::new(system).ticket(&link))?;
                 let operation = config.operation(name).expect("called");
-                let card = if name == "read" {
+                let mut card = if name == "read" {
                     operation.card(&output, system)?
                 } else {
                     operation.fallback_card(&output, system)?
                 };
+                // A failed comment listing still shows the ticket, with the reason in place of them.
+                if let Some(comments) = config.operation("read_comments") {
+                    match self
+                        .call(config, "read_comments", &Vars::new(system).ticket(&link))
+                        .and_then(|output| comments.comment_list(&output))
+                    {
+                        Ok(comments) => card.comments = comments,
+                        Err(error) => {
+                            card.fields.insert("comments".into(), format!("could not be read: {error}"));
+                        }
+                    }
+                }
                 Ok(TicketOutput::Card(Box::new(config.card_url(card)?)))
             }
             TicketOp::Read(link) => self.call(config, "get", &Vars::new(system).ticket(&link)).map(TicketOutput::Read),
@@ -2016,6 +2028,27 @@ pub(crate) mod tests {
             assert!(read.body.unwrap().contains("## Goal"));
             assert_eq!(read.comments[0].kind.as_deref(), Some("Agent"));
             assert_eq!(read.links[0].ci.as_deref(), Some("Passed"));
+            // Comments from a tool of their own; a failing one still shows the ticket.
+            let mut split = config.clone();
+            let read_op = split.operations.read.as_mut().unwrap();
+            split.operations.read_comments = Some(atomics_core::tickets::Operation {
+                tool: read_op.tool.clone(),
+                arguments: read_op.arguments.clone(),
+                comments: std::mem::take(&mut read_op.comments),
+                ..Default::default()
+            });
+            let TicketOutput::Card(read) = run(&split, TicketOp::ReadCard(children[0].link.clone())) else {
+                panic!("read with read_comments")
+            };
+            assert_eq!(read.comments[0].kind.as_deref(), Some("Agent"), "{dialect}");
+            assert!(!read.fields.contains_key("comments"));
+            split.operations.read_comments.as_mut().unwrap().comments.items = "no.such.list".into();
+            let TicketOutput::Card(read) = run(&split, TicketOp::ReadCard(children[0].link.clone())) else {
+                panic!("read with failing read_comments")
+            };
+            assert!(read.body.unwrap().contains("## Goal"));
+            assert!(read.comments.is_empty());
+            assert!(read.fields["comments"].contains("no comment list"), "{:?}", read.fields);
             let mut fallback = config.clone();
             fallback.operations.read = None;
             let TicketOutput::Card(read) = run(&fallback, TicketOp::ReadCard(epic.clone())) else { panic!("fallback") };

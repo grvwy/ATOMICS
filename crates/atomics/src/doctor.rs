@@ -339,7 +339,7 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
         if !missing.is_empty() {
             return Err(format!("missing mapped tools: {}", missing.join(", ")));
         }
-        Ok(["search", "semantic_search", "browse", "children", "related", "read"]
+        Ok(["search", "semantic_search", "browse", "children", "related", "read", "read_comments"]
             .into_iter()
             .filter_map(|name| {
                 config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
