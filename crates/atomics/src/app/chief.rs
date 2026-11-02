@@ -253,7 +253,6 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
 
 impl Desktop<'_> {
     pub(super) fn chief_pill(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let ctx = ui.ctx().clone();
         let p = self.palette();
         let chief = self.runtime.sessions.iter().position(|s| s.chief);
         let status = chief.map(|i| self.runtime.sessions[i].status);
@@ -377,10 +376,10 @@ impl Desktop<'_> {
             toggle = true;
         }
         if dock != self.runtime.chief_dock() {
-            self.set_chief_dock(dock);
+            self.send(Command::SetChiefDock(dock));
         }
         if toggle {
-            self.toggle_chief(&ctx);
+            self.send(Command::ToggleChief);
         }
     }
 
@@ -421,11 +420,11 @@ impl Desktop<'_> {
                 let dock = self.runtime.chief_dock();
                 let label = if dock == ChiefDock::Floating { "dock" } else { "float" };
                 if ui.small_button(label).clicked() {
-                    self.set_chief_dock(if dock == ChiefDock::Floating {
+                    self.send(Command::SetChiefDock(if dock == ChiefDock::Floating {
                         ChiefDock::Docked
                     } else {
                         ChiefDock::Floating
-                    });
+                    }));
                 }
             });
         });

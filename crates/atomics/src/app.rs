@@ -1869,7 +1869,7 @@ impl Desktop<'_> {
         if let Some(rect) = chief_rect
             && chief_divider(ui, rect, &mut self.runtime.store.chief_width, &p)
         {
-            self.save_chief_preferences();
+            self.send(Command::SaveChiefPreferences);
         }
 
         self.chief_ui(&ctx);

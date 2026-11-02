@@ -419,13 +419,7 @@ impl Desktop<'_> {
         if let Some(apply) = decision {
             let id = pending.id.clone();
             let note = std::mem::take(&mut self.client.config_note);
-            self.post(move |state| {
-                if apply {
-                    state.apply_proposal(&id, note);
-                } else {
-                    state.reject_proposal(&id, note);
-                }
-            });
+            self.send(Command::DecideProposal { id, apply, note });
         }
     }
 }

@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use atomics_core::approvals::Decision;
+use atomics_core::config::ChiefDock;
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::steer::ReviewComment;
 use atomics_core::store::SessionRecord;
@@ -165,6 +166,46 @@ pub enum Command {
         worktrees: Vec<PathBuf>,
         orphans: Vec<String>,
         delete_branches: bool,
+    },
+
+    // ── The chief and settings ─────────────────────────────────────────────────────────────────────────
+    /// Show or hide the chief, starting it when it is not running.
+    ToggleChief,
+    /// Float or dock the chief's window, and remember it.
+    SetChiefDock(ChiefDock),
+    /// Save the chief's window preferences: its dock and width.
+    SaveChiefPreferences,
+    /// What the user said, for the chief, which starts with it as its first prompt when it is not running.
+    VoiceToChief(String),
+    /// Show a theme and save its name to `config.toml`, or to this machine's file with `host`.
+    SelectTheme {
+        name: String,
+        host: bool,
+    },
+    /// Check again whether agents can run in Docker Sandboxes.
+    CheckSandbox,
+    /// Read the MCP servers sbx has and ATOMICS knows again.
+    RefreshConnections,
+    /// Import the MCP servers the agents' own configs name.
+    ImportConnections,
+    /// Connect an MCP server: sbx's registration, else its definition, else `url`; its environment is
+    /// stored first with `store_env`.
+    Connect {
+        name: String,
+        store_env: bool,
+        url: Option<String>,
+    },
+    Disconnect(String),
+    /// Add a remote MCP server by name and URL.
+    AddConnection {
+        name: String,
+        url: String,
+    },
+    /// Apply the chief's config proposal with this id, or reject it, with the user's note for the chief.
+    DecideProposal {
+        id: String,
+        apply: bool,
+        note: String,
     },
 
     // ── Not sent yet: the desktop carries these out itself ──────────────────────────────────────────

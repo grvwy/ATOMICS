@@ -178,7 +178,7 @@ impl Desktop<'_> {
             }
         }
         if pressed(&keys.toggle_chief) {
-            self.toggle_chief(ctx);
+            self.send(Command::ToggleChief);
         }
         if pressed(&keys.quick_open) && self.runtime.diff_target().is_some() {
             self.client.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });

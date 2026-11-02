@@ -369,21 +369,18 @@ impl Desktop<'_> {
     }
 
     pub(super) fn connection_action(&mut self, action: Action) {
-        match action {
-            Action::Refresh => self.post(|state| state.refresh_connections()),
-            Action::Import => self.post(|state| state.import_connections()),
-            Action::Connect(name, store) => self.post(move |state| state.connect_server(&name, store, None)),
-            Action::Disconnect(name) => self.post(move |state| state.disconnect_server(&name)),
+        let command = match action {
+            Action::Refresh => Command::RefreshConnections,
+            Action::Import => Command::ImportConnections,
+            Action::Connect(name, store_env) => Command::Connect { name, store_env, url: None },
+            Action::Disconnect(name) => Command::Disconnect(name),
             Action::Add => {
                 let (name, url) =
                     (std::mem::take(&mut self.client.connection_name), std::mem::take(&mut self.client.connection_url));
-                self.post(move |state| {
-                    if let Err(error) = state.add_connection(&name, &url) {
-                        state.toast(error);
-                    }
-                });
+                Command::AddConnection { name, url }
             }
-        }
+        };
+        self.send(command);
     }
 
     pub(super) fn connections_panel(&mut self, ui: &mut egui::Ui) -> Option<Action> {

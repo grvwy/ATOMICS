@@ -391,7 +391,7 @@ impl Desktop<'_> {
         }
 
         if let Some((name, store_env, url)) = connect {
-            self.post(move |state| state.connect_server(&name, store_env, url));
+            self.send(Command::Connect { name, store_env, url });
         }
         if let Some(id) = dismiss {
             self.send(Command::DismissMcp(id));

@@ -208,6 +208,36 @@ impl Local<'_> {
             Command::RemoveWorktrees { worktrees, orphans, delete_branches } => {
                 state.post(move |state| state.remove_worktrees(&worktrees, orphans, delete_branches))
             }
+            Command::ToggleChief => state.post(|state| state.toggle_chief()),
+            Command::SetChiefDock(dock) => state.post(move |state| state.set_chief_dock(dock)),
+            Command::SaveChiefPreferences => state.post(State::save_chief_preferences),
+            Command::VoiceToChief(text) => {
+                let quoted = format!("“{}”", truncate(&text, 60));
+                state.post(move |state| match state.send_to_chief(&text) {
+                    Ok(()) => state.toast(format!("Sent to the chief: {quoted}")),
+                    Err(error) => state.client_events.push(ClientEvent::VoiceFailed { text, error }),
+                })
+            }
+            Command::SelectTheme { name, host } => state.post(move |state| state.select_theme(&name, host)),
+            Command::CheckSandbox => state.post(|state| state.check_sandbox()),
+            Command::RefreshConnections => state.post(|state| state.refresh_connections()),
+            Command::ImportConnections => state.post(|state| state.import_connections()),
+            Command::Connect { name, store_env, url } => {
+                state.post(move |state| state.connect_server(&name, store_env, url))
+            }
+            Command::Disconnect(name) => state.post(move |state| state.disconnect_server(&name)),
+            Command::AddConnection { name, url } => state.post(move |state| {
+                if let Err(error) = state.add_connection(&name, &url) {
+                    state.toast(error);
+                }
+            }),
+            Command::DecideProposal { id, apply, note } => state.post(move |state| {
+                if apply {
+                    state.apply_proposal(&id, note);
+                } else {
+                    state.reject_proposal(&id, note);
+                }
+            }),
             Command::CleanUpPlan(plan) => state.post_plan(plan, |state, index| state.open_plan_cleanup(index)),
             Command::ReloadPlanCleanup => state.post(State::reload_plan_cleanup),
             Command::RemovePlanBranches { plan, branches } => {
@@ -231,9 +261,8 @@ impl Desktop<'_> {
         result
     }
 
-    /// Carries out a command now: an approval, plan, review, session or project command through the
-    /// in-process backend, the others with the posts and view-hint writes the desktop's code made, until
-    /// their domains reach it too.
+    /// Carries out a command now: a host's command through the in-process backend, the others with the
+    /// view-hint writes the desktop's code made.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::EditingPlan => self.runtime.plan_edit_open = true,
@@ -283,18 +312,6 @@ impl Desktop<'_> {
             self.client.focus_terminal = Some(id.to_string());
         }
         self.send(Command::SeeSession(id.to_string()));
-    }
-
-    pub(super) fn toggle_chief(&self, _ctx: &egui::Context) {
-        self.post(|state| state.toggle_chief());
-    }
-
-    pub(super) fn set_chief_dock(&self, dock: ChiefDock) {
-        self.post(move |state| state.set_chief_dock(dock));
-    }
-
-    pub(super) fn save_chief_preferences(&self) {
-        self.post(State::save_chief_preferences);
     }
 
     pub(super) fn pick_project(&mut self) {

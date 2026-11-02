@@ -63,15 +63,8 @@ impl Desktop<'_> {
             return;
         }
         let text = text.to_string();
-        let quoted = format!("“{}”", truncate(&text, 60));
         match self.runtime.config.voice.target {
-            VoiceTarget::Chief => self.post(move |state| {
-                let started = state.send_to_chief(&text);
-                match started {
-                    Ok(()) => state.toast(format!("Sent to the chief: {quoted}")),
-                    Err(error) => state.client_events.push(ClientEvent::VoiceFailed { text, error }),
-                }
-            }),
+            VoiceTarget::Chief => self.send(Command::VoiceToChief(text)),
             VoiceTarget::Active => {
                 if let Some(index) = self
                     .runtime
