@@ -155,7 +155,6 @@ impl Desktop<'_> {
         let mut close: Option<String> = None;
         let mut rename: Option<String> = None;
         let mut resume: Option<usize> = None;
-        let mut approval = None;
         // A banner's Connect button: the server, whether to store its environment, the agent's URL.
         let mut connect: Option<(String, bool, Option<String>)> = None;
         let mut dismiss: Option<String> = None;
@@ -167,10 +166,9 @@ impl Desktop<'_> {
         for (slot, &index) in tiled.iter().enumerate() {
             let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
             let tile = Rect::from_min_size(min, size).shrink(3.0);
-            // The header reads the session's row and the approval banner its first request. The rest of the
-            // body (the MCP banner, the terminal) still reads the model, until the terminal slice moves it.
+            // The header reads the session's row, and atomics-ui's approval banner its first request. The rest
+            // of the body (the MCP banner, the terminal) still reads the model, until the terminal slice moves it.
             let row = &sessions[index];
-            let pending = self.runtime.backend().session_approval(index);
             let active = self.runtime.active.as_deref() == Some(row.id.as_str());
             let reported = if matches!(row.status, AgentStatus::Idle | AgentStatus::Done) {
                 self.runtime
@@ -284,45 +282,8 @@ impl Desktop<'_> {
             let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
-            if let Some(pending) = &pending {
-                let request = &pending.request;
-                let deciding = self.client.approval_decisions.contains(&(pending.session.clone(), pending.id.clone()));
-                let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());
-                let banner = body.with_max_y(body.top() + height);
-                ui.painter().rect_filled(banner, 0.0, p.panel);
-                let mut child =
-                    ui.new_child(egui::UiBuilder::new().id_salt(("approval", &row.id)).max_rect(banner.shrink(6.0)));
-                child.set_clip_rect(banner);
-                child.label(RichText::new("Permission requested").color(p.warning).strong());
-                child.horizontal_wrapped(|ui| {
-                    for (label, decision) in
-                        [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
-                    {
-                        if request.tool == "Azure REST" && decision == Decision::AllowAlways {
-                            continue;
-                        }
-                        let response = ui.add_enabled(!deciding, egui::Button::new(label));
-                        #[cfg(test)]
-                        ui.ctx().data_mut(|data| {
-                            data.insert_temp(egui::Id::unique(("approval-button", label)), response.enabled());
-                        });
-                        if response.clicked() {
-                            approval = Some((index, pending.id.clone(), decision));
-                        }
-                    }
-                });
-                if deciding {
-                    child.label("Decision pending…");
-                }
-                egui::ScrollArea::vertical().max_height(child.available_height()).show(&mut child, |ui| {
-                    ui.label(RichText::new(request.command.as_deref().unwrap_or(&request.tool)).monospace());
-                    if !request.cwd.as_os_str().is_empty() {
-                        ui.label(format!("cwd: {}", request.cwd.display()));
-                    }
-                    ui.label(request.reason.as_deref().unwrap_or("Permission requested"));
-                });
-                body = body.with_min_y(banner.bottom());
-            }
+            body = self.draw(|backend, client| atomics_ui::approvals::banner(ui, body, index, backend, client));
+            let session = &mut self.runtime.sessions[index];
             if !needed.is_empty() {
                 let shown = needed.len().min(3);
                 let banner = body.with_max_y((body.top() + 8.0 + 28.0 * shown as f32).min(body.bottom()));
@@ -464,10 +425,6 @@ impl Desktop<'_> {
         }
         if let Some((plan, task, action)) = task_action {
             self.task_action(plan, task, action);
-        }
-
-        if let Some((index, approval, decision)) = approval {
-            self.approve_request(index, approval, decision);
         }
 
         if let Some((id, open)) = activate {

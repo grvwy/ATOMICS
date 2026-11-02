@@ -919,3 +919,341 @@ fn a_headless_host_refuses_window_requests_and_drops_client_events() {
         eventually(&host, |state| state.client_events.is_empty() && state.client_commands.is_empty());
     });
 }
+
+/// A protocol client of `host`, greeted with every capability, as client `test`.
+fn remote_client(host: &Host) -> crate::protocol::tests::TestClient {
+    let addr = host.protocol_addr().expect("the flag starts the server");
+    let advert: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths::atomics_home().join("protocol.json")).unwrap()).unwrap();
+    let mut client = crate::protocol::tests::TestClient::connect(addr, advert["token"].as_str().unwrap());
+    client.hello();
+    client
+}
+
+/// The final outcome of `op`, applying the board frames that come first.
+fn outcome_of(client: &mut crate::protocol::tests::TestClient, op: &str) -> atomics_core::ops::Outcome {
+    use atomics_core::wire::Message;
+    loop {
+        let envelope = client.step().expect("connection open");
+        if let Message::CommandResult(result) = envelope.message
+            && result.op == op
+            && result.outcome.is_final()
+        {
+            return result.outcome;
+        }
+    }
+}
+
+/// How the client was told approval `id` ended.
+fn resolved_as(client: &mut crate::protocol::tests::TestClient, id: &str) -> atomics_core::wire::Disposition {
+    use atomics_core::wire::Message;
+    loop {
+        if let Message::ApprovalResolved { id: resolved, disposition, .. } = client.step().expect("open").message
+            && resolved == id
+        {
+            return disposition;
+        }
+    }
+}
+
+fn decide(op: &str, approval: &str, decision: Decision) -> atomics_core::wire::Envelope {
+    let command =
+        atomics_core::ops::ApprovalDecide { op: op.into(), approval: approval.into(), decision, message: None };
+    atomics_core::wire::Envelope::new(atomics_core::wire::Message::ApprovalDecide(command))
+}
+
+fn steer(op: &str, session: &str, text: &str) -> atomics_core::ops::Command {
+    use atomics_core::ops::{Command, SessionAction, SessionCommand};
+    Command::SessionCommand(SessionCommand {
+        op: op.into(),
+        action: SessionAction::Steer { session: session.into(), text: text.into() },
+    })
+}
+
+/// A permission request waiting in `session`, its hook waiting for the answer.
+fn waiting_approval(session: &mut Session, id: &str) -> Arc<ipc::ApprovalReply> {
+    let reply = Arc::new(ipc::ApprovalReply::default());
+    session.approvals.push(PendingApproval {
+        id: id.into(),
+        request: ApprovalRequest {
+            tool: "Bash".into(),
+            command: Some(format!("touch {id}")),
+            cwd: session.cwd.clone(),
+            reason: None,
+            input: json!({}),
+        },
+        reply: Some(reply.clone()),
+    });
+    session.status = AgentStatus::NeedsInput;
+    reply
+}
+
+#[test]
+fn two_clients_racing_an_approval_get_exactly_one_winner_and_both_see_how_it_ended() {
+    with_state(
+        "app::host_tests::two_clients_racing_an_approval_get_exactly_one_winner_and_both_see_how_it_ended",
+        |mut state, _| {
+            use atomics_core::ops::Outcome;
+            use atomics_core::wire::{Disposition, ErrorCode};
+            state.config.remote.enabled = true;
+            state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+            let hook = waiting_approval(&mut state.sessions[0], "ask-1");
+            let host = state.into_host();
+            let (mut a, mut b) = (remote_client(&host), remote_client(&host));
+            a.sync_until(|m| m.approvals.contains_key("ask-1"));
+            b.sync_until(|m| m.approvals.contains_key("ask-1"));
+
+            // Both decisions are in the runtime's queue before either runs: the model is locked.
+            let guard = host.state();
+            a.send(&decide("a-1", "ask-1", Decision::Allow));
+            b.send(&decide("b-1", "ask-1", Decision::Deny));
+            std::thread::sleep(Duration::from_millis(100));
+            drop(guard);
+            let (by_a, by_b) = (outcome_of(&mut a, "a-1"), outcome_of(&mut b, "b-1"));
+            let a_won = matches!(by_a, Outcome::Done { .. });
+            let (won, lost) = if a_won { (&by_a, &by_b) } else { (&by_b, &by_a) };
+            assert!(matches!(won, Outcome::Done { .. }), "one wins: {by_a:?} / {by_b:?}");
+            assert!(
+                matches!(lost, Outcome::Refused { code: ErrorCode::AlreadyResolved, message } if message.contains(if a_won { "allowed" } else { "denied" })),
+                "the other hears how it ended: {lost:?}"
+            );
+            let answer = hook.wait(Duration::ZERO).stdout.expect("the hook was answered");
+            assert!(answer.contains(if a_won { "allow" } else { "deny" }), "with the winner's decision: {answer}");
+            let disposition = if a_won { Disposition::Allowed } else { Disposition::Denied };
+            assert_eq!(resolved_as(&mut a, "ask-1"), disposition, "every client is told how it ended");
+            assert_eq!(resolved_as(&mut b, "ask-1"), disposition);
+            assert!(host.state().sessions[0].approvals.is_empty());
+        },
+    );
+}
+
+#[test]
+fn the_desktop_and_a_client_racing_an_approval_get_exactly_one_winner() {
+    with_state(
+        "app::host_tests::the_desktop_and_a_client_racing_an_approval_get_exactly_one_winner",
+        |mut state, _| {
+            use atomics_core::ops::{ApprovalDecide, Command, Outcome};
+            use atomics_core::wire::ErrorCode;
+            state.config.remote.enabled = true;
+            state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+            let hook = waiting_approval(&mut state.sessions[0], "ask-1");
+            let host = state.into_host();
+            let mut client = remote_client(&host);
+            client.sync_until(|m| m.approvals.contains_key("ask-1"));
+            let guard = host.state();
+            client.send(&decide("c-1", "ask-1", Decision::Allow));
+            std::thread::sleep(Duration::from_millis(100));
+            // What the desktop's Deny button posts (`Desktop::approve_request`).
+            let (tx, desktop) = channel();
+            let _ = guard.action_tx.send(Box::new(move |state: &mut State| {
+                let outcome = state.mutate_desktop(|op| {
+                    Command::ApprovalDecide(ApprovalDecide {
+                        op,
+                        approval: "ask-1".into(),
+                        decision: Decision::Deny,
+                        message: None,
+                    })
+                });
+                tx.send(outcome).unwrap();
+            }));
+            drop(guard);
+            let by_desktop =
+                desktop.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10))).unwrap();
+            let by_client = outcome_of(&mut client, "c-1");
+            // The runtime takes the desktop's actions first in a pass; either way exactly one wins.
+            let wins = [&by_desktop, &by_client].iter().filter(|o| matches!(o, Outcome::Done { .. })).count();
+            assert_eq!(wins, 1, "{by_desktop:?} / {by_client:?}");
+            let lost = if matches!(by_desktop, Outcome::Done { .. }) { &by_client } else { &by_desktop };
+            assert!(matches!(lost, Outcome::Refused { code: ErrorCode::AlreadyResolved, .. }), "{lost:?}");
+            assert!(hook.wait(Duration::ZERO).stdout.is_some());
+        },
+    );
+}
+
+#[test]
+fn a_decision_for_an_answered_request_never_answers_the_next_one() {
+    with_state("app::host_tests::a_decision_for_an_answered_request_never_answers_the_next_one", |mut state, _| {
+        use atomics_core::ops::Outcome;
+        use atomics_core::wire::ErrorCode;
+        state.config.remote.enabled = true;
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let first = waiting_approval(&mut state.sessions[0], "ask-1");
+        let host = state.into_host();
+        let (mut slow, mut quick) = (remote_client(&host), remote_client(&host));
+        slow.sync_until(|m| m.approvals.contains_key("ask-1"));
+        quick.sync_until(|m| m.approvals.contains_key("ask-1"));
+        quick.send(&decide("q-1", "ask-1", Decision::Allow));
+        assert!(matches!(outcome_of(&mut quick, "q-1"), Outcome::Done { .. }));
+        assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        // The agent asks again; `slow` still shows the first request and denies it.
+        let (next, behind) = {
+            let mut guard = host.state();
+            (waiting_approval(&mut guard.sessions[0], "ask-2"), waiting_approval(&mut guard.sessions[0], "ask-3"))
+        };
+        slow.send(&decide("s-1", "ask-1", Decision::Deny));
+        let stale = outcome_of(&mut slow, "s-1");
+        assert!(matches!(stale, Outcome::Refused { code: ErrorCode::AlreadyResolved, .. }), "{stale:?}");
+        // A request queued behind another is not answered before it either.
+        slow.send(&decide("s-2", "ask-3", Decision::Allow));
+        let early = outcome_of(&mut slow, "s-2");
+        assert!(matches!(early, Outcome::Refused { code: ErrorCode::Rejected, .. }), "{early:?}");
+        // And one that never existed is not found.
+        slow.send(&decide("s-3", "ask-9", Decision::Allow));
+        assert!(matches!(outcome_of(&mut slow, "s-3"), Outcome::Refused { code: ErrorCode::NotFound, .. }));
+        let ids: Vec<String> = host.state().sessions[0].approvals.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids, ["ask-2", "ask-3"], "both later requests still wait");
+        assert!(next.answer(HookReply::default()) && behind.answer(HookReply::default()), "and nothing answered them");
+    });
+}
+
+#[test]
+fn a_retried_operation_returns_its_known_outcome_and_runs_once() {
+    with_state("app::host_tests::a_retried_operation_returns_its_known_outcome_and_runs_once", |mut state, _| {
+        use atomics_core::ops::Outcome;
+        use atomics_core::wire::{Envelope, ErrorCode};
+        state.config.remote.enabled = true;
+        // Outside ATOMICS: a message waits in the hub for the session's next hook.
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let hub = state.hub.clone();
+        let host = state.into_host();
+        let mut client = remote_client(&host);
+        client.sync_until(|m| m.sessions.contains_key("worker"));
+        client.send(&Envelope::new(steer("s-1", "worker", "check the tests").into_message()));
+        let first = outcome_of(&mut client, "s-1");
+        assert!(matches!(&first, Outcome::Done { result } if result["queued_until_next_hook"] == true), "{first:?}");
+        client.send(&Envelope::new(steer("s-1", "worker", "check the tests").into_message()));
+        assert_eq!(outcome_of(&mut client, "s-1"), first, "a retry is answered from the journal");
+        // So is one from a new connection of the same client, as after a reconnect.
+        drop(client);
+        let mut again = remote_client(&host);
+        again.send(&Envelope::new(steer("s-1", "worker", "check the tests").into_message()));
+        assert_eq!(outcome_of(&mut again, "s-1"), first);
+        assert_eq!(hub.lock().unwrap().outbox["worker"], ["check the tests"], "delivered once");
+        // The same ID for another command is a conflict, not the old outcome.
+        again.send(&Envelope::new(steer("s-1", "worker", "something else").into_message()));
+        let reused = outcome_of(&mut again, "s-1");
+        assert!(matches!(reused, Outcome::Refused { code: ErrorCode::Conflict, .. }), "{reused:?}");
+        assert_eq!(hub.lock().unwrap().outbox["worker"].len(), 1);
+    });
+}
+
+#[test]
+fn an_operation_the_host_stopped_during_is_uncertain_and_not_run_again() {
+    with_state(
+        "app::host_tests::an_operation_the_host_stopped_during_is_uncertain_and_not_run_again",
+        |mut state, _| {
+            use crate::protocol::journal::{self, Begun, Journal, Key};
+            use atomics_core::ops::Outcome;
+            use atomics_core::wire::Envelope;
+            state.config.remote.enabled = true;
+            state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+            let hub = state.hub.clone();
+            let command = steer("s-1", "worker", "merge it");
+            {
+                // An earlier host began the operation and died before it ended.
+                let path = paths::atomics_home().join("protocol-ops.jsonl");
+                let mut earlier = Journal::open(&path, atomics_core::store::now()).unwrap();
+                let began = earlier.begin(
+                    &Key::client("test", "s-1"),
+                    &journal::fingerprint(&command),
+                    atomics_core::store::now(),
+                );
+                assert_eq!(began, Begun::Fresh);
+            }
+            let host = state.into_host();
+            let mut client = remote_client(&host);
+            client.send(&Envelope::new(command.into_message()));
+            let outcome = outcome_of(&mut client, "s-1");
+            assert!(
+                matches!(&outcome, Outcome::Uncertain { message } if message.contains("check the board")),
+                "{outcome:?}"
+            );
+            assert!(!hub.lock().unwrap().outbox.contains_key("worker"), "never redelivered on its own");
+        },
+    );
+}
+
+#[test]
+fn approving_a_plan_names_the_scope_the_user_saw() {
+    with_state("app::host_tests::approving_a_plan_names_the_scope_the_user_saw", |mut state, _| {
+        use atomics_core::ops::{Command, Outcome, PlanAction, PlanCommand};
+        use atomics_core::wire::{Envelope, ErrorCode};
+        state.config.remote.enabled = true;
+        let task = Task { id: "t1".into(), title: "fix the parser".into(), ..Task::default() };
+        state.plans = vec![Plan { id: "p1".into(), goal: "ship".into(), tasks: vec![task], ..Plan::default() }];
+        state.selected_plan = 0;
+        let host = state.into_host();
+        let mut client = remote_client(&host);
+        client.sync_until(|m| m.plans.get("p1").is_some_and(|p| !p.digest.is_empty()));
+        let seen = client.mirror.plans["p1"].digest.clone();
+        let approve = |op: &str, digest: Option<&str>| {
+            let command = PlanCommand {
+                op: op.into(),
+                plan: Some("p1".into()),
+                digest: digest.map(str::to_string),
+                action: PlanAction::Approve,
+            };
+            Envelope::new(Command::PlanCommand(command).into_message())
+        };
+        client.send(&approve("p-0", None));
+        assert!(matches!(outcome_of(&mut client, "p-0"), Outcome::Refused { code: ErrorCode::Malformed, .. }));
+        // The chief rewrites the plan while the user reads it.
+        host.state().plans[0].tasks[0].brief = "and the lexer".into();
+        client.send(&approve("p-1", Some(&seen)));
+        let stale = outcome_of(&mut client, "p-1");
+        assert!(matches!(stale, Outcome::Refused { code: ErrorCode::StaleRevision, .. }), "{stale:?}");
+        assert!(!host.state().plans[0].approved);
+        client.sync_until(|m| m.plans["p1"].digest != seen);
+        let current = client.mirror.plans["p1"].digest.clone();
+        client.send(&approve("p-2", Some(&current)));
+        assert!(matches!(outcome_of(&mut client, "p-2"), Outcome::Done { .. }));
+        assert!(host.state().plans[0].approved);
+    });
+}
+
+#[test]
+fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_as_before() {
+    with_state(
+        "app::host_tests::without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_as_before",
+        |mut state, _| {
+            use atomics_core::ops::{ApprovalDecide, Command, Outcome, SessionAction, SessionCommand};
+            assert!(!state.config.remote.enabled, "[remote] unset");
+            state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+            let hook = waiting_approval(&mut state.sessions[0], "ask-1");
+            let hub = state.hub.clone();
+            let host = state.into_host();
+            // What the desktop's Allow button and steer bar post (`Desktop::approve_request`, `send_steer`).
+            let (tx, outcomes) = channel();
+            let _ = host.state().action_tx.send(Box::new(move |state: &mut State| {
+                let approved = state.mutate_desktop(|op| {
+                    Command::ApprovalDecide(ApprovalDecide {
+                        op,
+                        approval: "ask-1".into(),
+                        decision: Decision::Allow,
+                        message: None,
+                    })
+                });
+                let steered = state.mutate_desktop(|op| {
+                    let action = SessionAction::Steer { session: "worker".into(), text: "carry on".into() };
+                    Command::SessionCommand(SessionCommand { op, action })
+                });
+                tx.send((approved, steered)).unwrap();
+            }));
+            let (approved, steered) =
+                outcomes.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10))).unwrap();
+            assert_eq!(approved, Outcome::done(json!({ "disposition": "allowed" })));
+            assert!(hook.wait(Duration::ZERO).stdout.unwrap().contains("allow"), "the hook got the answer");
+            assert_eq!(
+                steered,
+                Outcome::done(json!({ "sent": true, "queued_until_next_hook": true })),
+                "the steer bar's own delivery"
+            );
+            assert_eq!(hub.lock().unwrap().outbox["worker"], ["carry on"]);
+            let worker = host.state();
+            assert!(worker.sessions[0].approvals.is_empty());
+            assert_eq!(worker.sessions[0].status, AgentStatus::Working);
+            assert!(!paths::atomics_home().join("protocol-ops.jsonl").exists(), "no journal file");
+            assert!(!paths::atomics_home().join("protocol.json").exists(), "and no server");
+        },
+    );
+}

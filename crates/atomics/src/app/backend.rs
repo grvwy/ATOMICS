@@ -1,6 +1,9 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
-use atomics_ui::{ApprovalRow, Backend, BoardView, DiffSnapshot, PlanRow, SessionRow};
+use atomics_ui::{
+    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, Notices, PlanRow, ProjectMenu, RecentSession,
+    SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
+};
 
 use super::*;
 
@@ -98,6 +101,19 @@ impl Backend for Local<'_> {
                 .collect(),
             ticket_config: state.ticket_config(),
             board_counts,
+            worktrees: plan
+                .tasks
+                .iter()
+                .filter(|task| task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir()))
+                .map(|task| task.id.clone())
+                .collect(),
+            codex: plan
+                .tasks
+                .iter()
+                .filter(|task| state.config.agent(&task.agent).is_some_and(|agent| agent.is_codex()))
+                .map(|task| task.id.clone())
+                .collect(),
+            now: atomics_core::store::now(),
             plan: plan.clone(),
         })
     }
@@ -131,6 +147,137 @@ impl Backend for Local<'_> {
             file: data.file.clone(),
             file_error: data.file_error.clone(),
         })
+    }
+
+    fn diff_heading(&self, root: &Path) -> DiffHeading {
+        let state = self.0;
+        let session = state.active_index().map(|i| &state.sessions[i]);
+        let title = session
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let branch = session
+            .and_then(|s| s.branch().map(str::to_string))
+            .or_else(|| state.worktrees.iter().find(|w| w.path == root).and_then(|w| w.branch.clone()))
+            .filter(|b| *b != title);
+        let can_send = state.sessions.iter().any(|s| s.root() == root && s.is_agent() && s.can_receive());
+        DiffHeading { title, branch, can_send }
+    }
+
+    fn ui_config(&self) -> UiConfig {
+        let config = &self.0.config;
+        UiConfig {
+            keys: config.keys.clone(),
+            font: config.font.clone(),
+            layout: config.layout.clone(),
+            agents: config.agents.iter().map(|agent| agent.name.clone()).collect(),
+        }
+    }
+
+    fn view_hints(&self) -> ViewHints {
+        let state = self.0;
+        ViewHints {
+            active: state.active.clone(),
+            diff_target: state.diff_target(),
+            plan_view: state.plan_view,
+            ungrouped: state.ungrouped,
+            project: state.view.clone(),
+            selected_plan: state.selected_plan,
+            diff_open: state.diff_open,
+            panel: state.panel,
+        }
+    }
+
+    fn visible_sessions(&self) -> Vec<usize> {
+        self.0.visible_sessions()
+    }
+
+    fn checkouts(&self) -> Vec<String> {
+        self.0.creating.iter().map(|(_, branch, _)| branch.clone()).collect()
+    }
+
+    fn recent_sessions(&self) -> Vec<RecentSession> {
+        let state = self.0;
+        let live_ids: HashSet<&str> = state.sessions.iter().filter_map(|s| s.claude_id.as_deref()).collect();
+        state
+            .store
+            .sessions
+            .iter()
+            .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
+            .filter(|r| state.project_of(&r.cwd).is_some())
+            .filter({
+                let mut seen = HashSet::new();
+                move |r| seen.insert((r.title.clone(), r.cwd.clone()))
+            })
+            .take(8)
+            .map(|record| RecentSession { folder: paths::display(&record.cwd), record: record.clone() })
+            .collect()
+    }
+
+    fn repos(&self) -> Vec<PathBuf> {
+        self.0.repos.clone()
+    }
+
+    fn project_of(&self, dir: &Path) -> Option<PathBuf> {
+        self.0.project_of(dir)
+    }
+
+    fn repo_workflow(&self, project: &Path) -> Option<atomics_core::repo_workflow::RepoWorkflow> {
+        self.0.repo_workflows.get(project).cloned()
+    }
+
+    fn worktrees(&self, project: &Path) -> Vec<WorktreeRow> {
+        let state = self.0;
+        state
+            .worktrees
+            .iter()
+            .filter(|w| w.path != project && state.worktree_project.get(&w.path).map(PathBuf::as_path) == Some(project))
+            .map(|w| WorktreeRow { path: w.path.clone(), branch: w.branch.clone() })
+            .collect()
+    }
+
+    fn display(&self, path: &Path) -> String {
+        paths::display(path)
+    }
+
+    fn plan_date(&self, index: usize) -> String {
+        self.0.plans.get(index).map(super::plan_view::history_date).unwrap_or_default()
+    }
+
+    fn notices(&self) -> Notices {
+        let state = self.0;
+        Notices {
+            toast: state.toast.as_ref().map(|(text, _)| text.clone()),
+            config_error: state.config_error.clone(),
+            config_problems: state.config_problems.clone(),
+            theme_error: state.theme_error.clone(),
+            hook_error: state.hook_error.clone(),
+        }
+    }
+
+    fn sandbox_load(&self) -> SandboxLoad {
+        let sampler = &self.0.sandbox_usage;
+        SandboxLoad {
+            total: (!sampler.usage.is_empty()).then(|| sampler.total().label()),
+            sampled: sampler.usage.len(),
+            error: sampler.error.clone(),
+        }
+    }
+
+    fn project_menu(&self) -> ProjectMenu {
+        let state = self.0;
+        ProjectMenu {
+            recent: state
+                .store
+                .recent_projects
+                .iter()
+                .filter(|p| !state.open_projects.contains(p) && p.is_dir())
+                .take(8)
+                .map(|p| (p.clone(), paths::display(p)))
+                .collect(),
+            workspaces: Workspace::list(),
+            current: state.workspace.clone(),
+            can_save: !state.open_projects.is_empty(),
+        }
     }
 }
 

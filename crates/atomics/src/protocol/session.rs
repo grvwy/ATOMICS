@@ -15,23 +15,31 @@
 //! input is written to the PTY from this thread as soon as the frame is read, and the screens
 //! thread is woken to copy the echo. The loop also tells the client whenever a followed screen's
 //! lease changes hands, and when the connection ends, so does any lease it held.
+//!
+//! A mutation passes two gates here, the `mutations` capability and the client's grants (its
+//! `welcome`'s `may`), and goes to the runtime thread (`ops.rs`), which journals and carries it
+//! out. Its outcomes come back on this client's own channel, which wakes the loop, and leave as
+//! `command_result`s answering the request that sent it. A refusal at the gates is a
+//! `command_result` too, so a client's pending operation always ends.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use atomics_core::diff::FileDiff;
 use atomics_core::lease::{LeaseReason, LeaseState};
+use atomics_core::ops::{Command, CommandResult, Grant, Outcome};
 use atomics_core::projection::DiffFileBody;
 use atomics_core::wire::{
-    self, CAPABILITIES, Envelope, ErrorCode, INPUT, Limits, MAX_SUBSCRIPTIONS, Message, Role, Seq, TERMINALS, Topic,
-    VERSION, WireError,
+    self, CAPABILITIES, Envelope, ErrorCode, INPUT, Limits, MAX_PENDING_OPS, MAX_SUBSCRIPTIONS, MUTATIONS, Message,
+    Role, Seq, TERMINALS, Topic, VERSION, WireError,
 };
 
 use super::hub::{Hub, Outbox, Scope, Taken};
 use super::lease::{Client, Policy, TerminalControl};
 use super::link::{Link, LinkError};
+use super::ops::{Commands, OpReply, OpRequest};
 use super::screens::Screens;
 
 /// Where `diff_get` finds hunks. Implemented over data the runtime thread published, never `State`.
@@ -99,6 +107,8 @@ pub struct Shared {
     pub hub: Arc<Mutex<Hub>>,
     pub diffs: Arc<dyn DiffSource>,
     pub screens: Arc<Screens>,
+    /// Where mutations are carried out.
+    pub commands: Arc<dyn Commands>,
     pub stop: Arc<AtomicBool>,
     pub config: SessionConfig,
     pub lease: Policy,
@@ -220,8 +230,9 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
         }
     };
     let outbox = attached.outbox;
-    if let Some(waker) = out.link.waker() {
-        outbox.set_waker(waker);
+    let waker = out.link.waker();
+    if let Some(waker) = &waker {
+        outbox.set_waker(waker.clone());
     }
     let mut capabilities = wire::common_capabilities(capabilities, CAPABILITIES);
     let terminals = capabilities.iter().any(|c| c == TERMINALS);
@@ -229,15 +240,22 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
     if !terminals {
         capabilities.retain(|c| c != INPUT);
     }
+    let may = role.may(&capabilities);
+    let (results_tx, results) = mpsc::channel();
     let mut follows = Follows {
         board: Narrowed::default(),
         screens: HashSet::new(),
         terminals,
         input: terminals && capabilities.iter().any(|c| c == INPUT),
-        role,
+        mutations: capabilities.iter().any(|c| c == MUTATIONS),
+        may: may.clone(),
+        client_id: client_id.clone(),
         me: Client { id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1, label: client_id.as_str().into() },
         told: HashMap::new(),
         slowed: HashMap::new(),
+        ops: HashMap::new(),
+        results,
+        reply: OpReply::new(results_tx, waker),
     };
     let welcome = Envelope::host(
         &attached.epoch,
@@ -247,6 +265,7 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
             limits: Limits { max_queued_frames: shared.queue_frames as u32, ..Limits::default() },
             role,
             resume: attached.resume,
+            may,
         },
     )
     .reply_to(envelope.request_id.clone());
@@ -320,15 +339,25 @@ struct Follows {
     /// Sessions whose screens it subscribed to.
     screens: HashSet<String>,
     terminals: bool,
-    /// It negotiated `input`: it may hold leases and is told who holds them.
+    /// It negotiated `input`: it is told who holds leases, and may hold one if it may `type`.
     input: bool,
-    role: Role,
+    /// It negotiated `mutations`.
+    mutations: bool,
+    /// What its role and capabilities let it change, as its `welcome` said.
+    may: Vec<Grant>,
+    /// The ID it said hello with, which names its operations in the journal.
+    client_id: String,
     me: Client,
     /// The lease last told for each followed screen: the terminal's identity and lease version.
     told: HashMap<String, (usize, u64)>,
     /// Input refused with `slow_client`, by followed screen: its lease token and number. What the
     /// client had already sent behind it meets `out_of_order`, which does not count either.
     slowed: HashMap<String, (u64, u64)>,
+    /// Its operations under way, and the request each answers.
+    ops: HashMap<String, Option<String>>,
+    /// Their outcomes, from the runtime thread.
+    results: mpsc::Receiver<CommandResult>,
+    reply: OpReply,
 }
 
 impl Follows {
@@ -408,6 +437,15 @@ fn conversation(
             }
             Taken::Lagged => resync(out, shared, outbox)?,
         }
+        while let Ok(result) = subscriptions.results.try_recv() {
+            let request_id = if result.outcome.is_final() {
+                subscriptions.ops.remove(&result.op).flatten()
+            } else {
+                subscriptions.ops.get(&result.op).cloned().flatten()
+            };
+            let reply = Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id);
+            out.envelope(&reply).map_err(link_ended)?;
+        }
         if subscriptions.input {
             tell_leases(out, shared, subscriptions).map_err(link_ended)?;
         }
@@ -427,18 +465,26 @@ fn conversation(
                     }
                 };
                 if let Err(e) = handle(out, shared, outbox, subscriptions, envelope) {
-                    match e {
+                    let (Refusal { error, counts }, op, request_id) = match e {
                         Handled::Link(ended) => return Err(ended),
-                        Handled::Refused(Refusal { error, counts }, request_id) => {
-                            let code = error.code;
-                            if counts {
-                                errors += 1;
-                            }
-                            out.error(error, request_id).map_err(link_ended)?;
-                            if errors > config.max_errors {
-                                return Err(Ended::Rejected(code));
-                            }
+                        Handled::Refused(refusal, request_id) => (refusal, None, request_id),
+                        Handled::Result(op, refusal, request_id) => (refusal, Some(op), request_id),
+                    };
+                    let code = error.code;
+                    if counts {
+                        errors += 1;
+                    }
+                    match op {
+                        // A refused mutation still ends with a result for its operation.
+                        Some(op) => {
+                            let result = CommandResult { op, outcome: Outcome::refused(error) };
+                            let reply = Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id);
+                            out.envelope(&reply).map_err(link_ended)?;
                         }
+                        None => out.error(error, request_id).map_err(link_ended)?,
+                    }
+                    if errors > config.max_errors {
+                        return Err(Ended::Rejected(code));
                     }
                 }
             }
@@ -501,7 +547,7 @@ fn controllable(
     if !follows.input {
         return Err(WireError::new(ErrorCode::Unauthorised, "the input capability was not negotiated").into());
     }
-    if follows.role != Role::Controller {
+    if !follows.may.contains(&Grant::Type) {
         return Err(WireError::new(ErrorCode::Unauthorised, "this client is view-only").into());
     }
     if !follows.screens.contains(session) {
@@ -538,6 +584,45 @@ fn resync(out: &mut Out<'_>, shared: &Shared, outbox: &Outbox) -> Result<(), End
 enum Handled {
     Link(Ended),
     Refused(Refusal, Option<String>),
+    /// A mutation refused before it reached the journal: answered with a `command_result`.
+    Result(String, Refusal, Option<String>),
+}
+
+/// Pass a mutation through the gates and hand it to the runtime thread. A repeat of an operation
+/// this connection still waits for is answered `accepted` and not sent again: the outcome it
+/// waits for answers the latest request.
+fn mutate(
+    out: &mut Out<'_>,
+    shared: &Shared,
+    follows: &mut Follows,
+    command: Command,
+    request_id: Option<String>,
+) -> Result<(), Handled> {
+    let op = command.op().to_string();
+    let refuse = |code: ErrorCode, message: &str| {
+        Handled::Result(op.clone(), WireError::new(code, message).into(), request_id.clone())
+    };
+    if !follows.mutations {
+        return Err(refuse(ErrorCode::Unauthorised, "the mutations capability was not negotiated"));
+    }
+    if !follows.may.contains(&command.grant()) {
+        let why = if follows.may.is_empty() { "this client is view-only" } else { "this client may not do that" };
+        return Err(refuse(ErrorCode::Unauthorised, why));
+    }
+    if let Some(answers) = follows.ops.get_mut(&op) {
+        *answers = request_id.clone();
+        let result = CommandResult { op, outcome: Outcome::Accepted };
+        return Ok(out.envelope(&Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id))?);
+    }
+    if follows.ops.len() >= MAX_PENDING_OPS {
+        return Err(refuse(ErrorCode::TooMany, "too many operations under way; wait for their results"));
+    }
+    let request = OpRequest { client: follows.client_id.clone(), command, reply: follows.reply.clone() };
+    if !shared.commands.submit(request) {
+        return Err(refuse(ErrorCode::Internal, "the host is stopping"));
+    }
+    follows.ops.insert(op, request_id);
+    Ok(())
 }
 
 impl From<LinkError> for Handled {
@@ -732,6 +817,13 @@ fn handle(
             Ok(out.envelope(&pong)?)
         }
         Message::Pong { .. } => Ok(()),
+        message @ (Message::ApprovalDecide(_)
+        | Message::PlanCommand(_)
+        | Message::ReviewCommand(_)
+        | Message::SessionCommand(_)) => {
+            let command = Command::from_message(message).expect("a mutation");
+            mutate(out, shared, subscriptions, command, id)
+        }
         Message::Hello { .. } => Err(refuse(ErrorCode::Malformed, "already greeted")),
         _ => Err(refuse(ErrorCode::Malformed, "that message is sent by the host, not to it")),
     }

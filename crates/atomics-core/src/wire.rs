@@ -2,9 +2,9 @@
 //!
 //! Browser-safe: serde types and pure functions only, so the same code builds the host's server
 //! and the wasm client. Ordering and tags follow `docs/daemon.md` (Client protocol). This module
-//! carries the read-only slice (board, plans, diffs, approvals, cursors), terminal screens
-//! (`screen` module) and typing into terminals under a controller lease (`lease` module); mutation
-//! messages join it in a later slice, and until then they fail as `unknown_kind`.
+//! carries the board (sessions, plans, diffs, approvals, cursors), terminal screens (`screen`
+//! module), typing into terminals under a controller lease (`lease` module) and the journaled
+//! mutations (`ops` module).
 //!
 //! Rules every decoder here applies:
 //! - A frame over `MAX_FRAME_BYTES` is rejected before it is parsed.
@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::diff::{FileDiff, Hunk};
 use crate::lease::{self, GridSize, LeaseState};
+pub use crate::ops::Grant;
+use crate::ops::{ApprovalDecide, CommandResult, OP_TTL_SECS, PlanCommand, ReviewCommand, SessionCommand};
 use crate::projection::{ApprovalInfo, DiffFileBody, DiffSummary, Loaded, PlanInfo, ReportInfo, SessionInfo};
 pub use crate::screen::Part;
 use crate::screen::{self, HistoryChunk, HistoryGet, ScreenDelta, ScreenSnapshot};
@@ -38,12 +40,15 @@ pub const MAX_CAPABILITIES: usize = 64;
 pub const MAX_ID_BYTES: usize = 1024;
 
 /// Capabilities this implementation can offer in a `welcome`.
-pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", TERMINALS, INPUT];
+pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", TERMINALS, INPUT, MUTATIONS];
 /// Screen streaming: `screen` topics, `screen_snapshot`/`screen_delta` and `history_get`.
 pub const TERMINALS: &str = "terminals";
 /// Typing into subscribed screens: the `lease_*` messages, `lease_state`, `terminal_input` and
 /// `terminal_resize`. Needs `terminals`.
 pub const INPUT: &str = "input";
+/// Changing things: `approval_decide`, `plan_command`, `review_command` and `session_command`,
+/// each answered by `command_result`. What a client may send is its `welcome`'s `may`.
+pub const MUTATIONS: &str = "mutations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -97,6 +102,13 @@ pub enum ErrorCode {
     Fenced,
     /// Input whose sequence number is not the next one in its lease. It was not applied.
     OutOfOrder,
+    /// The host could not carry out the command; the message says why. Nothing changed.
+    Rejected,
+    /// The approval was already answered (by another client, the desktop or an earlier
+    /// operation); the message says how. This decision changed nothing.
+    AlreadyResolved,
+    /// The operation ID was used before for a different command.
+    Conflict,
     /// A code from a newer peer. Minor versions may add codes; an older client still reads the frame.
     #[serde(other)]
     Unknown,
@@ -133,6 +145,9 @@ pub struct Limits {
     pub max_subscriptions: u32,
     pub max_pending_ops: u32,
     pub max_queued_frames: u32,
+    /// How long the host remembers an operation's outcome; see `ops::Pending`.
+    #[serde(default)]
+    pub op_ttl_secs: u32,
 }
 
 impl Default for Limits {
@@ -142,18 +157,41 @@ impl Default for Limits {
             max_subscriptions: MAX_SUBSCRIPTIONS as u32,
             max_pending_ops: MAX_PENDING_OPS as u32,
             max_queued_frames: MAX_QUEUED_FRAMES as u32,
+            op_ttl_secs: OP_TTL_SECS,
         }
     }
 }
 
+/// How far the host trusts a client: what a device's entry in the allowlist says once pairing
+/// ships, and on loopback (whose clients hold the bearer token) a controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// May take terminal leases and type, and answer approvals and send commands (when those
-    /// slices ship).
+    /// May type into terminals, answer approvals and send every command.
     Controller,
-    /// Follows everything, including who types, but never holds a lease.
+    /// Follows everything, including who types, but changes nothing: no lease, no mutation.
     Viewer,
+}
+
+impl Role {
+    /// What the role allows, before capabilities narrow it.
+    pub fn grants(self) -> &'static [Grant] {
+        match self {
+            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review],
+            Role::Viewer => &[],
+        }
+    }
+
+    /// What a client with this role may do over the capabilities it negotiated: typing needs
+    /// `input`, the rest `mutations`. This is `welcome`'s `may`.
+    pub fn may(self, capabilities: &[String]) -> Vec<Grant> {
+        let has = |name: &str| capabilities.iter().any(|c| c == name);
+        self.grants()
+            .iter()
+            .copied()
+            .filter(|grant| if *grant == Grant::Type { has(INPUT) } else { has(MUTATIONS) })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +268,18 @@ pub enum Disposition {
     Withdrawn,
 }
 
+impl Disposition {
+    pub fn label(self) -> &'static str {
+        match self {
+            Disposition::Allowed => "allowed",
+            Disposition::AllowedAlways => "allowed always",
+            Disposition::Denied => "denied",
+            Disposition::Expired => "expired",
+            Disposition::Withdrawn => "withdrawn",
+        }
+    }
+}
+
 /// What a client may subscribe to. `diff` and `plan` topics narrow the board's live updates: a
 /// client that has subscribed to no `diff` topic gets every worktree's `diff_summary`, and once it
 /// has subscribed to any it gets only those worktrees' (likewise for plans). Sessions and
@@ -292,6 +342,9 @@ pub enum Message {
         limits: Limits,
         role: Role,
         resume: Resume,
+        /// What this client may change; empty for a view-only one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        may: Vec<Grant>,
     },
     Subscribe {
         topics: Vec<Topic>,
@@ -420,6 +473,13 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<GridSize>,
     },
+    ApprovalDecide(ApprovalDecide),
+    PlanCommand(PlanCommand),
+    ReviewCommand(ReviewCommand),
+    SessionCommand(SessionCommand),
+    /// What became of a mutation: `accepted` first for work that takes a while, then `done`,
+    /// `refused` or `uncertain`. Echoes the mutation's `request_id`.
+    CommandResult(CommandResult),
     Ack {
         cursor: Cursor,
     },
@@ -474,6 +534,11 @@ const KINDS: &[&str] = &[
     "lease_state",
     "terminal_input",
     "terminal_resize",
+    "approval_decide",
+    "plan_command",
+    "review_command",
+    "session_command",
+    "command_result",
     "ack",
     "resync",
     "ping",
@@ -588,6 +653,11 @@ impl Message {
             }),
             Message::TerminalResize { session, size, .. } => long("session", session)
                 .or_else(|| size.and_then(|s| s.invalid()).map(|why| WireError::new(ErrorCode::Malformed, why))),
+            Message::ApprovalDecide(c) => c.validate().err(),
+            Message::PlanCommand(c) => c.validate().err(),
+            Message::ReviewCommand(c) => c.validate().err(),
+            Message::SessionCommand(c) => c.validate().err(),
+            Message::CommandResult(c) => c.validate().err(),
             _ => None,
         };
         failure.map_or(Ok(()), Err)

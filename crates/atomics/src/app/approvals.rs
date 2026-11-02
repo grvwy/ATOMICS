@@ -118,43 +118,93 @@ impl State {
         }
     }
 
+    /// Answer the approval with this ID, in whichever session it waits. Its ID belongs to that one
+    /// request, so a decision made for it never answers the next one. Protocol clients, the
+    /// desktop and ctl all decide on this thread, one at a time: the first decision wins, and a
+    /// later one finds it answered and hears how (`already_resolved`).
+    pub(super) fn decide(
+        &mut self,
+        approval: &str,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<Disposition, WireError> {
+        self.expire_approvals(Instant::now());
+        let waiting = self.sessions.iter().enumerate().find_map(|(index, session)| {
+            session.approvals.iter().position(|pending| pending.id == approval).map(|at| (index, at))
+        });
+        match waiting {
+            None => Err(match self.resolution(approval) {
+                Some(disposition) => WireError::new(
+                    ErrorCode::AlreadyResolved,
+                    format!("that permission request was already answered: {}", disposition.label()),
+                ),
+                None => WireError::new(ErrorCode::NotFound, "that permission request is no longer pending"),
+            }),
+            Some((_, at)) if at > 0 => Err(WireError::new(
+                ErrorCode::Rejected,
+                "an earlier permission request in that session waits for an answer first",
+            )),
+            Some((index, _)) => self.approve(index, approval, decision, message).map(|()| disposition(decision)),
+        }
+    }
+
+    /// How the approval `id` ended, if it was answered lately.
+    pub(super) fn resolution(&self, id: &str) -> Option<Disposition> {
+        self.resolved.iter().rev().find(|(i, _)| i == id).map(|(_, d)| *d)
+    }
+
+    fn record_resolution(&mut self, id: String, disposition: Disposition) {
+        self.resolved.push_back((id, disposition));
+        while self.resolved.len() > atomics_core::projection::MAX_RESOLUTIONS {
+            self.resolved.pop_front();
+        }
+    }
+
     pub(super) fn approve(
         &mut self,
         index: usize,
         approval: &str,
         decision: Decision,
         message: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WireError> {
+        let rejected = |message: &str| WireError::new(ErrorCode::Rejected, message);
         self.expire_approvals(Instant::now());
         let session = &mut self.sessions[index];
-        let Some(pending) = session.approvals.first_mut() else { return Err("no pending permission request".into()) };
+        let Some(pending) = session.approvals.first_mut() else {
+            return Err(WireError::new(ErrorCode::NotFound, "no pending permission request"));
+        };
         if pending.id != approval {
-            return Err("stale permission decision: review the current request".into());
+            return Err(WireError::new(
+                ErrorCode::StaleRevision,
+                "stale permission decision: review the current request",
+            ));
         }
         let reply = HookReply { stdout: Some(decision.output(message)) };
         let azure = pending.request.tool == "Azure REST";
         let answered = pending.reply.take().is_some_and(|sender| sender.answer(reply));
         if !answered {
             if azure {
-                session.approvals.remove(0);
-                return Err("the Azure request expired; retry the request".into());
+                let expired = session.approvals.remove(0);
+                self.record_resolution(expired.id, Disposition::Expired);
+                return Err(rejected("the Azure request expired; retry the request"));
             }
             let Some(terminal) = &session.terminal else {
-                return Err("the permission hook has returned; answer in the agent terminal".into());
+                return Err(rejected("the permission hook has returned; answer in the agent terminal"));
             };
             let Some(key) = atomics_core::approvals::menu_key(
                 &terminal.screen_text(60),
                 pending.request.command.as_deref(),
                 decision,
             ) else {
-                return Err("the permission menu is not visible; retry or answer in the terminal".into());
+                return Err(rejected("the permission menu is not visible; retry or answer in the terminal"));
             };
             terminal.write(key.as_bytes().to_vec());
             if key == "\x01" {
-                return Err("expanded the permission command; retry approval once it is visible".into());
+                return Err(rejected("expanded the permission command; retry approval once it is visible"));
             }
         }
         let pending = session.approvals.remove(0);
+        let id = pending.id.clone();
         if decision == Decision::AllowAlways && !azure {
             session.allowed.push(pending.request);
         }
@@ -162,7 +212,16 @@ impl State {
         if azure && !session.approvals.is_empty() {
             self.last_status.remove(&session.id);
         }
+        self.record_resolution(id, disposition(decision));
         Ok(())
+    }
+}
+
+fn disposition(decision: Decision) -> Disposition {
+    match decision {
+        Decision::Allow => Disposition::Allowed,
+        Decision::AllowAlways => Disposition::AllowedAlways,
+        Decision::Deny => Disposition::Denied,
     }
 }
 
@@ -335,7 +394,7 @@ mod tests {
                 tx.send(state.approve(0, "reviewed", Decision::Allow, None)).unwrap();
             });
             app.runtime.drain_actions();
-            assert!(rx.recv().unwrap().unwrap_err().contains("stale"));
+            assert!(rx.recv().unwrap().unwrap_err().message.contains("stale"));
             assert!(reviewed.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
             assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
             assert_eq!(app.runtime.sessions[0].approvals[0].id, "unreviewed");
@@ -521,6 +580,7 @@ mod tests {
                             None
                         )
                         .unwrap_err()
+                        .message
                         .contains("expanded")
                 );
                 assert!(reply.expired() || reply.wait(Duration::ZERO).stdout.is_none());

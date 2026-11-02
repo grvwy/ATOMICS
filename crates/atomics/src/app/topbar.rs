@@ -1,19 +1,7 @@
 use super::*;
 
-pub(super) use atomics_ui::topbar::measure;
 use atomics_ui::topbar::slot;
-
-/// Records where a top-bar item was drawn, for the layout tests. It stays here: it records only in the
-/// desktop's own test build.
-pub(super) fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Response) {
-    #[cfg(test)]
-    if !_ui.is_sizing_pass() {
-        _ui.ctx().data_mut(|data| {
-            data.get_temp_mut_or_default::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items"))
-                .push((_name.into(), _response.rect));
-        });
-    }
-}
+pub(super) use atomics_ui::topbar::{measure, record_item};
 
 impl Desktop<'_> {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -80,37 +68,20 @@ impl Desktop<'_> {
         ui.allocate_rect(rect, Sense::hover());
     }
 
-    fn top_bar_brand(&self, ui: &mut egui::Ui, show_agents: bool) {
-        let response = ui.image((self.client.icon.id(), vec2(20.0, 20.0)));
-        record_item(ui, "icon", &response);
-        let response = ui.label(RichText::new("ATOMICS").strong().size(14.0).color(self.palette().accent).monospace());
-        record_item(ui, "brand", &response);
-        if show_agents {
-            let agents = self.runtime.sessions.iter().filter(|s| s.is_agent()).count();
-            let response = ui.label(
-                RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" }))
-                    .color(self.palette().muted),
-            );
-            record_item(ui, "agents", &response);
-            let names: HashSet<_> = self.runtime.sessions.iter().filter_map(|s| s.sandbox.as_ref()).collect();
-            if !names.is_empty() {
-                let sampler = &self.runtime.sandbox_usage;
-                let label = if sampler.usage.is_empty() {
-                    "VMs —".into()
-                } else {
-                    format!("VMs {}", sampler.total().label())
-                };
-                let response =
-                    ui.label(RichText::new(label).size(11.0).color(self.palette().muted)).on_hover_text(format!(
-                        "Host overhead of {}/{} sandbox VM process trees. 100% CPU = one core.{}",
-                        sampler.usage.len(),
-                        names.len(),
-                        sampler.error.as_ref().map_or(String::new(), |e| format!("\n{e}"))
-                    ));
-                record_item(ui, "sandbox-total", &response);
-            }
-        }
-        ui.separator();
+    fn top_bar_brand(&mut self, ui: &mut egui::Ui, show_agents: bool) {
+        self.draw(|backend, client| atomics_ui::topbar::brand(ui, show_agents, backend, client));
+    }
+
+    pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
+        self.draw(|backend, client| atomics_ui::tabs::view_tabs(ui, backend, client));
+    }
+
+    pub(super) fn urgent_tabs_label(&mut self) -> (String, Color32) {
+        self.draw(atomics_ui::tabs::urgent_tabs_label)
+    }
+
+    pub(super) fn urgent_navigation_width(&mut self, ui: &mut egui::Ui) -> f32 {
+        self.draw(|backend, client| atomics_ui::tabs::urgent_navigation_width(ui, backend, client))
     }
 
     /// Phone and browser access through a rendezvous service, when `[remote.rendezvous]` is
@@ -155,35 +126,9 @@ impl Desktop<'_> {
     }
 
     fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool, in_menu: bool) {
-        let response = ui.button(if self.runtime.diff_open { "Hide diff" } else { "Show diff" });
-        record_item(ui, "diff", &response);
-        if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_diff)).clicked() {
-            self.runtime.diff_open = !self.runtime.diff_open;
-            if in_menu {
-                ui.close();
-            }
-        }
-        let response = ui.button("+ New");
-        record_item(ui, "+ New", &response);
-        if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.new_session)).clicked() {
-            self.open_new_dialog(None);
-            if in_menu {
-                ui.close();
-            }
-        }
-        let plan = self.runtime.backend().plan_row(self.runtime.selected_plan).expect("a plan is selected");
-        let (done, total, attention) = (plan.done, plan.total, plan.attention);
-        let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
-        let text =
-            RichText::new(label).color(if attention > 0 { self.palette().warning } else { self.palette().foreground });
-        let response = ui.selectable_label(self.runtime.panel == PanelMode::Plan && self.runtime.diff_open, text);
-        record_item(ui, "Plan", &response);
-        if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_plan)).clicked() {
-            self.runtime.toggle_plan();
-            if in_menu {
-                ui.close();
-            }
-        }
+        self.draw(|backend, client| atomics_ui::topbar::diff_button(ui, in_menu, backend, client));
+        self.draw(|backend, client| atomics_ui::topbar::new_button(ui, in_menu, backend, client));
+        self.draw(|backend, client| atomics_ui::topbar::plan_button(ui, in_menu, backend, client));
         if self.runtime.ticket_config().is_some() {
             // A dot says the ticket system wants a sign-in.
             let signed_out = self.runtime.tickets.panel.signin;
@@ -255,49 +200,7 @@ impl Desktop<'_> {
     }
 
     fn top_bar_notice(&mut self, ui: &mut egui::Ui) {
-        if ui.available_width() < 24.0 {
-            return;
-        }
-        let waiting = self.runtime.sessions.iter().filter(|s| s.status.needs_attention()).count();
-        let mut notices = Vec::new();
-        if waiting > 0 {
-            notices.push(format!("● {waiting} need{} you", if waiting == 1 { "s" } else { "" }));
-        }
-        if let Some((text, _)) = &self.runtime.toast {
-            notices.push(text.clone());
-        }
-        if let Some(err) = &self.runtime.config_error {
-            notices.push(format!("config error: {err}"));
-        }
-        if let Some(problems) = &self.runtime.config_problems {
-            notices.push(format!("config: {problems}"));
-        }
-        if let Some(err) = &self.runtime.theme_error {
-            notices.push(format!("theme: {err}"));
-        }
-        if let Some(err) = &self.runtime.hook_error {
-            notices.push(format!("hooks offline: {err}"));
-        }
-        if notices.is_empty() {
-            return;
-        }
-        let text = notices.join(" · ");
-        let response = ui.add(
-            egui::Label::new(RichText::new(&text).color(if waiting > 0 {
-                self.palette().warning
-            } else {
-                self.palette().foreground
-            }))
-            .truncate()
-            .sense(Sense::click()),
-        );
-        record_item(ui, "notice", &response);
-        if response.on_hover_text(text).clicked()
-            && let Some(i) = self.runtime.sessions.iter().position(|s| s.status.needs_attention())
-        {
-            let id = self.runtime.sessions[i].id.clone();
-            self.activate(&id, true);
-        }
+        self.draw(|backend, client| atomics_ui::topbar::notice(ui, backend, client));
     }
 }
 

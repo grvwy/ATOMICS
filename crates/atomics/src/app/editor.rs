@@ -127,50 +127,7 @@ impl Desktop<'_> {
             self.editor_panel(ui, rect, &root);
             return;
         }
-        let session = self.runtime.active_index().map(|i| &self.runtime.sessions[i]);
-        let title = session
-            .map(|s| s.title.clone())
-            .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-        let branch = session
-            .and_then(|s| s.branch().map(str::to_string))
-            .or_else(|| self.runtime.worktrees.iter().find(|w| w.path == root).and_then(|w| w.branch.clone()))
-            .filter(|b| *b != title);
-        let can_send = self.runtime.sessions.iter().any(|s| s.root() == root && s.is_agent() && s.can_receive());
-        let palette = self.palette();
-        let font = palette.mono(palette.fonts.diff_size.unwrap_or(self.runtime.config.font.diff_size));
-        let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
-        let state = self.client.diff_views.entry(root.clone()).or_default();
-        let header = Header {
-            title: &title,
-            branch: branch.as_deref(),
-            can_send,
-            split,
-            editor_shortcut: &self.runtime.config.keys.toggle_editor,
-        };
-        let before = state.comments.clone();
-        let action = diff_view::show(ui, rect, state, header, &palette, &font);
-        let after = state.comments.clone();
-        if before != after {
-            let root = root.clone();
-            self.post(move |runtime| {
-                runtime.diffs.entry(root).or_default().edit_comments(before, after);
-            });
-        }
-        match action {
-            DiffAction::None => {}
-            DiffAction::SendReview => {
-                self.send_review(&root);
-            }
-            DiffAction::Refresh => self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default())),
-            DiffAction::Close => self.runtime.diff_open = false,
-            DiffAction::Split(on) => {
-                self.client.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never })
-            }
-            DiffAction::Edit { path, line } => {
-                let ctx = ui.ctx().clone();
-                self.edit(&ctx, &root, path.as_deref(), line);
-            }
-        }
+        self.draw(|backend, client| atomics_ui::diff_panel::draw(ui, rect, &root, backend, client));
     }
 
     fn editor_panel(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {

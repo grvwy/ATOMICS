@@ -275,7 +275,14 @@ fn fixture(service: &FakeService, ledger: &Shared, tune: impl FnOnce(&mut Settin
         session: SessionConfig { tick: Duration::from_millis(5), ..SessionConfig::default() },
         ..ServerConfig::default()
     };
-    let server = Server::start(config, projections, Arc::new(NoDiffs), Arc::new(Terminals::default())).unwrap();
+    let server = Server::start(
+        config,
+        projections,
+        Arc::new(NoDiffs),
+        Arc::new(Terminals::default()),
+        Arc::new(crate::protocol::NoCommands),
+    )
+    .unwrap();
     let (dir, _, store) = crate::credentials::tests::machine(false);
     let home = dir.path().join("home");
     let mut settings = quick(&service.url());
@@ -327,8 +334,9 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_channel_as_a_viewer() {
     socket.send(service::joined(1));
     socket.hello(1);
     let welcome = socket.envelope(1);
-    let Message::Welcome { role, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
+    let Message::Welcome { role, may, capabilities, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
     assert_eq!(*role, Role::Viewer, "until pairing, a channel only watches");
+    assert!(may.is_empty(), "and may change nothing, whatever it negotiated: {capabilities:?} {may:?}");
     assert!(super::channel::PLAINTEXT && super::channel::ROLE == Role::Viewer, "the H5b seam still says so");
     let snapshot = socket.envelope(1);
     assert!(matches!(snapshot.message, Message::StateSnapshot { .. }), "{snapshot:?}");

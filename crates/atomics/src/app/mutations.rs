@@ -1,0 +1,336 @@
+//! Mutations, journaled: those protocol clients send and the desktop's own approve and steer.
+//!
+//! Every one runs here, on the runtime thread under the `State` lock, one at a time and in turn
+//! with the desktop's actions and ctl's commands. That is what gives an approval exactly one
+//! winner: the first decision for its ID answers it (`State::decide`), and any later one, from
+//! another client, the desktop or a retry with a new ID, finds it answered. The journal
+//! (`protocol::journal`) records an operation before it takes effect and its outcome after, so a
+//! retry of the same ID is answered from it instead of being carried out again.
+//!
+//! The commands reuse what ctl and MCP run (`State::control`), with the protocol's IDs resolved
+//! exactly and its staleness checks first: a plan's approval scope (`digest`) for approving or
+//! replacing it, a diff's revision for a comment. Work that ends later (a delivery to confirm, a
+//! worktree to create, a merge) answers `accepted` and then its outcome, when `poll_ops` sees it.
+
+use std::sync::mpsc::TryRecvError;
+
+use super::*;
+use crate::protocol::journal::{self, Begun};
+use crate::protocol::{OpReply, OpRequest};
+use atomics_core::ops::{
+    ApprovalDecide, Command, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction,
+    SessionCommand,
+};
+
+/// A mutation whose outcome comes later, and who waits for it.
+pub(super) struct InFlight {
+    key: journal::Key,
+    outcome: Receiver<ControlOutcome>,
+    replies: Vec<OpReply>,
+}
+
+enum Started {
+    Now(Outcome),
+    Later(Receiver<ControlOutcome>),
+}
+
+fn refused(code: ErrorCode, message: impl Into<String>) -> Outcome {
+    Outcome::refused(WireError::new(code, message))
+}
+
+fn not_found(message: impl Into<String>) -> WireError {
+    WireError::new(ErrorCode::NotFound, message)
+}
+
+/// The protocol's outcome for an answer from `State::control`. A delivery that could not be
+/// confirmed says so (`unconfirmed`); it is uncertain, not refused.
+fn from_control(outcome: ControlOutcome) -> Outcome {
+    match outcome {
+        ControlOutcome::Done(response) if response.ok => Outcome::done(response.result),
+        ControlOutcome::Done(response) => {
+            let message = response.error.unwrap_or_else(|| "refused".into());
+            if response.result.get("unconfirmed") == Some(&json!(true)) {
+                Outcome::Uncertain { message }
+            } else {
+                refused(ErrorCode::Rejected, message)
+            }
+        }
+        _ => refused(ErrorCode::Internal, "the command answered in an unexpected way"),
+    }
+}
+
+impl State {
+    /// What the protocol server hands mutations to. The journal moves to `journal`, a file, so
+    /// that an operation the host stopped during is answered `uncertain` after a restart. Called
+    /// once, as the server starts; a journal that cannot be opened stays in memory.
+    pub(crate) fn serve_commands(&mut self, journal: &Path) -> Arc<dyn crate::protocol::Commands> {
+        match journal::Journal::open(journal, atomics_core::store::now()) {
+            Ok(opened) => self.ops = opened,
+            Err(error) => eprintln!("atomics: the operation journal stays in memory: {error}"),
+        }
+        Arc::new(self.op_tx.clone())
+    }
+
+    /// A mutation from a protocol client: what is known now goes back at once, and the final
+    /// outcome of work that ends later when it does.
+    pub(super) fn serve_op(&mut self, request: OpRequest) {
+        let OpRequest { client, command, reply } = request;
+        let key = journal::Key::client(&client, command.op());
+        let op = command.op().to_string();
+        let first = self.mutate(key, command, Some(reply.clone()));
+        reply.send(&op, first);
+    }
+
+    /// The desktop's own mutation, through the same journal and checks as a client's. Returns
+    /// the first outcome; a later one only lands in the journal.
+    pub(super) fn mutate_desktop(&mut self, command: impl FnOnce(String) -> Command) -> Outcome {
+        let op = uuid::Uuid::new_v4().to_string();
+        self.mutate(journal::Key::desktop(op.clone()), command(op), None)
+    }
+
+    /// Carry out `command` once under `key`. Returns its outcome, or `accepted` for work that
+    /// ends later, whose outcome then goes to `reply`.
+    fn mutate(&mut self, key: journal::Key, command: Command, reply: Option<OpReply>) -> Outcome {
+        match self.ops.begin(&key, &journal::fingerprint(&command), atomics_core::store::now()) {
+            Begun::Fresh => {}
+            Begun::Known(outcome) => return outcome,
+            Begun::Running => {
+                if let (Some(reply), Some(flight)) = (reply, self.in_flight.iter_mut().find(|f| f.key == key)) {
+                    flight.replies.push(reply);
+                }
+                return Outcome::Accepted;
+            }
+            Begun::Conflict => return refused(ErrorCode::Conflict, "this operation ID was used for another command"),
+            Begun::Full => return refused(ErrorCode::TooMany, "too many operations to remember; try again shortly"),
+            Begun::Unwritable(why) => {
+                return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
+            }
+        }
+        match self.execute(command) {
+            Started::Now(outcome) => {
+                self.ops.finish(&key, &outcome);
+                outcome
+            }
+            Started::Later(outcome) => {
+                self.in_flight.push(InFlight { key, outcome, replies: reply.into_iter().collect() });
+                Outcome::Accepted
+            }
+        }
+    }
+
+    /// Finish the mutations whose outcomes have arrived.
+    pub(super) fn poll_ops(&mut self) -> bool {
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for flight in std::mem::take(&mut self.in_flight) {
+            let outcome = match flight.outcome.try_recv() {
+                Ok(outcome) => from_control(outcome),
+                Err(TryRecvError::Empty) => {
+                    self.in_flight.push(flight);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Outcome::Uncertain { message: "the host lost track of this operation; check the board".into() }
+                }
+            };
+            changed = true;
+            self.ops.finish(&flight.key, &outcome);
+            for reply in &flight.replies {
+                reply.send(&flight.key.op, outcome.clone());
+            }
+        }
+        changed
+    }
+
+    fn execute(&mut self, command: Command) -> Started {
+        let request = match command {
+            Command::ApprovalDecide(ApprovalDecide { approval, decision, message, .. }) => {
+                return Started::Now(match self.decide(&approval, decision, message.as_deref()) {
+                    Ok(disposition) => Outcome::done(json!({ "disposition": disposition })),
+                    Err(error) => Outcome::refused(error),
+                });
+            }
+            Command::ReviewCommand(review) => {
+                return Started::Now(self.review(review).map_or_else(Outcome::refused, Outcome::done));
+            }
+            Command::PlanCommand(plan) => self.plan_request(plan),
+            Command::SessionCommand(session) => self.session_request(session),
+        };
+        match request {
+            Ok(request) => self.run_control(request),
+            Err(error) => Started::Now(Outcome::refused(error)),
+        }
+    }
+
+    /// Run what ctl runs, and see whether it answered at once.
+    fn run_control(&mut self, request: ControlRequest) -> Started {
+        let (reply, outcome) = std::sync::mpsc::channel();
+        self.control(request, reply);
+        match outcome.try_recv() {
+            Ok(answer) => Started::Now(from_control(answer)),
+            Err(TryRecvError::Empty) => Started::Later(outcome),
+            Err(TryRecvError::Disconnected) => Started::Now(Outcome::Uncertain {
+                message: "the command ended without an answer; check the board".into(),
+            }),
+        }
+    }
+
+    /// The session with exactly this ID; the protocol never matches titles or prefixes.
+    fn session_by_id(&self, id: &str) -> Result<usize, WireError> {
+        self.sessions.iter().position(|s| s.id == id).ok_or_else(|| not_found(format!("no session {id}")))
+    }
+
+    fn plan_request(&self, command: PlanCommand) -> Result<ControlRequest, WireError> {
+        let PlanCommand { plan, digest, action, .. } = command;
+        let index = match &plan {
+            Some(id) => {
+                Some(self.plans.iter().position(|p| p.id == *id).ok_or_else(|| not_found(format!("no plan {id}")))?)
+            }
+            None => None,
+        };
+        // Approving or replacing a plan is about the plan the user saw: its approval scope.
+        let replaces =
+            matches!(action, PlanAction::Approve) || (matches!(action, PlanAction::Set { .. }) && index.is_some());
+        if replaces && digest.is_none() {
+            return Err(WireError::new(ErrorCode::Malformed, "name the digest of the plan the user reviewed"));
+        }
+        if let (Some(index), Some(digest)) = (index, &digest)
+            && self.plans[index].digest() != *digest
+        {
+            return Err(WireError::new(ErrorCode::StaleRevision, "the plan changed since; review it again"));
+        }
+        let task = |id: &str| -> Result<(), WireError> {
+            let found = index.is_some_and(|i| self.plans[i].tasks.iter().any(|t| t.id == id));
+            if found { Ok(()) } else { Err(not_found(format!("no task {id}"))) }
+        };
+        Ok(match action {
+            PlanAction::Set { goal, tasks, integration } => {
+                ControlRequest::PlanSet { plan, goal, tasks, integration, ticket: None }
+            }
+            PlanAction::Approve => ControlRequest::PlanApprove { plan },
+            PlanAction::Dispatch { task: id } => {
+                if let Some(id) = &id {
+                    task(id)?;
+                }
+                ControlRequest::PlanDispatch { plan, id }
+            }
+            PlanAction::Update { task: id, status, note } => {
+                task(&id)?;
+                let status = status.map(|s| s.label().to_string());
+                ControlRequest::PlanUpdate { plan, id, status, note, session: None }
+            }
+            PlanAction::Integrate { task: id } => {
+                task(&id)?;
+                ControlRequest::PlanIntegrate { plan, id }
+            }
+            PlanAction::Archive => {
+                ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Archived }
+            }
+        })
+    }
+
+    fn session_request(&self, command: SessionCommand) -> Result<ControlRequest, WireError> {
+        Ok(match command.action {
+            SessionAction::Steer { session, text } => {
+                self.session_by_id(&session)?;
+                ControlRequest::Send { session, text, raw: false }
+            }
+            SessionAction::Start { agent, folder, repo, branch, prompt } => {
+                if self.config.agent(&agent).is_none() {
+                    return Err(not_found(format!("no agent {agent} is configured")));
+                }
+                ControlRequest::Start { agent, folder, repo, branch, prompt, args: Vec::new(), isolation: None }
+            }
+            SessionAction::Close { session } => {
+                self.session_by_id(&session)?;
+                ControlRequest::Close { session }
+            }
+        })
+    }
+
+    fn review(&mut self, command: ReviewCommand) -> Result<serde_json::Value, WireError> {
+        let root = PathBuf::from(&command.worktree);
+        let Some(data) = self.diffs.get_mut(&root).filter(|data| data.prepared.is_some()) else {
+            return Err(not_found("no diff for that worktree"));
+        };
+        match command.action {
+            ReviewAction::Add { revision, path, line, removed, text } => {
+                if revision.0 != data.revision {
+                    return Err(WireError::new(
+                        ErrorCode::StaleRevision,
+                        format!("the diff is at revision {}; anchor the comment again", data.revision),
+                    ));
+                }
+                let in_diff = data.prepared.as_ref().is_some_and(|p| p.diff.files.iter().any(|f| f.path() == path));
+                if !in_diff {
+                    return Err(not_found(format!("{path} is not in the diff")));
+                }
+                let pending = self.add_comment(&root, path, line, removed, text);
+                Ok(json!({ "pending_comments": pending }))
+            }
+            ReviewAction::Remove { path, line, removed, text } => {
+                let at = data
+                    .comments
+                    .iter()
+                    .position(|c| c.path == path && c.line == line && c.removed == removed && c.body == text)
+                    .ok_or_else(|| not_found("no such comment"))?;
+                data.comments.remove(at);
+                Ok(json!({ "pending_comments": data.comments.len() }))
+            }
+            ReviewAction::Send => {
+                self.deliver_review(&root).map_err(|message| WireError::new(ErrorCode::Rejected, message))
+            }
+        }
+    }
+
+    /// Add a comment on a line of `root`'s diff (or the whole file), quoting the line. Returns how
+    /// many wait to be sent. ctl's `comment` and the protocol's `review_command` share it.
+    pub(super) fn add_comment(
+        &mut self,
+        root: &Path,
+        path: String,
+        line: Option<u32>,
+        removed: bool,
+        body: String,
+    ) -> usize {
+        let state = self.diffs.entry(root.to_path_buf()).or_default();
+        let file = state.prepared.as_ref().and_then(|p| p.diff.files.iter().find(|f| f.path() == path));
+        let excerpt = file
+            .and_then(|f| {
+                f.hunks.iter().flat_map(|h| &h.lines).find(|l| {
+                    let number = if removed { l.old_no } else { l.new_no };
+                    line.is_some() && number == line && (l.kind == atomics_core::diff::LineKind::Removed) == removed
+                })
+            })
+            .map(|l| l.text.clone())
+            // Untracked content a diff off screen left out is read from the file.
+            .or_else(|| {
+                let n = line.filter(|_| !removed && file.is_some_and(|f| f.omitted > 0))?;
+                let text = std::fs::read_to_string(root.join(&path)).ok()?;
+                text.lines().nth((n as usize).checked_sub(1)?).map(str::to_string)
+            })
+            .unwrap_or_default();
+        state.comments.push(steer::ReviewComment { path, line, removed, excerpt, body });
+        state.comments.len()
+    }
+
+    /// Send `root`'s comments to its agent as one message. ctl's `send_review` and the protocol's
+    /// `review_command` share it.
+    pub(super) fn deliver_review(&mut self, root: &Path) -> Result<serde_json::Value, String> {
+        let count = self.diffs.get(root).map_or(0, |d| d.comments.len());
+        if count == 0 {
+            return Err("no pending comments".into());
+        }
+        let delivery = self.send_review(root);
+        if self.diffs.get(root).is_some_and(|d| !d.comments.is_empty()) {
+            return Err("could not deliver the review".into());
+        }
+        Ok(match delivery {
+            Delivery::Held => json!({ "held_comments": count, "held": true }),
+            Delivery::Pending => json!({ "pending_comments": count, "sent": false }),
+            _ => json!({ "sent_comments": count }),
+        })
+    }
+}

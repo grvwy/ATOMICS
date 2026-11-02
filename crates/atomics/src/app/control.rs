@@ -115,7 +115,7 @@ impl State {
                         self.sessions[index].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default();
                     done(match self.approve(index, &approval, decision, message.as_deref()) {
                         Ok(()) => ControlResponse::ok(json!({"answered":true})),
-                        Err(error) => ControlResponse::error(error),
+                        Err(error) => ControlResponse::error(error.message),
                     })
                 }
                 None => missing(&session),
@@ -608,51 +608,18 @@ impl State {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
-                    let state = self.diffs.entry(root.clone()).or_default();
-                    let file = state.prepared.as_ref().and_then(|p| p.diff.files.iter().find(|f| f.path() == path));
-                    let excerpt = file
-                        .and_then(|f| {
-                            f.hunks.iter().flat_map(|h| &h.lines).find(|l| {
-                                let number = if removed { l.old_no } else { l.new_no };
-                                line.is_some()
-                                    && number == line
-                                    && (l.kind == atomics_core::diff::LineKind::Removed) == removed
-                            })
-                        })
-                        .map(|l| l.text.clone())
-                        // Untracked content a diff off screen left out is read from the file.
-                        .or_else(|| {
-                            let n = line.filter(|_| !removed && file.is_some_and(|f| f.omitted > 0))?;
-                            let text = std::fs::read_to_string(root.join(&path)).ok()?;
-                            text.lines().nth((n as usize).checked_sub(1)?).map(str::to_string)
-                        })
-                        .unwrap_or_default();
-                    state.comments.push(steer::ReviewComment { path, line, removed, excerpt, body: text });
-                    done(ControlResponse::ok(json!({ "pending_comments": state.comments.len() })))
+                    let pending = self.add_comment(&root, path, line, removed, text);
+                    done(ControlResponse::ok(json!({ "pending_comments": pending })))
                 }
             },
             ControlRequest::SendReview { session } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
-                    let count = self.diffs.get(&root).map(|d| d.comments.len()).unwrap_or(0);
-                    if count == 0 {
-                        done(ControlResponse::error("no pending comments"))
-                    } else {
-                        let delivery = self.send_review(&root);
-                        let left = self.diffs.get(&root).map(|d| d.comments.len()).unwrap_or(0);
-                        if left == 0 {
-                            done(ControlResponse::ok(if delivery == Delivery::Held {
-                                json!({"held_comments":count, "held":true})
-                            } else if delivery == Delivery::Pending {
-                                json!({"pending_comments":count, "sent":false})
-                            } else {
-                                json!({ "sent_comments": count })
-                            }))
-                        } else {
-                            done(ControlResponse::error("could not deliver the review"))
-                        }
-                    }
+                    done(match self.deliver_review(&root) {
+                        Ok(result) => ControlResponse::ok(result),
+                        Err(error) => ControlResponse::error(error),
+                    })
                 }
             },
             ControlRequest::Activate { session } => match self.find(&session) {

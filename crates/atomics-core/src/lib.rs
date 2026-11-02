@@ -36,6 +36,7 @@ pub mod mcp_import;
 pub mod paths;
 pub mod plan;
 pub mod mirror;
+pub mod ops;
 pub mod projection;
 pub mod remote;
 pub mod repo_workflow;
