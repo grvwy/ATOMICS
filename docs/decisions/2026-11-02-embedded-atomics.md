@@ -544,9 +544,10 @@ terminals, with pairing, the broker and the switcher entry. All work happens on 
 the milestones below are internal and each has a gate on the branch. Efforts are agent-days of focused work,
 excluding review wait.
 
-**Not in release 1** (Phase F, later): the headless host and container profile, signed-bundle verification in the
+**Not in release 1** (Phase F, later): the container profile, signed-bundle verification in the
 loader (release 1 has hash pinning), non-extractable browser keys, short-code pairing, the device-code fallback for
-hosts without OAuth.
+hosts without OAuth. The headless host itself was brought forward on 2026-11-02 so the host can run in the NixOS
+VM: `atomics host` (`docs/daemon.md`, "Headless host").
 
 ### Phase 0: spikes (about 2 days; blocks stream C's terminal input work)
 
@@ -720,7 +721,8 @@ Answered on 2026-11-02 and folded in above: typing from a phone (yes), live term
 7. **Preview environment.** May the gate's device runs use a separate preview deployment of the branch images on the
    cluster (a cluster change), or should all pre-merge testing stay on the local stack?
 8. **Where the host runs.** The first host is the desktop app. Does the headless host (Phase F) need to come earlier
-   for your use?
+   for your use? **Answered 2026-11-02: yes**, for the NixOS VM. `atomics host` runs the runtime, the local socket
+   and (with `[remote]`) the protocol thread with no window; the desktop attaching to it as a client is still phase 3.
 
 ## 13. Review (2026-11-02)
 

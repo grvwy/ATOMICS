@@ -37,11 +37,13 @@ The client keeps these responsibilities:
 
 - `app.rs` and `app/*.rs`: the UI portion of `App`, including tabs, dialogs, selection, chief docking, focus,
   steering drafts, board drawing and layout. Runtime actions become explicit commands.
-- `terminal.rs`: painting and `Metrics`, keyboard/pointer handling, selection and local clipboard use.
-  The client renders a cell cache instead of locking an emulator or holding a PTY sender.
+- `terminal.rs`: keyboard/pointer handling, selection and local clipboard use. Painting and `Metrics` are the
+  shared painter's (`atomics_ui::terminal`, see Terminal painter), which already draws from a cell copy; the client
+  renders a cell cache instead of locking an emulator or holding a PTY sender.
 - `diff_view.rs`: rendering, `DiffState`, `ExplorerState`, `DiffAction`, scrolling and comment drafts.
   Dirty scheduling moves to the host; accepted comments are shared host state for MCP and review delivery.
-- `theme.rs`: `Palette`, fonts, shortcuts and egui styling remain client code.
+- `theme.rs`: shortcuts and the desktop's font lookup (`SystemFonts`, fontique) remain client code; `Palette`
+  and egui styling are in `atomics-ui` (`theme`). The host keeps the resolved `Theme`, free of egui.
 - `voice.rs`: native microphone capture through `Recorder` stays on the native client; the browser
   uses its microphone permission flow. Audio upload and transcription are optional negotiated features.
 
@@ -81,6 +83,8 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `state_snapshot` | Sessions, projects, plan summaries and pending approvals at a single event cursor. |
 | Host → client | `session_upsert`, `session_removed` | Stable session ID, agent, title, cwd, worktree, status, chief flag and task link. |
 | Client → host | `session_command` | Start, close, steer or open an editor; return `command_result` with delivery state. |
+| Client → host | `lease_acquire`, `lease_renew`, `lease_release` | Session ID, takeover or the lease's fencing token. |
+| Host → client | `lease_state` | Session ID, holder, and for the holder only its token, next input sequence and time-to-live. |
 | Client → host | `terminal_input`, `terminal_resize` | Session ID, control lease, input sequence or rows/columns/cell pixels. |
 | Host → client | `screen_snapshot`, `screen_delta` | Session ID, screen generation, base/new revision, cells, cursor and modes. |
 | Client → host | `history_get` | Session ID and bounded scrollback range by stable line ID. |
@@ -207,7 +211,8 @@ allowed_origins = []     # exact Origin values; a native client sends none
 - **No locks across I/O.** The runtime thread publishes `Arc` projections (and the accepted diff content) and the
   protocol thread only reads them; it never takes the `State` mutex. `hub.rs` turns published changes into numbered
   events and keeps a replay ring (200 events, 8 MiB, 5 minutes); its mutex guards memory only. Every socket has its own
-  thread, so a socket write blocks nothing but that client.
+  thread, so a socket write blocks nothing but that client. That thread waits on its socket and a wake pipe, and
+  queueing anything for the client wakes it, so frames are sent as soon as they are queued.
 - **Slow readers.** Each client has a bounded queue (256 frames, 4 MiB). On overflow the backlog is dropped and the
   client's thread sends a current `state_snapshot` instead (a resync). A client whose socket stays unwritable for the
   write timeout (5 s) is disconnected. Neither case reaches the runtime thread or other clients.
@@ -217,14 +222,231 @@ allowed_origins = []     # exact Origin values; a native client sends none
 - **Bad input.** Malformed JSON, unknown kinds, a wrong major version, an oversize frame (over 256 KiB, refused before
   it is buffered) and binary frames get a typed `error` frame; oversize frames and a ninth error end the connection.
   A first message other than `hello` ends it. Idle clients are pinged every 25 s and dropped after 60 s of silence.
-- **Not yet.** Chunked transfers (a board or diff over one frame fails with `oversize`), `file_get` (answers
-  `not_found`), terminals, and every mutation (H2 to H4). A removed diff is sent as a `diff_summary` with no files and
-  no base (a tombstone), and a vanished approval as `approval_resolved` with `withdrawn`.
+- **Not yet.** Chunked transfers of the board and diffs (a board or diff over one frame fails with `oversize`),
+  `file_get` (answers `not_found`), and every mutation (H4). A removed diff is sent as a
+  `diff_summary` with no files and no base (a tombstone), and a vanished approval as `approval_resolved` with
+  `withdrawn`.
+
+### Terminal screens
+
+Stream H2. A client that negotiated the `terminals` capability subscribes to `{"topic": "screen", "session", "focused"}`
+and gets a `screen_snapshot`, then `screen_delta`s. The types and the reference client (`Screen`, `ScreenMirror`) are in
+`atomics_core::screen`; the host side is `protocol/screens.rs` and `terminal/screen.rs`.
+
+- **Who copies.** The runtime thread only publishes which terminals exist (`Terminals`), and only while the server runs;
+  it does so before the board, so a client that sees a session can subscribe to its screen at once. A server thread of
+  its own (`atomics-protocol-screens`) copies a screen only while a client subscribes to it, only when the emulator
+  reports a change, and at most every 100 ms (focused) or 200 ms (visible). The copy is taken under
+  the emulator's fair lock from the live screen, never the desktop's scrolled view; comparing and encoding happen after
+  the lock is released. The board keeps flowing while an emulator is locked, and nothing takes the `State` lock.
+- **Cells.** A frame lists the styles it uses once; each line is runs of cells sharing a style. A run is plain text (one
+  column per `char`) or a single cell spanning `w` columns: a wide character, or a character with its combining marks.
+  Colours are palette slots (0-255, 256 foreground, 257 background, 258 cursor; 259-268 are the dim and bright variants
+  the client derives, as the desktop does) or `"#rrggbb"`. Snapshots carry the palette (the theme with the program's
+  OSC colour changes), title, cursor shape and blink, and the modes a client needs to encode input: application cursor
+  and keypad, bracketed paste, mouse modes and encodings, focus reporting, alternate scroll and kitty keyboard flags.
+  Soft wraps are kept per line; trailing blanks and blank rows are left out.
+- **Revisions.** The first copy of a generation is a snapshot at revision 1. Each later change is one delta naming its
+  generation, base and revision: `scroll` (lines that moved into history) first, then the changed lines, cursor, modes,
+  title or palette. A resize, an alternate-screen switch, a replaced terminal, or output that cannot be followed exactly
+  starts a new generation with a snapshot. Changed rows come from comparing against the previous copy, not from
+  alacritty's damage, which is relative to the desktop's scrolled view and has a single reader.
+- **Line IDs.** The top screen line is `first_line`; history lines have the IDs below it and `history` says how many are
+  retained. Scrolling is followed exactly by finding the old top line's storage in history (alacritty rotates rows
+  rather than copying them), checked against the newest history line's content when storage may have been reused. When
+  that cannot be proven (more output than the history holds between two copies, a reset) the host starts a new
+  generation rather than guess. `history_get {session, generation, before, count <= 1000}` is answered by a
+  `history_chunk` of the retained lines (the newest, if one frame cannot hold them all), with `evicted` set when the
+  request reached past the oldest retained line. Another generation is `stale_revision`; a screen not subscribed to is
+  `not_found`.
+- **Slow and lossy clients.** Each client has a slot per screen, bounded at 32 deltas and 2 MiB of deltas across its
+  screens. A slot that overflows, or a delta that does not follow what the client was sent, is replaced by the current
+  snapshot, which is encoded once per revision and shared by every client. Board events are always sent before screen
+  frames. A client whose mirror reports a gap sends `resync {"screens": [session]}` and gets a snapshot. A socket that
+  stays unwritable for the write timeout still disconnects the client; the emulator never waits for one.
+- **Large screens.** A snapshot over the frame limit is split by rows into self-contained parts (`part {index, count}`),
+  applied when the last part arrives; a delta over the limit becomes a snapshot.
+- **Remote off.** No `Terminals`, no screens thread, nothing copied: the runtime thread skips publishing. The only
+  change on the desktop's path is a counter the listener bumps on a title change and a theme change bumps.
+- **Not yet.** Editor terminals and OSC 8 hyperlinks. Input and leases are H3, below.
+
+Desktop terminal frame times (2026-11-02, `terminal::frame_bench`, ignored by default: 600 frames of
+`TerminalView::show` plus tessellation for a 164x50 pane while a shell writes coloured lines as fast as it can; test
+profile, shared 18-core machine). The base is the code before this change, with the same bench added.
+
+| Build | Copies | mean | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| Base, no remote | none | 1.89 ms | 1.66 ms | 2.82 ms | 6.99 ms |
+| This change, remote off | none | 1.70 ms | 1.52 ms | 2.35 ms | 4.31 ms |
+| This change, one client, focused | every 100 ms | 1.70 ms | 1.59 ms | 2.37 ms | 3.50 ms |
+| This change, stress | every 10 ms | 1.63 ms | 1.49 ms | 2.65 ms | 3.37 ms |
+
+The differences are within run-to-run noise. A copy held the emulator lock for 1.3-1.5 ms on average in this unoptimised
+build, waiting for the busy PTY thread included.
 
 The M1 demo is a native client: `cargo run -p atomics --example loopback_client` prints the board and the first diff
-file of a running app (`--follow` keeps printing). The decoder has a fuzz target:
-`cd crates/atomics-core && cargo +nightly fuzz run envelope_decode`; a seeded mutation test in `wire/tests.rs` runs
-in the normal suite.
+file of a running app (`--follow` keeps printing); `--screen SESSION` prints that session's terminal instead, and
+`--screen SESSION --type 'ls\r'` takes its lease, types, lets go and prints the screen until it settles.
+The decoder has a fuzz target: `cd crates/atomics-core && cargo +nightly fuzz run envelope_decode`; a seeded mutation
+test in `wire/tests.rs` runs in the normal suite.
+
+### Terminal input and leases
+
+Stream H3. A client that negotiated `input` (with `terminals`) may type into a screen it subscribes to, under that
+terminal's controller lease. The types and the reference client (`Typist`) are in `atomics_core::lease`; the host
+side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's runtime state) and
+`protocol/session.rs`.
+
+- **One holder, on request.** Subscribing never takes control. `lease_acquire {session}` takes a free lease; while
+  another client holds it, it fails with `lease_held` unless `takeover` is set, an explicit user action that ends
+  the other client's lease. Typing needs the screen: `not_found` until the client subscribes, and unsubscribing ends
+  the lease. A view-only client (`Role::Viewer`) never gets one. Loopback clients hold the bearer token, so they are
+  controllers.
+- **Everyone sees who types.** Every client that negotiated `input` and follows the screen gets a `lease_state`
+  whenever the lease changes hands or the holder's size comes or goes: `holder` (its `client_id`), `resized`, and
+  `reason` (`granted`, `taken_over`, `released`, `expired`, `disconnected` or `desktop`). Only the holder is told the
+  fencing token (`lease`), the `next` input number and `ttl_ms`. Each lease request is answered with a `lease_state`.
+- **Fencing.** Each grant takes a fencing token from one counter for the whole process, so tokens only go up and
+  never come back. A lease belongs to the connection that took it. It ends when it is released or taken over, after
+  30 s without input, a resize or a `lease_renew`, when its connection ends, or when someone types on the desktop.
+  Input, a resize, a renew or a release naming an ended lease gets `fenced` and is not applied. `fenced` and
+  `lease_held` never count towards disconnecting a client: one that races another meets them as a matter of course.
+- **Order, and no replay.** `seq` starts at 1 in each lease and must be the next one; a repeat or a gap gets
+  `out_of_order` and is not applied. The client's own thread writes admitted input to the PTY under the lease's lock,
+  so input admitted under an old lease can never land after a takeover. Nothing is replayed across a disconnect: the
+  replay ring holds no input, the lease ends with the connection, and a new connection cannot use the old token.
+  `Typist::disconnected` forgets the lease, so a client sends nothing it typed before or during the outage.
+- **Input.** `data` is UTF-8 text the client encoded from the screen's published modes, at most 64 KiB per frame
+  (`Typist` splits longer pastes at character boundaries); 8-bit meta bytes cannot be sent. Remote input does not
+  move the desktop's scrolled view.
+- **Resizing only when asked.** Taking the lease or typing never resizes. `terminal_resize` with a `size` ("fit to
+  this screen") resizes for the holder; without one it returns to the host's own size. The holder's size lasts as
+  long as its lease: however the lease ends, the terminal returns to the desktop's size (the pane's last size, or
+  the size it started with on the headless host). A desktop resize made in the meantime waits until then. Resizes
+  are debounced: at most one per 100 ms, and the latest one waiting is applied when that time has passed.
+- **The desktop** is not a lease holder and types as it always has. Typing into a terminal pane (`TerminalView`)
+  takes a remote client's lease back (`reason: desktop`), and with it any size the client set. Steering, ctl and MCP
+  writes leave the lease alone.
+- **Echo at once.** A keystroke is written as soon as its frame is read, and both ends set `TCP_NODELAY`. Input wakes
+  the screens thread, which copies the next change at once. For 200 ms after that, it copies changes at most 5 ms
+  apart and looks for them every 250 µs. Queueing the echo wakes the typing client's thread (see Protocol server), so
+  it leaves at once rather than at the next 25 ms read timeout. Other viewers get the same frames; their screens
+  keep the usual cadence once the window has passed.
+- **Remote off.** No thread and no socket. Every terminal has a `Lease` that is never held: the desktop's resize goes
+  through its uncontended lock, and its typing checks it with a single atomic load.
+- **Tests.** `protocol/lease.rs` covers every rule in isolation, with a fake clock. `protocol/input_tests.rs` checks
+  them over real loopback sockets with emulators that echo what they are sent: order, fencing, takeover seen by
+  everyone, expiry and renewal, no replay after a reconnect, resizing only when asked and restored when the lease
+  ends, debounced bursts, the desktop taking the lease back, capability, subscription and role, and an echo that does
+  not wait for a 5 s cadence. `app::host_tests` types into a real shell through the host while the `State` lock is
+  held. `terminal::tests` drives `TerminalView` to show that desktop typing still reaches the PTY and takes the lease
+  back. The headless gate (`tests/headless_host.rs`) types into a shell that ctl started. `protocol/link.rs` races
+  wakes against the wake pipe's drain and checks that a later wake still ends a wait at once.
+- **Not yet.** `holder` is the `client_id` the client chose; device names arrive with pairing (H5). Encoding mouse
+  reports and the clipboard opt-in is client work (C3, C4).
+
+Keystroke echo on loopback (2026-11-02, `protocol::echo_bench`, ignored by default; release build, shared 18-core
+machine). A real PTY runs `cat` in cooked mode, so the kernel echoes each key. A client on a loopback socket with
+`TCP_NODELAY` holds the lease and types one key per frame. Each sample is timed from just before the frame is sent
+until the client's `ScreenMirror` shows the echo. The server runs its production settings (100 ms focused cadence,
+25 ms read tick).
+
+| Path | p50 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| Remote, typing (300 keys, 60 ms apart) | 0.55 ms | 0.61 ms | 0.67 ms | 0.72 ms | 0.78 ms |
+| Remote, cold (100 keys, 400 ms apart) | 0.60 ms | 0.70 ms | 0.72 ms | 1.14 ms | 14.0 ms |
+| The host's PTY alone (write, then read the emulator) | 0.07 ms | 0.10 ms | 0.13 ms | 0.38 ms | 2.97 ms |
+| Desktop, in-app, frame cadence included (`2026-11-02-vm-display.md`) | 4.7 ms | | 12.3 ms | | |
+
+The protocol adds about 0.5 ms to the PTY's own echo: under the desktop's 4.7 ms p50, and far under its 12.3 ms p95.
+The single 14 ms cold sample came in the same run as the PTY's own 2.97 ms worst case, on a machine other agents
+were loading.
+The remote figures leave out the client's own paint; the desktop's include the app's frame cadence. A first version
+that polled every 1 ms on both the screens thread and the client's thread measured 2.67 ms p50. The wake pipe and the
+250 µs echo poll removed that. Debug builds measure about 1.1 ms.
+
+### Terminal painter
+
+Stream C3. `atomics_ui::terminal::paint` draws an `atomics_core::screen::Screen` with egui, and the desktop paints its
+terminals through it too, so a browser and the desktop draw the same cells the same way. It lives next to the
+`Palette` (S5) in `atomics-ui`, which builds for wasm32; `Palette::terminal_theme` gives it the colours drawn around
+and over the cells, and `Palette::dim` is the painter's own fade.
+
+- **Desktop path.** `TerminalView::paint` copies the cells it displays (`terminal/screen.rs` `view`: the screen at
+  the view's scroll offset, the theme's palette with the program's OSC colours, the cursor hidden when scrolled out
+  of view) under the emulator lock, releases it, then paints. The old painter held the lock while it laid out text.
+  The cells are copied again only when the terminal's revision, the scroll offset, the history length or the view's
+  rows changed; the palette is refreshed every frame. The alacritty selection becomes a `Selection` in screen rows.
+- **The desktop's look, kept exactly.** One monospace font (bold and italic not drawn), every underline style as one
+  thin line in the text colour, no strikeout, the theme's cursor colour (not OSC 12), and a solid cursor only when
+  focused. Two old quirks are kept on purpose: combining marks over an ASCII letter are not drawn (`e` + U+0301 shows
+  `e`), and a wide character split from its spacer by an erase is still drawn two columns wide with nothing on the
+  stray spacer (the desktop copy keeps alacritty's flags; the wire form normalises them).
+- **Parity checks.** `terminal/legacy_paint.rs` keeps the old painter for tests only. `terminal::paint_tests` paints
+  23 scenes (colours, attributes, TUI and alternate screen, wide and combining text, split wide characters, OSC
+  colours, wrapping, five cursor shapes, selections simple, reversed, block and by word, scrollback with and without
+  a selection) both ways at 1x and 2x, focused and not, in two themes, and requires equal shapes and equal
+  CPU-rasterised pixels; `ATOMICS_TERMINAL_SCREENSHOTS=<dir>` saves them. Real-app screenshots of four tiles (colours,
+  an alternate-screen TUI, wide and combining text, history) compared the base binary with this one: identical on
+  macOS (2880x1800) and Linux QA (Xvfb, 1440x900, with an XTEST drag selection and wheel scrollback) except for the
+  topbar's live load figure and one braille glyph that also differs between two runs of the base binary on macOS.
+
+Frame times (2026-11-02, `terminal::frame_bench`: 600 frames of a 163x50 pane, mean / p50 in ms; `busy` is a shell
+writing coloured lines flat out, `tui` a still full screen of styled cells and fills). Each painter runs alone in
+alternating blocks, as in the app; the bench also has them take turns frame by frame, where the old painter's long
+lock hold makes the PTY thread's backlog land on the next frame.
+
+| Build | busy, old | busy, shared | tui, old | tui, shared |
+| --- | --- | --- | --- | --- |
+| macOS, test profile | 1.16-1.21 / 1.15-1.19 | 1.04-1.05 / 1.02-1.03 | 2.28-2.31 / 2.10-2.27 | 1.95-1.97 / 1.87-1.91 |
+| macOS, release | 0.54-0.64 / 0.48-0.62 | 0.54-0.64 / 0.49-0.63 | 0.76-0.78 / 0.71-0.74 | 0.70-0.73 / 0.66-0.67 |
+| macOS, release, taking turns | 0.61 / 0.53 | 0.60 / 0.51 | 0.68 / 0.67 | 0.66 / 0.65 |
+| Linux QA container, test profile | 2.92-3.01 / 2.58-2.83 | 2.29-2.95 / 2.20-2.71 | 2.80-2.88 / 2.62-2.71 | 2.63-3.22 / 2.40-2.99 |
+
+The shared machine's load moves whole blocks (the release busy blocks swap places between rounds), and the Linux
+container (2 CPUs) is noisy in both directions. The changes to `attrs` also cut the remote screen copy (h2) from
+about 1.05 ms to 0.4 ms in the macOS test profile.
+
+## Headless host (`atomics host`)
+
+Phase F of `docs/decisions/2026-11-02-embedded-atomics.md`, brought forward so the host can run in the NixOS VM.
+`atomics host [-w WORKSPACE] [PROJECT]...` runs `host::Host` (the runtime thread, the local socket and, with
+`[remote] enabled = true`, the protocol thread above) with no window, egui, display or GPU. Plain `atomics` is the
+desktop exactly as before.
+
+- **Service construction without egui.** `State::build(options, window)` builds the runtime model and its services;
+  the runtime asks a window for repaints, focus and its size only through `host::Window`, an optional
+  `host::Surface`. The desktop's `State::new` attaches its `egui::Context` as that surface and applies the theme
+  to it; the headless host attaches none, so every repaint is a no-op and `ctl list` reports `window: null`.
+  `Host::start`, `ipc::serve`, the governor and the usage pollers take the `Window`, and runtime methods no longer
+  take an `egui::Context`. The palette is still loaded on the host for diff highlighting (moving it is slice S5).
+- **No client attached.** The runtime thread answers and drops client events nobody consumes (a screenshot
+  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with "no window";
+  `restart` is refused, since a service manager restarts the host. Notices the desktop shows as toasts go to stderr.
+- **One owner per home.** `instance.lock` in `ATOMICS_HOME`, by `flock`: the host holds it exclusively and records
+  its pid, and every desktop holds it shared. A host refuses a home a desktop or another host is using, and a desktop
+  refuses a home a host is using; desktops still start side by side (the second runs without the socket, as before).
+  The kernel drops the lock with the process; the file is close-on-exec, so agents never inherit it. A desktop whose
+  home cannot be locked at all (no `flock`) starts as it always has; a host refuses.
+- **Service manager friendly.** Foreground, logs on stderr (start, socket, config, the protocol address but never its
+  token, notices, stop). SIGTERM, SIGINT and SIGHUP (unless ignored) reach a self-pipe from a signal handler, not a
+  blocked mask, so agents inherit default signal handling. On the first one it removes the socket, stops the protocol
+  server (removing `protocol.json`) and the runtime thread, shuts down as the desktop does on quit (terminals, tickets,
+  sandboxes, the clean-exit record) and exits 0. A second signal takes the default action. It exits 1 rather than run
+  half-reachable: when the local socket cannot be served (nothing could reach the host), or when `[remote]` is enabled
+  and the protocol server cannot start. `Host::protocol_error` carries that start error out (the desktop still logs it
+  and carries on), the log names the configured port, and any stale `protocol.json` is removed.
+- **Tests.** `crates/atomics/tests/headless_host.rs` runs the binary with an isolated home and no `DISPLAY`: a shell
+  starts through ctl, a permission hook waits and gets the `allow` that ctl gives, a plan persists, a loopback
+  `atomics.v1` client sees the session and the plan, a second host and the desktop are refused, SIGTERM exits 0 with
+  the shell, socket and `protocol.json` gone and the token in no log, and the home can be hosted again. A second test
+  checks that with remote off there is no `protocol.json` and that `atomics mcp` still reaches the host; a third occupies the
+  `[remote]` port first and expects exit 1, an accurate log line, no advert or socket left, and a healthy host on that
+  port once it is free. `app::host_tests` checks the refusals and the drained client
+  events in process, and `instance::tests` the lock both ways.
+- **Not yet.** The desktop cannot attach to a running host as a client (phase 3). Terminals keep the size they
+  started with unless a lease holder asks for its own (H3), and are seen and typed into through ctl, MCP and
+  `atomics.v1` (H2, H3). The container profile stays in Phase F.
 
 ## Rendezvous
 
@@ -403,8 +625,8 @@ History Reopen persisted the open status. The QA process then exited cleanly.
 
 ### Remaining for phase 3
 
-- Start the host independently of the native window/creation context. Move egui
-  notification and style/viewport adapters out of native service construction.
+- Done: the host starts independently of the native window and creation context, and the egui
+  notification and style/viewport adapters are out of service construction (`atomics host`, above).
 - Replace the shared native model borrow and emulator reads with immutable,
   versioned client projections and terminal screen snapshots/deltas. Keep the
   native input/resize channel behind the protocol adapter, with control leases.

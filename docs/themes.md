@@ -150,8 +150,13 @@ different theme is a separate proposal of `[theme] name` in the `main` or `host`
 
 ## For developers
 
-UI code takes every color from `Palette` (crates/atomics/src/theme.rs). A test fails on `Color32` constants,
-gray and alpha helpers, or constructors with literal channels anywhere else in the atomics crate; derive a
-shade from tokens with `lerp` or `gamma_multiply` instead, or add a token. A new token needs a field in
+UI code takes every color from `Palette` (crates/atomics-ui/src/theme.rs). A test fails on `Color32` constants,
+gray and alpha helpers, or constructors with literal channels anywhere else in the atomics and atomics-ui crates;
+derive a shade from tokens with `lerp` or `gamma_multiply` instead, or add a token. A new token needs a field in
 `ThemeTokens` (crates/atomics-core/src/theme.rs) and its `color_tokens!` list, a value in each built-in theme,
 a `Palette` field, and a row in the table above; the tests check that the built-in themes set every token.
+
+The host keeps the resolved theme as `Theme` (crates/atomics/src/theme.rs): the tokens, the fonts they name and
+the checked syntax theme. Terminals answer color queries from it, and each client makes its own `Palette` from
+it. Finding a named font is the host's: `Palette::apply` hands the fonts to a `FontHook`, which on the desktop
+(`SystemFonts`) looks families up in the system's font list and reads font files off the UI thread.

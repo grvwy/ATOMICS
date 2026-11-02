@@ -86,12 +86,12 @@ are agent-days of focused work, review wait excluded. "C1"/"C2" are the design's
 | # | Slice | What moves | Est. | Stream |
 | --- | --- | --- | --- | --- |
 | **S0** | **Done in this change.** `atomics-ui` crate with `Backend`, `PlanRow`, `PlanState`, `DiffSnapshot` and the dependency test; `Local` in-process impl; plan tabs, top bar plan button and `sync_diffs` read through it; `Prepared`, `FileView`, `Span` moved to `atomics-core::diff_data` | ~400 lines | 1.5 | C1 |
-| S1 | Session list: `SessionRow` (id, title, status, kind, chief, branch, root, approval counts, worktree) read by `sidebar.rs` `session_row`, `fleet.rs`, `ungrouped_session`. Largest single read domain (475 uses): do it in three PRs by file | 3 PRs | 2 | C1 |
-| S2 | Board: `plan_panel` (`board.rs`, 89 reads) onto `BoardView` { plan, ready ids, session titles, integration notes, integrating, ticket config, board counts }. Plan header first, kanban columns second | 2 PRs | 2 | C2 |
-| S3 | Approvals and review comments: `approvals.rs` draw path onto `ApprovalRow`; comments on `DiffSnapshot` already | 1 PR | 1 | C2 |
+| **S1** | **Done** (4.2). Session list: `SessionRow` (id, title, status, kind, chief, branch, root, approval counts, worktree) read by `sidebar.rs` `session_row`, `fleet.rs`, `ungrouped_session`. Largest single read domain (475 uses): do it in three PRs by file | 3 PRs | 2 | C1 |
+| **S2** | **Done** (4.4). Board: `plan_panel` (`board.rs`, 89 reads) onto `BoardView` { plan, ready ids, session titles, integration notes, integrating, ticket config, board counts }. Plan header first, kanban columns second | 2 PRs | 2 | C2 |
+| **S3** | **Done** (4.4). Approvals and review comments: `approvals.rs` draw path onto `ApprovalRow`; comments on `DiffSnapshot` already | 1 PR | 1 | C2 |
 | S4 | Ticket panels: `tickets_panel.rs` (3,093 lines) onto `TicketsView`. Split by panel (tree, find, sign-in) | 3 PRs | 2.5 | C2 |
-| S5 | `Palette` (egui colors and fonts) out of `State`: the web crate owns `Palette`; `fontique` lookup stays a desktop hook that supplies the fonts (`theme::FontSource` already names a font in the config). `config.keys` and `layout` are already core | 1–2 PRs | 1.5 | C1 |
-| S6 | Move the files that read nothing from `runtime`: `diff_view.rs`, `panel_nav.rs`, `markdown.rs`, `topbar` helpers into `atomics-ui` (adds `egui` with default features off). Needs S5 for `Palette` | 1 PR | 1.5 | C1 |
+| **S5** | **Done** (4.3). `Palette` (egui colors and fonts) out of `State`: the web crate owns `Palette`; `fontique` lookup stays a desktop hook that supplies the fonts (`theme::FontSource` already names a font in the config). `config.keys` and `layout` are already core | 1–2 PRs | 1.5 | C1 |
+| **S6** | **Done** (4.5). Move the files that read nothing from `runtime`: `diff_view.rs`, `panel_nav.rs`, `markdown.rs`, `topbar` helpers into `atomics-ui` (adds `egui` with default features off). Needs S5 for `Palette` | 1 PR | 1.5 | C1 |
 | S7 | Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus | 8–10 PRs | 5 | C1 |
 | S8 | Writes: `Command` enum and `Backend::send`, domain by domain, replacing `post` closures (50 sites) and the direct `runtime.*` view-hint writes | 5 PRs | 3 | H4 / C1 |
 | S9 | `atomics-ui` builds for `wasm32-unknown-unknown` in CI (`cargo check --target`), eframe web entry point `atomics-web` | 1 PR | 1.5 | C5 |
@@ -103,7 +103,9 @@ Risks: S7 is where merge conflicts with `main` concentrate (draw functions chang
 `main` first each time, and announce large UI changes on `main` early. S4 and `github.rs` carry the most
 stateful view code; they may need a `ViewState` struct per panel before they move.
 
-## 4. What S0 changed, exactly
+## 4. What each slice changed, exactly
+
+### 4.1 S0
 
 - `atomics-core/src/diff_data.rs`: `Span`, `Spans`, `FileHighlights`, `Prepared`, `FileView` (were in `highlight.rs` and
   `diff_worker.rs`, which re-export them, so nothing else changed).
@@ -113,12 +115,102 @@ stateful view code; they may need a `ViewState` struct per panel before they mov
   `urgent_navigation_width`, `view_tabs`, `view_tab`), `topbar.rs` (plan button) and `sync_diffs` read through it.
   `board.rs` is **not** moved yet: it is S2. The plan list is read once per call, and per tab for `view_tab`.
 
+### 4.2 S1
+
+Three commits, one per file group; no existing test changed:
+
+- `atomics-ui`: `SessionRow` and `Backend::session_list` / `session_row`, addressed by position like plans. Beyond the
+  list above, a row carries what the draw code reads: `agent`, `project` (the host's `project_of`, which a browser cannot
+  compute), `ungrouped` (the host's `ungrouped_session`), `scratch`, `sandbox`, `outside` (no terminal in ATOMICS) and
+  `changes` (the root's diff counts). Approval counts are `pending_approvals` and `held_messages`. The worktree is its
+  root path: `atomics_core::git` is native-only.
+- `app/backend.rs`: `Local` builds the rows; `session_rows_follow_the_model` checks the mapping.
+- `sidebar.rs`: `session_row` draws a `SessionRow`; the All, Ungrouped and project counts, the Repos change total and the
+  explorer (agent counts, worktree dots and pick) read rows.
+- `fleet.rs`: the tab strip and the tile headers read rows.
+
+`ungrouped_session` stays on `State` as the host's rule; the draw code reads it as `SessionRow::ungrouped`. Still on
+the model, on purpose: `State::visible_sessions`, `show_ungrouped`, `set_view`, `completed_tasks` and `close_idle`
+(runtime logic, also used by `control.rs`; the view filter moves with `Client` in S7); the tile body (approval banner: S3; MCP banner; the terminal and the outside-ATOMICS transcript: C3); the tile
+subtitle's slot-queue note (needs the terminal's process id); the close and resume handling (writes: S8); the RECENT
+list's claude ids (the store's domain).
+
+### 4.3 S5
+
+One commit; the existing theme tests moved with the code they test, nothing else changed:
+
+- `atomics-ui` depends on `egui` (default features off, `default_fonts` on: a browser needs egui's fonts behind a
+  theme's for missing glyphs). `atomics-ui::theme` holds `Palette` (now built by `Palette::new(&ThemeTokens, Fonts)`),
+  its style, the theme preview, `lerp` and `parse_hex`, and `FontSource` / `Fonts`. Finding a font is a hook:
+  `Palette::apply(ctx, &dyn FontHook)`, and `definitions(ui, mono, load)` puts found faces in front of egui's.
+- Desktop `theme.rs`: `Theme`, the host's theme free of egui: resolved tokens, the fonts they name (paths parsed
+  against the themes folder, `~` expanded) and the syntax theme checked against the highlighter. It gives
+  terminals their colors (`terminal_colors`, OSC 4/10/11/12) and agents `COLORFGBG`, and makes a `Palette`.
+  `theme/fonts.rs` is the desktop hook, `SystemFonts`: fontique and font files, off the UI thread, as before.
+- `State` holds `theme: Arc<Theme>` instead of `palette: Arc<Palette>`; a proposed theme's preview is a `Theme`
+  too. The client makes its palette from the host's theme and makes it again when that `Arc` changes
+  (`Desktop::palette()`); `ConfigChanged` applies it to egui as before.
+- `atomics_core::theme::xterm_color` holds the xterm 256-color cube and grays, so the host's OSC answers and the
+  painter read the same colors; `terminals_answer_the_colors_the_painter_draws` checks both agree for every theme.
+- The color-literal test scans `atomics-ui` too.
+
+Checked with screenshots of the same scene before and after, on macOS and Linux (Xvfb), for the built-in claude
+theme and for a light theme file with an installed family for UI text, a font file for monospace and a larger
+`ui_size`; the shell prints glyphs neither font has.
+
+### 4.4 S2 and S3
+
+Four commits, the board's header before its columns; no existing test changed:
+
+- `atomics-ui`: `BoardView` and `Backend::board(index)`, addressed by plan position. The plan comes whole (`Plan` is
+  browser-safe), so the board still works out from it what the plan alone decides: counts, stages, dependencies, the
+  ticket mode and the "ticket says" labels. Beside it come the list above (`ready` in plan order; `sessions` as title
+  and status by id; `integration_notes` as note and whether its check runs; `integrating` as this plan's task ids;
+  `board_counts` as the board's tickets and those without a task), plus `state` (the goal's color) and `checking`
+  (an integration check of the plan runs). `ApprovalRow` { session, id, request } and `Backend::session_approval(index)`:
+  the first request a session waits on, which is what its banner shows, with `ApprovalRequest` as it is.
+- `app/backend.rs`: `Local` builds both; `boards_and_approvals_follow_the_model` checks the mapping.
+- `board.rs`: `plan_panel` reads the selected plan's `BoardView` once per frame, the header first, then the kanban
+  columns. Its writes still go through `post_plan`, addressed by the index it read.
+- `fleet.rs`: the tile's approval banner reads the session's `ApprovalRow`. `approvals.rs` holds no draw code (it is
+  the host's approval logic), so the banner is the approvals draw path. Review comments already reach the diff panel
+  on `DiffSnapshot` (S0).
+
+Still on the model, on purpose: `task_result` (shared with the completed-task tiles; it reads `config` for a Codex
+resume and checks the task's worktree on disk, so it moves with the tiles in S7); the `plan_edit_open` and `panel`
+writes and `task_action`, `open_plan_cleanup` and `activate` (S8). The palette is the client's since S5
+(`Desktop::palette()`). A shape dump of the board and the banner (open, unapproved, completed and archived plans,
+board and ticket mode, two widths; Bash, Azure and pending decisions) was byte-identical before and after.
+
+### 4.5 S6
+
+One commit; the tests moved with the code they test, nothing else changed:
+
+- `atomics-ui` holds `diff_view` (the diff panel: `DiffState`, `ExplorerState`, `DiffAction`, `Header`, `show`),
+  `panel_nav` (the keyboard focus and row scrolling that the diff, the Tickets panel and the trace lane share),
+  `markdown` (the ticket text reader), `keys` (the chord helpers `shortcut`, `shortcut_label`, `consume_chord`,
+  `consume_physical_shortcut`, `is_app_chord` and `is_digit`, which were in the desktop's `theme.rs`; the diff
+  header labels its editor shortcut with them) and `topbar` (`measure`, `slot`). `egui` came in with S5.
+- The desktop imports the three modules at its crate root (`use atomics_ui::{diff_view, markdown, panel_nav}`), so
+  every `crate::diff_view::…` path in it reads as before; `theme.rs` re-exports the chord helpers and
+  `app/topbar.rs` the two layout helpers.
+- `topbar::record_item` stays in the desktop: it records where items were drawn only in the desktop's own test
+  build (`cfg(test)`), which code in another crate cannot see.
+- The wasm32 check of `atomics-ui`, the dependency test and the color-literal scan (which reads `atomics-ui/src`)
+  pass unchanged.
+
+Checked with screenshots before and after on macOS and Linux (Xvfb): a changed and a new Rust file with a review
+comment, and on macOS also an unchanged file's whole-file view. The diff panel is identical pixel for pixel; the
+rest of the window differs only where two runs of the same build differ too (the load gauge, terminal text).
+
 ## 5. The dependency test
 
 `crates/atomics-ui/tests/dependencies.rs` runs `cargo tree --locked -p atomics-ui` for the host target and for
 `wasm32-unknown-unknown` (metadata only, so no wasm toolchain is needed) and fails if the tree contains `atomics`,
 `syntect`, `onig`, `two-face`, `alacritty_terminal`, `cpal`, `rfd`, `notify`, `ureq`, `fontique`, `ring`, `tempfile`,
-`dirs` or `libc`, or if `atomics-core` is present with its `native` feature. A second test checks the list against
+`dirs` or `libc`, or if `atomics-core` is present with its `native` feature. One exception, on the host target
+only: egui's locks (`parking_lot_core`) use `libc` on Unix, so the host tree may reach `libc` through them and
+nothing else; the wasm32 tree may not contain it at all. A second test checks the list against
 `atomics`'s own tree so a rename of a crate cannot make the first test vacuous. Add a crate to the list when the web
 crate's reviewers find another one the browser cannot use.
 

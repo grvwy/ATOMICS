@@ -595,7 +595,7 @@ three pre-existing stock images: `docker/sandbox-templates:claude-code-docker` (
 
 ## Linux warm folders
 
-On Linux, ATOMICS explicitly mounts existing directories from `[worktrees] warm` read-write, at the
+On Linux, ATOMICS explicitly mounts existing directories matched by `[worktrees] warm` read-write, at the
 same paths inside the sandbox. These are the worktree's independent reflink copies, so one task does
 not modify another worktree's cache. Missing directories, absolute paths, parent traversal, `.git`
 components and symlinks are skipped, so in a main checkout they sit beside its read-only `.git`, never in

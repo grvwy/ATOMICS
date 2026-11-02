@@ -80,7 +80,7 @@ stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved
 | Key | Type | Meaning |
 | --- | --- | --- |
 | `base_ref` | string | Base ref for project diffs, worktrees, branch guards, integration and cleanup. |
-| `worktrees.warm` | array of strings | Relative cache folders to clone from the main checkout when creating worktrees. Existing path and CoW safeguards apply. |
+| `worktrees.warm` | array of strings | Relative cache folders or glob patterns to expand in the main checkout and clone into new worktrees. `*` matches one path component; `**` matches directory levels. Existing path and CoW safeguards apply. |
 | `tickets.branch` | string | Branch template; overrides the workspace's `[tickets] branch` for this project. |
 | `pr_title` | string | PR title template hint for agents, conventionally `{key}` and `{title}`. ATOMICS does not create PRs or expand this hint. |
 | `test_commands`, `qa_commands` | arrays of strings | Command hints passed to agents. ATOMICS never executes them. |

@@ -9,10 +9,7 @@ Codex and shells side by side, each in its own git worktree. Click any agent's t
 against main, comment on lines, and send the review straight to the agent while it keeps working. Or let an
 orchestrating agent plan the work, hand out tasks and review the results while you approve and steer.
 
-An open-source atomisk.ai project. The name nods to Atom, the editor, and to ATOMISK. ATOMICS was called IMACS
-until v0.9: the first command you run (the app, setup, doctor) moves `~/.imacs`, `~/.local/state/imacs` and `~/.config/imacs` to their ATOMICS places,
-keeps reading the `imacs-credentials-v1` keychain item until it saves the new one, honors `IMACS_HOME`, `IMACS_CONFIG`
-and `IMACS_SOCKET`, and reads a repository's `IMACS.md` and `.imacs/` until it has `ATOMICS.md` and `.atomics/`.
+An open-source project.
 
 The command is `atomics`. `scripts/macos-app.sh` builds ATOMICS.app for the Dock; `scripts/linux-install.sh` installs
 the Linux desktop app. State stays in `~/.atomics` on macOS and existing installs; new Linux installs use
@@ -126,6 +123,50 @@ embedded fallback fonts, so the UI and terminal do not require macOS fonts; syst
 Vulkan driver (for example Mesa's `mesa-vulkan-drivers`) supports the default wgpu renderer. File dialogs use the desktop
 portal and external files open through `xdg-open` (`xdg-utils`).
 
+### NixOS
+
+The flake provides `packages.aarch64-linux.atomics` and `packages.x86_64-linux.atomics` from the workspace
+`Cargo.lock`. Install it and set the ATOMICS config for the machine with the NixOS module:
+
+```nix
+{
+  inputs.atomics.url = "github:xmagit/ATOMICS";
+  outputs = { nixpkgs, atomics, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "aarch64-linux";
+      modules = [
+        atomics.nixosModules.atomics
+        {
+          users.users.alice.isNormalUser = true;
+          programs.atomics.enable = true;
+          programs.atomics.user = "alice";
+          programs.atomics.settings = {
+            base_ref = "main";
+            layout.diff_split = "auto";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+`programs.atomics.package` overrides the installed package. When `programs.atomics.settings` is non-empty,
+`programs.atomics.user` must name an existing NixOS user. The settings seed that user's
+`~/.config/atomics/config.toml` only if it is missing; subsequent edits and `config.d/<host>.toml` stay in the
+writable config folder. With empty settings, the module does not create or replace a config file.
+The package puts the `atomics` CLI on PATH for
+hooks and MCP, and wraps the binary with its Wayland, X11, Vulkan, Mesa, font and audio libraries. A working
+GPU Vulkan driver and desktop session are still required for the accelerated UI. Run `nix flake check` to
+evaluate the sample NixOS configuration and build the package on supported Linux builders.
+
+For the headless Apple Silicon VZ guest with Rosetta, Docker, btrfs and the development toolchains,
+see [the NixOS VM setup](docs/nixos-vm.md). Its Lima profile allocates 4 vCPU, 8 GiB RAM and 100 GiB disk by
+default; `atomics.vm.cpus`, `memoryGiB` and `diskGiB` change that, and `atomics.vm.user` (default `atomics`) names
+the VM's user. Stacks beyond the base, such as the example .NET and Azure DevOps module, are opt-in modules.
+ATOMICS stays native on the Mac (Metal) and starts its agents and chief in the guest over ssh; the
+flake's `atomics-vm-mac` bundle holds the Mac's wrappers, socket forward and config snippet.
+
 The config is created on first start at `${XDG_CONFIG_HOME:-~/.config}/atomics/config.toml`. It is commented and reloads while ATOMICS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
 steering. `[github]` lists extra repositories and GitHub Enterprise hosts, picks what the counter counts
@@ -139,6 +180,56 @@ temporary directory. Existing `~/.atomics` installs retain their state and socke
 `ATOMICS_HOME` always overrides the state path and keeps the socket beside that state; `ATOMICS_SOCKET` overrides just the
 socket, and `ATOMICS_CONFIG` overrides the config file. Runtime FIFO paths are distinct for each state home. Empty or relative
 XDG paths are ignored. The earlier `~/.cox` and config rename migration still runs without overwriting existing state.
+
+### Upgrading from IMACS
+
+ATOMICS was called IMACS before v0.9. The first command you run (the app, setup or doctor) moves `~/.imacs`,
+`~/.local/state/imacs` and `~/.config/imacs` to their ATOMICS places without overwriting anything. Until you move
+them yourself, ATOMICS honors `IMACS_HOME`, `IMACS_CONFIG` and `IMACS_SOCKET`, keeps reading the old keychain item
+until it saves the new one, and reads a repository's `IMACS.md` and `.imacs/` while it has no `ATOMICS.md` or
+`.atomics/`.
+
+### Headless host
+
+`atomics host` runs the same runtime with no window, egui, display or GPU, for a VM or a server. Agents run in their
+terminals, and hooks, `atomics ctl` and `atomics mcp` reach the host through its local socket with no client attached.
+With `[remote] enabled = true` it also serves the `atomics.v1` protocol ([docs/daemon.md](docs/daemon.md#headless-host-atomics-host)),
+and `cargo run -p atomics --example loopback_client` prints its board. With remote off there is no protocol thread or port.
+
+```sh
+atomics host                        # the projects of the last session, or the launch folder
+atomics host -w daily ~/repos/app   # a workspace and a project, as for the desktop
+```
+
+`host` is a subcommand, so `atomics host` no longer opens a folder named `./host` in the desktop; `atomics -- host`
+(or `atomics ./host`) still does.
+
+It stays in the foreground and logs to stderr: startup, the protocol address, the notices the desktop would show, and
+shutdown. The protocol token is only in `protocol.json` (mode 0600), never in the log. SIGTERM, SIGINT or SIGHUP stops
+it cleanly: the socket goes first, agents stop as they do when the desktop quits, `protocol.json` is removed and it
+exits 0. A second signal ends it at once. It exits 1 instead of running half-reachable: when the local socket cannot be
+served, or when `[remote]` is enabled and the protocol server cannot start (a taken `port`, say). The log then says why.
+
+A host owns its `ATOMICS_HOME`. It holds `instance.lock` there exclusively, and every desktop holds it shared: a host
+does not start while a desktop uses that home, a desktop does not start while a host does, and desktops still start
+side by side as before. Requests only a window can serve (`screenshot`, `resize`, `show_settings`) return an error, and
+`restart` is left to the service manager. The desktop cannot attach to a running host yet; that is phase 3 of
+[docs/daemon.md](docs/daemon.md). A systemd user unit (use the installed binary's absolute path):
+
+```ini
+[Unit]
+Description=ATOMICS headless host
+
+[Service]
+ExecStart=%h/.local/bin/atomics host
+# SIGTERM to the host alone; it stops its agents itself, and anything left gets SIGKILL after the timeout.
+KillMode=mixed
+TimeoutStopSec=60
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
 
 ### Restart onto a new build
 
@@ -322,9 +413,10 @@ failed or timed-out probes are retried on the next start.
 On the first Codex launch from an ATOMICS install, review and trust the ATOMICS hooks in Codex's
 startup prompt (or `/hooks`). Their definitions stay identical across panes, so this is a
 one-time step until the install path, socket or hook definitions change. Repository hooks keep
-their own trust review; ATOMICS never bypasses hook trust. Codex sessions with hooks run with
-`--no-daemon`, so a hook's process ancestry identifies its terminal reliably. `SessionStart`
-maps the Codex session ID to that pane, including when several panes share a worktree.
+their own trust review; ATOMICS never bypasses hook trust. Each Codex session gets its pane in
+`ATOMICS_HOOK_PANE`, which its hooks inherit, so it is found even through a wrapper such as ssh into
+a VM; without it, a hook's process ancestry identifies the terminal (Codex runs with `--no-daemon`).
+`SessionStart` maps the Codex session ID to that pane, including when several panes share a worktree.
 `atomics doctor` prints the trust instructions. To make Claude sessions in any other terminal show up too
 (status, diff, and messages delivered at their next tool call or turn end), add the hooks to your user settings:
 
@@ -397,8 +489,9 @@ prompt hook. ATOMICS retries unconfirmed input and returns an error if delivery 
 another message cannot replace a send still awaiting confirmation.
 
 Agent terminals inherit no `ATOMICS_SOCKET`, `ATOMICS_PANE`, `ATOMICS_HOME` or `ATOMICS_CONFIG`.
-Codex hooks receive the socket as an argument and find their pane from process ancestry or
-the mapped Codex session ID; Claude hooks receive socket and pane arguments. MCP servers receive
+Codex hooks receive the socket as an argument and their pane in `ATOMICS_HOOK_PANE`, which ATOMICS
+sets for that session only (a terminal never inherits another's), then use the mapped Codex session
+ID; Claude hooks receive socket and pane arguments. MCP servers receive
 their own routing environment. An ATOMICS launched from an agent therefore uses its own defaults; explicitly set
 `ATOMICS_HOME`, `ATOMICS_SOCKET` and `ATOMICS_CONFIG` when launching a separate test instance.
 An explicit `ATOMICS_HOME` also gives bare agents their own `CODEX_HOME` (`<home>/codex`) and
@@ -598,10 +691,17 @@ that it removes afterwards.
 
 ```toml
 [worktrees]
-warm = ["target"]          # existing folders relative to the repository root; nested paths also work
+warm = ["target"]          # existing folders relative to the repository root
+# warm = ["src/**/bin", "src/**/obj"] # .NET caches at any depth
 # warm = ["target", "build/cache"]
 # warm = []               # turn cache warming off
 ```
+
+Entries may use glob patterns: `*` matches within one path component and `**` matches directory levels,
+including zero levels. Patterns expand against existing directories in the main checkout. Invalid patterns,
+absolute paths, parent traversal, `.git` directories and symlinked directories are skipped. On Linux, the
+expanded directories are also mounted read-write in the agent sandbox. For .NET repositories with many
+project folders, `src/**/bin` and `src/**/obj` warm each project's build outputs independently.
 
 Measured once per configuration on this Mac (APFS, 2026-10-29), with sccache disabled. ATOMICS itself created and
 launched both agent worktrees at revision `63dcfd1`, using separate isolated instances with their own
