@@ -186,6 +186,64 @@ Terminal contents, diffs, prompts and reports are private data; use no-store res
 The Unix socket stays private to the host user with a mode-0700 parent and mode-0600 socket.
 Agent hooks and MCP use that socket inside the user's environment; do not publish it through ingress.
 
+## Rendezvous
+
+Specification only; no code yet (stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-7).
+The rendezvous lets a browser reach a host that cannot accept inbound connections. The host dials out to a
+broker; a browser dials the same broker; the broker pairs the sockets and relays opaque frames. The protocol
+above (`atomics.v1`) runs unchanged inside an end-to-end encrypted channel, so the broker is never a protocol peer.
+Nothing here names a product: the broker, the profile operations and the pass format belong to the deployment.
+
+**Roles.** Host (this program, off by default), broker (untrusted relay of bytes), client (browser).
+
+**Frames on the broker socket.** Binary WebSocket messages with a small plaintext header `{kind, channel}`:
+`data` carries one Noise transport message; `ctrl` carries broker hints. The broker assigns each browser
+connection a `channel` and tells the host `joined(channel)` and `left(channel)`. Those hints are untrusted:
+a forged `joined` produces a failed handshake and nothing else. One Noise session per channel; a channel
+is closed on any authentication failure.
+
+**Host identity and admission.**
+1. The host keeps an Ed25519 signing key and an X25519 Noise static key in the OS credential store, never in plaintext.
+2. *Register* (a profile operation over the user's existing authenticated connection) sends both public keys, a
+   display name and the protocol major. The deployment binds the `host_id` to the human the connection acts for,
+   and refuses a connection with no human owner.
+3. *Pass*: to dial, the host asks for a pass with its `host_id` and a signature over a fresh server nonce. A pass is
+   single use and lives about five minutes. It goes in the upgrade's `Authorization` header, never the URL.
+4. A browser obtains a single-use connect ticket (about 30 seconds, bound to user, host and session) from the
+   deployment's web tier and presents it in `Sec-WebSocket-Protocol`. The broker never reads a session cookie;
+   it verifies the exact `Origin` and re-checks the session behind each channel about every minute.
+5. Revoking the connection, deleting the host or rotating its device key stops new passes; the broker closes the
+   host's sockets within a pass lifetime.
+
+**Pairing.** The host shows a QR code and a link whose *fragment* is `<v>.<host_id>.<host_noise_pubkey>.<psk>`;
+fragments are never sent to a server. The `psk` is single use, expires in five minutes, and only one pairing is
+open at a time. Both screens then show a six-digit code derived from the handshake hash; the user confirms they
+match on the host before the device is added to the allowlist. A device may be added view-only.
+
+**Handshake.** First pairing: `Noise_IKpsk2_25519_ChaChaPoly_SHA256`, the browser as initiator. Known devices:
+`Noise_IK_25519_ChaChaPoly_SHA256`, with the browser key looked up in the host allowlist. The prologue binds
+`atomics.v1`, the protocol major and `host_id`. Before authentication the host parses only a bounded Noise message,
+never JSON. Rekey every 1 GiB or hour. After the handshake the first plaintext frame is `hello` (see Client
+protocol), and `welcome` decides replay or reset from the epoch and cursor as in Reconnect.
+
+**Limits (broker enforces bytes and time; the host enforces meaning).**
+Frame at most 256 KiB (`wire::MAX_FRAME_BYTES`), a per-channel send buffer of 1 MiB closed after 10 s full,
+sustained 2 MiB/s per host with an 8 MiB burst, ping every 25 s with a 60 s idle close, and per-user quotas on hosts
+and channels. The broker cannot read frames, so it cannot supersede screen deltas: the host applies the queue
+policy from Terminal streaming before encrypting, and a closed slow channel reconnects to a fresh snapshot.
+Close codes are typed: `unauthorised`, `revoked`, `slow`, `replaced`, `quota`.
+
+**Reconnect.** Jittered backoff. A dropped broker socket detaches channels without touching sessions. The host
+redials with a fresh pass; each browser reconnects, handshakes again and sends `hello` with its prior epoch and
+cursor. Handshake state is never resumed across sockets.
+
+**What the broker sees.** The user, host ID and display name, online state and times, source addresses, channel
+numbers, frame sizes and timing, and public keys. It cannot read terminal contents, diffs, paths, plans, approvals,
+or which device holds a lease, and cannot forge, replay or reorder frames; it can drop, delay or cut them.
+
+**Out of scope here.** Serving the client code (its integrity is the deployment's trust boundary), a fallback
+pairing without an authenticated connection, non-extractable browser keys, and routing between broker replicas.
+
 ## Container state and credentials
 
 Run one non-root host per user/pod with a stable UID and no display server, GPU or Docker socket.
