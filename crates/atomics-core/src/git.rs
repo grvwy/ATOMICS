@@ -910,8 +910,16 @@ pub fn warm_worktree(repo: &Path, worktree: &Path, folders: &[String]) -> bool {
     warmed
 }
 
+/// How many folder levels below the checkout `[worktrees] warm` patterns look; a deeper folder is
+/// never matched. It bounds the walks `**` makes.
+pub const MAX_WARM_DEPTH: usize = 8;
+/// How many folders `[worktrees] warm` patterns match in all; later matches are left out.
+pub const MAX_WARM_MATCHES: usize = 256;
+
 /// Expand configured cache directories without walking through symlinks or Git metadata.
-/// Paths remain relative so callers can apply them to a different worktree.
+/// Paths remain relative so callers can apply them to a different worktree. A walk stops at
+/// [`MAX_WARM_DEPTH`] and [`MAX_WARM_MATCHES`], and never descends into a folder it matched:
+/// that folder is cloned or mounted whole.
 pub fn expand_warm_folders(root: &Path, folders: &[String]) -> Vec<PathBuf> {
     let mut matches = Vec::new();
     for folder in folders {
@@ -930,42 +938,78 @@ pub fn expand_warm_folders(root: &Path, folders: &[String]) -> Vec<PathBuf> {
             continue;
         };
         let mut found = Vec::new();
-        expand_warm_pattern(root, Path::new(""), &parts, 0, &mut found);
+        let mut walk =
+            WarmWalk { parts: &parts, budget: MAX_WARM_MATCHES - matches.len(), found: &mut found, truncated: false };
+        walk.expand(root, Path::new(""), 0);
+        let truncated = walk.truncated;
         found.sort();
         for path in found {
             if !matches.contains(&path) {
                 matches.push(path);
             }
         }
+        if truncated {
+            eprintln!(
+                "ATOMICS: [worktrees] warm matches more than {MAX_WARM_MATCHES} folders; the first {MAX_WARM_MATCHES} \
+                 are warmed and the rest start cold"
+            );
+            break;
+        }
     }
     matches
 }
 
-fn expand_warm_pattern(root: &Path, relative: &Path, parts: &[Pattern], index: usize, matches: &mut Vec<PathBuf>) {
-    if index == parts.len() {
-        if !relative.as_os_str().is_empty() {
-            matches.push(relative.to_path_buf());
+/// One pattern's walk: its components, the matches it may still add, and what it found.
+struct WarmWalk<'a> {
+    parts: &'a [Pattern],
+    budget: usize,
+    found: &'a mut Vec<PathBuf>,
+    /// A match was left out for want of budget.
+    truncated: bool,
+}
+
+impl WarmWalk<'_> {
+    fn expand(&mut self, root: &Path, relative: &Path, index: usize) {
+        if self.truncated {
+            return;
         }
-        return;
-    }
-    if parts[index].as_str() == "**" {
-        expand_warm_pattern(root, relative, parts, index + 1, matches);
-    }
-    let Ok(entries) = std::fs::read_dir(root.join(relative)) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name == ".git" || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
+        if index == self.parts.len() {
+            if relative.as_os_str().is_empty() || self.found.iter().any(|f| f == relative) {
+                return;
+            }
+            if self.budget == 0 {
+                self.truncated = true;
+                return;
+            }
+            self.found.push(relative.to_path_buf());
+            self.budget -= 1;
+            return;
         }
-        if parts[index].as_str() == "**" || parts[index].matches(&name.to_string_lossy()) {
-            let child = relative.join(name);
-            expand_warm_pattern(
-                root,
-                &child,
-                parts,
-                if parts[index].as_str() == "**" { index } else { index + 1 },
-                matches,
-            );
+        let any_depth = self.parts[index].as_str() == "**";
+        if any_depth {
+            self.expand(root, relative, index + 1);
+        }
+        if relative.components().count() >= MAX_WARM_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(root.join(relative)) else { return };
+        let mut names: Vec<_> = entries
+            .flatten()
+            .filter(|entry| entry.file_name() != ".git" && entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.file_name())
+            .collect();
+        // In name order, so which folders a full walk keeps does not depend on the filesystem.
+        names.sort();
+        for name in names {
+            if !any_depth && !self.parts[index].matches(&name.to_string_lossy()) {
+                continue;
+            }
+            let child = relative.join(&name);
+            // A matched folder is taken whole; nothing below it is a separate match.
+            if self.found.iter().any(|f| child.starts_with(f)) {
+                continue;
+            }
+            self.expand(root, &child, if any_depth { index } else { index + 1 });
         }
     }
 }
@@ -1833,6 +1877,31 @@ pub(crate) mod tests {
             expand_warm_folders(root, &["src/**/bin".into(), "src/linked/bin".into(), "src/real/linked-bin".into()]),
             [PathBuf::from("src/real/bin")]
         );
+    }
+
+    #[test]
+    fn warm_globs_stop_at_their_depth_and_match_count_and_take_a_matched_folder_whole() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path();
+        let deep = (1..=MAX_WARM_DEPTH).map(|n| format!("d{n}")).collect::<Vec<_>>().join("/");
+        std::fs::create_dir_all(root.join(&deep).join("cache/below")).unwrap();
+        std::fs::create_dir_all(root.join("app/cache/nested/cache")).unwrap();
+        // `d1/…/d7/cache` is at the deepest level a pattern reaches; `d1/…/d8/cache` is below it.
+        let shallow = (1..MAX_WARM_DEPTH).map(|n| format!("d{n}")).collect::<Vec<_>>().join("/");
+        std::fs::create_dir_all(root.join(&shallow).join("cache")).unwrap();
+        assert_eq!(
+            expand_warm_folders(root, &["**/cache".into()]),
+            [PathBuf::from("app/cache"), Path::new(&shallow).join("cache")]
+        );
+
+        let many = MAX_WARM_MATCHES + 4;
+        for n in 0..many {
+            std::fs::create_dir_all(root.join(format!("pkgs/p{n:03}/obj"))).unwrap();
+        }
+        let found = expand_warm_folders(root, &["pkgs/*/obj".into(), "app/cache".into()]);
+        assert_eq!(found.len(), MAX_WARM_MATCHES);
+        assert_eq!(found[0], PathBuf::from("pkgs/p000/obj"));
+        assert!(!found.contains(&PathBuf::from("app/cache")), "patterns after the limit are not walked");
     }
 
     #[test]

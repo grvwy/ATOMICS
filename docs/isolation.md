@@ -599,7 +599,8 @@ On Linux, ATOMICS explicitly mounts existing directories matched by `[worktrees]
 same paths inside the sandbox. These are the worktree's independent reflink copies, so one task does
 not modify another worktree's cache. Missing directories, absolute paths, parent traversal, `.git`
 components and symlinks are skipped, so in a main checkout they sit beside its read-only `.git`, never in
-it. On macOS these mounts are omitted: its compiled artifacts are incompatible with the Linux VM. Other
+it. As for cloning, patterns look at most 8 levels deep and mount at most 256 folders
+([`worktrees.warm`](repo-workflow.md)). On macOS these mounts are omitted: its compiled artifacts are incompatible with the Linux VM. Other
 configured host mounts stay read-only.
 
 When `target` is a warm folder, `CARGO_TARGET_DIR` points to the worktree's `target`, overriding a

@@ -22,6 +22,8 @@ const DESKTOP_ONLY: &[&str] = &[
     "tempfile",
     "dirs",
     "libc",
+    // Warm-folder patterns are matched on the host only.
+    "glob",
 ];
 
 /// Desktop-only crates the host target may still reach, and the only crates allowed to depend on them there.
