@@ -14,6 +14,7 @@ use atomics_core::projection::{
 };
 
 use super::State;
+use crate::protocol::{TerminalEntry, Terminals};
 
 /// Diff summaries already built, by worktree and the diff revision they were built from, so an
 /// unchanged diff is not walked again on every runtime pass.
@@ -55,6 +56,28 @@ fn text(path: &std::path::Path) -> String {
 }
 
 impl State {
+    /// Publish which terminals exist, by session, for the protocol thread to stream. Called only
+    /// while the protocol server runs; builds handles only when the set of terminals changed.
+    pub(crate) fn publish_terminals(&self, out: &Terminals) {
+        let live = || self.sessions.iter().filter_map(|s| Some((s, s.terminal.as_ref()?)));
+        if out.matches(live().map(|(s, t)| (s.id.as_str(), t.screen_identity()))) {
+            return;
+        }
+        out.publish(
+            live()
+                .map(|(s, t)| {
+                    let handle = Arc::new(t.screen_handle());
+                    TerminalEntry {
+                        session: s.id.clone(),
+                        identity: t.screen_identity(),
+                        source: handle.clone(),
+                        control: handle,
+                    }
+                })
+                .collect(),
+        );
+    }
+
     /// The `[remote]` settings, for the host to decide whether to start the protocol server.
     pub(crate) fn remote_access(&self) -> atomics_core::config::RemoteAccessConfig {
         self.config.remote.clone()

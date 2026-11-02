@@ -968,11 +968,11 @@ impl Desktop<'_> {
                 } else {
                     "Azure DevOps: run az login to see pull requests"
                 };
-                ("–".to_string(), self.runtime.palette.muted, hover.to_string())
+                ("–".to_string(), self.palette().muted, hover.to_string())
             }
             Counter::Count { count, failing } => (
                 count.to_string(),
-                if *failing { self.runtime.palette.warning } else { self.runtime.palette.foreground },
+                if *failing { self.palette().warning } else { self.palette().foreground },
                 format!(
                     "{count} pull request{} {}{}",
                     if *count == 1 { "" } else { "s" },
@@ -1006,7 +1006,7 @@ impl Desktop<'_> {
         if !self.runtime.github.modal {
             return;
         }
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let mut open = true;
         let title = if self.runtime.github.repos().iter().any(RepoId::is_azure) { "Pull requests" } else { "GitHub" };
         egui::Window::new(title)
@@ -1576,13 +1576,13 @@ impl Desktop<'_> {
                                      Load the diff again to review the new head.",
                                     short_sha(latest)
                                 ))
-                                .color(self.runtime.palette.warning),
+                                .color(self.palette().warning),
                             );
                         }
                         if *admin {
                             ui.label(
                                 RichText::new("This bypasses the branch rules that block it.")
-                                    .color(self.runtime.palette.warning),
+                                    .color(self.palette().warning),
                             );
                         }
                         if *admin { "Admin merge" } else { "Merge" }
@@ -1649,7 +1649,7 @@ impl Desktop<'_> {
         if self.client.github.pr_view.as_ref().is_none_or(|(shown, _)| *shown != key) {
             self.client.github.pr_view = Some((key.clone(), DiffState::default()));
         }
-        let palette = self.runtime.palette.clone();
+        let palette = self.palette();
         let font = palette.mono(palette.fonts.diff_size.unwrap_or(self.runtime.config.font.diff_size));
         let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
         let editor_shortcut = self.runtime.config.keys.toggle_editor.clone();

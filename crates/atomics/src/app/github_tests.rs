@@ -982,7 +982,7 @@ fn github_merge_sends_the_reviewed_head_and_a_moved_branch_is_refused() {
 
 #[test]
 fn github_config_problems_are_reported_while_the_config_still_loads() {
-    with_app("app::github::tests::github_config_problems_are_reported_while_the_config_still_loads", |app, ctx| {
+    with_app("app::github::tests::github_config_problems_are_reported_while_the_config_still_loads", |app, _ctx| {
         let path = app.runtime.config_path.clone();
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str(
@@ -990,7 +990,7 @@ fn github_config_problems_are_reported_while_the_config_still_loads() {
         );
         std::fs::write(&path, text).unwrap();
         app.runtime.config_checked = Instant::now() - Duration::from_secs(2);
-        app.runtime.runtime_tick(ctx);
+        app.runtime.runtime_tick();
         assert_eq!(app.runtime.config.github.actions.len(), 1, "the config loaded and applies");
         assert!(app.runtime.config_error.is_none(), "{:?}", app.runtime.config_error);
         let problems = app.runtime.config_problems.clone().unwrap();

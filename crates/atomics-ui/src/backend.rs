@@ -1,9 +1,14 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use atomics_core::approvals::ApprovalRequest;
+use atomics_core::config::AgentKind;
 use atomics_core::diff_data::{FileView, Prepared};
-use atomics_core::plan::PlanStatus;
+use atomics_core::plan::{Plan, PlanStatus};
+use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
+use atomics_core::tickets::TicketConfig;
 
 /// What a plan is doing, for its tab. Selection is independent of activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +58,75 @@ pub struct PlanRow {
     pub attention: usize,
 }
 
+/// One session as the sidebar, the tab strip and the tile headers show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub id: String,
+    pub title: String,
+    /// The configured agent it runs, by name.
+    pub agent: String,
+    pub kind: AgentKind,
+    pub status: AgentStatus,
+    /// The chief, which stays outside the agent fleet.
+    pub chief: bool,
+    /// The worktree it runs in, if any.
+    pub worktree: Option<PathBuf>,
+    /// Its worktree's branch; `None` outside a worktree or on a detached HEAD.
+    pub branch: Option<String>,
+    /// Its worktree, else its folder: where its diff is read.
+    pub root: PathBuf,
+    /// The open project `root` belongs to, if any.
+    pub project: Option<PathBuf>,
+    /// Neither the chief nor in any plan's task: the Ungrouped tab shows it.
+    pub ungrouped: bool,
+    /// It works in a scratch folder of its own, outside any project.
+    pub scratch: bool,
+    /// The sandbox it runs in, if any.
+    pub sandbox: Option<String>,
+    /// It runs in a terminal outside ATOMICS, which sees it through its hooks.
+    pub outside: bool,
+    /// Permission requests waiting for a decision.
+    pub pending_approvals: usize,
+    /// Messages held back until those requests are decided.
+    pub held_messages: usize,
+    /// Lines added and removed in the diff of `root`, once the host has read it.
+    pub changes: Option<(usize, usize)>,
+}
+
+/// One plan as its board shows it: the plan header and the kanban columns. The plan comes whole; the
+/// other fields are what the board reads beside it from the rest of the host's model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardView {
+    /// The plan as the host holds it: goal, status, tasks, ticket and stages.
+    pub plan: Plan,
+    /// What the plan is doing; it colors the goal.
+    pub state: PlanState,
+    /// Planned tasks whose dependencies are done and integrated, by id, in plan order.
+    pub ready: Vec<String>,
+    /// Every session's title and status, by session id: a card's session line and its open button.
+    pub sessions: HashMap<String, (String, AgentStatus)>,
+    /// Why a task's integration is not verified yet, by task id, and whether a check of it runs now.
+    pub integration_notes: HashMap<String, (String, bool)>,
+    /// An integration freshness check of this plan runs.
+    pub checking: bool,
+    /// The plan's tasks being integrated now, by id.
+    pub integrating: HashSet<String>,
+    /// The `[tickets]` in effect, once the host has read it.
+    pub ticket_config: Option<Arc<TicketConfig>>,
+    /// The tickets on the plan's board, and how many of them no task follows, once the host has read them.
+    pub board_counts: Option<(usize, usize)>,
+}
+
+/// A permission request a session waits on, as its approval banner shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRow {
+    /// The session that asked, by id.
+    pub session: String,
+    /// The request's id. A decision names it, so the host refuses one made for an earlier request.
+    pub id: String,
+    pub request: ApprovalRequest,
+}
+
 /// A worktree's diff as the host last published it, and the whole file open beside it.
 #[derive(Clone, Default)]
 pub struct DiffSnapshot {
@@ -74,6 +148,19 @@ pub trait Backend {
 
     /// One plan of [`plan_list`](Backend::plan_list), without building the others.
     fn plan_row(&self, index: usize) -> Option<PlanRow>;
+
+    /// The board of the plan at `index` of [`plan_list`](Backend::plan_list).
+    fn board(&self, index: usize) -> Option<BoardView>;
+
+    /// Every session, in the host's order. The UI addresses a session by its position in this list.
+    fn session_list(&self) -> Vec<SessionRow>;
+
+    /// One session of [`session_list`](Backend::session_list), without building the others.
+    fn session_row(&self, index: usize) -> Option<SessionRow>;
+
+    /// The first permission request the session at `index` of [`session_list`](Backend::session_list)
+    /// waits on: the one its banner shows. Later ones wait behind it.
+    fn session_approval(&self, index: usize) -> Option<ApprovalRow>;
 
     /// The worktrees the host has a diff for.
     fn diff_roots(&self) -> Vec<PathBuf>;

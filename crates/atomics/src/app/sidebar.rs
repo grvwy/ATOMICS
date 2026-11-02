@@ -1,3 +1,5 @@
+use atomics_ui::SessionRow;
+
 use super::*;
 
 #[derive(Clone)]
@@ -52,6 +54,14 @@ impl State {
     }
 }
 
+/// A project's agents, and the lines they changed.
+fn project_summary(sessions: &[SessionRow], root: &Path) -> (usize, usize) {
+    let agents = sessions.iter().filter(|s| !s.chief && s.project.as_deref() == Some(root));
+    agents.fold((0, 0), |(count, changes), session| {
+        (count + 1, changes + session.changes.map_or(0, |(additions, deletions)| additions + deletions))
+    })
+}
+
 fn measure_divider(ui: &mut egui::Ui) -> f32 {
     super::topbar::measure(ui, |ui| {
         ui.separator();
@@ -68,14 +78,7 @@ fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.add_space(1.0);
 }
 
-fn session_row(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    s: &Session,
-    active: bool,
-    selected: bool,
-    stats: Option<(usize, usize)>,
-) -> egui::Response {
+fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, selected: bool) -> egui::Response {
     let height = 38.0;
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
@@ -89,7 +92,7 @@ fn session_row(
     painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
     let clip = painter.with_clip_rect(rect.shrink2(vec2(2.0, 0.0)));
     // The diff stats keep their corner; a long title is cut before them.
-    let stats_left = match stats {
+    let stats_left = match s.changes {
         Some((add, del)) => clip
             .text(
                 pos2(rect.right() - 6.0, rect.top() + 5.0),
@@ -108,11 +111,12 @@ fn session_row(
         p.ui(13.0),
         if active { p.accent } else { p.foreground },
     );
-    let mut detail = match s.scratch {
-        Some(_) => format!("{} · scratch · {}", s.agent, s.status.label()),
-        None => format!("{} · {}", s.agent, s.status.label()),
+    let mut detail = if s.scratch {
+        format!("{} · scratch · {}", s.agent, s.status.label())
+    } else {
+        format!("{} · {}", s.agent, s.status.label())
     };
-    if s.terminal.is_none() {
+    if s.outside {
         detail.push_str(" · outside");
     }
     if selected {
@@ -218,17 +222,17 @@ impl Desktop<'_> {
             }
         }
         if needs > 0 {
-            (format!("Tabs · {needs} needs you"), self.runtime.palette.warning)
+            (format!("Tabs · {needs} needs you"), self.palette().warning)
         } else if running > 0 {
-            (format!("Tabs · {running} running"), self.runtime.palette.accent)
+            (format!("Tabs · {running} running"), self.palette().accent)
         } else {
-            ("Tabs".into(), self.runtime.palette.foreground)
+            ("Tabs".into(), self.palette().foreground)
         }
     }
 
     fn plan_label_width(&self, ui: &mut egui::Ui, label: &str) -> f32 {
         super::topbar::measure(ui, |ui| {
-            ui.add(egui::Button::new(RichText::new(label).font(self.runtime.palette.ui(12.5))).right_text("   "));
+            ui.add(egui::Button::new(RichText::new(label).font(self.palette().ui(12.5))).right_text("   "));
         })
     }
 
@@ -324,7 +328,7 @@ impl Desktop<'_> {
             })
             .sum();
         let mut menu_label = "Tabs".to_string();
-        let mut menu_color = self.runtime.palette.foreground;
+        let mut menu_color = self.palette().foreground;
         let mut menu_width = super::topbar::measure(ui, |ui| {
             ui.menu_button("Tabs", |_| {});
         });
@@ -463,17 +467,6 @@ impl Desktop<'_> {
         }
     }
 
-    fn project_summary(&self, root: &Path) -> (usize, usize) {
-        self.runtime
-            .sessions
-            .iter()
-            .filter(|s| !s.chief && self.runtime.project_of(&s.root()).as_deref() == Some(root))
-            .fold((0, 0), |(count, changes), session| {
-                let size = self.runtime.diffs.get(&session.root()).and_then(|d| d.prepared.as_ref());
-                (count + 1, changes + size.map_or(0, |diff| diff.additions + diff.deletions))
-            })
-    }
-
     fn repos_tab(&mut self, ui: &mut egui::Ui, width: Option<f32>) {
         let selected = self.view_tab_selected(&ViewTab::Repos);
         let label = if selected {
@@ -485,12 +478,13 @@ impl Desktop<'_> {
                 .to_string_lossy()
                 .into_owned()
         } else {
-            let changes: usize = self.runtime.repos.iter().map(|root| self.project_summary(root).1).sum();
+            let sessions = self.runtime.backend().session_list();
+            let changes: usize = self.runtime.repos.iter().map(|root| project_summary(&sessions, root).1).sum();
             format!("Repos · {changes}")
         };
-        let color = if selected { self.runtime.palette.accent } else { self.runtime.palette.foreground };
+        let color = if selected { self.palette().accent } else { self.palette().foreground };
         let mut menu = |ui: &mut egui::Ui| {
-            ui.menu_button(RichText::new(&label).font(self.runtime.palette.ui(12.5)).color(color), |ui| {
+            ui.menu_button(RichText::new(&label).font(self.palette().ui(12.5)).color(color), |ui| {
                 for root in self.runtime.repos.clone() {
                     self.view_tab(ui, &ViewTab::Project(root), None, None);
                 }
@@ -518,7 +512,7 @@ impl Desktop<'_> {
             self.repos_tab(ui, width);
             return;
         }
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let selected = self.view_tab_selected(tab);
         let plan_row = match tab {
             ViewTab::Plan(index) => self.runtime.backend().plan_row(*index),
@@ -526,17 +520,17 @@ impl Desktop<'_> {
         };
         let (label, hover, color) = match tab {
             ViewTab::All => {
-                let agents = self.runtime.sessions.iter().filter(|s| !s.chief).count();
+                let agents = self.runtime.backend().session_list().iter().filter(|s| !s.chief).count();
                 (format!("All · {agents}"), "All projects".into(), p.foreground)
             }
             ViewTab::Ungrouped => {
-                let count = self.runtime.sessions.iter().filter(|s| self.runtime.ungrouped_session(s)).count();
+                let count = self.runtime.backend().session_list().iter().filter(|s| s.ungrouped).count();
                 let hover = "Sessions outside any plan. New sessions start here, in scratch folders of their own";
                 (format!("Ungrouped · {count}"), hover.into(), if selected { p.accent } else { p.foreground })
             }
             ViewTab::Project(root) => {
                 let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let (count, changes) = self.project_summary(root);
+                let (count, changes) = project_summary(&self.runtime.backend().session_list(), root);
                 (
                     format!("{name} · {count} sessions · {changes} changes"),
                     paths::display(root),
@@ -690,7 +684,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let files_root = self.runtime.diff_target();
         section(ui, &p, "USAGE");
         self.runtime.usage.show(ui, &p);
@@ -704,14 +698,14 @@ impl Desktop<'_> {
             let mut clicked: Option<String> = None;
             let mut close: Option<String> = None;
             let mut rename: Option<String> = None;
+            let sessions = self.runtime.backend().session_list();
             let visible = self.runtime.visible_sessions();
-            for (index, session) in self.runtime.sessions.iter_mut().enumerate() {
+            for (index, session) in sessions.iter().enumerate() {
                 if !visible.contains(&index) {
                     continue;
                 }
                 let active = self.runtime.active.as_deref() == Some(session.id.as_str());
-                let stats = self.runtime.diffs.get(&session.root()).and_then(|d| d.prepared.as_ref()).map(|p| (p.additions, p.deletions));
-                let row = session_row(ui, &p, session, active, self.client.selected.contains(&session.id), stats);
+                let row = session_row(ui, &p, session, active, self.client.selected.contains(&session.id));
                 if row.clicked() {
                     clicked = Some(session.id.clone());
                 }
@@ -737,7 +731,7 @@ impl Desktop<'_> {
                     ui.label(RichText::new(format!("checking out {branch}…")).color(p.muted).size(12.0));
                 });
             }
-            if self.runtime.sessions.is_empty() && self.runtime.creating.is_empty() {
+            if sessions.is_empty() && self.runtime.creating.is_empty() {
                 ui.label(RichText::new("No agents yet. Start one with + New,\nor install hooks to see agents\nrunning in other terminals.").color(p.muted).size(12.0));
             }
             if let Some(id) = clicked {
@@ -795,17 +789,13 @@ impl Desktop<'_> {
                 }
             });
         });
+        let sessions = self.runtime.backend().session_list();
         let mut switch_to: Option<PathBuf> = None;
         let mut close: Option<PathBuf> = None;
         ui.horizontal_wrapped(|ui| {
             for root in self.runtime.repos.clone() {
                 let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let agents = self
-                    .runtime
-                    .sessions
-                    .iter()
-                    .filter(|s| self.runtime.project_of(&s.root()).as_ref() == Some(&root))
-                    .count();
+                let agents = sessions.iter().filter(|s| s.project.as_ref() == Some(&root)).count();
                 let label = if agents > 0 { format!("{name} ·{agents}") } else { name };
                 let selected = focus.as_ref() == Some(&root);
                 let color = if selected { p.accent } else { p.foreground };
@@ -910,7 +900,7 @@ impl Desktop<'_> {
                 }
                 for wt in &worktrees {
                     let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let agent = self.runtime.sessions.iter().find(|s| s.root() == wt.path);
+                    let agent = sessions.iter().find(|s| s.root == wt.path);
                     let selected = target.as_ref() == Some(&wt.path);
                     let response = ui
                         .horizontal(|ui| {
@@ -946,7 +936,7 @@ impl Desktop<'_> {
                 return;
             }
             if let Some(path) = pick {
-                match self.runtime.sessions.iter().find(|s| s.root() == path).map(|s| s.id.clone()) {
+                match sessions.iter().find(|s| s.root == path).map(|s| s.id.clone()) {
                     Some(id) => self.activate(&id, true),
                     None => {
                         self.runtime.active = None;
@@ -996,7 +986,7 @@ impl Desktop<'_> {
             .collect();
         if !recent.is_empty() {
             ui.separator();
-            ui.label(RichText::new("Recent projects").size(11.0).color(self.runtime.palette.muted));
+            ui.label(RichText::new("Recent projects").size(11.0).color(self.palette().muted));
             for root in recent {
                 if ui.button(paths::display(&root)).clicked() {
                     self.open_project(&root);
@@ -1005,7 +995,7 @@ impl Desktop<'_> {
             }
         }
         ui.separator();
-        ui.label(RichText::new("Workspaces").size(11.0).color(self.runtime.palette.muted));
+        ui.label(RichText::new("Workspaces").size(11.0).color(self.palette().muted));
         for name in Workspace::list() {
             let current = self.runtime.workspace.as_deref() == Some(name.as_str());
             if ui.selectable_label(current, &name).clicked() {

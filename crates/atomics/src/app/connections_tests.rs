@@ -97,11 +97,11 @@ fn tile(app: &mut Desktop<'_>, ctx: &egui::Context, index: usize, events: Vec<eg
     texts(output)
 }
 
-fn tick_until(app: &mut Desktop<'_>, ctx: &egui::Context, what: &str, mut done: impl FnMut(&mut Desktop<'_>) -> bool) {
+fn tick_until(app: &mut Desktop<'_>, _ctx: &egui::Context, what: &str, mut done: impl FnMut(&mut Desktop<'_>) -> bool) {
     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
     while !done(app) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        app.runtime.runtime_tick(ctx);
+        app.runtime.runtime_tick();
         if !done(app) {
             app.runtime.wake.wait_until(deadline.min(Instant::now() + Duration::from_millis(50)));
         }

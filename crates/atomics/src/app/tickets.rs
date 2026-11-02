@@ -1611,7 +1611,7 @@ mod tests {
 
     fn ticket_request(app: &mut Desktop<'_>, value: Value) -> ControlResponse {
         let (tx, rx) = channel();
-        app.runtime.control(&app.runtime.ctx.clone(), serde_json::from_value(value).unwrap(), tx);
+        app.runtime.control(serde_json::from_value(value).unwrap(), tx);
         settle(app);
         match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
             ControlOutcome::Done(response) => response,
@@ -2312,7 +2312,7 @@ mod tests {
         app.runtime.plans[index].tasks[task].ticket.clone().unwrap()
     }
 
-    fn wait_for(app: &mut Desktop<'_>, ctx: &egui::Context, statuses: &[&str]) -> Receiver<ControlOutcome> {
+    fn wait_for(app: &mut Desktop<'_>, _ctx: &egui::Context, statuses: &[&str]) -> Receiver<ControlOutcome> {
         let (tx, rx) = channel();
         let request = ControlRequest::Wait {
             // Ticket events reach waiters watching other sessions too.
@@ -2321,7 +2321,7 @@ mod tests {
             after: Some(app.runtime.event_seq),
             timeout_secs: Some(30),
         };
-        app.runtime.control(ctx, request, tx);
+        app.runtime.control(request, tx);
         rx
     }
 
@@ -2735,7 +2735,6 @@ mod tests {
 
             let (tx, rx) = channel();
             app.runtime.control(
-                &app.runtime.ctx.clone(),
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() },
                 tx,
             );
@@ -2833,7 +2832,7 @@ mod tests {
             let (tx, rx) = channel();
             let comment =
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
-            app.runtime.control(ctx, comment, tx);
+            app.runtime.control(comment, tx);
             settle(app);
             let ControlOutcome::Done(commented) =
                 rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
@@ -2873,7 +2872,7 @@ mod tests {
                 create: None,
                 unlink: false,
             };
-            app.runtime.control(ctx, linked, tx);
+            app.runtime.control(linked, tx);
             settle(app);
             rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
             assert_eq!(link(app, index, 1).system, "issues");
@@ -2888,7 +2887,7 @@ mod tests {
     fn a_late_create_never_replaces_a_newer_link_or_takes_another_system() {
         with_app(
             "app::tickets::tests::a_late_create_never_replaces_a_newer_link_or_takes_another_system",
-            |app, ctx| {
+            |app, _ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "CARD");
                 configure(app, CARDS, &state, |_| {});
@@ -2913,7 +2912,7 @@ mod tests {
                             .then(|| TicketDraft { title: "Created late".into(), body: String::new() }),
                         unlink: false,
                     };
-                    app.runtime.control(ctx, request, tx);
+                    app.runtime.control(request, tx);
                     rx
                 };
                 // The create is under way when the chief links another ticket to the same task.
@@ -2945,7 +2944,7 @@ mod tests {
 
     #[test]
     fn a_read_after_a_comment_reports_what_someone_else_changed() {
-        with_app("app::tickets::tests::a_read_after_a_comment_reports_what_someone_else_changed", |app, ctx| {
+        with_app("app::tickets::tests::a_read_after_a_comment_reports_what_someone_else_changed", |app, _ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |_| {});
@@ -2964,7 +2963,7 @@ mod tests {
             let (tx, rx) = channel();
             let comment =
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Note".into() };
-            app.runtime.control(ctx, comment, tx);
+            app.runtime.control(comment, tx);
             settle(app);
             rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
             let moved: Vec<_> = app.runtime.events.iter().filter_map(|e| e.ticket.clone()).collect();
@@ -2980,7 +2979,7 @@ mod tests {
     fn plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with() {
         with_app(
             "app::tickets::tests::plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with",
-            |app, ctx| {
+            |app, _ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "CARD");
                 configure(app, CARDS, &state, |_| {});
@@ -3000,7 +2999,7 @@ mod tests {
                     create: Some(TicketDraft { title: "Created late".into(), body: String::new() }),
                     unlink: false,
                 };
-                app.runtime.control(ctx, create, tx);
+                app.runtime.control(create, tx);
                 // A task without an id becomes t1, and its ticket is newer than the pending create.
                 assert!(
                     request(
@@ -3019,7 +3018,7 @@ mod tests {
 
     #[test]
     fn a_rejected_link_request_leaves_a_pending_create_alone() {
-        with_app("app::tickets::tests::a_rejected_link_request_leaves_a_pending_create_alone", |app, ctx| {
+        with_app("app::tickets::tests::a_rejected_link_request_leaves_a_pending_create_alone", |app, _ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |_| {});
@@ -3039,18 +3038,15 @@ mod tests {
                 unlink: false,
             };
             let (tx, created) = channel();
-            app.runtime.control(
-                ctx,
-                link_request(None, Some(TicketDraft { title: "Wanted".into(), body: String::new() })),
-                tx,
-            );
+            app.runtime
+                .control(link_request(None, Some(TicketDraft { title: "Wanted".into(), body: String::new() })), tx);
             for invalid in [
                 link_request(Some(TicketLink::default()), None),
                 link_request(None, Some(TicketDraft { title: " ".into(), body: String::new() })),
                 link_request(None, None),
             ] {
                 let (tx, rx) = channel();
-                app.runtime.control(ctx, invalid, tx);
+                app.runtime.control(invalid, tx);
                 let ControlOutcome::Done(rejected) =
                     rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
                 else {
@@ -3073,7 +3069,7 @@ mod tests {
     fn late_results_are_cleaned_with_the_secrets_of_the_job_that_made_them() {
         with_app(
             "app::tickets::tests::late_results_are_cleaned_with_the_secrets_of_the_job_that_made_them",
-            |app, ctx| {
+            |app, _ctx| {
                 const OLD_KEY: &str = "alpha-key-7c1d9e";
                 const OLD_TOKEN: &str = "alpha-token-5b6c7d";
                 let dir = crate::test_support::tempdir().unwrap();
@@ -3103,7 +3099,7 @@ mod tests {
                     task: Some("a".into()),
                     text: "Hi".into(),
                 };
-                app.runtime.control(ctx, comment, tx);
+                app.runtime.control(comment, tx);
                 configure(app, CARDS, &state, with_key("bravo-key-2e8f4a"));
                 settle(app);
                 let ControlOutcome::Done(commented) =
@@ -3149,7 +3145,7 @@ mod tests {
 
     #[test]
     fn tickets_read_from_a_backend_are_cleaned_before_they_are_stored() {
-        with_app("app::tickets::tests::tickets_read_from_a_backend_are_cleaned_before_they_are_stored", |app, ctx| {
+        with_app("app::tickets::tests::tickets_read_from_a_backend_are_cleaned_before_they_are_stored", |app, _ctx| {
             const TOKEN: &str = "sk-title-4d5e6f";
             // SAFETY: set before the ticket worker starts; nothing else reads this variable.
             unsafe { std::env::set_var("CARDS_TOKEN", TOKEN) };
@@ -3199,7 +3195,7 @@ mod tests {
                 create: None,
                 unlink: false,
             };
-            app.runtime.control(ctx, linked, tx);
+            app.runtime.control(linked, tx);
             assert_eq!(link(app, index, 2).url.as_deref(), Some("https://cards.example/3"), "cleaned as given");
             settle(app);
             rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
@@ -3296,7 +3292,7 @@ mod tests {
 
     #[test]
     fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
-        with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
+        with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, _ctx| {
             const TOKEN: &str = "sk-synthetic-7f3a9c";
             // SAFETY: set before the ticket worker starts; nothing else reads this variable.
             unsafe { std::env::set_var("TRACKER_TOKEN", TOKEN) };
@@ -3326,7 +3322,7 @@ mod tests {
             let (tx, rx) = channel();
             let comment =
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
-            app.runtime.control(ctx, comment, tx);
+            app.runtime.control(comment, tx);
             settle(app);
             let ControlOutcome::Done(commented) =
                 rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
@@ -3340,7 +3336,7 @@ mod tests {
             let (tx, rx) = channel();
             let comment =
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
-            app.runtime.control(ctx, comment, tx);
+            app.runtime.control(comment, tx);
             settle(app);
             let ControlOutcome::Done(split) =
                 rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
@@ -3385,13 +3381,13 @@ mod tests {
 
     #[test]
     fn chief_tools_link_create_and_comment_within_the_comment_policy() {
-        with_app("app::tickets::tests::chief_tools_link_create_and_comment_within_the_comment_policy", |app, ctx| {
+        with_app("app::tickets::tests::chief_tools_link_create_and_comment_within_the_comment_policy", |app, _ctx| {
             assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_ticket_comment"));
             let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             let call = |app: &mut Desktop<'_>, value: Value| {
                 let (tx, rx) = channel();
-                app.runtime.control(ctx, serde_json::from_value(value).unwrap(), tx);
+                app.runtime.control(serde_json::from_value(value).unwrap(), tx);
                 settle(app);
                 match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap() {
                     ControlOutcome::Done(response) => response,

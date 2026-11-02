@@ -108,11 +108,10 @@ impl Desktop<'_> {
                     ui.push_id(&plan.id, |ui| {
                         ui.horizontal(|ui| {
                             let state = self.runtime.plan_state(index);
-                            ui.label(RichText::new(&plan.goal).color(state.color(&self.runtime.palette)));
+                            ui.label(RichText::new(&plan.goal).color(state.color(&self.palette())));
                             let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
                             ui.label(
-                                RichText::new(format!("{status} · {}", history_date(plan)))
-                                    .color(self.runtime.palette.muted),
+                                RichText::new(format!("{status} · {}", history_date(plan))).color(self.palette().muted),
                             )
                             .on_hover_text(
                                 "Date the plan was last saved, or its last task completion when no saved file exists",
@@ -387,20 +386,15 @@ mod tests {
                 let expected = state.label(&app.runtime.plans[index].goal);
                 let label = labels.iter().find(|shape| shape.galley.text() == expected).unwrap();
                 assert!(
-                    label
-                        .galley
-                        .job
-                        .sections
-                        .iter()
-                        .any(|section| section.format.color == state.color(&app.runtime.palette)),
+                    label.galley.job.sections.iter().any(|section| section.format.color == state.color(&app.palette())),
                     "{expected}: wrong state color"
                 );
             }
             let items =
                 ctx.data(|data| data.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items"))).unwrap();
             let idle = items.iter().find(|(name, _)| name == "Idle · idle").unwrap().1;
-            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.rect.center().distance(idle.center())<1.0&&rect.stroke.color==app.runtime.palette.accent&&rect.fill==Color32::TRANSPARENT)),"selection should be an outline");
-            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==app.runtime.palette.accent.gamma_multiply(0.35))),"running should be filled");
+            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.rect.center().distance(idle.center())<1.0&&rect.stroke.color==app.palette().accent&&rect.fill==Color32::TRANSPARENT)),"selection should be an outline");
+            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==app.palette().accent.gamma_multiply(0.35))),"running should be filled");
             let running_tab = items.iter().find(|(name, _)| name == "● Running · 2 running").unwrap().1;
             let close_id = egui::Id::NULL.with(("plan-close", "running"));
             assert!(
@@ -449,9 +443,12 @@ mod tests {
                     .find(|shape| shape.galley.text() == app.runtime.plans[index].goal)
                     .unwrap();
                 assert!(
-                    title.galley.job.sections.iter().any(
-                        |section| section.format.color == app.runtime.plan_state(index).color(&app.runtime.palette)
-                    )
+                    title
+                        .galley
+                        .job
+                        .sections
+                        .iter()
+                        .any(|section| section.format.color == app.runtime.plan_state(index).color(&app.palette()))
                 );
                 output.drop_without_applying_deltas();
             }

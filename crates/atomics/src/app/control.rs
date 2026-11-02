@@ -31,9 +31,15 @@ impl State {
         })
     }
 
-    pub(super) fn control(&mut self, ctx: &egui::Context, request: ControlRequest, reply: Sender<ControlOutcome>) {
+    pub(super) fn control(&mut self, request: ControlRequest, reply: Sender<ControlOutcome>) {
         if self.restarting {
             let _ = reply.send(ControlOutcome::Done(ControlResponse::error("ATOMICS is restarting")));
+            return;
+        }
+        if !self.window.is_attached()
+            && let Some(refusal) = headless_refusal(&request)
+        {
+            let _ = reply.send(ControlOutcome::Done(ControlResponse::error(refusal)));
             return;
         }
         let done = |response: ControlResponse| ControlOutcome::Done(response);
@@ -119,7 +125,8 @@ impl State {
             }
             ControlRequest::List => {
                 let sessions: Vec<_> = (0..self.sessions.len()).map(|i| self.describe(i)).collect();
-                let (window, monitor) = ctx.input(|i| (i.content_rect().size(), i.viewport().monitor_size));
+                // The headless host has no window: both are null there.
+                let viewport = self.window.viewport();
                 let layout = self.last_layout.map(|l| {
                     json!({ "sidebar": l.sidebar, "dock_width": l.dock_width, "diff": format!("{:?}", l.diff), "columns": l.columns, "rows": l.rows, "tiled": l.tiled, "tabs": l.tabs, "completed": l.completed })
                 });
@@ -129,8 +136,8 @@ impl State {
                     "resources": self.resources_json(),
                     "visible": self.visible_sessions().iter().map(|&i| &self.sessions[i].id).collect::<Vec<_>>(),
                     "chief": { "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width },
-                    "window": [window.x, window.y],
-                    "monitor": monitor.map(|m| [m.x, m.y]),
+                    "window": viewport.map(|viewport| viewport.content),
+                    "monitor": viewport.and_then(|viewport| viewport.monitor),
                     "layout": layout,
                     "sessions": sessions,
                 })))
@@ -149,7 +156,7 @@ impl State {
                 Some(index) => {
                     let (id, root) = (self.sessions[index].id.clone(), self.sessions[index].root());
                     self.activate(&id, true);
-                    self.edit(ctx, &root, Some(&path), line);
+                    self.edit(&root, Some(&path), line);
                     done(ControlResponse::ok(json!({ "editing": path, "line": line })))
                 }
             },
@@ -486,7 +493,7 @@ impl State {
                         self.save_chief_preferences();
                     }
                     if open && !self.chief_open {
-                        self.toggle_chief(ctx);
+                        self.toggle_chief();
                     } else if !open {
                         self.chief_open = false;
                     }
@@ -513,12 +520,12 @@ impl State {
                         return;
                     }
                     (Some(folder), _, _) => {
-                        self.start_as(ctx, &agent, paths::expand(&folder), None, args, prompt, Role::Agent(isolation))
+                        self.start_as(&agent, paths::expand(&folder), None, args, prompt, Role::Agent(isolation))
                     }
                     (None, Some(_), None) | (None, None, Some(_)) => {
                         Err("give a repo and a branch for a new worktree".to_string())
                     }
-                    (None, None, None) => self.start_scratch(ctx, &agent, args, prompt, isolation),
+                    (None, None, None) => self.start_scratch(&agent, args, prompt, isolation),
                 };
                 match started {
                     Ok(id) => {
@@ -839,4 +846,18 @@ fn unescape(text: &str) -> String {
         }
     }
     out
+}
+
+/// Requests only a desktop window can serve fail clearly in the headless host instead of
+/// queueing work nothing will consume.
+fn headless_refusal(request: &ControlRequest) -> Option<&'static str> {
+    match request {
+        ControlRequest::Screenshot { .. } | ControlRequest::Resize { .. } | ControlRequest::ShowSettings { .. } => {
+            Some(super::NO_WINDOW)
+        }
+        ControlRequest::Restart { .. } => {
+            Some("the headless host does not restart itself; restart it with its service manager (systemctl restart)")
+        }
+        _ => None,
+    }
 }

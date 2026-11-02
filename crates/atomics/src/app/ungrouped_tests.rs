@@ -20,11 +20,11 @@ fn probe(name: &str, kind: AgentKind, out: &Path) -> atomics_core::config::Agent
     }
 }
 
-fn tick_until(app: &mut Desktop<'_>, ctx: &egui::Context, what: &str, mut done: impl FnMut(&mut Desktop<'_>) -> bool) {
+fn tick_until(app: &mut Desktop<'_>, _ctx: &egui::Context, what: &str, mut done: impl FnMut(&mut Desktop<'_>) -> bool) {
     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
     while !done(app) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        app.runtime.runtime_tick(ctx);
+        app.runtime.runtime_tick();
         if !done(app) {
             app.runtime.wake.wait_until(deadline.min(Instant::now() + Duration::from_millis(50)));
         }
@@ -146,11 +146,11 @@ fn new_sessions_start_ungrouped_in_scratch_folders_named_by_their_first_prompt()
             assert_eq!(app.runtime.sessions[typed].title, UNTITLED);
             let terminal = app.runtime.sessions[typed].terminal.as_ref().unwrap();
             *terminal.shared.submitted.lock().unwrap() = Some("/login".into());
-            app.runtime.runtime_tick(ctx);
+            app.runtime.runtime_tick();
             assert_eq!(app.runtime.sessions[typed].title, UNTITLED, "a slash command names nothing");
             let terminal = app.runtime.sessions[typed].terminal.as_ref().unwrap();
             *terminal.shared.submitted.lock().unwrap() = Some("Draft the release notes".into());
-            app.runtime.runtime_tick(ctx);
+            app.runtime.runtime_tick();
             assert_eq!(app.runtime.sessions[typed].title, "Draft the release notes");
             // Each scratch session has a folder of its own.
             assert_ne!(app.runtime.sessions[typed].scratch, Some(scratch.clone()));

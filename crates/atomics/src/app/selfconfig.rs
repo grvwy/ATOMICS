@@ -23,7 +23,7 @@ pub(super) struct Pending {
     /// Who proposed it, as far as ATOMICS can tell. The user judges the diff, not the name.
     from: String,
     /// A theme change's theme, drawn above its diff.
-    preview: Option<Arc<Palette>>,
+    preview: Option<Arc<Theme>>,
 }
 
 /// What `atomics_config_propose` asks to change.
@@ -174,8 +174,8 @@ impl State {
             Scope::Theme => {
                 let name = theme.map(str::trim).filter(|name| !name.is_empty());
                 let name = name.ok_or("a theme change names its theme: give theme, such as \"dusk\"")?;
-                let (file, proposal, palette) = self.propose_theme(name, toml, remove)?;
-                preview = Some(Arc::new(palette));
+                let (file, proposal, theme) = self.propose_theme(name, toml, remove)?;
+                preview = Some(Arc::new(theme));
                 (file, proposal)
             }
             _ => {
@@ -217,7 +217,7 @@ impl State {
 
     /// A theme change: checked as a theme file, resolved through the other theme files, and
     /// drawn for the user. Its syntax theme must exist too, which only the app can tell.
-    fn propose_theme(&self, name: &str, toml: &str, remove: &[String]) -> Result<(PathBuf, Proposal, Palette), String> {
+    fn propose_theme(&self, name: &str, toml: &str, remove: &[String]) -> Result<(PathBuf, Proposal, Theme), String> {
         let dir = atomics_core::theme::themes_dir(&self.config_path);
         // Checked before the name becomes a path.
         if !atomics_core::theme::valid_name(name) {
@@ -230,7 +230,7 @@ impl State {
         let read = |other: &str| atomics_core::theme::read_file(&dir, other);
         let mut proposal =
             selfconfig::propose_theme(name, &paths::display(&file), before.as_deref(), toml, remove, read)?;
-        let (palette, problems) = Palette::preview(name, &proposal.after, &dir);
+        let (theme, problems) = Theme::preview(name, &proposal.after, &dir);
         if !problems.is_empty() {
             return Err(problems.join("; "));
         }
@@ -240,7 +240,7 @@ impl State {
                 "ATOMICS shows the {selected} theme; showing this one is a separate main or host change: [theme] name = \"{name}\""
             ));
         }
-        Ok((file, proposal, palette))
+        Ok((file, proposal, theme))
     }
 
     /// Writes a proposal the user applied, after a backup, and reloads the config.
@@ -317,7 +317,7 @@ impl Desktop<'_> {
             self.client.config_seen = None;
             return;
         };
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let seen = match &self.client.config_seen {
             Some((id, at)) if *id == pending.id => *at,
             _ => {
@@ -365,6 +365,7 @@ impl Desktop<'_> {
                         ui.label(RichText::new(warning).color(p.warning).size(12.0));
                     }
                     if let Some(preview) = &pending.preview {
+                        let preview = preview.palette();
                         ui.add_space(4.0);
                         ui.label(RichText::new("Preview").color(p.muted).size(12.0));
                         preview.show_preview(ui);
@@ -475,12 +476,12 @@ mod tests {
         }
     }
 
-    fn wait_for_config(app: &mut Desktop<'_>, ctx: &egui::Context) -> std::sync::mpsc::Receiver<ControlOutcome> {
+    fn wait_for_config(app: &mut Desktop<'_>, _ctx: &egui::Context) -> std::sync::mpsc::Receiver<ControlOutcome> {
         let (tx, rx) = std::sync::mpsc::channel();
         let after = app.runtime.event_seq;
         let wait =
             ControlRequest::Wait { sessions: vec![], statuses: vec![], after: Some(after), timeout_secs: Some(30) };
-        app.runtime.control(ctx, wait, tx);
+        app.runtime.control(wait, tx);
         assert!(rx.try_recv().is_err(), "nothing happened yet");
         rx
     }
@@ -766,7 +767,7 @@ mod tests {
             std::fs::write(&main, "[theme]\nname = \"dusk\"\n").unwrap();
             app.runtime.reload_config();
             assert_eq!(app.runtime.theme_error.as_deref(), Some("unknown theme \"dusk\""));
-            let amber = crate::theme::parse_hex("#e0a458").unwrap();
+            let amber = atomics_ui::theme::parse_hex("#e0a458").unwrap();
             let themes = atomics_core::theme::themes_dir(&main);
             let dusk = themes.join("dusk.toml");
 
@@ -795,7 +796,7 @@ mod tests {
             assert_eq!(proposed.result["file"], paths::display(&dusk));
             assert!(proposed.result["warnings"].as_array().unwrap().is_empty(), "dusk is the selected theme");
             assert!(!dusk.exists(), "nothing is written before the user applies it");
-            assert_eq!(app.runtime.proposals[0].preview.as_ref().unwrap().accent, amber);
+            assert_eq!(app.runtime.proposals[0].preview.as_ref().unwrap().palette().accent, amber);
 
             // The dialog draws the proposed theme above the diff, in its own colors, once it
             // has been measured and faded in.
@@ -824,7 +825,7 @@ mod tests {
             assert!(texts.iter().any(|t| t == "Preview"), "{texts:?}");
             assert!(texts.iter().any(|t| t.starts_with("+accent = '#e0a458'")), "{texts:?}");
             assert!(amber_fill, "the preview paints the proposed accent");
-            assert_ne!(app.runtime.palette.accent, amber, "the theme itself waits for Apply");
+            assert_ne!(app.palette().accent, amber, "the theme itself waits for Apply");
 
             app.client.config_seen.as_mut().unwrap().1 -= APPLY_DELAY;
             click(app, ctx, "Apply");
@@ -835,7 +836,7 @@ mod tests {
                 std::fs::read_to_string(&dusk).unwrap(),
                 "extends = 'midnight'\naccent = '#e0a458'\non_accent = '#16181d'\n"
             );
-            assert_eq!(app.runtime.palette.accent, amber, "an applied theme shows at once");
+            assert_eq!(app.palette().accent, amber, "an applied theme shows at once");
             assert!(app.runtime.theme_error.is_none(), "{:?}", app.runtime.theme_error);
 
             // Another theme is written but not shown; selecting it is a config change.
@@ -845,7 +846,10 @@ mod tests {
             );
             let warnings = other.result["warnings"].as_array().unwrap();
             assert!(warnings[0].as_str().unwrap().contains("[theme] name = \"dawn\""), "{warnings:?}");
-            assert_eq!(app.runtime.proposals[0].preview.as_ref().unwrap().mode, atomics_core::theme::ThemeMode::Light);
+            assert_eq!(
+                app.runtime.proposals[0].preview.as_ref().unwrap().mode(),
+                atomics_core::theme::ThemeMode::Light
+            );
 
             let themes_info = request(app, json!({"cmd":"config_get"})).result["themes"].clone();
             assert_eq!(themes_info["selected"], "dusk");

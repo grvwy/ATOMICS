@@ -1,30 +1,10 @@
 use super::*;
 
-/// Measure with the same fonts, padding and widgets that will actually be drawn.
-/// The disabled, invisible child cannot activate controls or take space from the bar.
-pub(super) fn measure(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) -> f32 {
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("topbar-measure")
-            .max_rect(Rect::from_min_size(ui.max_rect().min, vec2(100_000.0, ui.max_rect().height())))
-            .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .sizing_pass()
-            .invisible(),
-    );
-    contents(&mut child);
-    child.min_rect().width().ceil()
-}
+pub(super) use atomics_ui::topbar::measure;
+use atomics_ui::topbar::slot;
 
-/// A slot bounds both painting and layout. Popups retain their own clip rects.
-fn slot(ui: &mut egui::Ui, id: &str, rect: Rect, contents: impl FnOnce(&mut egui::Ui)) {
-    let mut child = ui.new_child(
-        egui::UiBuilder::new().id_salt(id).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    child.set_clip_rect(ui.clip_rect().intersect(rect));
-    child.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-    contents(&mut child);
-}
-
+/// Records where a top-bar item was drawn, for the layout tests. It stays here: it records only in the
+/// desktop's own test build.
 pub(super) fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Response) {
     #[cfg(test)]
     if !_ui.is_sizing_pass() {
@@ -103,14 +83,13 @@ impl Desktop<'_> {
     fn top_bar_brand(&self, ui: &mut egui::Ui, show_agents: bool) {
         let response = ui.image((self.client.icon.id(), vec2(20.0, 20.0)));
         record_item(ui, "icon", &response);
-        let response =
-            ui.label(RichText::new("ATOMICS").strong().size(14.0).color(self.runtime.palette.accent).monospace());
+        let response = ui.label(RichText::new("ATOMICS").strong().size(14.0).color(self.palette().accent).monospace());
         record_item(ui, "brand", &response);
         if show_agents {
             let agents = self.runtime.sessions.iter().filter(|s| s.is_agent()).count();
             let response = ui.label(
                 RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" }))
-                    .color(self.runtime.palette.muted),
+                    .color(self.palette().muted),
             );
             record_item(ui, "agents", &response);
             let names: HashSet<_> = self.runtime.sessions.iter().filter_map(|s| s.sandbox.as_ref()).collect();
@@ -122,7 +101,7 @@ impl Desktop<'_> {
                     format!("VMs {}", sampler.total().label())
                 };
                 let response =
-                    ui.label(RichText::new(label).size(11.0).color(self.runtime.palette.muted)).on_hover_text(format!(
+                    ui.label(RichText::new(label).size(11.0).color(self.palette().muted)).on_hover_text(format!(
                         "Host overhead of {}/{} sandbox VM process trees. 100% CPU = one core.{}",
                         sampler.usage.len(),
                         names.len(),
@@ -154,11 +133,8 @@ impl Desktop<'_> {
         let plan = self.runtime.backend().plan_row(self.runtime.selected_plan).expect("a plan is selected");
         let (done, total, attention) = (plan.done, plan.total, plan.attention);
         let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
-        let text = RichText::new(label).color(if attention > 0 {
-            self.runtime.palette.warning
-        } else {
-            self.runtime.palette.foreground
-        });
+        let text =
+            RichText::new(label).color(if attention > 0 { self.palette().warning } else { self.palette().foreground });
         let response = ui.selectable_label(self.runtime.panel == PanelMode::Plan && self.runtime.diff_open, text);
         record_item(ui, "Plan", &response);
         if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_plan)).clicked() {
@@ -171,9 +147,9 @@ impl Desktop<'_> {
             // A dot says the ticket system wants a sign-in.
             let signed_out = self.runtime.tickets.panel.signin;
             let text = RichText::new(if signed_out { "Tickets ●" } else { "Tickets" }).color(if signed_out {
-                self.runtime.palette.warning
+                self.palette().warning
             } else {
-                self.runtime.palette.foreground
+                self.palette().foreground
             });
             let open = self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open;
             let response = ui.selectable_label(open, text);
@@ -262,9 +238,9 @@ impl Desktop<'_> {
         let text = notices.join(" · ");
         let response = ui.add(
             egui::Label::new(RichText::new(&text).color(if waiting > 0 {
-                self.runtime.palette.warning
+                self.palette().warning
             } else {
-                self.runtime.palette.foreground
+                self.palette().foreground
             }))
             .truncate()
             .sense(Sense::click()),
@@ -520,7 +496,7 @@ mod tests {
                                 .job
                                 .sections
                                 .iter()
-                                .any(|section| section.format.color == app.runtime.palette.warning)
+                                .any(|section| section.format.color == app.palette().warning)
                         );
                         assert!(!text.galley.elided, "width={width}: urgency suffix on Tabs was clipped");
                     }

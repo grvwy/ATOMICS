@@ -344,7 +344,7 @@ impl Desktop<'_> {
 
     /// Draws the lane in `rect`. `docked` collapses cards to a line each.
     pub(super) fn trace_lane(&mut self, ui: &mut egui::Ui, rect: Rect, docked: bool) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let config = self.runtime.ticket_config();
         let now = now_ms();
         let time = ui.input(|i| i.time);
@@ -756,11 +756,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let request = crate::mcp::request_for_tool(tool, input.clone()).unwrap();
         app.runtime.on_hook(hook("PreToolUse", tool, tool, input.clone(), Value::Null));
-        app.runtime.control(
-            &app.runtime.ctx.clone(),
-            serde_json::to_value(request).and_then(serde_json::from_value).unwrap(),
-            tx,
-        );
+        app.runtime.control(serde_json::to_value(request).and_then(serde_json::from_value).unwrap(), tx);
         settle(app);
         let crate::ipc::ControlOutcome::Done(response) =
             rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap()

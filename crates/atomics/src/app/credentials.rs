@@ -378,7 +378,7 @@ mod tests {
     fn credentials_bare_claude_launch_uses_a_placeholder_and_revokes_it_on_exit() {
         super::super::tests::with_app(
             "app::credentials::tests::credentials_bare_claude_launch_uses_a_placeholder_and_revokes_it_on_exit",
-            |app, ctx| {
+            |app, _ctx| {
                 use std::os::unix::fs::PermissionsExt;
                 let (dir, keychain, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
                 let token = "sk-ant-oat01-PRIVATE-BARE";
@@ -406,11 +406,10 @@ mod tests {
                     busy_text: None,
                     isolation: None,
                 });
-                let session =
-                    app.runtime.start(ctx, "relay-probe", dir.path().to_path_buf(), None, vec![], None).unwrap();
+                let session = app.runtime.start("relay-probe", dir.path().to_path_buf(), None, vec![], None).unwrap();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
                 loop {
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     if output.exists()
                         && relay.live_grants() == 0
                         && app.runtime.sessions.iter().any(|s| s.id == session && s.terminal.is_some())

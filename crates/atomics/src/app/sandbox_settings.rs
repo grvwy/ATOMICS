@@ -56,9 +56,9 @@ impl Desktop<'_> {
             for line in &self.runtime.sandbox_lines {
                 ui.add(
                     egui::Label::new(RichText::new(line).color(if line.starts_with('✗') {
-                        self.runtime.palette.warning
+                        self.palette().warning
                     } else {
-                        self.runtime.palette.foreground
+                        self.palette().foreground
                     }))
                     .wrap(),
                 );

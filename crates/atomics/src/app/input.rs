@@ -423,7 +423,7 @@ impl Desktop<'_> {
                         ui.label("");
                         ui.label(
                             RichText::new(format!("in {}", paths::display(&paths::scratch_dir().join("…"))))
-                                .color(self.runtime.palette.muted)
+                                .color(self.palette().muted)
                                 .size(11.5),
                         );
                         ui.end_row();
@@ -500,7 +500,7 @@ impl Desktop<'_> {
                     ui.end_row();
                 });
                 if let Some(err) = &dialog.error {
-                    ui.label(RichText::new(err).color(self.runtime.palette.error));
+                    ui.label(RichText::new(err).color(self.palette().error));
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -779,7 +779,7 @@ mod tests {
         std::fs::create_dir_all(root).unwrap();
         let terminal = Terminal::spawn(
             app.runtime.wake.clone(),
-            app.runtime.palette.terminal_colors(),
+            app.runtime.theme.terminal_colors(),
             "/bin/sh".into(),
             vec!["-c".into(), "stty raw -echo; printf ready; exec cat > input.bin".into()],
             root,
@@ -1153,7 +1153,7 @@ mod tests {
             diff_agent(app, &second, "second");
             let editor = Terminal::spawn(
                 app.runtime.wake.clone(),
-                app.runtime.palette.terminal_colors(),
+                app.runtime.theme.terminal_colors(),
                 "/bin/sh".into(),
                 vec!["-c".into(), "stty raw -echo; printf ready; exec cat > editor.bin".into()],
                 &second,

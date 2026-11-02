@@ -387,7 +387,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn connections_panel(&mut self, ui: &mut egui::Ui) -> Option<Action> {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let mut action = None;
         ui.set_max_width(640.0);
         let connections = &self.runtime.connections;

@@ -369,7 +369,7 @@ mod tests {
     fn show(state: &mut State, cwd: &Path, text: &str) {
         let terminal = crate::terminal::Terminal::spawn(
             state.wake.clone(),
-            state.palette.terminal_colors(),
+            state.theme.terminal_colors(),
             "/bin/sh".into(),
             vec!["-c".into(), format!("printf '%s' '{text}'; exec sleep 600")],
             cwd,

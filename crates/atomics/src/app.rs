@@ -24,7 +24,7 @@ use crate::lifecycle::Scope;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
-use crate::theme::{Palette, lerp, shortcut, shortcut_label};
+use crate::theme::{Palette, SystemFonts, Theme, lerp, shortcut, shortcut_label};
 use crate::voice::{MAX_RECORDING, Recorder};
 use crate::watcher::{Change, Watcher};
 use atomics_core::approvals::{ApprovalRequest, Decision};
@@ -87,6 +87,8 @@ const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
 const PULSE_STEP: Duration = Duration::from_millis(250);
+/// The answer to a request only a desktop window can serve, in the headless host.
+const NO_WINDOW: &str = "no window: this is the headless host (atomics host); start the desktop for window commands";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
 const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
 
@@ -445,7 +447,8 @@ struct Screenshot {
 /// content and publish view hints; runtime effects run through its action queue.
 /// Drafts, selections, dialogs, terminal painting and microphone capture are client-owned.
 pub(crate) struct State {
-    ctx: egui::Context,
+    /// The desktop's window, or none in the headless host.
+    window: crate::host::Window,
     wake: crate::host::Wake,
     control_tx: crate::host::Sender<ControlMessage>,
     client_commands: Vec<ControlRequest>,
@@ -470,7 +473,9 @@ pub(crate) struct State {
     theme_choices: Arc<Vec<themes::ThemeChoice>>,
     /// This machine's config.d file picks a theme, which wins over config.toml's.
     host_theme: bool,
-    palette: Arc<Palette>,
+    /// The theme as resolved: what terminals answer and the highlighter draws with. Each change is a new
+    /// `Arc`, which tells clients to make their palette again.
+    theme: Arc<Theme>,
     highlighter: Arc<Highlighter>,
     sessions: Vec<Session>,
     codex_versions: HashMap<String, CodexVersion>,
@@ -639,6 +644,9 @@ enum ClientEvent {
 
 /// View data belongs to the desktop, never to the runtime scheduler.
 struct Client {
+    ctx: egui::Context,
+    /// The host's theme in egui colors and fonts, with the theme it was made from.
+    palette: std::cell::RefCell<Option<(Arc<Theme>, Arc<Palette>)>>,
     project_picker: Option<PathBuf>,
     approval_decisions: HashSet<(String, String)>,
     focus_terminal: Option<String>,
@@ -691,9 +699,24 @@ struct Client {
 }
 
 impl Client {
+    /// `theme` in egui colors and fonts, made again only when the host's theme changed.
+    fn palette(&self, theme: &Arc<Theme>) -> Arc<Palette> {
+        let mut made = self.palette.borrow_mut();
+        match &*made {
+            Some((made_from, palette)) if Arc::ptr_eq(made_from, theme) => palette.clone(),
+            _ => {
+                let palette = Arc::new(theme.palette());
+                *made = Some((theme.clone(), palette.clone()));
+                palette
+            }
+        }
+    }
+
     fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         Self {
+            ctx: ctx.clone(),
+            palette: Default::default(),
             project_picker: None,
             approval_decisions: HashSet::new(),
             focus_terminal: None,
@@ -749,6 +772,13 @@ impl Client {
 struct Desktop<'a> {
     runtime: &'a mut State,
     client: &'a mut Client,
+}
+
+impl Desktop<'_> {
+    /// The colors and fonts to draw with: the host's theme, as this client's palette.
+    fn palette(&self) -> Arc<Palette> {
+        self.client.palette(&self.runtime.theme)
+    }
 }
 
 impl std::ops::Deref for Desktop<'_> {
@@ -839,13 +869,52 @@ impl Drop for State {
     }
 }
 
-impl State {
-    fn into_host(self) -> crate::host::Host {
-        let (wake, ctx, commands) = (self.wake.clone(), self.ctx.clone(), self.control_tx.clone());
-        crate::host::Host::start(self, wake, ctx, commands)
+/// The desktop's window as the runtime sees it. egui stays in the desktop: the runtime only
+/// asks for repaints, focus and the window's size through [`crate::host::Surface`].
+impl crate::host::Surface for egui::Context {
+    fn repaint(&self) {
+        self.request_repaint();
     }
 
+    fn repaint_after(&self, delay: Duration) {
+        self.request_repaint_after(delay);
+    }
+
+    fn raise(&self) {
+        self.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        self.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn viewport(&self) -> crate::host::Viewport {
+        self.input(|input| {
+            let content = input.content_rect().size();
+            let viewport = input.viewport();
+            crate::host::Viewport {
+                content: [content.x, content.y],
+                monitor: viewport.monitor_size.map(|size| [size.x, size.y]),
+                inner: viewport.inner_rect.map(|rect| [rect.width(), rect.height()]),
+                maximized: viewport.maximized.unwrap_or(false),
+            }
+        })
+    }
+}
+
+impl State {
+    pub(crate) fn into_host(self) -> crate::host::Host {
+        let (wake, commands) = (self.wake.clone(), self.control_tx.clone());
+        crate::host::Host::start(self, wake, commands)
+    }
+
+    /// The desktop's model: its egui window attached and the theme applied to it.
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options, _icon: &egui::IconData) -> State {
+        let state = State::build(options, crate::host::Window::attach(cc.egui_ctx.clone()));
+        state.theme.palette().apply(&cc.egui_ctx, &SystemFonts);
+        state
+    }
+
+    /// The runtime model and its services, with `window` attached or (headless) none. Nothing here
+    /// needs egui, a display or a GPU.
+    pub(crate) fn build(options: Options, window: crate::host::Window) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
         crate::sandbox::load_pins(&paths::git_pins_dir());
@@ -856,9 +925,7 @@ impl State {
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
         };
         let config_problems = github::config_problems(&config);
-        let ctx = cc.egui_ctx.clone();
-        let (palette, theme_errors) = Palette::load(&config.theme, &theme::themes_dir(&config_path));
-        palette.apply(&ctx);
+        let (theme, theme_errors) = Theme::load(&config.theme, &theme::themes_dir(&config_path));
         let theme_error = theme_error(&theme_errors);
 
         let hub = Arc::new(Mutex::new(Hub::default()));
@@ -866,13 +933,13 @@ impl State {
         let (hook_tx, hook_rx) = wake.channel();
         let (control_tx, control_rx) = wake.channel();
         let (action_tx, action_rx) = wake.channel();
-        let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
+        let (usage, usage_tx) = crate::usage::UsagePanel::new(window.clone());
         let sandbox_pull = crate::usage::SandboxPull::new(usage_tx.clone());
-        let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
+        let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
         let hook_error =
-            ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
+            ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()).err().map(|e| format!("{e:#}"));
         // Only the instance that owns the socket owns the pool, so a second ATOMICS never replaces it.
         let mut notices = Vec::new();
         let jobserver = match hook_error {
@@ -914,15 +981,15 @@ impl State {
             plans.len() - 1
         });
         let mut app = State {
-            ctx: ctx.clone(),
+            window,
             wake: wake.clone(),
             control_tx,
             client_commands: Vec::new(),
             client_events: Vec::new(),
             action_tx,
             action_rx,
-            highlighter: Arc::new(Highlighter::new(&palette.syntax)),
-            palette: Arc::new(palette),
+            highlighter: Arc::new(Highlighter::new(&theme.syntax)),
+            theme: Arc::new(theme),
             config_stamp: config_fingerprints(&config_path),
             repo_workflows: HashMap::new(),
             project_roots: HashMap::new(),
@@ -1085,7 +1152,32 @@ impl State {
     }
 
     fn toast(&mut self, text: impl Into<String>) {
-        self.toast = Some((text.into(), Instant::now()));
+        let text = text.into();
+        // The headless host has nowhere to show a toast; its log is stderr.
+        if !self.window.is_attached() {
+            eprintln!("atomics host: {text}");
+        }
+        self.toast = Some((text, Instant::now()));
+    }
+
+    pub(crate) fn window(&self) -> &crate::host::Window {
+        &self.window
+    }
+
+    /// Why the local socket could not be served, when it could not.
+    pub(crate) fn hook_error(&self) -> Option<&str> {
+        self.hook_error.as_deref()
+    }
+
+    /// With no window attached nothing consumes client events. Answer the ones a caller waits on
+    /// and drop the rest, so they never pile up in the headless host.
+    pub(crate) fn drop_client_events(&mut self) {
+        for event in self.client_events.drain(..) {
+            if let ClientEvent::Screenshot { reply, .. } = event {
+                let _ = reply.send(ControlOutcome::Done(ControlResponse::error(NO_WINDOW)));
+            }
+        }
+        self.client_commands.clear();
     }
 
     fn active_index(&self) -> Option<usize> {
@@ -1477,7 +1569,7 @@ impl Desktop<'_> {
                     });
                     ctx.request_repaint();
                 }
-                ClientEvent::ConfigChanged => self.runtime.palette.apply(ctx),
+                ClientEvent::ConfigChanged => self.palette().apply(ctx, &SystemFonts),
                 ClientEvent::Viewport(command) => ctx.send_viewport_cmd(command),
                 ClientEvent::ShowSettings(open) => self.client.show_settings = Some(open),
                 ClientEvent::VoiceFailed { text, error } => self.voice_failed(&text, &error),
@@ -1513,7 +1605,7 @@ impl Desktop<'_> {
             self.client.load = (Instant::now(), crate::governor::load_average());
         }
         let Some(load) = self.client.load.1 else { return };
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let per_core = load / self.runtime.governor.cores as f64;
         let color = if per_core >= 1.0 {
             p.error
@@ -1542,14 +1634,14 @@ impl Desktop<'_> {
     }
 
     fn metrics(&self, ui: &egui::Ui) -> Metrics {
-        let p = &self.runtime.palette;
+        let p = self.palette();
         let font = p.mono(p.fonts.mono_size.unwrap_or(self.runtime.config.font.size));
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
         Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
     }
 
     fn steer_bar(&mut self, ui: &mut egui::Ui) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.horizontal(|ui| {
             let active_title = self
                 .runtime
@@ -1612,7 +1704,7 @@ impl Desktop<'_> {
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("welcome")
@@ -1697,7 +1789,7 @@ impl Desktop<'_> {
         }
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
 
         egui::Panel::top("top")
             .exact_size(34.0)

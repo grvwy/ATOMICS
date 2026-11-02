@@ -165,7 +165,7 @@ impl Desktop<'_> {
             return;
         }
         let Some(mut cleanup) = self.runtime.cleanup.take() else { return };
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let agent_roots: HashSet<PathBuf> = self.runtime.sessions.iter().map(Session::root).collect();
         let live_sandboxes: HashSet<String> = self.runtime.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
         let name = cleanup.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -457,7 +457,7 @@ mod tests {
     fn cache_warming_finishes_on_the_worktree_job_before_agent_launch() {
         with_state(
             "app::worktrees::tests::cache_warming_finishes_on_the_worktree_job_before_agent_launch",
-            |mut state, ctx| {
+            |mut state, _ctx| {
                 let (_dir, repo) = repository();
                 state.config.base_ref = "main".into();
                 state.config.agents.push(atomics_core::config::AgentConfig {
@@ -517,7 +517,7 @@ mod tests {
                         assert!(!path.join("target").exists());
                     }
                     state.worktree_tx.send(event).unwrap();
-                    state.runtime_tick(ctx);
+                    state.runtime_tick();
                     if branch == "warm" && supported {
                         assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
                     }

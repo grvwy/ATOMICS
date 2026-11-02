@@ -4,8 +4,7 @@ impl State {
     /// Shows a file in the diff panel: its hunks when changed, the whole file otherwise.
     pub(super) fn open_file(&mut self, root: &Path, path: &str) {
         if self.panel == PanelMode::Editor {
-            let ctx = self.ctx.clone();
-            self.edit(&ctx, root, Some(path), None);
+            self.edit(root, Some(path), None);
             return;
         }
         self.diff_open = true;
@@ -26,7 +25,7 @@ impl State {
 
     /// Switches the panel to the editor for `root`, opening `path` at `line`. One
     /// editor runs per worktree and keeps running when you switch back to the diff.
-    pub(super) fn edit(&mut self, _ctx: &egui::Context, root: &Path, path: Option<&str>, line: Option<u32>) {
+    pub(super) fn edit(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) {
         self.panel = PanelMode::Editor;
         self.diff_open = true;
         self.client_events.push(ClientEvent::Edit { root: root.to_path_buf(), path: path.map(str::to_string) });
@@ -47,14 +46,14 @@ impl State {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-        env.insert("COLORFGBG".into(), self.palette.colorfgbg().into());
+        env.insert("COLORFGBG".into(), self.theme.colorfgbg().into());
         if let Some(shell_path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;
         match Terminal::spawn(
             self.wake.clone(),
-            self.palette.terminal_colors(),
+            self.theme.terminal_colors(),
             crate::setup::editor_program(program),
             args,
             root,
@@ -107,7 +106,7 @@ impl Desktop<'_> {
                 PanelMode::Editor => self.client.editor_file.get(&root).cloned(),
                 _ => self.client.diff_views.get(&root).and_then(|d| d.focused.clone()),
             };
-            let p = self.runtime.palette.clone();
+            let p = self.palette();
             let state = self.client.diff_views.entry(root.clone()).or_default();
             if let Some((path, line)) = diff_view::changed_files(ui, column, state, current.as_deref(), &p) {
                 match self.runtime.panel {
@@ -137,7 +136,7 @@ impl Desktop<'_> {
             .or_else(|| self.runtime.worktrees.iter().find(|w| w.path == root).and_then(|w| w.branch.clone()))
             .filter(|b| *b != title);
         let can_send = self.runtime.sessions.iter().any(|s| s.root() == root && s.is_agent() && s.can_receive());
-        let palette = self.runtime.palette.clone();
+        let palette = self.palette();
         let font = palette.mono(palette.fonts.diff_size.unwrap_or(self.runtime.config.font.diff_size));
         let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
         let state = self.client.diff_views.entry(root.clone()).or_default();
@@ -175,7 +174,7 @@ impl Desktop<'_> {
     }
 
     fn editor_panel(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.painter().rect_filled(rect, 0.0, p.terminal);
         let header = rect.with_max_y(rect.top() + 30.0);
         let body = rect.with_min_y(header.bottom());
@@ -259,7 +258,7 @@ impl Desktop<'_> {
         all.sort();
         all.dedup();
         let changed: HashSet<&str> = prepared.diff.files.iter().map(|f| f.path()).collect();
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let mut keep = true;
         let mut open: Option<String> = None;
         egui::Window::new("Go to file")
@@ -402,7 +401,7 @@ mod tests {
     fn helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme() {
         with_app(
             "app::editor::tests::helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme",
-            |app, ctx| {
+            |app, _ctx| {
                 let Some(helix) = crate::setup::find_program("hx").or_else(|| crate::setup::find_program("helix"))
                 else {
                     eprintln!("Helix is not installed; skipping the native diff-gutter smoke test");
@@ -420,7 +419,7 @@ mod tests {
                     vec![helix.to_string_lossy().into_owned(), "--log".into(), log.to_string_lossy().into_owned()];
                 let check = |app: &mut Desktop<'_>, path: &str, marker: bool| {
                     app.runtime.editors.remove(&root);
-                    app.runtime.edit(ctx, &root, Some(path), None);
+                    app.runtime.edit(&root, Some(path), None);
                     let terminal = &app.runtime.editors[&root];
                     // The normal startup sequence applies the theme after 900 ms, with pauses
                     // between commands. Inspect the screen after it has settled.
@@ -476,7 +475,7 @@ mod tests {
                 )
                 .drop_without_applying_deltas();
             };
-            app.runtime.edit(ctx, root, None, None);
+            app.runtime.edit(root, None, None);
             let terminal = &app.runtime.editors[root];
             wait(terminal, &|| terminal.screen_text(40).contains("ready"));
             frame(app);
@@ -499,7 +498,7 @@ mod tests {
             terminal.write(b"quit\r".to_vec());
             wait(terminal, &|| terminal.exited());
             // Restart without a client frame or consuming either Edit event.
-            app.runtime.edit(ctx, root, None, None);
+            app.runtime.edit(root, None, None);
             assert_ne!(app.runtime.editors[root].process_id(), old_id);
             assert_eq!(app.client.terminal_views.len(), 1);
             frame(app);

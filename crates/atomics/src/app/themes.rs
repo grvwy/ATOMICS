@@ -28,7 +28,9 @@ pub(super) fn theme_choices(dir: &Path) -> Vec<ThemeChoice> {
         .chain(files.iter().filter(|file| !builtin.contains(&file.as_str())).map(|file| (file.clone(), true)));
     names
         .map(|(name, file)| {
-            let (p, _) = Palette::load(&ThemeConfig { name: name.clone(), ..ThemeConfig::default() }, dir);
+            let p = crate::theme::Theme::load(&ThemeConfig { name: name.clone(), ..ThemeConfig::default() }, dir)
+                .0
+                .palette();
             let swatches = [p.background, p.panel, p.foreground, p.accent, p.ansi[1], p.ansi[2], p.ansi[4]];
             ThemeChoice { name, file, swatches }
         })
@@ -85,7 +87,7 @@ impl State {
 impl Desktop<'_> {
     /// The Themes section of the Settings menu.
     pub(super) fn themes_menu(&mut self, ui: &mut egui::Ui) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.label(RichText::new("Themes").strong());
         // Outlines that stay visible on the menu, where a dark swatch or the checkbox would vanish.
         let edge = lerp(p.border, p.foreground, 0.3);
@@ -248,7 +250,11 @@ mod tests {
                 ]
             );
             let dusk = &app.runtime.theme_choices[5];
-            assert_eq!(dusk.swatches[3], crate::theme::parse_hex("#e0a458").unwrap(), "the strip shows its accent");
+            assert_eq!(
+                dusk.swatches[3],
+                atomics_ui::theme::parse_hex("#e0a458").unwrap(),
+                "the strip shows its accent"
+            );
             let built_in = request(app, json!({"cmd":"config_get"})).result["themes"]["built_in"].clone();
             assert_eq!(built_in, json!(["claude", "midnight", "paper", "atomisk", "tide"]));
 
@@ -258,8 +264,10 @@ mod tests {
                 assert!(find(app, ctx, name).is_some(), "{name} is listed");
             }
             click(app, ctx, "atomisk");
-            let atomisk = Palette::from_config(&ThemeConfig { name: "atomisk".into(), ..ThemeConfig::default() });
-            assert_eq!(app.runtime.palette.accent, atomisk.accent, "a picked theme shows at once");
+            let atomisk =
+                crate::theme::Theme::from_config(&ThemeConfig { name: "atomisk".into(), ..ThemeConfig::default() })
+                    .palette();
+            assert_eq!(app.palette().accent, atomisk.accent, "a picked theme shows at once");
             let written = std::fs::read_to_string(&main).unwrap();
             assert!(
                 written.contains("name = \"atomisk\"             # built in: claude, midnight, atomisk"),
@@ -308,8 +316,8 @@ mod tests {
             );
             assert!(app.runtime.config_error.is_none(), "{:?}", app.runtime.config_error);
             assert_eq!(app.runtime.config.theme.name, "paper");
-            assert_eq!(app.runtime.palette.mode, atomics_core::theme::ThemeMode::Light);
-            assert_eq!(app.runtime.palette.accent, crate::theme::parse_hex("#00ff88").unwrap(), "[theme] still wins");
+            assert_eq!(app.palette().mode, atomics_core::theme::ThemeMode::Light);
+            assert_eq!(app.palette().accent, atomics_ui::theme::parse_hex("#00ff88").unwrap(), "[theme] still wins");
 
             // A file that does not parse is never rewritten.
             std::fs::write(&main, "[theme\nname = 'claude'").unwrap();

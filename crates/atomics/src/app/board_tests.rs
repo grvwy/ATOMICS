@@ -47,7 +47,7 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, even
         .shapes
         .iter()
         .filter_map(|shape| match &shape.shape {
-            egui::epaint::Shape::Rect(rect) if rect.fill == app.runtime.palette.raised && rect.rect.height() > 40.0 => {
+            egui::epaint::Shape::Rect(rect) if rect.fill == app.palette().raised && rect.rect.height() > 40.0 => {
                 Some(rect.rect)
             }
             _ => None,
@@ -310,7 +310,7 @@ fn approve_plan_fills_with_the_accent_and_writes_on_accent() {
     super::tests::with_app("app::board_tests::approve_plan_fills_with_the_accent_and_writes_on_accent", |app, ctx| {
         populate(app);
         app.runtime.plans[0].approved = false;
-        let p = app.runtime.palette.clone();
+        let p = app.palette().clone();
         assert_ne!(p.on_accent, p.foreground, "the check needs on_accent to differ from ordinary text");
         for time in 0..2 {
             frame(app, ctx, 1600.0, time as f64, vec![]);

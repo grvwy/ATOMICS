@@ -101,8 +101,8 @@ impl Session {
 impl State {
     // ── sessions ──────────────────────────────────────────────────────────
 
-    pub(super) fn spawn(&mut self, ctx: &egui::Context, agent_name: &str, cwd: PathBuf, resume: Option<String>) {
-        if let Err(err) = self.start(ctx, agent_name, cwd, resume, Vec::new(), None) {
+    pub(super) fn spawn(&mut self, agent_name: &str, cwd: PathBuf, resume: Option<String>) {
+        if let Err(err) = self.start(agent_name, cwd, resume, Vec::new(), None) {
             self.toast(err);
         }
     }
@@ -110,21 +110,19 @@ impl State {
     /// Starts an agent in a terminal and returns its session id.
     pub(super) fn start(
         &mut self,
-        ctx: &egui::Context,
         agent_name: &str,
         cwd: PathBuf,
         resume: Option<String>,
         extra_args: Vec<String>,
         prompt: Option<String>,
     ) -> Result<String, String> {
-        self.start_as(ctx, agent_name, cwd, resume, extra_args, prompt, Role::Agent(None))
+        self.start_as(agent_name, cwd, resume, extra_args, prompt, Role::Agent(None))
     }
 
     /// Starts `agent_name` outside any project, in a new scratch folder of its own. It takes the
     /// launch every agent takes, so it gets the isolation, credentials and MCP servers they get.
     pub(super) fn start_scratch(
         &mut self,
-        ctx: &egui::Context,
         agent_name: &str,
         args: Vec<String>,
         prompt: Option<String>,
@@ -136,7 +134,7 @@ impl State {
         if let Err(err) = git::git(&folder, &["init", "-q"]) {
             eprintln!("ATOMICS: git init in {} failed: {err:#}", folder.display());
         }
-        let started = self.start_as(ctx, agent_name, folder.clone(), None, args, prompt, Role::Agent(isolation));
+        let started = self.start_as(agent_name, folder.clone(), None, args, prompt, Role::Agent(isolation));
         if started.is_err() {
             let _ = std::fs::remove_dir_all(&folder);
         }
@@ -147,7 +145,6 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_as(
         &mut self,
-        ctx: &egui::Context,
         agent_name: &str,
         cwd: PathBuf,
         resume: Option<String>,
@@ -156,7 +153,7 @@ impl State {
         role: Role,
     ) -> Result<String, String> {
         let first = prompt.clone();
-        let id = self.launch_as(ctx, agent_name, cwd, resume, extra_args, prompt, role)?;
+        let id = self.launch_as(agent_name, cwd, resume, extra_args, prompt, role)?;
         if let Some(prompt) = first
             && let Some(session) = self.sessions.iter_mut().find(|s| s.id == id)
         {
@@ -168,7 +165,6 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     fn launch_as(
         &mut self,
-        ctx: &egui::Context,
         agent_name: &str,
         cwd: PathBuf,
         resume: Option<String>,
@@ -272,7 +268,7 @@ impl State {
         }
         let version = if codex {
             let program = resolve_program(&launch.agent.command[0]);
-            let ready = self.codex_version(ctx, program);
+            let ready = self.codex_version(program);
             match ready.get().copied() {
                 Some(supported) => {
                     if supported.is_none() {
@@ -296,7 +292,7 @@ impl State {
         } else {
             None
         };
-        self.launch_agent(ctx, launch, version)
+        self.launch_agent(launch, version)
     }
 
     /// The sandbox `agent` gets in `cwd`, or `None` to run it bare: the isolation in effect for
@@ -411,7 +407,7 @@ impl State {
         })
     }
 
-    fn codex_version(&mut self, _ctx: &egui::Context, program: String) -> CodexVersion {
+    fn codex_version(&mut self, program: String) -> CodexVersion {
         if self.codex_versions.get(&program).is_some_and(|ready| ready.get() == Some(&None)) {
             self.codex_versions.remove(&program);
         }
@@ -431,12 +427,7 @@ impl State {
             .clone()
     }
 
-    pub(super) fn launch_agent(
-        &mut self,
-        _ctx: &egui::Context,
-        launch: AgentLaunch,
-        codex: Option<bool>,
-    ) -> Result<String, String> {
+    pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay } = launch;
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
@@ -456,7 +447,7 @@ impl State {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
-        env.insert("COLORFGBG".into(), self.palette.colorfgbg().into());
+        env.insert("COLORFGBG".into(), self.theme.colorfgbg().into());
         if sandboxed.is_none() && agent.kind != AgentKind::Shell {
             env.extend(instance_agent_env());
         }
@@ -555,6 +546,9 @@ impl State {
                         args.push("--no-daemon".into());
                     }
                     args.extend(atomics_core::hook::codex_hook_args(Path::new(&exe), Path::new(&socket), &id));
+                    // The handlers find this pane without process ancestry, which a wrapper
+                    // such as ssh into a VM would hide.
+                    env.insert(atomics_core::hook::HOOK_PANE_ENV.into(), id.clone());
                 }
                 args.extend([
                     "-c".to_string(),
@@ -668,7 +662,7 @@ impl State {
         };
         match Terminal::spawn(
             self.wake.clone(),
-            self.palette.terminal_colors(),
+            self.theme.terminal_colors(),
             program,
             args,
             &cwd,
@@ -1364,12 +1358,12 @@ mod tests {
     fn sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit() {
         with_app(
             "app::sessions::tests::sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit",
-            |app, ctx| {
+            |app, _ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
                 for (text, exit) in [("API Error: 401 authentication_failed", false), ("HTTP 401 Unauthorized", true)] {
                     let terminal = Terminal::spawn(
                         app.runtime.wake.clone(),
-                        app.runtime.palette.terminal_colors(),
+                        app.runtime.theme.terminal_colors(),
                         "/bin/sh".into(),
                         vec![
                             "-c".into(),
@@ -1398,7 +1392,7 @@ mod tests {
                     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
                     loop {
                         app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
-                        app.runtime.runtime_tick(ctx);
+                        app.runtime.runtime_tick();
                         if app.runtime.sessions[0].status == AgentStatus::NeedsInput
                             && app.runtime.plans[0].tasks[0].status == TaskStatus::Blocked
                             && app.runtime.plans[0].tasks[0].report.as_ref().is_some_and(|r| r.summary.contains(text))
@@ -1411,7 +1405,7 @@ mod tests {
                     }
                     // It stays blocked on the following tick, including after the terminal exits.
                     app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                     assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
                     assert!(app.runtime.plans[0].tasks[0].report.as_ref().unwrap().summary.contains(text));
@@ -1429,7 +1423,7 @@ mod tests {
             for text in ["Trust this folder?", "Review hooks\n› 1. Trust hooks\n  2. Cancel"] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     "/bin/sh".into(),
                     vec!["-c".into(), format!("printf '%s' '{}'; exec sleep 600", text)],
                     dir.path(),
@@ -1457,7 +1451,7 @@ mod tests {
 
     #[test]
     fn isolated_agents_write_provider_trust_only_inside_the_instance() {
-        with_app("app::sessions::tests::isolated_agents_write_provider_trust_only_inside_the_instance", |app, ctx| {
+        with_app("app::sessions::tests::isolated_agents_write_provider_trust_only_inside_the_instance", |app, _ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "trust-probe".into(),
@@ -1467,7 +1461,7 @@ mod tests {
                 busy_text: None,
                 isolation: None,
             });
-            let id = app.runtime.start(ctx, "trust-probe", dir.path().into(), None, vec![], None).unwrap();
+            let id = app.runtime.start("trust-probe", dir.path().into(), None, vec![], None).unwrap();
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             let home = paths::atomics_home();
             while !home.join("claude/.claude.json").exists() {
@@ -1519,7 +1513,7 @@ mod tests {
 
     #[test]
     fn agents_share_the_job_pool_at_lower_priority() {
-        with_app("app::sessions::tests::agents_share_the_job_pool_at_lower_priority", |app, ctx| {
+        with_app("app::sessions::tests::agents_share_the_job_pool_at_lower_priority", |app, _ctx| {
             // This closure runs in its own test process. Cover an already-niced launcher too:
             // Darwin allows niceness 20, whereas Linux saturates at 19.
             for saturated in [false, true] {
@@ -1543,7 +1537,7 @@ mod tests {
                 app.runtime.config.resources.agent_nice = 7;
                 // SAFETY: querying this process's priority has no preconditions.
                 let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-                app.runtime.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
+                app.runtime.start("probe", dir.path().into(), None, vec![], None).unwrap();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
                 while !out.exists() {
                     assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
@@ -1572,7 +1566,7 @@ mod tests {
 
     #[test]
     fn dotnet_agents_get_the_budget_in_their_terminal() {
-        with_app("app::sessions::tests::dotnet_agents_get_the_budget_in_their_terminal", |app, ctx| {
+        with_app("app::sessions::tests::dotnet_agents_get_the_budget_in_their_terminal", |app, _ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("src")).unwrap();
             std::fs::write(dir.path().join("src/Example.csproj"), "").unwrap();
@@ -1589,7 +1583,7 @@ mod tests {
                 busy_text: None,
                 isolation: None,
             });
-            app.runtime.start(ctx, "dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
+            app.runtime.start("dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             while !out.exists() {
                 assert!(Instant::now() < deadline, "the .NET probe never wrote its environment");
@@ -1607,7 +1601,7 @@ mod tests {
 
     #[test]
     fn codex_version_is_cached_per_program_without_blocking_launch() {
-        with_app("app::sessions::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, ctx| {
+        with_app("app::sessions::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, _ctx| {
             use std::os::unix::fs::PermissionsExt;
             let dir = crate::test_support::tempdir().unwrap();
             let script = r#"#!/bin/sh
@@ -1656,9 +1650,9 @@ fi
                 }
             });
             let program = |name: &str| dir.path().join(name).join("codex").to_string_lossy().into_owned();
-            let one = app.runtime.codex_version(ctx, program("one"));
-            assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(ctx, program("one"))));
-            let two = app.runtime.codex_version(ctx, program("two"));
+            let one = app.runtime.codex_version(program("one"));
+            assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(program("one"))));
+            let two = app.runtime.codex_version(program("two"));
             release.join().unwrap();
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while one.get().is_none() || two.get().is_none() {
@@ -1672,7 +1666,7 @@ fi
             // inherit pipe writers on macOS and otherwise keep git's output() waiting for EOF.
             let mut ids = Vec::new();
             for name in ["one", "one", "two"] {
-                ids.push(app.runtime.start(ctx, name, dir.path().into(), None, vec![], None).unwrap());
+                ids.push(app.runtime.start(name, dir.path().into(), None, vec![], None).unwrap());
             }
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while ids
@@ -1692,7 +1686,7 @@ fi
                     .unwrap()
                     .contains("hooks.PermissionRequest")
             );
-            assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(ctx, program("one"))));
+            assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(program("one"))));
             for name in ["one", "two"] {
                 assert_eq!(std::fs::read_to_string(dir.path().join(name).join("checks")).unwrap().lines().count(), 1);
                 let args = std::fs::read_to_string(dir.path().join(name).join("launch-args")).unwrap();
@@ -1721,7 +1715,7 @@ fi
     fn failed_codex_probes_are_retried_and_recovered_launches_get_hooks() {
         with_app(
             "app::sessions::tests::failed_codex_probes_are_retried_and_recovered_launches_get_hooks",
-            |app, ctx| {
+            |app, _ctx| {
                 use std::os::unix::fs::PermissionsExt;
                 let dir = crate::test_support::tempdir().unwrap();
                 let program = dir.path().join("codex");
@@ -1751,7 +1745,7 @@ fi
 "#,
                     )
                     .unwrap();
-                    let id = app.runtime.start(ctx, "flaky", dir.path().into(), None, vec![], None).unwrap();
+                    let id = app.runtime.start("flaky", dir.path().into(), None, vec![], None).unwrap();
                     let retried = app.runtime.codex_versions[&name].clone();
                     assert!(!Arc::ptr_eq(&failed, &retried), "failed probes must not be reused as old versions");
                     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
@@ -1761,14 +1755,14 @@ fi
                         .is_none_or(|terminal| !terminal.exited())
                     {
                         assert!(Instant::now() < deadline, "recovered fake agent must launch and exit");
-                        app.runtime.runtime_tick(ctx);
+                        app.runtime.runtime_tick();
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let args = std::fs::read_to_string(dir.path().join("launch-args")).unwrap();
                     assert!(args.contains("--no-daemon"));
                     assert!(args.contains("hooks.PermissionRequest"));
                     assert_eq!(retried.get(), Some(&Some(true)));
-                    assert!(Arc::ptr_eq(&retried, &app.runtime.codex_version(ctx, name.clone())));
+                    assert!(Arc::ptr_eq(&retried, &app.runtime.codex_version(name.clone())));
                 }
             },
         );
@@ -1776,7 +1770,7 @@ fi
 
     #[test]
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
-        with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, ctx| {
+        with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, _ctx| {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
@@ -1789,7 +1783,7 @@ fi
             for mode in ["queue", "retry", "drop", "drop-paste", "drop-empty", "exit", "hook"] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), mode.into()],
                     &app.runtime.launch_dir,
@@ -1807,11 +1801,7 @@ fi
                 app.runtime.sessions[0].agent = "fake-codex".into();
                 app.runtime.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
-                app.runtime.control(
-                    ctx,
-                    ControlRequest::Send { session: mode.into(), text: text.into(), raw: false },
-                    tx,
-                );
+                app.runtime.control(ControlRequest::Send { session: mode.into(), text: text.into(), raw: false }, tx);
                 assert!(rx.try_recv().is_err(), "an unverified send must not claim success");
                 let held = request(app, json!({"cmd":"send", "session":mode, "text":"second message"}));
                 assert!(held.ok && held.result["held"] == true, "another send must wait for the pending receipt");
@@ -1883,7 +1873,7 @@ fi
 
     #[test]
     fn codex_clipped_and_repeated_receipts_never_repaste() {
-        with_app("app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste", |app, ctx| {
+        with_app("app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste", |app, _ctx| {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
@@ -1900,7 +1890,7 @@ fi
                 };
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), mode.into()],
                     &app.runtime.launch_dir,
@@ -1918,7 +1908,7 @@ fi
                 app.runtime.sessions[0].agent = "fake-codex".into();
                 app.runtime.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
-                app.runtime.control(ctx, ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
+                app.runtime.control(ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
                 let mut paste_seen = false;
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Enters: 1") {
                     assert!(Instant::now() < deadline, "{mode}: the original paste and Enter must reach the fixture");
@@ -1977,7 +1967,7 @@ fi
             app.runtime.sessions[0].terminal = Some(
                 Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec![],
                     &app.runtime.launch_dir,

@@ -12,8 +12,7 @@ const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 impl State {
     /// Handles a link, toasting why when it cannot be opened.
     pub(super) fn open_link(&mut self, incoming: Incoming) -> Result<(), String> {
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.window.raise();
         let result =
             incoming.map_err(|reason| format!("Ignored a link: {reason}")).and_then(|link| self.show_link(link));
         if let Err(message) = &result {
@@ -152,8 +151,7 @@ impl State {
     fn draft_for_chief(&mut self, text: String) {
         if !self.sessions.iter().any(|s| s.chief && s.status != AgentStatus::Exited) {
             self.sessions.retain(|s| !s.chief);
-            let ctx = self.ctx.clone();
-            if let Err(error) = self.start_chief(&ctx, None) {
+            if let Err(error) = self.start_chief(None) {
                 self.toast(error);
                 return;
             }

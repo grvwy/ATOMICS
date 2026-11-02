@@ -5,7 +5,7 @@ use std::ffi::{CStr, c_char};
 use std::sync::Mutex;
 
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{AllocAnyThread, ClassType, class, define_class, msg_send, sel};
+use objc2::{AllocAnyThread, class, define_class, msg_send, sel};
 
 /// 'GURL': the class and id of the get-URL event.
 const GET_URL: u32 = 0x4755_524C;

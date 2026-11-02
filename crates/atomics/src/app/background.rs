@@ -3,7 +3,7 @@ use super::*;
 impl State {
     // ── background events ─────────────────────────────────────────────────
 
-    pub(crate) fn runtime_tick(&mut self, ctx: &egui::Context) -> bool {
+    pub(crate) fn runtime_tick(&mut self) -> bool {
         if self.restarting || self.shutting_down {
             return false;
         }
@@ -13,11 +13,11 @@ impl State {
         changed |= self.poll_connections();
         changed |= self.github_tick();
         for record in std::mem::take(&mut self.resume) {
-            self.resume_record(ctx, record);
+            self.resume_record(record);
             changed = true;
         }
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
-            match self.start_chief(ctx, None) {
+            match self.start_chief(None) {
                 Ok(_) => self.chief_open = true,
                 Err(error) => self.toast(format!("Could not start the chief: {error}")),
             }
@@ -47,7 +47,7 @@ impl State {
         }
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             changed = true;
-            self.spawn(ctx, &agent, dir, None);
+            self.spawn(&agent, dir, None);
         }
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
@@ -62,7 +62,7 @@ impl State {
                         "Codex version probe failed; starting without hooks and retrying detection on the next start",
                     );
                 }
-                if let Err(error) = self.launch_agent(ctx, launch, Some(supported.unwrap_or(false))) {
+                if let Err(error) = self.launch_agent(launch, Some(supported.unwrap_or(false))) {
                     if let Some(index) = self.find(&id) {
                         self.sessions[index].status = AgentStatus::Exited;
                         self.sessions[index].last_message = Some(error.clone());
@@ -108,7 +108,7 @@ impl State {
                     self.ref_alert(&id, alerts.join("\n"));
                 }
                 let relay = granted.clone();
-                let launched = self.launch_agent(ctx, AgentLaunch { ref_guard: guard, relay, ..launch }, None);
+                let launched = self.launch_agent(AgentLaunch { ref_guard: guard, relay, ..launch }, None);
                 if launched.is_err()
                     && let Some(granted) = granted
                 {
@@ -162,7 +162,7 @@ impl State {
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
                 let role = Role::Agent(launch.isolation);
-                let outcome = self.start_as(ctx, &launch.agent, path, None, launch.args, launch.prompt, role);
+                let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
                 if warmed && outcome.is_ok() {
                     self.toast("warm cache from main");
                 }
@@ -214,7 +214,7 @@ impl State {
         self.expire_approvals(Instant::now());
         while let Ok(message) = self.control_rx.try_recv() {
             changed = true;
-            self.control(ctx, message.request, message.reply);
+            self.control(message.request, message.reply);
             if self.restarting {
                 return true;
             }
@@ -282,7 +282,7 @@ impl State {
             self.stop_sandbox(name);
         }
         let names = self.sessions.iter().filter_map(|s| Some((s.sandbox.clone()?, s.root()))).collect();
-        changed |= self.sandbox_usage.poll(names, ctx);
+        changed |= self.sandbox_usage.poll(names, &self.window);
         // Only sandboxes with an attached agent are running; `sbx exec` would start a stopped one.
         let live = self
             .sessions
@@ -290,7 +290,7 @@ impl State {
             .filter(|s| s.status != AgentStatus::Starting && s.terminal.as_ref().is_some_and(|t| !t.exited()))
             .filter_map(|s| s.sandbox.clone())
             .collect();
-        self.sandbox_pull.poll(&self.sbx, live, ctx);
+        self.sandbox_pull.poll(&self.sbx, live, &self.window);
         self.track_busy();
         self.verify_deliveries();
         for index in 0..self.sessions.len() {
@@ -406,7 +406,7 @@ impl State {
         }
 
         let target = self.diff_target();
-        self.watch(ctx, target.as_deref());
+        self.watch(target.as_deref());
         if let Some(root) = &target {
             let state = self.diffs.entry(root.clone()).or_default();
             // A diff seen off screen may lack untracked content; on screen it gets all of it.
@@ -465,9 +465,9 @@ impl State {
         self.config_stamp = stamp;
         match Config::load(&self.config_path) {
             Ok(config) => {
-                let (palette, theme_errors) =
-                    Palette::load(&config.theme, &atomics_core::theme::themes_dir(&self.config_path));
-                let syntax_changed = palette.syntax != self.palette.syntax;
+                let (theme, theme_errors) =
+                    Theme::load(&config.theme, &atomics_core::theme::themes_dir(&self.config_path));
+                let syntax_changed = theme.syntax != self.theme.syntax;
                 let theme_reloaded = config.theme != self.config.theme || themes_changed;
                 if config.terminal.scrollback != self.config.terminal.scrollback {
                     let terminals =
@@ -485,11 +485,11 @@ impl State {
                 }
                 self.theme_error = theme_error(&theme_errors);
                 if syntax_changed {
-                    self.highlighter = Arc::new(Highlighter::new(&palette.syntax));
+                    self.highlighter = Arc::new(Highlighter::new(&theme.syntax));
                 }
-                self.palette = Arc::new(palette);
+                self.theme = Arc::new(theme);
                 self.refresh_themes();
-                let colors = self.palette.terminal_colors();
+                let colors = self.theme.terminal_colors();
                 let terminals = self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
                 for terminal in terminals {
                     terminal.set_colors(colors.clone());
@@ -772,7 +772,7 @@ impl State {
 
     /// Watches the worktree of every agent and the one on screen, so their diffs follow
     /// file changes without polling.
-    fn watch(&mut self, _ctx: &egui::Context, target: Option<&Path>) {
+    fn watch(&mut self, target: Option<&Path>) {
         let mut wanted: Vec<PathBuf> = self
             .sessions
             .iter()
@@ -825,7 +825,7 @@ mod tests {
         with_app("app::background::tests::needs_input_without_a_pending_menu_uses_slow_screen_checks", |app, _ctx| {
             let terminal = Terminal::spawn(
                 app.runtime.wake.clone(),
-                app.runtime.palette.terminal_colors(),
+                app.runtime.theme.terminal_colors(),
                 "/bin/sh".into(),
                 vec!["-c".into(), "printf 'Working (esc to interrupt)'; exec sleep 30".into()],
                 &app.runtime.launch_dir,
@@ -928,7 +928,7 @@ mod tests {
     fn watcher_retries_missing_roots_and_receives_events_under_symlinked_parents() {
         with_app(
             "app::background::tests::watcher_retries_missing_roots_and_receives_events_under_symlinked_parents",
-            |app, ctx| {
+            |app, _ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
                 let real = dir.path().join("real");
                 std::fs::create_dir(&real).unwrap();
@@ -937,11 +937,11 @@ mod tests {
                 let root = alias.join("worktree");
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();
-                app.runtime.watch(ctx, Some(&root));
+                app.runtime.watch(Some(&root));
                 let watched = |app: &Desktop<'_>| app.runtime.watcher.as_ref().unwrap().roots().to_vec();
                 assert!(watched(app).is_empty(), "a failed watch must remain pending");
                 std::fs::create_dir(&root).unwrap();
-                app.runtime.watch(ctx, Some(&root));
+                app.runtime.watch(Some(&root));
                 assert_eq!(watched(app), std::slice::from_ref(&root));
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 loop {
@@ -956,7 +956,7 @@ mod tests {
                     }
                     assert!(Instant::now() < deadline, "no event for symlinked worktree");
                 }
-                app.runtime.watch(ctx, None);
+                app.runtime.watch(None);
                 assert!(watched(app).is_empty());
             },
         );
@@ -964,11 +964,11 @@ mod tests {
 
     #[test]
     fn ref_updates_mark_integrations_dirty() {
-        with_app("app::background::tests::ref_updates_mark_integrations_dirty", |app, ctx| {
+        with_app("app::background::tests::ref_updates_mark_integrations_dirty", |app, _ctx| {
             let (_dir, repo) = repository();
             app.runtime.sessions.clear();
             app.runtime.plans.clear();
-            app.runtime.watch(ctx, Some(&repo));
+            app.runtime.watch(Some(&repo));
             // The last one moves a branch inside a refs folder created after watching began.
             for args in [
                 &["branch", "feature/one"][..],
@@ -985,7 +985,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            app.runtime.watch(ctx, None);
+            app.runtime.watch(None);
         });
     }
 

@@ -330,6 +330,23 @@ pub fn parse_color(text: &str) -> Option<[u8; 3]> {
     Some([(value >> 16) as u8, (value >> 8) as u8, value as u8])
 }
 
+/// Colors 16–255 of the xterm palette, which no theme sets: a 6×6×6 cube, then 24 grays. `None` for 0–15
+/// (the theme's `ansi`) and past 255. Terminals answer OSC 4 with these, and the UI paints with them.
+pub fn xterm_color(index: usize) -> Option<[u8; 3]> {
+    match index {
+        16..232 => {
+            let i = index - 16;
+            let level = |v: usize| if v == 0 { 0 } else { (55 + v * 40) as u8 };
+            Some([level(i / 36), level((i / 6) % 6), level(i % 6)])
+        }
+        232..256 => {
+            let v = (8 + (index - 232) * 10) as u8;
+            Some([v, v, v])
+        }
+        _ => None,
+    }
+}
+
 /// Theme names are file names: letters, digits, `-` and `_`.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
@@ -652,6 +669,17 @@ mod tests {
         assert!(ThemeFile::parse("mode = \"sepia\"").is_err(), "a value of the wrong kind is not a theme");
         assert_eq!(parse_color("#7aa2f7"), Some([0x7a, 0xa2, 0xf7]));
         assert_eq!(parse_color("#+1+2+3"), None);
+    }
+
+    #[test]
+    fn xterm_colors_fill_the_cube_and_grays() {
+        assert_eq!(xterm_color(15), None, "the first 16 are the theme's");
+        assert_eq!(xterm_color(16), Some([0, 0, 0]));
+        assert_eq!(xterm_color(17), Some([0, 0, 95]));
+        assert_eq!(xterm_color(231), Some([255, 255, 255]));
+        assert_eq!(xterm_color(232), Some([8, 8, 8]));
+        assert_eq!(xterm_color(255), Some([238, 238, 238]));
+        assert_eq!(xterm_color(256), None);
     }
 
     #[test]

@@ -346,7 +346,7 @@ fn agent_exit_updates_and_saves_its_plan_without_frames() {
     with_state("app::host_tests::agent_exit_updates_and_saves_its_plan_without_frames", |mut state, _ctx| {
         let terminal = Terminal::spawn(
             state.wake.clone(),
-            state.palette.terminal_colors(),
+            state.theme.terminal_colors(),
             "/bin/sh".into(),
             vec!["-c".into(), "sleep 0.1".into()],
             &state.launch_dir,
@@ -378,7 +378,7 @@ fn delivery_verification_times_out_without_frames() {
     with_state("app::host_tests::delivery_verification_times_out_without_frames", |mut state, _ctx| {
         let terminal = Terminal::spawn(
             state.wake.clone(),
-            state.palette.terminal_colors(),
+            state.theme.terminal_colors(),
             "/bin/sleep".into(),
             vec!["30".into()],
             &state.launch_dir,
@@ -458,7 +458,7 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
         worker.terminal = Some(
             Terminal::spawn(
                 state.wake.clone(),
-                state.palette.terminal_colors(),
+                state.theme.terminal_colors(),
                 fixture.to_string_lossy().into_owned(),
                 vec!["--mode".into(), "queue".into()],
                 &state.launch_dir,
@@ -510,8 +510,7 @@ fn desktop_actions_launch_and_deliver_on_the_host_without_frames() {
         actions
             .send(Box::new(move |state| {
                 assert_eq!(std::thread::current().name(), Some("atomics-runtime"));
-                let id =
-                    state.start(&state.ctx.clone(), "shell", state.launch_dir.clone(), None, vec![], None).unwrap();
+                let id = state.start("shell", state.launch_dir.clone(), None, vec![], None).unwrap();
                 tx.send(id).unwrap();
             }))
             .unwrap();
@@ -666,7 +665,141 @@ fn the_protocol_server_is_off_by_default() {
         let host = state.into_host();
         assert!(host.protocol_addr().is_none(), "no flag, no listener");
         assert!(!paths::atomics_home().join("protocol.json").exists(), "and nothing advertised");
+        assert!(!host.streams_terminals(), "and no terminal is published, copied or streamed");
     });
+}
+
+#[test]
+fn the_protocol_streams_a_session_terminal_while_the_state_lock_is_held() {
+    with_state(
+        "app::host_tests::the_protocol_streams_a_session_terminal_while_the_state_lock_is_held",
+        |mut state, _| {
+            use crate::protocol::tests::TestClient;
+            use atomics_core::screen::ScreenMirror;
+            use atomics_core::wire::{Envelope, Message, Topic};
+            state.config.remote.enabled = true;
+            let script = "printf 'first line\\r\\n'; read -r go; printf 'second line\\r\\n'; exec sleep 30";
+            let terminal = Terminal::spawn(
+                state.wake.clone(),
+                state.theme.terminal_colors(),
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                &state.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            state.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &state.launch_dir)];
+            state.sessions[0].terminal = Some(terminal);
+            let host = state.into_host();
+            assert!(host.streams_terminals());
+            let addr = host.protocol_addr().expect("the flag starts the server");
+            let advert: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(paths::atomics_home().join("protocol.json")).unwrap()).unwrap();
+            let mut client = TestClient::connect(addr, advert["token"].as_str().unwrap());
+            client.hello();
+            let subscribe = Envelope::new(Message::Subscribe {
+                topics: vec![Topic::Screen { session: "worker".into(), focused: true }],
+            });
+            // Terminals are published before the board: a session on the board can be subscribed to.
+            client.sync_until(|m| m.sessions.contains_key("worker"));
+            client.send(&subscribe);
+            let mut mirror = ScreenMirror::default();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+            let follow = |client: &mut TestClient, mirror: &mut ScreenMirror, text: &str| {
+                while !mirror.screen.as_ref().is_some_and(|s| s.text().contains(text)) {
+                    assert!(Instant::now() < deadline, "the screen never showed {text}");
+                    match client.next().expect("connection open").message {
+                        Message::ScreenSnapshot(s) => drop(mirror.apply_snapshot(&s).unwrap()),
+                        Message::ScreenDelta(d) => drop(mirror.apply_delta(&d).unwrap()),
+                        Message::Error { code, message } => panic!("{code:?}: {message}"),
+                        _ => {}
+                    }
+                }
+            };
+            follow(&mut client, &mut mirror, "first line");
+
+            // With the model locked, as for a whole frame of drawing, output still streams.
+            let guard = host.state();
+            guard.sessions[0].terminal.as_ref().unwrap().write(b"go\r".to_vec());
+            follow(&mut client, &mut mirror, "second line");
+            drop(guard);
+            let screen = mirror.screen.unwrap();
+            assert_eq!(screen.lines[0].text(), "first line");
+            assert_eq!((screen.cols, screen.rows), (80, 24));
+        },
+    );
+}
+
+#[test]
+fn a_remote_client_types_into_a_session_shell_through_its_lease_while_the_state_lock_is_held() {
+    with_state(
+        "app::host_tests::a_remote_client_types_into_a_session_shell_through_its_lease_while_the_state_lock_is_held",
+        |mut state, _| {
+            use crate::protocol::tests::TestClient;
+            use atomics_core::lease::Typist;
+            use atomics_core::screen::ScreenMirror;
+            use atomics_core::wire::{Envelope, Message, Topic};
+            state.config.remote.enabled = true;
+            let script = "read -r line; printf 'got %s\\r\\n' \"$line\"; exec sleep 30";
+            let terminal = Terminal::spawn(
+                state.wake.clone(),
+                state.theme.terminal_colors(),
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                &state.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            state.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &state.launch_dir)];
+            state.sessions[0].terminal = Some(terminal);
+            let host = state.into_host();
+            let addr = host.protocol_addr().expect("the flag starts the server");
+            let advert: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(paths::atomics_home().join("protocol.json")).unwrap()).unwrap();
+            let mut client = TestClient::connect(addr, advert["token"].as_str().unwrap());
+            client.ws.get_ref().set_nodelay(true).unwrap();
+            client.hello();
+            client.sync_until(|m| m.sessions.contains_key("worker"));
+            client.send(&Envelope::new(Message::Subscribe {
+                topics: vec![Topic::Screen { session: "worker".into(), focused: true }],
+            }));
+            let mut typist = Typist::new("worker");
+            client.send(&Envelope::new(typist.acquire(false)));
+            let (mut mirror, deadline) = (
+                ScreenMirror::default(),
+                Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10)),
+            );
+            let follow = |client: &mut TestClient,
+                          typist: &mut Typist,
+                          mirror: &mut ScreenMirror,
+                          done: &dyn Fn(&Typist, &ScreenMirror) -> bool| {
+                while !done(typist, mirror) {
+                    assert!(Instant::now() < deadline, "the remote client never got there");
+                    match client.next().expect("connection open").message {
+                        Message::ScreenSnapshot(s) => drop(mirror.apply_snapshot(&s).unwrap()),
+                        Message::ScreenDelta(d) => drop(mirror.apply_delta(&d).unwrap()),
+                        Message::LeaseState(l) => typist.apply(&l),
+                        Message::Error { code, message } => panic!("{code:?}: {message}"),
+                        _ => {}
+                    }
+                }
+            };
+            follow(&mut client, &mut typist, &mut mirror, &|t, m| t.may_type() && m.screen.is_some());
+
+            // With the model locked, as for a whole frame of drawing, typing still reaches the shell.
+            let guard = host.state();
+            for frame in typist.input("hello\r") {
+                client.send(&Envelope::new(frame));
+            }
+            follow(&mut client, &mut typist, &mut mirror, &|_, m| {
+                m.screen.as_ref().is_some_and(|s| s.text().contains("got hello"))
+            });
+            drop(guard);
+            assert_eq!(mirror.screen.unwrap().lines[0].text(), "hello", "the PTY echoed what was typed");
+        },
+    );
 }
 
 #[test]
@@ -695,5 +828,38 @@ fn the_protocol_serves_the_board_while_the_state_lock_is_held() {
 
         // And the host still answers its own clients with a client attached.
         assert_eq!(host.state().sessions.len(), 1);
+    });
+}
+
+#[test]
+fn a_headless_host_refuses_window_requests_and_drops_client_events() {
+    with_state("app::host_tests::a_headless_host_refuses_window_requests_and_drops_client_events", |mut state, _| {
+        // The desktop's model has its window attached; `atomics host` builds one with none.
+        assert!(state.window.is_attached());
+        state.window = crate::host::Window::default();
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let host = state.into_host();
+        for request in [
+            json!({"cmd":"screenshot", "path":"/tmp/atomics-never.png"}),
+            json!({"cmd":"resize", "width":800.0, "height":600.0}),
+            json!({"cmd":"show_settings", "open":true}),
+            json!({"cmd":"restart"}),
+        ] {
+            let outcome = host.command(serde_json::from_value(request.clone()).unwrap());
+            let Ok(ControlOutcome::Done(refused)) =
+                outcome.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10)))
+            else {
+                panic!("{request} was not answered");
+            };
+            assert!(
+                !refused.ok && refused.error.as_deref().unwrap().contains("headless host"),
+                "{request}: {refused:?}"
+            );
+        }
+        let list = command(&host, json!({"cmd":"list"}));
+        assert!(list.result["window"].is_null() && list.result["monitor"].is_null(), "{}", list.result);
+        // Work that would show something in a window queues nothing for a client that never comes.
+        command(&host, json!({"cmd":"open", "session":"worker", "path":"README.md"}));
+        eventually(&host, |state| state.client_events.is_empty() && state.client_commands.is_empty());
     });
 }

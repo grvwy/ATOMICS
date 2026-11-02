@@ -101,10 +101,9 @@ impl State {
                 self.panel = PanelMode::Diff;
             }
             "resume" if !self.sessions.iter().any(|s| task.session.as_deref() == Some(&s.id)) => {
-                let ctx = self.ctx.clone();
                 let agent = if task.agent.is_empty() { "claude" } else { &task.agent };
                 let resume = Some(task.resume_id.unwrap_or_default());
-                match self.start_as(&ctx, agent, root, resume, task.args, None, Role::Agent(task.isolation)) {
+                match self.start_as(agent, root, resume, task.args, None, Role::Agent(task.isolation)) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
@@ -778,12 +777,11 @@ mod tests {
 
     #[test]
     fn plan_events_reach_only_waiters_asking_for_them() {
-        with_app("app::plans::tests::plan_events_reach_only_waiters_asking_for_them", |app, ctx| {
+        with_app("app::plans::tests::plan_events_reach_only_waiters_asking_for_them", |app, _ctx| {
             let (_dir, repo) = repository();
             let wait = |app: &mut Desktop<'_>, statuses: &[&str]| {
                 let (tx, rx) = std::sync::mpsc::channel();
                 app.runtime.control(
-                    ctx,
                     ControlRequest::Wait {
                         sessions: vec![],
                         statuses: statuses.iter().map(|s| s.to_string()).collect(),
@@ -1379,7 +1377,7 @@ mod tests {
                 let root = dir.path();
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     "/bin/sh".into(),
                     vec!["-c".into(), "exec sleep 600".into()],
                     root,
@@ -1659,7 +1657,7 @@ mod tests {
                 app.runtime.sessions[1].terminal = Some(
                     Terminal::spawn(
                         app.runtime.wake.clone(),
-                        app.runtime.palette.terminal_colors(),
+                        app.runtime.theme.terminal_colors(),
                         "/bin/sleep".into(),
                         vec!["10".into()],
                         &repo,
@@ -1877,7 +1875,7 @@ mod tests {
     fn dispatch_from_visible_board_returns_to_fleet_and_preserves_docked_chief() {
         with_app(
             "app::plans::tests::dispatch_from_visible_board_returns_to_fleet_and_preserves_docked_chief",
-            |app, ctx| {
+            |app, _ctx| {
                 let (dir, repo) = repository();
                 app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
@@ -1906,7 +1904,7 @@ mod tests {
                     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                     while !app.runtime.creating.is_empty() {
                         assert!(Instant::now() < deadline);
-                        app.runtime.runtime_tick(ctx);
+                        app.runtime.runtime_tick();
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let session = app.runtime.plans[index].tasks[0].session.as_ref().unwrap();
@@ -1923,7 +1921,7 @@ mod tests {
     fn background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief() {
         with_app(
             "app::plans::tests::background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief",
-            |app, ctx| {
+            |app, _ctx| {
                 let (dir, repo) = repository();
                 app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
@@ -1962,7 +1960,7 @@ mod tests {
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.creating.is_empty() {
                     assert!(Instant::now() < deadline);
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(app.runtime.plans[one].tasks[0].session.is_some());
@@ -2187,7 +2185,7 @@ mod tests {
     fn background_dispatch_preserves_selection_and_routes_delayed_start_failure() {
         with_app(
             "app::plans::tests::background_dispatch_preserves_selection_and_routes_delayed_start_failure",
-            |app, ctx| {
+            |app, _ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
                 let repo = dir.path().join("repo");
                 std::fs::create_dir(&repo).unwrap();
@@ -2231,7 +2229,7 @@ mod tests {
                 app.runtime.show_plan_fleet();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.creating.is_empty() && Instant::now() < deadline {
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(app.runtime.creating.is_empty());

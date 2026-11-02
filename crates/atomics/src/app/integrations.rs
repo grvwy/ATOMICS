@@ -463,7 +463,7 @@ mod tests {
     /// A control request answered now or later, as the chief's MCP server waits for it.
     fn control(app: &mut Desktop<'_>, ctx: &egui::Context, value: serde_json::Value) -> ControlResponse {
         let (tx, rx) = channel();
-        app.runtime.control(ctx, serde_json::from_value(value.clone()).unwrap(), tx);
+        app.runtime.control(serde_json::from_value(value.clone()).unwrap(), tx);
         let mut response = None;
         tick_until(app, ctx, &format!("an answer to {value}"), |_| {
             response = response.take().or_else(|| match rx.try_recv() {
@@ -540,7 +540,7 @@ mod tests {
                 let revision = app.runtime.integration_revision;
                 let quiet = Instant::now() + Duration::from_millis(1500);
                 while Instant::now() < quiet {
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     assert!(app.runtime.integration_checks.is_empty(), "a check started with no ref changed");
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -812,7 +812,7 @@ mod tests {
     fn integrated_tasks_in_other_repositories_are_rechecked_after_commits() {
         with_app(
             "app::integrations::tests::integrated_tasks_in_other_repositories_are_rechecked_after_commits",
-            |app, ctx| {
+            |app, _ctx| {
                 let (_project_dir, project) = repository();
                 let (_task_dir, repo) = repository();
                 git::git(&repo, &["branch", "task-a"]).unwrap();
@@ -830,7 +830,7 @@ mod tests {
                 app.runtime.sessions.clear();
                 app.runtime.active = None;
                 app.runtime.diff_root = None;
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 assert!(
                     app.runtime.watcher.as_ref().is_some_and(|watcher| watcher.roots().contains(&repo)),
                     "the task repository must be watched even without a live agent or visible diff"
@@ -839,7 +839,7 @@ mod tests {
                 while !app.runtime.plans[index].tasks[0].integration_verified {
                     assert!(Instant::now() < deadline, "initial integration check did not finish");
                     std::thread::sleep(Duration::from_millis(10));
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                 }
                 assert_eq!(app.runtime.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
                 git::git(&repo, &["switch", "task-a"]).unwrap();
@@ -847,7 +847,7 @@ mod tests {
                 while app.runtime.plans[index].tasks[0].integrated.is_some() {
                     assert!(Instant::now() < deadline, "a later commit in the task repository was not detected");
                     std::thread::sleep(Duration::from_millis(25));
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                 }
                 assert!(!app.runtime.plans[index].tasks[0].integration_verified);
                 assert!(app.runtime.plans[index].ready().is_empty());
@@ -870,7 +870,8 @@ mod tests {
             app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
             app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
             // Isolate the integration refresh from other app repaint sources.
-            app.runtime.ctx = egui::Context::default();
+            let ctx = egui::Context::default();
+            app.runtime.window = crate::host::Window::attach(ctx.clone());
             app.runtime.refresh_integrations();
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while !app.runtime.plans[index].tasks[0].integration_verified {
@@ -878,7 +879,6 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 app.runtime.refresh_integrations();
             }
-            let ctx = app.runtime.ctx.clone();
             for _ in 0..3 {
                 ctx.run_ui(Default::default(), |_| {}).drop_without_applying_deltas();
             }

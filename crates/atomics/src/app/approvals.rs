@@ -357,7 +357,7 @@ mod tests {
             |app, ctx| {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     "/bin/sleep".into(),
                     vec!["30".into()],
                     &app.runtime.launch_dir,
@@ -479,7 +479,7 @@ mod tests {
                 });
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), "hidden".into()],
                     &app.runtime.launch_dir,
@@ -624,7 +624,7 @@ mod tests {
             assert!(atomics_core::approvals::menu_key(menu, Some("touch fixture"), Decision::Allow).is_none());
             let terminal = Terminal::spawn(
                 app.runtime.wake.clone(),
-                app.runtime.palette.terminal_colors(),
+                app.runtime.theme.terminal_colors(),
                 "/bin/sh".into(),
                 vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 10".into(), "fixture".into(), menu.into()],
                 dir.path(),
@@ -701,7 +701,7 @@ mod tests {
     fn approvals_and_held_sends_stay_with_their_plan_across_tab_switches() {
         with_app(
             "app::approvals::tests::approvals_and_held_sends_stay_with_their_plan_across_tab_switches",
-            |app, ctx| {
+            |app, _ctx| {
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: "test".into(),
                     command: vec![],
@@ -724,7 +724,7 @@ mod tests {
                     worker.terminal = Some(
                         Terminal::spawn(
                             app.runtime.wake.clone(),
-                            app.runtime.palette.terminal_colors(),
+                            app.runtime.theme.terminal_colors(),
                             "/bin/cat".into(),
                             vec![],
                             dir.path(),
@@ -754,7 +754,6 @@ mod tests {
                 app.runtime.record_events();
                 let (wait_tx, wait_rx) = channel();
                 app.runtime.control(
-                    ctx,
                     ControlRequest::Wait {
                         sessions: vec!["worker-one".into()],
                         statuses: vec!["needs you".into()],

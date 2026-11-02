@@ -102,7 +102,7 @@ fn sandbox_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
 
 impl Desktop<'_> {
     pub(super) fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize], visible: &[usize]) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.painter().rect_filled(rect, 0.0, p.panel);
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -111,10 +111,11 @@ impl Desktop<'_> {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         let mut clicked = None;
+        let sessions = self.runtime.backend().session_list();
         egui::ScrollArea::horizontal().id_salt("tab-strip-scroll").show(&mut child, |ui| {
             ui.horizontal(|ui| {
                 for &i in visible {
-                    let s = &self.runtime.sessions[i];
+                    let s = &sessions[i];
                     let active = self.runtime.active.as_deref() == Some(s.id.as_str());
                     let shown = tiled.contains(&i);
                     let color = if active {
@@ -147,7 +148,7 @@ impl Desktop<'_> {
             return;
         }
         let metrics = self.metrics(ui);
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let (cols, rows) = (layout.columns.max(1), layout.rows.max(1));
         let size = vec2(rect.width() / cols as f32, rect.height() / rows as f32);
         let mut activate: Option<(String, bool)> = None;
@@ -161,25 +162,28 @@ impl Desktop<'_> {
         let focus_request = self.client.focus_terminal.take();
         let now = ui.input(|i| i.time);
         let (slots_running, slots_waiting) = self.runtime.governor.snapshot();
+        let sessions = self.runtime.backend().session_list();
 
         for (slot, &index) in tiled.iter().enumerate() {
             let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
             let tile = Rect::from_min_size(min, size).shrink(3.0);
-            let active = self.runtime.active.as_deref() == Some(self.runtime.sessions[index].id.as_str());
-            let reported = if matches!(self.runtime.sessions[index].status, AgentStatus::Idle | AgentStatus::Done) {
+            // The header reads the session's row and the approval banner its first request. The rest of the
+            // body (the MCP banner, the terminal) still reads the model, until the terminal slice moves it.
+            let row = &sessions[index];
+            let pending = self.runtime.backend().session_approval(index);
+            let active = self.runtime.active.as_deref() == Some(row.id.as_str());
+            let reported = if matches!(row.status, AgentStatus::Idle | AgentStatus::Done) {
                 self.runtime
                     .plans
                     .iter()
                     .flat_map(|p| &p.tasks)
-                    .find(|t| t.session.as_deref() == Some(&self.runtime.sessions[index].id))
+                    .find(|t| t.session.as_deref() == Some(&row.id))
                     .and_then(|t| t.reported_line(atomics_core::store::now()))
             } else {
                 None
             };
-            let needed = match self.runtime.sessions[index].sandbox {
-                Some(_) => {
-                    self.connect_buttons(&self.runtime.sessions[index].mcp_needed, &self.runtime.sessions[index].title)
-                }
+            let needed = match row.sandbox {
+                Some(_) => self.connect_buttons(&self.runtime.sessions[index].mcp_needed, &row.title),
                 None => Vec::new(),
             };
             let session = &mut self.runtime.sessions[index];
@@ -194,10 +198,10 @@ impl Desktop<'_> {
             ui.painter().circle_filled(
                 pos2(header.left() + 12.0, header.center().y),
                 3.5,
-                status_dot(session.status, &p, now),
+                status_dot(row.status, &p, now),
             );
             let mut badge_width = 0.0;
-            if let Some(name) = &session.sandbox {
+            if let Some(name) = &row.sandbox {
                 let usage = self.runtime.sandbox_usage.usage.get(name);
                 let text = usage.map_or_else(|| "Sandbox".into(), |usage| format!("Sandbox · {}", usage.label()));
                 let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.0), p.info));
@@ -228,20 +232,19 @@ impl Desktop<'_> {
                 pos2(header.left() + 22.0, header.top()),
                 pos2(header.right() - 28.0 - badge_width, header.bottom()),
             );
-            let title_response =
-                ui.interact(title_rect, ui.scope_id().with(("tile-title", &session.id)), Sense::click());
+            let title_response = ui.interact(title_rect, ui.scope_id().with(("tile-title", &row.id)), Sense::click());
             let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
-            let mut subtitle = match (&session.scratch, session.branch()) {
-                (Some(_), _) => format!("{} · scratch · {}", session.agent, session.status.label()),
-                (None, Some(branch)) => format!("{} · {} · {}", session.agent, branch, session.status.label()),
-                (None, None) => format!("{} · {}", session.agent, session.status.label()),
+            let mut subtitle = match (row.scratch, row.branch.as_deref()) {
+                (true, _) => format!("{} · scratch · {}", row.agent, row.status.label()),
+                (false, Some(branch)) => format!("{} · {} · {}", row.agent, branch, row.status.label()),
+                (false, None) => format!("{} · {}", row.agent, row.status.label()),
             };
             if let Some(note) =
                 session.terminal.as_ref().and_then(|t| queue_note(t.process_id(), &slots_running, &slots_waiting))
             {
                 subtitle.push_str(&format!(" · {note}"));
             }
-            let galley = ui.fonts_mut(|f| f.layout_no_wrap(session.title.clone(), p.ui(13.0), title_color));
+            let galley = ui.fonts_mut(|f| f.layout_no_wrap(row.title.clone(), p.ui(13.0), title_color));
             let title_width = galley.size().x;
             ui.painter().with_clip_rect(title_rect).galley(
                 pos2(title_rect.left(), header.center().y - galley.size().y / 2.0),
@@ -255,20 +258,19 @@ impl Desktop<'_> {
                 p.ui(11.5),
                 p.muted,
             );
-            let hover = if session.chief {
+            let hover = if row.chief {
                 "Show this worktree's diff against main"
             } else {
                 "Show this worktree's diff against main · double-click to rename"
             };
             let title_response = title_response.on_hover_text(hover);
             if title_response.double_clicked() {
-                rename = Some(session.id.clone());
+                rename = Some(row.id.clone());
             } else if title_response.clicked() {
-                activate = Some((session.id.clone(), true));
+                activate = Some((row.id.clone(), true));
             }
             let close_rect = Rect::from_center_size(pos2(header.right() - 14.0, header.center().y), Vec2::splat(18.0));
-            let close_response =
-                ui.interact(close_rect, ui.scope_id().with(("tile-close", &session.id)), Sense::click());
+            let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
             ui.painter().text(
                 close_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -277,19 +279,19 @@ impl Desktop<'_> {
                 if close_response.hovered() { p.error } else { p.muted },
             );
             if close_response.clicked() {
-                close = Some(session.id.clone());
+                close = Some(row.id.clone());
             }
             let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
-            if let Some(pending) = session.approvals.first() {
+            if let Some(pending) = &pending {
                 let request = &pending.request;
-                let deciding = self.client.approval_decisions.contains(&(session.id.clone(), pending.id.clone()));
+                let deciding = self.client.approval_decisions.contains(&(pending.session.clone(), pending.id.clone()));
                 let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());
                 let banner = body.with_max_y(body.top() + height);
                 ui.painter().rect_filled(banner, 0.0, p.panel);
-                let mut child = ui
-                    .new_child(egui::UiBuilder::new().id_salt(("approval", &session.id)).max_rect(banner.shrink(6.0)));
+                let mut child =
+                    ui.new_child(egui::UiBuilder::new().id_salt(("approval", &row.id)).max_rect(banner.shrink(6.0)));
                 child.set_clip_rect(banner);
                 child.label(RichText::new("Permission requested").color(p.warning).strong());
                 child.horizontal_wrapped(|ui| {
@@ -585,15 +587,8 @@ mod tests {
                         let mut action = None;
                         let output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
                             egui::CentralPanel::default().show(ui, |ui| {
-                                action = task_result(
-                                    ui,
-                                    &task,
-                                    None,
-                                    false,
-                                    false,
-                                    &app.runtime.config,
-                                    &app.runtime.palette,
-                                );
+                                action =
+                                    task_result(ui, &task, None, false, false, &app.runtime.config, &app.palette());
                             });
                         });
                         let pos = output
@@ -656,7 +651,7 @@ mod tests {
                 let mut action = None;
                 let output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        action = task_result(ui, &task, None, false, false, &app.runtime.config, &app.runtime.palette);
+                        action = task_result(ui, &task, None, false, false, &app.runtime.config, &app.palette());
                     });
                 });
                 let text: Vec<_> = output

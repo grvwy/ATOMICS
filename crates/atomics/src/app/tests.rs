@@ -100,11 +100,11 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
 
 #[test]
 fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
-    with_state("app::tests::config_reloads_when_host_overrides_are_created_changed_or_removed", |mut state, ctx| {
+    with_state("app::tests::config_reloads_when_host_overrides_are_created_changed_or_removed", |mut state, _ctx| {
         let [base, host_file] = Config::source_paths(&state.config_path);
         std::fs::write(&base, "[font]\nsize = 14.0\ndiff_size = 11.0").unwrap();
         state.config_checked = Instant::now() - Duration::from_secs(2);
-        state.runtime_tick(ctx);
+        state.runtime_tick();
         assert_eq!(state.config.font.size, 14.0);
 
         std::fs::create_dir_all(host_file.parent().unwrap()).unwrap();
@@ -118,19 +118,19 @@ fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
                 .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)))
                 .unwrap();
             state.config_checked = Instant::now() - Duration::from_secs(2);
-            state.runtime_tick(ctx);
+            state.runtime_tick();
             assert_eq!(state.config.font.size, size);
             assert_eq!(state.config.font.diff_size, 11.0);
         }
         std::fs::write(&host_file, "[font]\nsize = 'invalid'").unwrap();
         state.config_checked = Instant::now() - Duration::from_secs(2);
-        state.runtime_tick(ctx);
+        state.runtime_tick();
         assert!(state.config_error.is_some());
         assert_eq!(state.config.font.size, 18.0);
 
         std::fs::remove_file(&host_file).unwrap();
         state.config_checked = Instant::now() - Duration::from_secs(2);
-        state.runtime_tick(ctx);
+        state.runtime_tick();
         assert!(state.config_error.is_none());
         assert_eq!(state.config.font.size, 14.0);
     });
@@ -138,10 +138,10 @@ fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
 
 #[test]
 fn themes_reload_live_and_terminals_answer_the_new_colors() {
-    with_state("app::tests::themes_reload_live_and_terminals_answer_the_new_colors", |mut state, ctx| {
+    with_state("app::tests::themes_reload_live_and_terminals_answer_the_new_colors", |mut state, _ctx| {
         let reload = |state: &mut State| {
             state.config_checked = Instant::now() - Duration::from_secs(2);
-            state.runtime_tick(ctx);
+            state.runtime_tick();
         };
         let wait_for = |terminal: &Terminal, text: &str| {
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
@@ -150,20 +150,20 @@ fn themes_reload_live_and_terminals_answer_the_new_colors() {
                 std::thread::sleep(Duration::from_millis(5));
             }
         };
-        let color = |hex: &str| crate::theme::parse_hex(hex).unwrap();
+        let color = |hex: &str| atomics_ui::theme::parse_hex(hex).unwrap();
         let themes = theme::themes_dir(&state.config_path);
         std::fs::create_dir_all(&themes).unwrap();
         std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#102030\"").unwrap();
         std::fs::write(&state.config_path, "[theme]\nname = \"mine\"\naccent = \"#405060\"").unwrap();
         reload(&mut state);
         assert!(state.config_error.is_none() && state.theme_error.is_none(), "{:?}", state.theme_error);
-        assert_eq!(state.palette.terminal, color("#102030"));
-        assert_eq!(state.palette.accent, color("#405060"), "inline [theme] tokens win");
-        assert_eq!(state.palette.syntax, "OneHalfDark", "the rest comes from midnight");
+        assert_eq!(state.theme.palette().terminal, color("#102030"));
+        assert_eq!(state.theme.palette().accent, color("#405060"), "inline [theme] tokens win");
+        assert_eq!(state.theme.syntax, "OneHalfDark", "the rest comes from midnight");
 
         let terminal = Terminal::spawn(
             state.wake.clone(),
-            state.palette.terminal_colors(),
+            state.theme.terminal_colors(),
             "/bin/sh".into(),
             crate::terminal::color_query_args("\\033]11;?\\007", 24),
             &state.launch_dir,
@@ -182,7 +182,7 @@ fn themes_reload_live_and_terminals_answer_the_new_colors() {
         std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#a0b0c0\"").unwrap();
         reload(&mut state);
         assert_eq!(state.toast.as_ref().unwrap().0, "Theme reloaded");
-        assert_eq!(state.palette.terminal, color("#a0b0c0"));
+        assert_eq!(state.theme.palette().terminal, color("#a0b0c0"));
         let terminal = state.sessions[0].terminal.as_ref().unwrap();
         terminal.write(b"x".to_vec());
         wait_for(terminal, "^]11;rgb:a0a0/b0b0/c0c0!");
@@ -192,7 +192,7 @@ fn themes_reload_live_and_terminals_answer_the_new_colors() {
         let error = state.theme_error.clone().unwrap();
         assert!(error.contains("themes/mine.toml: terminal = \"#a0b0c\""), "{error}");
         assert!(state.config_error.is_none(), "the config itself still loads");
-        assert_eq!(state.palette.terminal, color("#16181d"), "a bad token falls back to the theme it extends");
+        assert_eq!(state.theme.palette().terminal, color("#16181d"), "a bad token falls back to the theme it extends");
     });
 }
 
@@ -210,7 +210,7 @@ fn review_followups() {
 
 pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
-    app.runtime.control(&app.runtime.ctx.clone(), serde_json::from_value(value).unwrap(), tx);
+    app.runtime.control(serde_json::from_value(value).unwrap(), tx);
     match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
         ControlOutcome::Done(response) => response,
         _ => panic!("unexpected deferred response"),
@@ -228,7 +228,7 @@ pub(super) fn repository() -> (crate::test_support::TempDir, PathBuf) {
     (dir, repo)
 }
 
-fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, ctx: &egui::Context) {
+fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     let dir = crate::test_support::tempdir().unwrap();
     app.runtime.sessions = vec![session("codex", AgentKind::Generic, AgentStatus::Working, dir.path())];
     app.runtime.sessions[0].claude_id = Some("s1".into());
@@ -252,7 +252,6 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, ctx
     for decision in [Decision::Allow, Decision::Deny, Decision::AllowAlways] {
         let (wait_tx, wait_rx) = channel();
         app.runtime.control(
-            ctx,
             ControlRequest::Wait {
                 sessions: vec!["codex".into()],
                 statuses: vec!["needs you".into()],
@@ -272,7 +271,6 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, ctx
         assert_eq!(response.result["events"][0]["approval"]["cwd"], json!(dir.path()));
         let (tx, rx) = channel();
         app.runtime.control(
-            ctx,
             ControlRequest::Approve { session: "codex".into(), decision, message: Some("Reviewed".into()) },
             tx,
         );
@@ -343,7 +341,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     let dir = crate::test_support::tempdir().unwrap();
     let terminal = Terminal::spawn(
         app.runtime.wake.clone(),
-        app.runtime.palette.terminal_colors(),
+        app.runtime.theme.terminal_colors(),
         "/bin/sh".into(),
         vec!["-c".into(), "printf 'esc to interrupt'; sleep 10".into()],
         dir.path(),
@@ -503,7 +501,6 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
     app.runtime.worktree_project.insert("/worktree".into(), project.clone());
     let (tx, rx) = channel();
     app.runtime.control(
-        &app.runtime.ctx.clone(),
         ControlRequest::PlanSet {
             ticket: None,
             plan: None,

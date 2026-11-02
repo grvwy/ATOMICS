@@ -6,7 +6,7 @@ use atomics_core::isolation::IsolationMode;
 
 #[test]
 fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
-    with_app("app::sandbox_tests::startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting", |app, ctx| {
+    with_app("app::sandbox_tests::startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting", |app, _ctx| {
         if let Some(job) = app.runtime.startup_cleanup.take() {
             job.join().unwrap();
         }
@@ -36,7 +36,7 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
             std::thread::sleep(Duration::from_millis(10));
         }
         let reached_sbx = bin.path().join("waiting-ls").exists();
-        app.runtime.runtime_tick(ctx); // Must return while the sweep is blocked in sbx.
+        app.runtime.runtime_tick(); // Must return while the sweep is blocked in sbx.
         let still_waiting = app.runtime.startup_cleanup.as_ref().is_some_and(|job| !job.is_finished());
         std::fs::remove_file(gate).unwrap();
         app.runtime.startup_cleanup.take().unwrap().join().unwrap();
@@ -81,11 +81,11 @@ fn quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup() {
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         std::fs::write(bin.path().join("run-waits"), "wait").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        let running = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
+        let running = app.runtime.start("claude", repo.clone(), None, vec![], None).unwrap();
         tick_until(app, ctx, "running sandbox", |app| {
             app.runtime.sessions.iter().any(|s| s.id == running && s.terminal.is_some())
         });
-        let preparing = app.runtime.start(ctx, "claude", repo, None, vec![], None).unwrap();
+        let preparing = app.runtime.start("claude", repo, None, vec![], None).unwrap();
         assert!(!app.runtime.pending_sandbox.is_empty());
         app.runtime.shutdown();
         let stopped = fake::calls_to(bin.path(), &["stop"]);
@@ -118,7 +118,7 @@ fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
             app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
             let tree = worktree(&repo, "task");
             // A sandboxed session that ran, so that resuming it reattaches to its sandbox.
-            let first = app.runtime.start(ctx, "claude", tree, None, vec![], None).unwrap();
+            let first = app.runtime.start("claude", tree, None, vec![], None).unwrap();
             tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
             let cid = app.runtime.sessions[app.runtime.find(&first).unwrap()].claude_id.clone().unwrap();
             let record = app.runtime.store.sessions.iter().find(|r| r.claude_session_id == cid).unwrap().clone();
@@ -137,7 +137,7 @@ fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
                 let _ = stuck.recv();
             });
             let calls = fake::calls(bin.path()).len();
-            app.runtime.resume_record(ctx, record);
+            app.runtime.resume_record(record);
             let next = dir.path().join("next");
             let launch = Launch {
                 agent: "shell".into(),
@@ -153,7 +153,7 @@ fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
             // Each returned with the cleanup still stuck; joining it here would never have returned.
             assert!(app.runtime.lifecycle_jobs.iter().any(|job| !job.is_finished()));
             for _ in 0..20 {
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(fake::calls(bin.path()).len(), calls, "the resumed sandbox waits for the cleanup");
@@ -178,7 +178,7 @@ fn quitting_stops_making_a_sandbox_rather_than_waiting_for_it() {
         app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
         // sbx takes its time making the sandbox, as a first image pull can for minutes.
         std::fs::write(bin.path().join("wait-create"), "wait").unwrap();
-        let id = app.runtime.start(ctx, "claude", repo, None, vec![], None).unwrap();
+        let id = app.runtime.start("claude", repo, None, vec![], None).unwrap();
         let name = format!("atomics-{id}");
         tick_until(app, ctx, "sbx create", |_| bin.path().join("waiting-create").exists());
         let quit = Instant::now();
@@ -245,14 +245,14 @@ fn plan_close_cleanup_settings_control_worktrees_and_archive_keeps_branches() {
 /// Bound a hang without assuming a parallel, lower-priority test gets CPU within ten seconds.
 pub(super) fn tick_until(
     app: &mut Desktop<'_>,
-    ctx: &egui::Context,
+    _ctx: &egui::Context,
     what: &str,
     mut done: impl FnMut(&mut Desktop<'_>) -> bool,
 ) {
     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
     while !done(app) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        app.runtime.runtime_tick(ctx);
+        app.runtime.runtime_tick();
         if !done(app) {
             // Preparation, terminal output/exit and cleanup completions wake the host. The
             // short fallback also notices fixture files written without a terminal event.
@@ -305,7 +305,7 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
                 .with_azure(crate::relay::azure::Azure::new(program, config.clone())),
         );
         assert!(!app.runtime.config.isolation.sandbox.azure.enabled);
-        let off = app.runtime.start(ctx, "codex", repo.clone(), None, vec![], None).unwrap();
+        let off = app.runtime.start("codex", repo.clone(), None, vec![], None).unwrap();
         let off_name = format!("atomics-{off}");
         tick_until(app, ctx, "the Azure-disabled sandbox to attach", |_| {
             fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
@@ -319,7 +319,7 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         app.runtime.close(&off);
         app.runtime.config.isolation.sandbox.azure = config.clone();
         for agent in ["claude", "codex"] {
-            let id = app.runtime.start(ctx, agent, repo.clone(), None, vec![], None).unwrap();
+            let id = app.runtime.start(agent, repo.clone(), None, vec![], None).unwrap();
             let name = format!("atomics-{id}");
             tick_until(app, ctx, "the Azure-enabled sandbox to attach", |_| {
                 fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
@@ -355,7 +355,7 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
 
-        let id = app.runtime.start(ctx, "claude", worktree.clone(), None, vec![], Some("Fix the bug".into())).unwrap();
+        let id = app.runtime.start("claude", worktree.clone(), None, vec![], Some("Fix the bug".into())).unwrap();
         let name = format!("atomics-{id}");
         let index = app.runtime.find(&id).unwrap();
         assert!(app.runtime.sessions[index].terminal.is_none(), "the tile waits for its sandbox");
@@ -391,7 +391,7 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         // A restart resumes the session in the same sandbox, without making another.
         finish_agents(app, ctx);
         std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
-        app.runtime.resume_record(ctx, record);
+        app.runtime.resume_record(record);
         tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("run-ssh").exists());
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
@@ -449,7 +449,7 @@ fn sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_en
             app.runtime.config.isolation.mode = IsolationMode::Sandbox;
             let upstream = subscription(app, bin.path());
 
-            let id = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
+            let id = app.runtime.start("claude", repo.clone(), None, vec![], None).unwrap();
             let name = format!("atomics-{id}");
             tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
             let home = paths::atomics_home();
@@ -490,7 +490,7 @@ fn sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_en
             // This time the agent exits once the test lets it go.
             std::fs::remove_file(bin.path().join("run-waits")).unwrap();
             std::fs::write(bin.path().join("wait-agent"), "").unwrap();
-            app.runtime.resume_record(ctx, record);
+            app.runtime.resume_record(record);
             tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("waiting-agent").exists());
             let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
             let settings: serde_json::Value =
@@ -522,7 +522,7 @@ fn sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_en
             std::fs::remove_file(bin.path().join("keychain-value")).unwrap();
             std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
             std::fs::write(bin.path().join("run-waits"), "").unwrap();
-            let plain = app.runtime.start(ctx, "claude", repo, None, vec![], None).unwrap();
+            let plain = app.runtime.start("claude", repo, None, vec![], None).unwrap();
             tick_until(app, ctx, "the plain agent to attach", |_| bin.path().join("run-ssh").exists());
             let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
             assert!(!create.iter().any(|arg| arg == "--env"), "{create:?}");
@@ -676,7 +676,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             boxed.terminal = Some(
                 Terminal::spawn(
                     app.runtime.wake.clone(),
-                    app.runtime.palette.terminal_colors(),
+                    app.runtime.theme.terminal_colors(),
                     "/bin/sh".into(),
                     vec!["-c".into(), "exec sleep 30".into()],
                     &worktree,
@@ -704,7 +704,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
 
             let exec = |app: &mut Desktop<'_>, request: serde_json::Value| {
                 let (tx, rx) = channel();
-                app.runtime.control(ctx, serde_json::from_value(request).unwrap(), tx);
+                app.runtime.control(serde_json::from_value(request).unwrap(), tx);
                 match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
                     ControlOutcome::Exec { job, session, then } => (job, session, then),
                     _ => panic!("a sandboxed session's command runs on the socket thread"),
@@ -722,7 +722,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             assert_eq!(session, json!("boxed"));
             // Its agent still runs in the sandbox, which stays up.
             then();
-            app.runtime.runtime_tick(ctx);
+            app.runtime.runtime_tick();
             app.runtime.finish_lifecycle_jobs();
             assert!(fake::calls_to(bin.path(), &["stop"]).is_empty());
 
@@ -786,10 +786,8 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
         .into();
         let codex = app.runtime.config.agents.iter_mut().find(|a| a.name == "codex").unwrap();
         codex.command = vec!["codex".into(), "--full-auto".into(), "--search".into()];
-        let sandbox_id = app
-            .runtime
-            .start(ctx, "codex", worktree.clone(), None, task_args.clone(), Some("Do the task".into()))
-            .unwrap();
+        let sandbox_id =
+            app.runtime.start("codex", worktree.clone(), None, task_args.clone(), Some("Do the task".into())).unwrap();
         tick_until(app, ctx, "the agent to reach its fixture hook", |_| bin.path().join("waiting-agent").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         let trusted =
@@ -818,7 +816,7 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
             busy_text: None,
             isolation: Some(IsolationMode::Bare),
         });
-        let bare_id = app.runtime.start(ctx, "bare-agent", worktree.clone(), None, task_args.clone(), None).unwrap();
+        let bare_id = app.runtime.start("bare-agent", worktree.clone(), None, task_args.clone(), None).unwrap();
         tick_until(app, ctx, "the bare agent to finish", |app| {
             app.runtime
                 .sessions
@@ -856,7 +854,7 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         // Bare mode, and an agent set bare under sandbox mode, start on this machine as before.
         for (mode, agent) in [(IsolationMode::Bare, "probe"), (IsolationMode::Sandbox, "bare-probe")] {
             app.runtime.config.isolation.mode = mode;
-            let id = app.runtime.start(ctx, agent, worktree.clone(), None, vec![], None).unwrap();
+            let id = app.runtime.start(agent, worktree.clone(), None, vec![], None).unwrap();
             assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some(), "{agent} starts at once");
             tick_until(app, ctx, "the bare probe", |_| out.exists());
             std::fs::remove_file(&out).unwrap();
@@ -866,7 +864,7 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
 
         // An agent sbx cannot run is refused rather than run bare.
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        let error = app.runtime.start(ctx, "probe", worktree.clone(), None, vec![], None).unwrap_err();
+        let error = app.runtime.start("probe", worktree.clone(), None, vec![], None).unwrap_err();
         assert!(error.contains("no agent for /bin/sh") && error.contains("isolation = \"bare\""), "{error}");
 
         // A repository that requires sandboxes overrides the user's bare mode and the agent's own.
@@ -884,10 +882,10 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         // The repository selects its template only once ATOMICS has built that tag from it.
         let root = repo.canonicalize().unwrap();
         atomics_core::repo_workflow::record_template(&paths::atomics_home(), "repo:local", &root).unwrap();
-        let error = app.runtime.start(ctx, "bare-probe", worktree.clone(), None, vec![], None).unwrap_err();
+        let error = app.runtime.start("bare-probe", worktree.clone(), None, vec![], None).unwrap_err();
         assert!(error.contains("requires sandboxed agents"), "{error}");
         assert!(!out.exists());
-        let id = app.runtime.start(ctx, "shell", worktree.clone(), None, vec![], None).unwrap();
+        let id = app.runtime.start("shell", worktree.clone(), None, vec![], None).unwrap();
         tick_until(app, ctx, "the sandboxed shell", |_| bin.path().join("run-ssh").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         assert_eq!(run, ["run", "--name", format!("atomics-{id}").as_str(), "shell", "--"]);
@@ -897,7 +895,7 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         // A repository asking for bare is ignored: sandbox mode stays.
         std::fs::write(repo.join(".atomics/config.toml"), "[isolation]\nmode = \"bare\"\n").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        let id = app.runtime.start(ctx, "shell", worktree.clone(), None, vec![], None).unwrap();
+        let id = app.runtime.start("shell", worktree.clone(), None, vec![], None).unwrap();
         assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_none());
         tick_until(app, ctx, "the second sandbox to attach", |app| {
             app.runtime.sessions.iter().find(|s| s.id == id).is_some_and(|s| s.terminal.is_some())
@@ -1034,8 +1032,7 @@ fn a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task() {
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         for (program, reason) in [(app.runtime.sbx.clone(), "not installed"), (sbx, "not signed in")] {
             app.runtime.sbx = program;
-            let id =
-                app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+            let id = app.runtime.start("codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
             // Dispatch links the task to the session as soon as the tile exists.
             app.runtime.plans = vec![Plan {
                 id: "plan".into(),
@@ -1087,7 +1084,7 @@ fn the_chief_always_runs_on_this_machine() {
         ];
         app.runtime.config.chief.args = Vec::new();
 
-        let id = app.runtime.start_chief(ctx, None).unwrap();
+        let id = app.runtime.start_chief(None).unwrap();
         let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
         assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare at once");
         tick_until(app, ctx, "the chief", |_| out.exists());
@@ -1108,7 +1105,7 @@ fn the_chief_always_runs_on_this_machine() {
         };
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
-        app.runtime.resume_record(ctx, record);
+        app.runtime.resume_record(record);
         assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         tick_until(app, ctx, "the resumed chief", |_| out.exists());
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
@@ -1172,7 +1169,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
             };
             app.runtime.close(&native);
             std::fs::remove_file(&out).unwrap();
-            app.runtime.resume_record(ctx, record);
+            app.runtime.resume_record(record);
             tick_until(app, ctx, "the resumed bare task", |_| out.exists());
             assert_eq!(session(app, 0), None);
 
@@ -1203,7 +1200,7 @@ fn sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board() {
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         std::fs::write(bin.path().join("agent"),
             "git -c user.name=Test -c user.email=test@example.org commit --allow-empty -qm task\ngit update-ref refs/heads/main HEAD\n").unwrap();
-        let id = app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+        let id = app.runtime.start("codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
         app.runtime.plans = vec![Plan {
             id: "guard-plan".into(),
             tasks: vec![Task {
@@ -1264,7 +1261,7 @@ echo new > a.txt
                 marker = marker.display()
             );
             std::fs::write(bin.path().join("agent"), script).unwrap();
-            let id = app.runtime.start(ctx, "codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
+            let id = app.runtime.start("codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
             let name = format!("atomics-{id}");
             // Ref recovery on exit restores the moved branch with git's update-ref.
             tick_until(app, ctx, "ref recovery on agent exit", |app| {
@@ -1313,7 +1310,7 @@ fn sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you() {
             "printf '  Trust this folder? Codex can read, edit, and run files here.\\n\\n› 1. Trust and continue\\n  2. Open restricted\\n'\nexec sleep 30\n",
         )
         .unwrap();
-        let id = app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+        let id = app.runtime.start("codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
         tick_until(app, ctx, "the agent to attach", |_| !fake::calls_to(bin.path(), &["run"]).is_empty());
 
         // The mounted worktree is trusted up front; its dotted name stays one key of the table.
@@ -1355,7 +1352,7 @@ fn sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity() {
             let text = task.compose_brief_for("Sandbox task", Some(&config));
             assert!(!text.contains("atomics queue"));
             assert!(text.contains("CPUs and 8g memory"));
-            let id = app.runtime.start(ctx, "codex", worktree, None, vec![], Some(text.clone())).unwrap();
+            let id = app.runtime.start("codex", worktree, None, vec![], Some(text.clone())).unwrap();
             tick_until(app, ctx, "the sandboxed agent", |_| bin.path().join("run-ssh").exists());
             let name = format!("atomics-{id}");
             let brief = paths::briefs_dir().join(&id).join("brief.md");
@@ -1380,7 +1377,7 @@ fn sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity() {
 fn sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_turn() {
     with_app(
         "app::sandbox_tests::sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_turn",
-        |app, ctx| {
+        |app, _ctx| {
             let (_dir, repo) = repository();
             let worktree = worktree(&repo, "task");
             for (agent, kind) in [("claude", AgentKind::Claude), ("codex", AgentKind::Generic)] {
@@ -1393,7 +1390,7 @@ fn sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_t
                 let screen = |app: &mut Desktop<'_>, text: &str| {
                     let terminal = Terminal::spawn(
                         app.runtime.wake.clone(),
-                        app.runtime.palette.terminal_colors(),
+                        app.runtime.theme.terminal_colors(),
                         "/bin/sh".into(),
                         vec!["-c".into(), format!("printf '%s' '{text}'; exec sleep 600")],
                         &worktree,
@@ -1437,7 +1434,7 @@ fn sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_t
                 screen(app, "Working (esc to interrupt)");
                 track(app);
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "new turn resumes screen detection");
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 assert!(app.runtime.sessions[0].approvals.is_empty());
                 app.runtime.sessions.clear();
             }
@@ -1466,7 +1463,7 @@ fn worktrees_are_listed_off_the_ui_thread_and_a_planted_one_never_shows() {
         app.runtime.worktrees_at = None;
         for _ in 0..3 {
             let started = Instant::now();
-            app.runtime.runtime_tick(ctx);
+            app.runtime.runtime_tick();
             assert!(started.elapsed() < Duration::from_secs(2), "the UI thread waited for git");
             std::thread::sleep(Duration::from_millis(200));
         }

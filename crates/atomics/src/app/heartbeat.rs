@@ -222,14 +222,13 @@ mod tests {
     fn interval_emits_one_empty_event_to_waiters_and_updates_pill_state() {
         with_app(
             "app::heartbeat::tests::interval_emits_one_empty_event_to_waiters_and_updates_pill_state",
-            |app, ctx| {
+            |app, _ctx| {
                 app.runtime.config.chief.heartbeat_secs = 7;
                 app.runtime.heartbeat();
                 assert!(app.runtime.heartbeat.pending.is_none());
                 assert!(app.runtime.heartbeat.last.is_none());
                 let (tx, rx) = channel();
                 app.runtime.control(
-                    ctx,
                     ControlRequest::Wait {
                         sessions: vec![],
                         statuses: vec!["heartbeat".into()],
@@ -268,7 +267,7 @@ mod tests {
     fn gone_agents_survive_plan_sync_and_filtered_waiters_receive_findings() {
         with_app(
             "app::heartbeat::tests::gone_agents_survive_plan_sync_and_filtered_waiters_receive_findings",
-            |app, ctx| {
+            |app, _ctx| {
                 app.runtime.sessions.push(session(
                     "gone",
                     AgentKind::Generic,
@@ -287,7 +286,6 @@ mod tests {
                 }];
                 let (tx, rx) = channel();
                 app.runtime.control(
-                    ctx,
                     ControlRequest::Wait {
                         sessions: vec!["gone".into()],
                         statuses: vec!["heartbeat".into()],
@@ -377,7 +375,7 @@ mod tests {
                 let has_findings = !findings.is_empty();
                 let at = atomics_core::store::now() - age;
                 app.runtime.heartbeat.last = Some((at, findings));
-                let error = app.runtime.palette.error;
+                let error = app.palette().error;
                 let mut frame = |events| {
                     time += 1.0;
                     ctx.run_ui(

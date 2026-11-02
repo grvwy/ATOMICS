@@ -7,7 +7,7 @@ impl Desktop<'_> {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 self.client.voice = Voice::Opening(cancelled.clone());
                 let (config, tx, ctx) =
-                    (self.runtime.config.voice.clone(), self.client.voice_tx.clone(), self.runtime.ctx.clone());
+                    (self.runtime.config.voice.clone(), self.client.voice_tx.clone(), self.client.ctx.clone());
                 std::thread::spawn(move || {
                     let recording = Recorder::start().and_then(|recorder| {
                         config.api_key(env_var).map_err(|err| format!("{err:#}"))?;
@@ -33,7 +33,7 @@ impl Desktop<'_> {
         let Voice::Recording(recorder) = std::mem::replace(&mut self.client.voice, Voice::Transcribing) else { return };
         let recording = recorder.finish();
         let (config, tx, ctx) =
-            (self.runtime.config.voice.clone(), self.client.voice_tx.clone(), self.runtime.ctx.clone());
+            (self.runtime.config.voice.clone(), self.client.voice_tx.clone(), self.client.ctx.clone());
         std::thread::spawn(move || {
             let transcript = recording.and_then(|(samples, rate)| {
                 if samples.len() < rate as usize / 5 {

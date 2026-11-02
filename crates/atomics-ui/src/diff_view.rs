@@ -6,16 +6,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use atomics_core::diff::{DiffLine, FileStatus, LineKind, SplitRow, split_rows};
+use atomics_core::diff_data::Span;
 use atomics_core::files::{self, Dir};
 use atomics_core::layout::DiffSplit;
 use atomics_core::steer::ReviewComment;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use crate::highlight::Span;
-use crate::theme::{Palette, lerp, shortcut_label};
+use crate::keys::shortcut_label;
+use crate::theme::{Palette, lerp};
 
-pub use crate::diff_worker::{FileView, Prepared};
+pub use atomics_core::diff_data::{FileView, Prepared};
 
 #[derive(Default)]
 pub struct DiffState {

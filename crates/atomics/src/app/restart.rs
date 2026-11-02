@@ -95,7 +95,7 @@ impl State {
             // is already authorized and must not pass through session-close dialogs.
             self.restarting = true;
             self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::Close));
-            self.ctx.request_repaint();
+            self.window.request_repaint();
             Ok(())
         })();
         match result {
@@ -105,6 +105,7 @@ impl State {
     }
 
     fn save_restart(&mut self, reason: Option<String>) -> anyhow::Result<()> {
+        let viewport = self.window.viewport();
         for plan in self.plans.iter().filter(|plan| !plan.id.is_empty()) {
             plan.save_in(&paths::atomics_home())?;
         }
@@ -152,8 +153,8 @@ impl State {
                 PanelMode::Diff | PanelMode::Tickets => "diff",
             }
             .into(),
-            window_size: self.ctx.input(|input| input.viewport().inner_rect.map(|rect| [rect.width(), rect.height()])),
-            maximized: self.ctx.input(|input| input.viewport().maximized.unwrap_or(false)),
+            window_size: viewport.and_then(|viewport| viewport.inner),
+            maximized: viewport.is_some_and(|viewport| viewport.maximized),
         });
         self.store.save(&paths::store_file())
     }
@@ -198,7 +199,7 @@ impl State {
         self.restart_layout = Some(restart);
     }
 
-    pub(super) fn resume_record(&mut self, ctx: &egui::Context, record: SessionRecord) {
+    pub(super) fn resume_record(&mut self, record: SessionRecord) {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let args = if record.chief { self.config.chief.args.clone() } else { Vec::new() };
@@ -220,7 +221,7 @@ impl State {
             Role::Agent(task.and_then(|task| task.isolation).or(Some(ran)))
         };
         let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd) } else { record.cwd };
-        match self.start_as(ctx, &record.agent, cwd, Some(record.claude_session_id), args, prompt, role) {
+        match self.start_as(&record.agent, cwd, Some(record.claude_session_id), args, prompt, role) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.last_prompt = record.last_prompt;
@@ -366,10 +367,10 @@ mod tests {
 
     #[test]
     fn restart_snapshot_saves_all_plans_live_session_ids_and_layout() {
-        with_app("app::restart::tests::restart_snapshot_saves_all_plans_live_session_ids_and_layout", |app, ctx| {
+        with_app("app::restart::tests::restart_snapshot_saves_all_plans_live_session_ids_and_layout", |app, _ctx| {
             app.runtime.config.chief.command = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
             app.runtime.config.chief.args.clear();
-            let id = app.runtime.start_chief(ctx, None).unwrap();
+            let id = app.runtime.start_chief(None).unwrap();
             let claude_id = app.runtime.sessions[0].claude_id.clone().unwrap();
             app.runtime.plans =
                 vec![Plan { id: "saved-plan".into(), goal: "save all plans".into(), ..Default::default() }];
@@ -474,7 +475,7 @@ mod tests {
                 app.runtime.shutdown();
                 let cc = eframe::CreationContext::_new_kittest(ctx.clone());
                 let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
-                reopened.runtime_tick(ctx);
+                reopened.runtime_tick();
                 assert_eq!(reopened.sessions.len(), 1);
                 let chief = &reopened.sessions[0];
                 assert!(chief.chief);
@@ -488,7 +489,6 @@ mod tests {
                 assert_eq!(reopened.desktop_diff_split, Some(DiffSplit::Never));
                 let (tx, rx) = channel();
                 reopened.control(
-                    ctx,
                     serde_json::from_value(
                         json!({"cmd":"wait", "after":999999, "statuses":["heartbeat"], "timeout_secs":0}),
                     )
@@ -523,8 +523,8 @@ mod tests {
             app.runtime.shutdown();
             let cc = eframe::CreationContext::_new_kittest(ctx.clone());
             let mut started = State::new(&cc, Options::default(), &crate::load_icon());
-            started.runtime_tick(ctx);
-            started.runtime_tick(ctx);
+            started.runtime_tick();
+            started.runtime_tick();
             assert_eq!(started.sessions.iter().filter(|s| s.chief).count(), 1);
             let chief = started.sessions.iter().find(|s| s.chief).unwrap();
             assert_eq!(chief.claude_id.as_deref(), Some("pinned-claude-id"));
@@ -553,8 +553,8 @@ mod tests {
             started.store.save(&paths::store_file()).unwrap();
             started.shutdown();
             let mut restarted = State::new(&cc, Options::default(), &crate::load_icon());
-            restarted.runtime_tick(ctx);
-            restarted.runtime_tick(ctx);
+            restarted.runtime_tick();
+            restarted.runtime_tick();
             let chiefs: Vec<_> = restarted.sessions.iter().filter(|s| s.chief).collect();
             assert_eq!(chiefs.len(), 1);
             assert_eq!(chiefs[0].claude_id.as_deref(), Some("restarted-claude-id"));
@@ -596,7 +596,7 @@ mod tests {
                 let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
                 reopened.startup_cleanup.take().unwrap().join().unwrap();
                 assert!(scratch.is_dir() && !orphan.exists(), "only the handoff's scratch folders survive startup");
-                reopened.runtime_tick(ctx);
+                reopened.runtime_tick();
                 let [session] = &reopened.sessions[..] else { panic!("one resumed session") };
                 assert_eq!(session.scratch.as_ref(), Some(&scratch));
                 assert_eq!(session.cwd, scratch);

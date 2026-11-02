@@ -91,14 +91,14 @@ impl State {
     /// Starts the chief agent in `[chief] cwd`, else in the main checkout of the project on screen,
     /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
     /// win over the main and host config's.
-    pub(super) fn start_chief(&mut self, ctx: &egui::Context, prompt: Option<String>) -> Result<String, String> {
+    pub(super) fn start_chief(&mut self, prompt: Option<String>) -> Result<String, String> {
         let cwd = self.chief_cwd().unwrap_or_else(|| {
             self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
         });
         let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
         let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
         let args = self.config.chief.args.clone();
-        self.start_as(ctx, "chief", cwd, resume, args, prompt, Role::Chief)
+        self.start_as("chief", cwd, resume, args, prompt, Role::Chief)
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the
@@ -150,18 +150,17 @@ impl State {
             },
             None => {
                 self.sessions.retain(|s| !s.chief);
-                let ctx = self.ctx.clone();
-                self.start_chief(&ctx, Some(text.to_string()))?;
+                self.start_chief(Some(text.to_string()))?;
                 Ok(Delivery::Sent)
             }
         }
     }
 
-    pub(super) fn toggle_chief(&mut self, ctx: &egui::Context) {
+    pub(super) fn toggle_chief(&mut self) {
         if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
             self.sessions.retain(|s| !s.chief);
             self.traces.retain(|id, _| self.sessions.iter().any(|session| session.id == *id && session.chief));
-            if let Err(err) = self.start_chief(ctx, None) {
+            if let Err(err) = self.start_chief(None) {
                 self.toast(err);
                 return;
             }
@@ -255,7 +254,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
 impl Desktop<'_> {
     pub(super) fn chief_pill(&mut self, ui: &mut egui::Ui, compact: bool) {
         let ctx = ui.ctx().clone();
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let chief = self.runtime.sessions.iter().position(|s| s.chief);
         let status = chief.map(|i| self.runtime.sessions[i].status);
         let mut toggle = false;
@@ -386,7 +385,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn chief_ui(&mut self, ctx: &egui::Context) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         if !self.runtime.chief_open || self.runtime.last_layout.is_some_and(|layout| layout.dock_width > 0.0) {
             return;
         }
@@ -408,7 +407,7 @@ impl Desktop<'_> {
 
     pub(super) fn chief_content(&mut self, ui: &mut egui::Ui) {
         let Some(index) = self.runtime.sessions.iter().position(|s| s.chief) else { return };
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.horizontal(|ui| {
             ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -603,7 +602,7 @@ mod chief_tests {
     #[test]
     fn divider_drags_and_double_click_resets() {
         let ctx = egui::Context::default();
-        let palette = Palette::from_config(&atomics_core::config::ThemeConfig::default());
+        let palette = crate::theme::Theme::from_config(&atomics_core::config::ThemeConfig::default()).palette();
         let mut width = Some(720.0);
         let mut time = 0.0;
         let mut frame = |events| {

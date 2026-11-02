@@ -2,7 +2,7 @@ use super::*;
 
 impl State {
     pub(super) fn toggle_plan(&mut self) {
-        self.ctx.request_repaint();
+        self.window.request_repaint();
         if self.panel == PanelMode::Plan && self.diff_open {
             self.panel = PanelMode::Diff;
         } else {
@@ -125,16 +125,19 @@ pub(super) fn tracked_label(plan: &Plan, config: &atomics_core::tickets::TicketC
 }
 
 impl Desktop<'_> {
+    /// The selected plan's board: its header, then the kanban columns, drawn from the plan's
+    /// [`BoardView`](atomics_ui::BoardView), read once per frame.
     pub(super) fn plan_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.painter().rect_filled(rect, 0.0, p.background);
+        let index = self.runtime.selected_plan;
+        let Some(mut board) = self.runtime.backend().board(index) else { return };
+        let plan = &board.plan;
         let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt(("plan-panel", &self.runtime.plans[self.runtime.selected_plan].id))
-                .max_rect(rect.shrink2(vec2(12.0, 8.0))),
+            egui::UiBuilder::new().id_salt(("plan-panel", &plan.id)).max_rect(rect.shrink2(vec2(12.0, 8.0))),
         );
         let ui = &mut child;
-        let read_only = self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
+        let read_only = plan.status != PlanStatus::Open;
         let mut reopen = false;
         let mut archive = false;
         let mut approve = false;
@@ -142,24 +145,19 @@ impl Desktop<'_> {
         let mut integrate_accepted = false;
         let mut close_status = None;
         let mut clean_plan = false;
-        let ready = self.runtime.plans[self.runtime.selected_plan].ready().len();
-        if self
-            .runtime
-            .integration_checks
-            .keys()
-            .any(|(plan, _)| plan == &self.runtime.plans[self.runtime.selected_plan].id)
-        {
+        let ready = board.ready.len();
+        if board.checking {
             ui.label(RichText::new("Checking integration freshness…").color(p.muted));
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new("PLAN").color(p.accent).strong().size(13.0));
-            let total = self.runtime.plans[self.runtime.selected_plan].tasks.len();
+            let total = plan.tasks.len();
             if total > 0 {
-                let done = self.runtime.plans[self.runtime.selected_plan].count(TaskStatus::Done);
+                let done = plan.count(TaskStatus::Done);
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
             if read_only {
-                let status = if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
+                let status = if plan.status == PlanStatus::Completed {
                     "Completed ✓ · read-only"
                 } else {
                     "Archived · read-only"
@@ -168,7 +166,7 @@ impl Desktop<'_> {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if read_only {
-                    if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
+                    if plan.status == PlanStatus::Completed {
                         archive = ui.small_button("Archive").clicked();
                         clean_plan = ui.small_button("Clean up plan…").clicked();
                     }
@@ -180,7 +178,7 @@ impl Desktop<'_> {
                     if total == 0 {
                         return;
                     }
-                    if !self.runtime.plans[self.runtime.selected_plan].approved {
+                    if !plan.approved {
                         let button = egui::Button::new(RichText::new("Approve plan").color(p.on_accent)).fill(p.accent);
                         approve = ui.add(button).on_hover_text("Let the orchestrator dispatch these tasks").clicked();
                     } else {
@@ -193,30 +191,25 @@ impl Desktop<'_> {
                 }
             });
         });
-        if !self.runtime.plans[self.runtime.selected_plan].goal.is_empty() {
-            ui.label(
-                RichText::new(&self.runtime.plans[self.runtime.selected_plan].goal)
-                    .color(self.runtime.plan_state(self.runtime.selected_plan).color(&p))
-                    .size(13.0),
-            );
+        if !plan.goal.is_empty() {
+            ui.label(RichText::new(&plan.goal).color(board.state.color(&p)).size(13.0));
         }
-        let integration = self.runtime.plans[self.runtime.selected_plan].integration_branch();
-        if !self.runtime.plans[self.runtime.selected_plan].tasks.is_empty() {
+        let integration = plan.integration_branch();
+        if !plan.tasks.is_empty() {
             ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
         }
-        let pending = self.runtime.plans[self.runtime.selected_plan].pending_integrations().len();
+        let pending = plan.pending_integrations().len();
         if !read_only && pending > 0 {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{pending} accepted tasks not integrated yet")).color(p.warning));
                 integrate_accepted = ui.button("Integrate").clicked();
             });
         }
-        let ticket_config = self.runtime.ticket_config();
-        stage_chip(ui, self.runtime.plans[self.runtime.selected_plan].stages.last());
+        let ticket_config = &board.ticket_config;
+        stage_chip(ui, plan.stages.last());
         let mut sync_tickets = false;
-        if let Some(link) = self.runtime.plans[self.runtime.selected_plan].ticket.clone() {
-            let plan = &self.runtime.plans[self.runtime.selected_plan];
+        if let Some(link) = &plan.ticket {
             ui.horizontal_wrapped(|ui| {
                 let system = ticket_config.as_ref().map_or(link.system.as_str(), |c| c.system.as_str());
                 let what = ticket_config.as_ref().map_or("ticket".to_string(), |c| mode_label(plan, c));
@@ -229,20 +222,16 @@ impl Desktop<'_> {
                     })
                     .and_then(|c| c.states.status_of(link.state.as_deref()?))
                     .map(|ticket| (ticket, atomics_core::tickets::plan_status(plan)));
-                ui.vertical(|ui| ticket_chip(ui, &link, means, ticket_config.as_deref(), &p));
+                ui.vertical(|ui| ticket_chip(ui, link, means, ticket_config.as_deref(), &p));
                 if let Some(title) = &link.title {
                     ui.label(RichText::new(title).color(p.foreground).size(11.5));
                 }
                 if let Some(tracked) = ticket_config.as_ref().and_then(|c| tracked_label(plan, c)) {
                     ui.label(RichText::new(tracked).color(p.muted).size(11.5));
                 }
-                if let Some(items) = self.runtime.tickets.boards.get(&plan.id) {
-                    let planned = |item: &atomics_core::tickets::TicketLink| {
-                        plan.tasks.iter().any(|t| t.ticket.as_ref().is_some_and(|l| l.same_ticket(item)))
-                    };
-                    let loose = items.iter().filter(|item| !planned(item)).count();
+                if let Some((tickets, loose)) = board.board_counts {
                     ui.label(
-                        RichText::new(format!("{} tickets · {loose} without a task", items.len()))
+                        RichText::new(format!("{tickets} tickets · {loose} without a task"))
                             .color(if loose > 0 { p.warning } else { p.muted })
                             .size(11.5),
                     );
@@ -252,19 +241,19 @@ impl Desktop<'_> {
                 }
             });
         }
-        if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
+        if plan.status == PlanStatus::Completed {
             ui.label(
                 RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
             );
             if clean_plan {
-                self.open_plan_cleanup(self.runtime.selected_plan);
+                self.open_plan_cleanup(index);
             }
         }
-        for (task, dep) in self.runtime.plans[self.runtime.selected_plan].unknown_dependencies() {
+        for (task, dep) in plan.unknown_dependencies() {
             ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.5));
         }
         ui.add_space(6.0);
-        if self.runtime.plans[self.runtime.selected_plan].tasks.is_empty() {
+        if plan.tasks.is_empty() {
             ui.label(
                 RichText::new(
                     "No plan yet. Ask an orchestrator (a Claude session with the ATOMICS MCP server) to plan a goal: \
@@ -276,41 +265,28 @@ impl Desktop<'_> {
 
         let mut actions: Vec<(String, &str)> = Vec::new();
         let mut open_session: Option<String> = None;
-        let editable = !read_only && !self.runtime.plans[self.runtime.selected_plan].approved;
-        let ready_ids: HashSet<String> =
-            self.runtime.plans[self.runtime.selected_plan].ready().iter().map(|t| t.id.clone()).collect();
-        let approved = self.runtime.plans[self.runtime.selected_plan].approved;
-        let sessions: HashMap<String, (String, AgentStatus)> =
-            self.runtime.sessions.iter().map(|s| (s.id.clone(), (s.title.clone(), s.status))).collect();
+        let editable = !read_only && !plan.approved;
+        let ready_ids = &board.ready;
+        let approved = plan.approved;
+        let sessions = &board.sessions;
         let expanded = &mut self.client.expanded_tasks;
-        let integrating = &self.runtime.integrating;
-        let plan_id = self.runtime.plans[self.runtime.selected_plan].id.clone();
+        let integrating = &board.integrating;
+        let plan_id = plan.id.clone();
         let ticket_states = ticket_config.as_ref().map(|c| c.states.clone());
-        let latest_stages: std::collections::HashMap<_, _> = self.runtime.plans[self.runtime.selected_plan]
+        let latest_stages: std::collections::HashMap<_, _> = plan
             .tasks
             .iter()
-            .filter_map(|task| {
-                self.runtime.plans[self.runtime.selected_plan]
-                    .latest_stage(task)
-                    .map(|stage| (task.id.clone(), stage.clone()))
-            })
+            .filter_map(|task| plan.latest_stage(task).map(|stage| (task.id.clone(), stage.clone())))
             .collect();
-        let integration_notes: HashMap<String, (String, bool)> = self.runtime.plans[self.runtime.selected_plan]
+        let integration_notes = &board.integration_notes;
+        let expected_tasks: std::collections::HashSet<_> = plan
             .tasks
             .iter()
-            .filter_map(|task| {
-                let note = self.runtime.integration_check_note(self.runtime.selected_plan, task)?;
-                let checking = self.runtime.integration_checks.contains_key(&(plan_id.clone(), task.id.clone()));
-                Some((task.id.clone(), (note, checking)))
-            })
-            .collect();
-        let expected_tasks: std::collections::HashSet<_> = self.runtime.plans[self.runtime.selected_plan]
-            .tasks
-            .iter()
-            .filter(|task| self.runtime.plans[self.runtime.selected_plan].ticket_progress_expected(Some(&task.id)))
+            .filter(|task| plan.ticket_progress_expected(Some(&task.id)))
             .map(|task| task.id.clone())
             .collect();
-        let mut edited_tasks = self.runtime.plans[self.runtime.selected_plan].tasks.clone();
+        // The cards edit briefs in place; an edit is posted below.
+        let mut edited_tasks = std::mem::take(&mut board.plan.tasks);
         let tasks = &mut edited_tasks;
         if !tasks.is_empty() {
             egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(
@@ -538,8 +514,7 @@ impl Desktop<'_> {
                                                                 TaskStatus::Review | TaskStatus::Done
                                                             )
                                                         {
-                                                            let busy = integrating
-                                                                .contains(&(plan_id.clone(), task.id.clone()));
+                                                            let busy = integrating.contains(&task.id);
                                                             let label =
                                                                 if busy { "integrating…" } else { "integrate" };
                                                             if ui
@@ -575,28 +550,23 @@ impl Desktop<'_> {
                 "edited" => {
                     if let Some(edited) = edited_tasks.iter().find(|t| t.id == id) {
                         let brief = edited.brief.clone();
-                        self.post_plan(self.runtime.selected_plan, move |state, index| {
+                        self.post_plan(index, move |state, index| {
                             state.edit_task_brief(index, &id, brief);
                         });
                     }
                 }
-                "start" => self.post_plan(self.runtime.selected_plan, move |state, index| {
-                    state.dispatch_when_checked(index, Some(id), None)
-                }),
-                "integrate" => {
-                    self.post_plan(self.runtime.selected_plan, move |state, index| state.integrate(index, &id, None))
+                "start" => {
+                    self.post_plan(index, move |state, index| state.dispatch_when_checked(index, Some(id), None))
                 }
+                "integrate" => self.post_plan(index, move |state, index| state.integrate(index, &id, None)),
                 "diff" | "resume" | "acknowledge_refs" => {
-                    if let Some(task) =
-                        self.runtime.plans[self.runtime.selected_plan].tasks.iter().position(|t| t.id == id)
-                    {
-                        let index = self.runtime.selected_plan;
+                    if let Some(task) = edited_tasks.iter().position(|t| t.id == id) {
                         self.task_action(index, task, action);
                     }
                 }
                 status => {
                     if let Some(status) = TaskStatus::parse(status) {
-                        self.post_plan(self.runtime.selected_plan, move |state, index| {
+                        self.post_plan(index, move |state, index| {
                             if state.plans[index].status != PlanStatus::Open {
                                 return;
                             }
@@ -617,13 +587,13 @@ impl Desktop<'_> {
             }
         }
         if approve {
-            self.post_plan(self.runtime.selected_plan, |state, index| {
+            self.post_plan(index, |state, index| {
                 state.approve_plan(index);
                 state.toast("Plan approved: the orchestrator can dispatch it now");
             });
         }
         if integrate_accepted {
-            self.post_plan(self.runtime.selected_plan, |state, index| {
+            self.post_plan(index, |state, index| {
                 let ids: Vec<_> = state.plans[index].pending_integrations().iter().map(|t| t.id.clone()).collect();
                 for id in ids {
                     state.integrate(index, &id, None);
@@ -631,34 +601,34 @@ impl Desktop<'_> {
             });
         }
         if sync_tickets {
-            self.post_plan(self.runtime.selected_plan, |state, index| {
+            self.post_plan(index, |state, index| {
                 let id = state.plans[index].id.clone();
                 state.resync_tickets(&id);
             });
         }
         if dispatch_all {
-            self.post_plan(self.runtime.selected_plan, |state, index| state.dispatch_when_checked(index, None, None));
+            self.post_plan(index, |state, index| state.dispatch_when_checked(index, None, None));
         }
         if let Some(session) = open_session {
             self.activate(&session, true);
             self.runtime.panel = PanelMode::Diff;
         }
         if reopen {
-            self.post_plan(self.runtime.selected_plan, |state, index| {
+            self.post_plan(index, |state, index| {
                 if let Err(error) = state.reopen_plan(index) {
                     state.toast(error);
                 }
             });
         }
         if archive {
-            self.post_plan(self.runtime.selected_plan, |state, index| {
+            self.post_plan(index, |state, index| {
                 if let Err(error) = state.close_plan(index, PlanStatus::Archived) {
                     state.toast(error);
                 }
             });
         }
         if let Some(status) = close_status {
-            self.client.confirm_plan_close = Some((self.runtime.plans[self.runtime.selected_plan].id.clone(), status));
+            self.client.confirm_plan_close = Some((plan_id, status));
         }
     }
 }

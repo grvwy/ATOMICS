@@ -151,9 +151,9 @@ impl Desktop<'_> {
                             }
                             let label = reason.map(|why| format!("Keep: {why}")).unwrap_or_else(|| "Remove".into());
                             ui.label(RichText::new(label).color(if reason.is_some() {
-                                self.runtime.palette.warning
+                                self.palette().warning
                             } else {
-                                self.runtime.palette.success
+                                self.palette().success
                             }));
                         });
                         let path =
@@ -161,7 +161,7 @@ impl Desktop<'_> {
                         ui.label(
                             RichText::new(format!("{} · {path}", paths::display(&entry.repo)))
                                 .small()
-                                .color(self.runtime.palette.muted),
+                                .color(self.palette().muted),
                         );
                         ui.separator();
                     }
@@ -382,7 +382,7 @@ mod tests {
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
                 while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 frame(app, vec![]); // egui sizes a newly opened window before painting it.
@@ -415,7 +415,7 @@ mod tests {
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
-                    app.runtime.runtime_tick(ctx);
+                    app.runtime.runtime_tick();
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(!dir.path().join("clean").exists());

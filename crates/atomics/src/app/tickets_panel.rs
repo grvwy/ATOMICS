@@ -370,7 +370,7 @@ pub(super) fn score_range(cards: &[TicketCard]) -> Option<(f64, f64)> {
 
 impl State {
     pub(super) fn toggle_tickets(&mut self) {
-        self.ctx.request_repaint();
+        self.window.request_repaint();
         if self.panel == PanelMode::Tickets && self.diff_open {
             self.panel = PanelMode::Diff;
         } else {
@@ -386,7 +386,7 @@ impl State {
         self.diff_open = true;
         self.tickets.panel.view = TicketsView::Find;
         self.tickets.panel.focus_query = true;
-        self.ctx.request_repaint();
+        self.window.request_repaint();
     }
 
     /// Shift+↓/↑ in the panel: the next or previous item, a result in Find and a ticket in Read.
@@ -541,14 +541,14 @@ impl State {
             panel.find.selected = Some(at);
             panel.find.reveal = true;
         }
-        self.ctx.request_repaint();
+        self.window.request_repaint();
     }
 
     /// Reads a ticket in the panel: the card, its children and the tickets related to it.
     pub(super) fn open_ticket(&mut self, link: TicketLink, nav: Nav) {
         self.panel = PanelMode::Tickets;
         self.diff_open = true;
-        self.ctx.request_repaint();
+        self.window.request_repaint();
         let Some(config) = self.ticket_config() else {
             self.toast("Tickets are not configured ([tickets] in the config)");
             return;
@@ -909,7 +909,7 @@ impl Desktop<'_> {
             self.client.focus_editor = false;
             ui.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
         }
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         ui.painter().rect_filled(rect, 0.0, p.background);
         // The chief's newest trace card, one line, opens the chief.
         let echo = self.runtime.lane_echo();
@@ -1012,7 +1012,7 @@ impl Desktop<'_> {
     pub(super) fn plan_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.runtime.tickets.panel.dialog.take() else { return };
         let Some(config) = self.runtime.ticket_config() else { return };
-        let p = self.runtime.palette.clone();
+        let p = self.palette();
         let children = self.runtime.tickets.panel.read.as_ref().map_or(Part::Unmapped, |read| read.children.clone());
         let count = children.items().len();
         let mut keep = true;
@@ -2744,92 +2744,9 @@ mod tests {
         });
     }
 
-    /// A CPU rasterizer for egui output, so a screenshot
-    /// needs no window or GPU. `ATOMICS_TICKETS_SCREENSHOTS=<dir>` makes the fake-server test write them.
-    #[derive(Default)]
-    struct Raster {
-        textures: HashMap<egui::TextureId, egui::ColorImage>,
-    }
-
-    impl Raster {
-        fn feed(&mut self, output: &egui::FullOutput) {
-            for (id, deltas) in &output.textures_delta.set {
-                for delta in deltas {
-                    let egui::epaint::ImageData::Color(image) = &delta.image;
-                    match delta.pos {
-                        None => {
-                            self.textures.insert(*id, (**image).clone());
-                        }
-                        Some([x, y]) => {
-                            if let Some(target) = self.textures.get_mut(id) {
-                                for row in 0..image.size[1] {
-                                    let from = row * image.size[0];
-                                    let to = (y + row) * target.size[0] + x;
-                                    target.pixels[to..to + image.size[0]]
-                                        .copy_from_slice(&image.pixels[from..from + image.size[0]]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        fn paint(
-            &self,
-            ctx: &egui::Context,
-            output: egui::FullOutput,
-            size: [usize; 2],
-            background: Color32,
-        ) -> egui::ColorImage {
-            let ppp = output.pixels_per_point;
-            let mut image = egui::ColorImage::filled(size, background);
-            for clipped in ctx.tessellate(output.shapes, ppp) {
-                let egui::epaint::Primitive::Mesh(mesh) = clipped.primitive else { continue };
-                let Some(texture) = self.textures.get(&mesh.texture_id) else { continue };
-                let clip = clipped.clip_rect * ppp;
-                for triangle in mesh.indices.as_chunks::<3>().0 {
-                    let v: Vec<_> = triangle.iter().map(|&i| mesh.vertices[i as usize]).collect();
-                    let p = |n: usize| v[n].pos.to_vec2() * ppp;
-                    let (a, b, c) = (p(0), p(1), p(2));
-                    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-                    if area.abs() < 1e-6 {
-                        continue;
-                    }
-                    let min = a.min(b).min(c).max(clip.min.to_vec2());
-                    let max = a.max(b).max(c).min(clip.max.to_vec2());
-                    for y in (min.y.floor() as i64).max(0)..(max.y.ceil() as i64).min(size[1] as i64) {
-                        for x in (min.x.floor() as i64).max(0)..(max.x.ceil() as i64).min(size[0] as i64) {
-                            let point = vec2(x as f32 + 0.5, y as f32 + 0.5);
-                            let w0 = ((b.x - point.x) * (c.y - point.y) - (b.y - point.y) * (c.x - point.x)) / area;
-                            let w1 = ((c.x - point.x) * (a.y - point.y) - (c.y - point.y) * (a.x - point.x)) / area;
-                            let w2 = 1.0 - w0 - w1;
-                            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                                continue;
-                            }
-                            let uv = v[0].uv.to_vec2() * w0 + v[1].uv.to_vec2() * w1 + v[2].uv.to_vec2() * w2;
-                            let tx = ((uv.x * texture.size[0] as f32) as usize).min(texture.size[0] - 1);
-                            let ty = ((uv.y * texture.size[1] as f32) as usize).min(texture.size[1] - 1);
-                            let tex = texture.pixels[ty * texture.size[0] + tx].to_array();
-                            let col = |n: usize| v[n].color.to_array();
-                            let mix = |k: usize| col(0)[k] as f32 * w0 + col(1)[k] as f32 * w1 + col(2)[k] as f32 * w2;
-                            let src: Vec<f32> = (0..4).map(|k| mix(k) * tex[k] as f32 / 255.0).collect();
-                            let dst = &mut image.pixels[y as usize * size[0] + x as usize];
-                            let d = dst.to_array();
-                            let keep = 1.0 - src[3] / 255.0;
-                            *dst = Color32::from_rgba_premultiplied(
-                                (src[0] + d[0] as f32 * keep) as u8,
-                                (src[1] + d[1] as f32 * keep) as u8,
-                                (src[2] + d[2] as f32 * keep) as u8,
-                                background.a(),
-                            );
-                        }
-                    }
-                }
-            }
-            image
-        }
-    }
+    // A CPU rasterizer, so a screenshot needs no window or GPU. `ATOMICS_TICKETS_SCREENSHOTS=<dir>`
+    // makes the fake-server test write them.
+    use crate::test_raster::Raster;
 
     /// Saves the panel as it was last drawn when `ATOMICS_TICKETS_SCREENSHOTS` names a folder.
     fn screenshot(app: &mut Desktop<'_>, ctx: &egui::Context, name: &str) {
@@ -2854,7 +2771,7 @@ mod tests {
                 ctx,
                 last.unwrap(),
                 [(width * ppp) as usize, (height * ppp) as usize],
-                app.runtime.palette.background,
+                app.palette().background,
             )
         });
         std::fs::create_dir_all(&dir).unwrap();
@@ -3263,7 +3180,7 @@ mod tests {
     fn a_cold_link_waits_for_the_sign_in_state_instead_of_toasting_early() {
         with_app(
             "app::tickets_panel::tests::a_cold_link_waits_for_the_sign_in_state_instead_of_toasting_early",
-            |app, ctx| {
+            |app, _ctx| {
                 let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
                 let mut config: TicketConfig = toml::from_str("system = \"echo\"").unwrap();
                 config.server.url = Some("https://tickets.example/mcp".into());
@@ -3275,12 +3192,12 @@ mod tests {
                     Some(Ok(crate::open_link::OpenLink { ticket: Some("DEMO-1".into()), ..Default::default() }));
 
                 assert!(!app.runtime.ticket_state_known());
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 assert!(app.runtime.pending_link.is_some(), "the link was handled before the state was known");
                 assert!(!toasted(app).contains("Sign in"), "{}", toasted(app));
 
                 assert!(app.runtime.ticket_state_known());
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 assert!(app.runtime.pending_link.is_none());
                 assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
             },
@@ -3302,17 +3219,17 @@ mod tests {
 
     #[test]
     fn a_ticket_link_over_the_socket_waits_for_the_ticket_state() {
-        with_app("app::tickets_panel::tests::a_ticket_link_over_the_socket_waits_for_the_ticket_state", |app, ctx| {
+        with_app("app::tickets_panel::tests::a_ticket_link_over_the_socket_waits_for_the_ticket_state", |app, _ctx| {
             let _dir = cold_ticket_state(app);
             let reply = super::super::tests::request(app, json!({"cmd":"open_link", "ticket": "DEMO-1"}));
             assert!(reply.ok, "{:?}", reply.error);
             assert!(app.runtime.pending_link.is_some());
             assert!(!toasted(app).contains("Sign in"), "{}", toasted(app));
 
-            app.runtime.runtime_tick(ctx);
+            app.runtime.runtime_tick();
             assert!(app.runtime.pending_link.is_some(), "the link was handled before the state was known");
             assert!(app.runtime.ticket_state_known());
-            app.runtime.runtime_tick(ctx);
+            app.runtime.runtime_tick();
             assert!(app.runtime.pending_link.is_none());
             assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
         });

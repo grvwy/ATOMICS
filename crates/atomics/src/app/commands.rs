@@ -81,7 +81,7 @@ impl Desktop<'_> {
 
     pub(super) fn edit(&self, _ctx: &egui::Context, root: &Path, path: Option<&str>, line: Option<u32>) {
         let (root, path) = (root.to_path_buf(), path.map(str::to_string));
-        self.post(move |state| state.edit(&state.ctx.clone(), &root, path.as_deref(), line));
+        self.post(move |state| state.edit(&root, path.as_deref(), line));
     }
 
     pub(super) fn open_file(&self, root: &Path, path: &str) {
@@ -97,7 +97,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn toggle_chief(&self, _ctx: &egui::Context) {
-        self.post(|state| state.toggle_chief(&state.ctx.clone()));
+        self.post(|state| state.toggle_chief());
     }
 
     pub(super) fn set_chief_dock(&self, dock: ChiefDock) {

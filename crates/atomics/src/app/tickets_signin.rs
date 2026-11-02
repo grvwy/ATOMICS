@@ -135,7 +135,7 @@ impl State {
         sign.paste.clear();
         sign.state = Some((url_of(&server), SignState::SigningIn));
         sign.job = Some(SignInJob::start(sign.oauth(), server, !sign.headless, &sign.wake));
-        self.ctx.request_repaint();
+        self.window.request_repaint();
     }
 
     pub(super) fn cancel_sign_in(&mut self) {

@@ -174,7 +174,7 @@ mod tests {
     fn diff_base_refs_of_agent_folders_come_from_the_cache_without_git() {
         with_app(
             "app::repo_workflow::tests::diff_base_refs_of_agent_folders_come_from_the_cache_without_git",
-            |app, ctx| {
+            |app, _ctx| {
                 let (_dir, repo) = repository();
                 let repo = repo.canonicalize().unwrap();
                 std::fs::create_dir(repo.join(".atomics")).unwrap();
@@ -184,13 +184,13 @@ mod tests {
                 let linked = linked.canonicalize().unwrap();
                 // An agent folder outside the open projects, as when a workspace's chief runs agents elsewhere.
                 app.runtime.diffs.entry(linked.clone()).or_default();
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 app.runtime.reload_repo_workflows();
                 assert_eq!(app.runtime.project_roots[&linked], repo);
                 assert_eq!(app.runtime.project_base_ref(&linked), "develop");
                 // Every later tick answers from the cache: with git unusable the base ref is unchanged.
                 std::fs::rename(repo.join(".git"), repo.join(".git-moved")).unwrap();
-                app.runtime.runtime_tick(ctx);
+                app.runtime.runtime_tick();
                 assert_eq!(app.runtime.project_base_ref(&linked), "develop");
                 assert_eq!(app.runtime.project_config(&linked).base_ref, "develop");
                 std::fs::rename(repo.join(".git-moved"), repo.join(".git")).unwrap();

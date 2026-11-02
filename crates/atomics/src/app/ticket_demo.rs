@@ -42,9 +42,7 @@ fn demo_call(app: &mut Desktop<'_>, tool: &str, input: serde_json::Value) -> ser
     }
     let request = crate::mcp::request_for_tool(tool, input.clone()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    app.runtime.control(
-        &app.runtime.ctx.clone(),
-        serde_json::to_value(request).and_then(serde_json::from_value).unwrap(),
+    app.runtime.control(serde_json::to_value(request).and_then(serde_json::from_value).unwrap(),
         tx,
     );
     settle(app);
