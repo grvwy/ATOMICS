@@ -162,7 +162,7 @@ impl Desktop<'_> {
             ui.label(RichText::new(format!("theme: {error}")).color(p.warning).size(11.5));
         }
         if let Some(name) = picked {
-            self.post(move |state| state.select_theme(&name, host));
+            self.send(Command::SelectTheme { name, host });
         }
     }
 }

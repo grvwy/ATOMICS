@@ -1,5 +1,5 @@
 //! What one UI holds for itself, apart from the host: the palette it draws with, the cards it has open,
-//! what waits for the user's confirmation, and the intents its last draw recorded.
+//! what waits for the user's confirmation, and the commands its last draw recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use atomics_core::layout::DiffSplit;
 use atomics_core::plan::PlanStatus;
 
-use crate::Intent;
+use crate::Command;
 use crate::diff_view::{DiffState, ExplorerState};
 use crate::theme::{Fonts, Palette};
 
@@ -17,9 +17,9 @@ use crate::theme::{Fonts, Palette};
 pub struct Client {
     /// The colors and fonts to draw with, made by the platform from the host's theme.
     pub palette: Arc<Palette>,
-    /// What the user asked the host to do while this UI drew, oldest first. The platform takes them
-    /// after each draw.
-    pub intents: Vec<Intent>,
+    /// What the user asked for while this UI drew, oldest first. The platform takes them after each
+    /// draw and carries them out.
+    pub commands: Vec<Command>,
     /// The task cards open on boards, by plan and task id.
     pub expanded_tasks: HashSet<(String, String)>,
     /// A plan waiting for the user to confirm closing it, and the status it would close with.
@@ -48,7 +48,7 @@ impl Default for Client {
         let tokens = atomics_core::theme::builtin(atomics_core::theme::DEFAULT).expect("the default theme is built in");
         Self {
             palette: Arc::new(Palette::new(&tokens, Fonts::default())),
-            intents: Vec::new(),
+            commands: Vec::new(),
             expanded_tasks: HashSet::new(),
             confirm_plan_close: None,
             approval_decisions: HashSet::new(),
@@ -64,8 +64,8 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Records what the user asked for; the host carries it out after the draw.
-    pub fn act(&mut self, intent: Intent) {
-        self.intents.push(intent);
+    /// Records what the user asked for; the platform carries it out after the draw.
+    pub fn send(&mut self, command: Command) {
+        self.commands.push(command);
     }
 }

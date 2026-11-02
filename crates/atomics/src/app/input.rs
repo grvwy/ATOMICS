@@ -21,7 +21,7 @@ impl Desktop<'_> {
             self.runtime.toast("Voice: recording cancelled");
         }
         if pressed(&keys.toggle_diff) {
-            self.runtime.diff_open = !self.runtime.diff_open;
+            self.send(Command::ToggleDiff);
         }
         if pressed(&keys.focus_steer) {
             self.client.focus_steer = true;
@@ -32,7 +32,7 @@ impl Desktop<'_> {
             self.runtime.toast(super::github::READ_ONLY);
         } else if editor_pressed && let Some(root) = self.runtime.diff_target() {
             if self.runtime.panel == PanelMode::Editor {
-                self.runtime.panel = PanelMode::Diff;
+                self.send(Command::SetPanel(PanelMode::Diff));
             } else {
                 let state = self.client.diff_views.get(&root);
                 let file = state.and_then(|s| s.viewing.clone()).or_else(|| {
@@ -40,7 +40,7 @@ impl Desktop<'_> {
                         .and_then(|s| s.prepared.as_ref())
                         .and_then(|p| p.diff.files.first().map(|f| f.path().to_string()))
                 });
-                self.edit(ctx, &root, file.as_deref(), None);
+                self.send(Command::Edit { root, path: file, line: None });
             }
         }
         // The GitHub controls, like the agent chords, are taken before the focused terminal or editor.
@@ -84,15 +84,15 @@ impl Desktop<'_> {
                 && self.runtime.github_pr_diff().is_some()
                 && let Some((_, state)) = self.client.github.pr_view.as_mut()
             {
-                self.runtime.diff_open = true;
-                self.client.focus_terminal = None;
-                self.client.focus_editor = false;
-                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 if hunk {
                     state.step_hunk(step);
                 } else {
                     state.step(step);
                 }
+                self.send(Command::OpenDiff);
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
             } else if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
                 // The Tickets panel takes Shift+↓/↑; it pages with PageUp/PageDown itself.
                 self.client.focus_terminal = None;
@@ -102,8 +102,8 @@ impl Desktop<'_> {
             } else if step != 0
                 && let Some(root) = self.runtime.diff_target()
             {
-                self.runtime.diff_open = true;
-                self.runtime.panel = PanelMode::Diff;
+                self.send(Command::OpenDiff);
+                self.send(Command::SetPanel(PanelMode::Diff));
                 self.client.focus_terminal = None;
                 self.client.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
@@ -111,17 +111,12 @@ impl Desktop<'_> {
                 let target = if hunk { state.step_hunk(step) } else { state.step(step) };
                 if target.is_some() {
                     // Keep the host in diff mode without reopening the file over the jump.
-                    self.post(move |runtime| {
-                        let data = runtime.diffs.entry(root).or_default();
-                        data.viewing = None;
-                        data.file = None;
-                        data.file_error = None;
-                    });
+                    self.send(Command::LeaveFile(root));
                 }
             }
         }
         if pressed(&keys.toggle_plan) {
-            self.runtime.toggle_plan();
+            self.send(Command::TogglePlan);
         }
         // Plan with chief, from a ticket the panel is reading.
         if self.runtime.panel == PanelMode::Tickets
@@ -183,18 +178,18 @@ impl Desktop<'_> {
             }
         }
         if pressed(&keys.toggle_chief) {
-            self.toggle_chief(ctx);
+            self.send(Command::ToggleChief);
         }
         if pressed(&keys.quick_open) && self.runtime.diff_target().is_some() {
             self.client.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });
         }
         if pressed(&keys.new_session) {
-            self.open_new_dialog(None);
+            self.send(Command::NewSession);
         }
         if pressed(&keys.refresh_diff)
             && let Some(root) = self.runtime.diff_target()
         {
-            self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default()));
+            self.send(Command::RefreshDiff(root));
         }
         if pressed(&keys.next_attention) {
             let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
@@ -202,8 +197,8 @@ impl Desktop<'_> {
             if let Some(i) =
                 (0..n).map(|k| (start + k) % n).find(|&i| self.runtime.sessions[i].status.needs_attention())
             {
-                let id = self.runtime.sessions[i].id.clone();
-                self.activate(&id, true);
+                let session = self.runtime.sessions[i].id.clone();
+                self.send(Command::Activate { session, open_diff: true });
             } else {
                 self.runtime.toast("Nothing needs you right now");
             }
@@ -225,7 +220,7 @@ impl Desktop<'_> {
             if ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
-                self.activate(&id, true);
+                self.send(Command::Activate { session: id.clone(), open_diff: true });
                 self.client.focus_terminal = None;
                 if self.runtime.panel == PanelMode::Editor {
                     self.client.focus_editor = true;
@@ -249,7 +244,7 @@ impl Desktop<'_> {
                                 })
                             })
                         });
-                        self.edit(ctx, &root, path.as_deref(), None);
+                        self.send(Command::Edit { root, path, line: None });
                     }
                 } else if self.runtime.panel == PanelMode::Tickets {
                     // Find stays in Find; Read shows the agent's ticket.
@@ -258,7 +253,7 @@ impl Desktop<'_> {
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 } else {
                     self.client.focus_editor = false;
-                    self.runtime.panel = PanelMode::Diff;
+                    self.send(Command::SetPanel(PanelMode::Diff));
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 }
             }
@@ -290,7 +285,7 @@ impl Desktop<'_> {
                 self.client.focus_terminal = self.runtime.active.clone();
                 // At the smallest window size the diff covers the terminal entirely.
                 if self.runtime.last_layout.is_some_and(|l| l.diff == DiffPlacement::Full) {
-                    self.runtime.diff_open = false;
+                    self.send(Command::CloseDiff);
                 }
             }
         }
@@ -336,11 +331,7 @@ impl Desktop<'_> {
                                 [("Complete plan", PlanStatus::Completed), ("Archive plan", PlanStatus::Archived)]
                             {
                                 if ui.button(label).clicked() {
-                                    self.post_plan(index, move |state, index| {
-                                        if let Err(error) = state.close_plan(index, status) {
-                                            state.toast(error);
-                                        }
-                                    });
+                                    self.send(Command::ClosePlan { plan: index, status });
                                     self.client.confirm_plan_close = None;
                                 }
                             }
@@ -379,7 +370,7 @@ impl Desktop<'_> {
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Close session").clicked() {
-                            self.close(&id);
+                            self.send(Command::CloseSession(id.clone()));
                             self.client.confirm_close = None;
                         }
                         if ui.button("Cancel").clicked() {
@@ -544,13 +535,8 @@ impl Desktop<'_> {
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Rename").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                        let (id, title) = (rename.session.clone(), rename.title.clone());
-                        self.post(move |state| {
-                            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                                session.rename(&title);
-                            }
-                            state.remember(&id);
-                        });
+                        let (session, title) = (rename.session.clone(), rename.title.clone());
+                        self.send(Command::RenameSession { session, title });
                         keep = false;
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {

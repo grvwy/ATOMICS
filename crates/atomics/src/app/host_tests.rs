@@ -610,7 +610,7 @@ fn delayed_file_open_keeps_the_hosts_resolved_target() {
             {
                 let mut state = host.state();
                 let mut app = Desktop { runtime: &mut state, client: &mut client };
-                app.open_file(&repo, path);
+                app.send(Command::OpenFile { root: repo.clone(), path: path.into() });
                 // Do not drain the action or consume events across these frames.
                 for _ in 0..2 {
                     ctx.run_ui(egui::RawInput::default(), |_| app.sync_diffs()).drop_without_applying_deltas();
@@ -1043,7 +1043,7 @@ fn the_desktop_and_a_client_racing_an_approval_get_exactly_one_winner() {
             let guard = host.state();
             client.send(&decide("c-1", "ask-1", Decision::Allow));
             std::thread::sleep(Duration::from_millis(100));
-            // What the desktop's Deny button posts (`Desktop::approve_request`).
+            // What the desktop's Deny button posts (`Command::Decide`).
             let (tx, desktop) = channel();
             let _ = guard.action_tx.send(Box::new(move |state: &mut State| {
                 let outcome = state.mutate_desktop(|op| {
@@ -1222,7 +1222,7 @@ fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_a
             let hook = waiting_approval(&mut state.sessions[0], "ask-1");
             let hub = state.hub.clone();
             let host = state.into_host();
-            // What the desktop's Allow button and steer bar post (`Desktop::approve_request`, `send_steer`).
+            // What the desktop's Allow button and steer bar post (`Command::Decide`, `send_steer`).
             let (tx, outcomes) = channel();
             let _ = host.state().action_tx.send(Box::new(move |state: &mut State| {
                 let approved = state.mutate_desktop(|op| {

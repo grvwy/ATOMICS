@@ -1,6 +1,6 @@
 //! A plan's board: its header, then the kanban columns of its tasks, drawn from the plan's
 //! [`BoardView`](crate::BoardView).
-//! Buttons record [`Intent`]s on the [`Client`]; the host carries them out after the draw.
+//! Buttons record [`Command`]s on the [`Client`]; the platform carries them out after the draw.
 
 use atomics_core::plan::{self, Plan, PlanStatus, Task, TaskStatus};
 use atomics_core::session::AgentStatus;
@@ -9,7 +9,7 @@ use egui::{Rect, RichText, Sense, Stroke, vec2};
 use crate::status::{status_color, task_color};
 use crate::text::truncate;
 use crate::theme::{Palette, lerp};
-use crate::{Backend, Client, Intent};
+use crate::{Backend, Client, Command};
 
 /// A ticket's key and state. A click opens it in the browser; hovering shows the rest.
 /// A failed ticket operation shows beneath it, and a state that means another ATOMICS
@@ -303,7 +303,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
         );
         if clean_plan {
-            client.act(Intent::CleanUpPlan(index));
+            client.send(Command::CleanUpPlan(index));
         }
     }
     for (task, dep) in plan.unknown_dependencies() {
@@ -562,7 +562,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     }
 
     if editing {
-        client.act(Intent::EditingPlan);
+        client.send(Command::EditingPlan);
     }
     for (id, action) in actions {
         match action {
@@ -574,43 +574,45 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             }
             "edited" => {
                 if let Some(edited) = edited_tasks.iter().find(|t| t.id == id) {
-                    client.act(Intent::EditBrief { plan: index, brief: edited.brief.clone(), task: id });
+                    client.send(Command::EditBrief { plan: index, brief: edited.brief.clone(), task: id });
                 }
             }
-            "start" => client.act(Intent::StartTask { plan: index, task: id }),
-            "integrate" => client.act(Intent::IntegrateTask { plan: index, task: id }),
+            "start" => client.send(Command::StartTask { plan: index, task: id }),
+            "integrate" => client.send(Command::IntegrateTask { plan: index, task: id }),
             "diff" | "resume" | "acknowledge_refs" => {
-                if let Some(task) = edited_tasks.iter().position(|t| t.id == id) {
-                    client.act(Intent::TaskAction { plan: index, task, action });
+                if let Some(command) =
+                    edited_tasks.iter().position(|t| t.id == id).and_then(|task| Command::task(index, task, action))
+                {
+                    client.send(command);
                 }
             }
             status => {
                 if let Some(status) = TaskStatus::parse(status) {
-                    client.act(Intent::SetTaskStatus { plan: index, task: id, status });
+                    client.send(Command::SetTaskStatus { plan: index, task: id, status });
                 }
             }
         }
     }
     if approve {
-        client.act(Intent::ApprovePlan(index));
+        client.send(Command::ApprovePlan(index));
     }
     if integrate_accepted {
-        client.act(Intent::IntegrateAccepted(index));
+        client.send(Command::IntegrateAccepted(index));
     }
     if sync_tickets {
-        client.act(Intent::SyncTickets(index));
+        client.send(Command::SyncTickets(index));
     }
     if dispatch_all {
-        client.act(Intent::DispatchReady(index));
+        client.send(Command::DispatchReady(index));
     }
     if let Some(session) = open_session {
-        client.act(Intent::OpenTaskSession(session));
+        client.send(Command::OpenTaskSession(session));
     }
     if reopen {
-        client.act(Intent::ReopenPlan(index));
+        client.send(Command::ReopenPlan(index));
     }
     if archive {
-        client.act(Intent::ArchivePlan(index));
+        client.send(Command::ArchivePlan(index));
     }
     if let Some(status) = close_status {
         client.confirm_plan_close = Some((plan_id, status));

@@ -36,7 +36,7 @@ use atomics_core::wire::{Disposition, ErrorCode, WireError};
 use atomics_core::workspace::{self, Workspace};
 use atomics_ui::status::{PULSE_STEP, status_dot};
 use atomics_ui::text::truncate;
-use atomics_ui::{Backend, PanelMode};
+use atomics_ui::{Backend, Command, PanelMode};
 use serde_json::json;
 
 mod approvals;
@@ -54,7 +54,6 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
-mod intents;
 mod mutations;
 mod open_link;
 mod plan_cleanup;
@@ -770,9 +769,10 @@ impl std::ops::DerefMut for Client {
     }
 }
 
-/// A short-lived desktop borrow. Runtime effects are sent as host commands. It is also the shim between
-/// the draw code that moved to atomics-ui and the host's model: [`Desktop::draw`] runs that code over the
-/// in-process [`Backend`] and then carries out the intents it recorded.
+/// A short-lived desktop borrow. What the user asks for is a [`Command`](atomics_ui::Command), carried out
+/// by [`Desktop::send`]. It is also the shim between the draw code that moved to atomics-ui and the host's
+/// model: [`Desktop::draw`] runs that code over the in-process [`Backend`] and then sends the commands it
+/// recorded.
 struct Desktop<'a> {
     runtime: &'a mut State,
     client: &'a mut Client,
@@ -1872,7 +1872,7 @@ impl Desktop<'_> {
         if let Some(rect) = chief_rect
             && chief_divider(ui, rect, &mut self.runtime.store.chief_width, &p)
         {
-            self.save_chief_preferences();
+            self.send(Command::SaveChiefPreferences);
         }
 
         self.chief_ui(&ctx);

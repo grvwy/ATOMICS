@@ -7,7 +7,7 @@ use egui::{FontId, RichText, Sense, pos2, vec2};
 
 use crate::status::{status_color, status_dot};
 use crate::theme::{Palette, lerp};
-use crate::{Backend, Client, Intent, RecentSession, SessionRow, diff_view};
+use crate::{Backend, Client, Command, RecentSession, SessionRow, diff_view};
 
 pub fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.horizontal(|ui| {
@@ -123,13 +123,13 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         );
     }
     if let Some(id) = clicked {
-        client.act(Intent::Activate { session: id, open_diff: true });
+        client.send(Command::Activate { session: id, open_diff: true });
     }
     if let Some(id) = close {
         client.confirm_close = Some(id);
     }
     if let Some(id) = rename {
-        client.act(Intent::Rename(id));
+        client.send(Command::Rename(id));
     }
 
     let recent = backend.recent_sessions();
@@ -141,7 +141,7 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             let response =
                 ui.selectable_label(false, RichText::new(&record.title).color(p.muted).size(12.5)).on_hover_text(hover);
             if response.clicked() {
-                client.act(Intent::Resume(record));
+                client.send(Command::Resume(record));
             }
         }
     }
@@ -160,7 +160,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         section(ui, p, "EXPLORER");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("+").on_hover_text("Open project…").clicked() {
-                client.act(Intent::PickProject);
+                client.send(Command::PickProject);
             }
         });
     });
@@ -181,12 +181,12 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             response.on_hover_text(backend.display(&root)).context_menu(|ui| {
                 for agent in &agent_names {
                     if ui.button(format!("Start {agent} in the main checkout")).clicked() {
-                        client.act(Intent::StartAgent { agent: agent.clone(), folder: root.clone() });
+                        client.send(Command::StartAgent { agent: agent.clone(), folder: root.clone() });
                         ui.close();
                     }
                 }
                 if ui.button("New worktree…").clicked() {
-                    client.act(Intent::NewWorktree(root.clone()));
+                    client.send(Command::NewWorktree(root.clone()));
                     ui.close();
                 }
                 if ui.button("Close project").clicked() {
@@ -197,10 +197,10 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
     });
     if let Some(root) = switch_to {
-        client.act(Intent::ShowRoot(root));
+        client.send(Command::ShowRoot(root));
     }
     if let Some(root) = close {
-        client.act(Intent::CloseProject(root));
+        client.send(Command::CloseProject(root));
         return;
     }
     let Some(project) = focus else {
@@ -247,7 +247,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
     });
     if open_cleanup {
-        client.act(Intent::OpenCleanup { repo: project.clone(), preselect: None });
+        client.send(Command::OpenCleanup { repo: project.clone(), preselect: None });
         return;
     }
     let explorer = client.explorers.entry(project.clone()).or_default();
@@ -281,7 +281,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 response.context_menu(|ui| {
                     for agent in &agent_names {
                         if ui.button(format!("Start {agent} here")).clicked() {
-                            client.act(Intent::StartAgent { agent: agent.clone(), folder: wt.path.clone() });
+                            client.send(Command::StartAgent { agent: agent.clone(), folder: wt.path.clone() });
                             ui.close();
                         }
                     }
@@ -293,13 +293,13 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             }
         });
         if let Some(path) = remove_one {
-            client.act(Intent::OpenCleanup { repo: project.clone(), preselect: Some(path) });
+            client.send(Command::OpenCleanup { repo: project.clone(), preselect: Some(path) });
             return;
         }
         if let Some(path) = pick {
             match sessions.iter().find(|s| s.root == path).map(|s| s.id.clone()) {
-                Some(id) => client.act(Intent::Activate { session: id, open_diff: true }),
-                None => client.act(Intent::ShowRoot(path)),
+                Some(id) => client.send(Command::Activate { session: id, open_diff: true }),
+                None => client.send(Command::ShowRoot(path)),
             }
         }
     }
@@ -323,6 +323,6 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     };
     let explorer = client.explorers.entry(project).or_default();
     if let Some(path) = diff_view::files_panel(ui, explorer, &main, &changes, viewing.as_deref(), p) {
-        client.act(Intent::OpenFile { root: review, path });
+        client.send(Command::OpenFile { root: review, path });
     }
 }

@@ -110,13 +110,8 @@ impl Desktop<'_> {
             let state = self.client.diff_views.entry(root.clone()).or_default();
             if let Some((path, line)) = diff_view::changed_files(ui, column, state, current.as_deref(), &p) {
                 match self.runtime.panel {
-                    PanelMode::Editor => {
-                        let ctx = ui.ctx().clone();
-                        self.edit(&ctx, &root, Some(&path), line);
-                    }
-                    _ => {
-                        self.open_file(&root, &path);
-                    }
+                    PanelMode::Editor => self.send(Command::Edit { root: root.clone(), path: Some(path), line }),
+                    _ => self.send(Command::OpenFile { root: root.clone(), path }),
                 }
             }
             rect.with_min_x(column.right())
@@ -170,8 +165,8 @@ impl Desktop<'_> {
             }
         });
         match action {
-            Some("close") => self.runtime.diff_open = false,
-            Some("diff") => self.runtime.panel = PanelMode::Diff,
+            Some("close") => self.send(Command::CloseDiff),
+            Some("diff") => self.send(Command::SetPanel(PanelMode::Diff)),
             Some("hints") => {
                 if let Some(editor) = self.runtime.editors.get(root) {
                     editor.type_steps(self.runtime.config.editor.inlay_hints_keys.clone(), Duration::ZERO);
@@ -196,8 +191,7 @@ impl Desktop<'_> {
                     ui.new_child(egui::UiBuilder::new().id_salt("editor-empty").max_rect(body.shrink(20.0)));
                 child.label(RichText::new("The editor is not running.").color(p.muted));
                 if child.button("Open editor").clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.edit(&ctx, root, None, None);
+                    self.send(Command::Edit { root: root.to_path_buf(), path: None, line: None });
                 }
             }
         }
@@ -285,7 +279,7 @@ impl Desktop<'_> {
                 }
             });
         if let Some(path) = open {
-            self.open_file(&root, &path);
+            self.send(Command::OpenFile { root: root.clone(), path });
             keep = false;
         }
         if keep {

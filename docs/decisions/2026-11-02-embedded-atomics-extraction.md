@@ -72,8 +72,8 @@ Rules that keep every slice small and mechanical:
 2. **A view type only for what the UI reads**, never `State` fields wholesale. Types that are already browser-safe in
    `atomics-core` (`Plan`, `Task`, `ApprovalRequest`, `ReviewComment`) are returned as they are. Types that were in the
    desktop crate move to `atomics-core` first (`diff_data.rs` this time), with a `pub use` left behind.
-3. **Writes later, as `Command` values** (slice S8), replacing the 50 `post` closures one domain at a time. Until then
-   the draw code keeps `post`.
+3. **Writes are `Command` values** (slice S8, 4.7): the draw code records them, a view command stays with the client
+   and every other one goes to `Backend::send`. No draw code posts a closure.
 4. **Indices are positions in the last list read**, as today. The protocol slice (H1) addresses by id; `post_plan` already
    converts.
 5. No behaviour change in any slice: the slice's tests are the existing ones, run unchanged.
@@ -93,7 +93,7 @@ are agent-days of focused work, review wait excluded. "C1"/"C2" are the design's
 | **S5** | **Done** (4.3). `Palette` (egui colors and fonts) out of `State`: the web crate owns `Palette`; `fontique` lookup stays a desktop hook that supplies the fonts (`theme::FontSource` already names a font in the config). `config.keys` and `layout` are already core | 1–2 PRs | 1.5 | C1 |
 | **S6** | **Done** (4.5). Move the files that read nothing from `runtime`: `diff_view.rs`, `panel_nav.rs`, `markdown.rs`, `topbar` helpers into `atomics-ui` (adds `egui` with default features off). Needs S5 for `Palette` | 1 PR | 1.5 | C1 |
 | S7 | Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus | 8–10 PRs | 5 | C1 |
-| S8 | Writes: `Command` enum and `Backend::send`, domain by domain, replacing `post` closures (50 sites) and the direct `runtime.*` view-hint writes | 5 PRs | 3 | H4 / C1 |
+| **S8** | **Done** (4.7). Writes: `Command` enum and `Backend::send`, domain by domain, replacing `post` closures (50 sites) and the direct `runtime.*` view-hint writes | 5 PRs | 3 | H4 / C1 |
 | S9 | `atomics-ui` builds for `wasm32-unknown-unknown` in CI (`cargo check --target`), eframe web entry point `atomics-web` | 1 PR | 1.5 | C5 |
 
 **Sum:** C1 (S0, S1, S5, S6, S7) ≈ 11.5 days, inside the design's 10–15. C2 reads (S2–S4) ≈ 5.5, inside 5–8. S8 and S9 belong
@@ -217,7 +217,7 @@ Client)`:
   gives the client the host's palette, runs the moved code over the in-process `Backend` and then carries
   out the recorded intents with the posts and view-hint writes the desktop code made (`app/intents.rs`).
   So an intent runs in the same frame, when the draw function returns, rather than where the click was
-  handled; nothing the moved code reads changes in between. S8 turns intents into the protocol's commands.
+  handled; nothing the moved code reads changes in between. S8 made intents commands (4.7).
 - Facts the draw code read from the host's disk or native modules come from the host on the view types.
 
 Commits, one per file group:
@@ -271,6 +271,63 @@ Commits, one per file group:
    records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stays in the desktop with the
    items that have not moved: the chief pill, the Tickets button and sign-in (S4), the GitHub counter, the
    load gauge and the Settings menu.
+
+### 4.7 S8
+
+Eight commits, one per domain, then the mapping. The tests ran unchanged but one, which called the removed
+`Desktop::open_file` and now sends `Command::OpenFile`.
+
+- `atomics_ui::Command` is S7's `Intent`, recorded with `Client::send`. `Backend::send(&self, Command)` carries out a
+  host's command. `Command::is_view` names the UI's own commands, the view hints and the dialogs: the platform
+  carries those out itself and they never reach `send`.
+- The desktop has one entry, `Desktop::send` (`app/commands.rs`, which replaces `app/intents.rs`). A view command
+  writes the native model's view hints as before (`active`, `diff_root`, `diff_open`, `panel`, the tab,
+  `plan_edit_open`), where ctl reads them, or opens a dialog on the window's client. Any other goes to
+  `Local::send`, which runs it with the post and `State` method the desktop's code used (`Local::run`): a
+  position becomes an id when the command is sent, and the id a position again when the action runs. The
+  approval (`Decide`) and the steer bar (`Steer`, one operation per target) still go through
+  `State::mutate_desktop`, the journaled path H4 added. `post`, `post_plan` and `post_session` are `State`'s now;
+  two tests still post a closure to set up a race.
+- The domains, and what each maps onto in atomics.v1 (`Command::remote`):
+
+| Domain | Commands | atomics.v1 |
+| --- | --- | --- |
+| Approvals | `Decide` | `approval_decide` |
+| Plans | `ApprovePlan` (with the plan's digest), `StartTask`, `DispatchReady`, `SetTaskStatus`, `IntegrateTask`, `IntegrateAccepted` (one `integrate` per accepted task), `ArchivePlan`, `ArchiveFinished`, `ClosePlan` as archived | `plan_command`: `approve`, `dispatch`, `update`, `integrate`, `archive` |
+| | `EditBrief`, `ResumeTask`, `AcknowledgeRefs`, `SyncTickets`, `ReopenPlan`, `ClosePlan` as completed, `CleanUpPlan`, `ReloadPlanCleanup`, `RemovePlanBranches` | none yet |
+| Review | `EditComments` (a `remove` for each comment gone, then an `add` for each new one, at the diff's revision), `SendReview` | `review_command` |
+| | `RefreshDiff`, `OpenFile`, `LeaveFile`, `Edit` | none (a remote client reads files with `diff_get` and `file_get`) |
+| Sessions | `Steer` (one per session), `VoiceToSession` (a steer), `StartAgent` (`start` in the folder), `CloseSession` | `session_command` |
+| | `Resume`, `RenameSession`, `CloseIdle`, `SeeSession`, `DismissMcp` | none yet |
+| Projects and worktrees | `OpenProject`, `CloseProject`, `OpenWorkspace`, `SaveWorkspace`, `OpenCleanup`, `CleanupFetch`, `CleanupPrune`, `CleanupReload`, `RemoveWorktrees` | none yet |
+| Chief and settings | `ToggleChief`, `SetChiefDock`, `SaveChiefPreferences`, `VoiceToChief`, `SelectTheme`, `CheckSandbox`, `RefreshConnections`, `ImportConnections`, `Connect`, `Disconnect`, `AddConnection`, `DecideProposal` | none yet |
+| View | `Activate`, `OpenTaskSession`, `ShowTaskDiff`, `ShowRoot`, `OpenDiff`, `CloseDiff`, `ToggleDiff`, `SetPanel`, `SetView`, `ShowUngrouped`, `ShowPlan`, `ViewPlanHistory`, `TogglePlan`, `EditingPlan`, `ClosePlanTab`; the dialogs `NewSession`, `NewWorktree`, `Rename`, `PickProject` | none: the client's own |
+
+- `Command::remote(backend, op)` is the mapping the remote `Backend` (C5) uses. It answers `Remote::Send` with the
+  mutations in order (empty when what the command names is gone), `Remote::Client` or `Remote::Unsupported`. It
+  reads positions from the client's snapshot (`plan_row`, `session_row`, `board`) and two reads this slice adds:
+  `Backend::plan_digest`, the approval scope that approving names, and `DiffSnapshot::revision`, which a new
+  comment is anchored to. `op` gives each mutation its operation ID. `commands_map_onto_atomics_v1` checks the
+  mapping over `Local` and sends the mapped approval through `State::mutate_desktop`.
+- The desktop's own plan, review and session commands still run the `State` methods its code called, not
+  `plan_command`, `review_command` or `session_command` through the journal: those differ in what the user sees
+  (the board's toasts, the user rather than the chief as a ticket's author, no digest check). Only the approval
+  and the steer were journaled before this slice, and they still are.
+- Where work happens moved in a few places; what it does did not. The board's `TaskAction` is `ResumeTask`,
+  `AcknowledgeRefs` and `ShowTaskDiff`. The approval banner marks a request as being decided on the click (it was
+  right after the draw, in the same frame). The removals of the two cleanup dialogs moved into
+  `State::remove_plan_branches` and `State::remove_worktrees`, which read the dialog's rows, channel and plan when
+  the action runs, on the next runtime tick, instead of at the click. `StartAgent` fills `pending_open` from an
+  action, which the runtime tick drains before it spawns what is pending. Shift+arrows over a pull request's diff
+  step the view before they open the panel.
+- The desktop's shortcuts, tiles and editor bar send view commands instead of writing `runtime.diff_open`,
+  `runtime.panel` and `runtime.active`. The writes left are `Desktop::send`'s, `view_plan_history` (which carries
+  out `ViewPlanHistory`) and the per-frame reset of `plan_edit_open`. Code that has not moved yet switches
+  panels through `State` methods (the Tickets panel, GitHub, the trace lane); those become commands as it moves.
+- A trap for later slices: `Desktop` derefs to `State`, which has methods named like the removed wrappers
+  (`close`, `open_file`, `send_review`, `open_project`, `set_chief_dock`, `save_chief_preferences`,
+  `task_action`). A call left behind would compile and run at once instead of being posted; making the wrapper
+  private does not help, since method lookup then goes on to `State`'s. Every call site sends a command now.
 
 ## 5. The dependency test
 

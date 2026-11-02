@@ -2,7 +2,7 @@
 use super::*;
 
 impl State {
-    fn check_sandbox(&mut self) {
+    pub(super) fn check_sandbox(&mut self) {
         if self.sandbox_check.is_some() {
             return;
         }
@@ -48,7 +48,7 @@ impl Desktop<'_> {
             ui.set_max_width(560.0);
             ui.label(format!("Agent isolation: {}", self.runtime.config.isolation.mode.name()));
             if self.runtime.sandbox_lines.is_empty() && self.runtime.sandbox_check.is_none() {
-                self.post(|state| state.check_sandbox());
+                self.send(Command::CheckSandbox);
             }
             if self.runtime.sandbox_check.is_some() || self.runtime.sandbox_lines.is_empty() {
                 ui.label("Checking Docker Sandboxes…");
@@ -67,7 +67,7 @@ impl Desktop<'_> {
                 .add_enabled(self.runtime.sandbox_check.is_none(), egui::Button::new("Refresh sandbox checks"))
                 .clicked()
             {
-                self.post(|state| state.check_sandbox());
+                self.send(Command::CheckSandbox);
             }
             ui.separator();
             ui.label("For guided fresh-machine setup, run this in a host terminal:");
