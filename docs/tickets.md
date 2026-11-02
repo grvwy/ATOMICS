@@ -878,9 +878,12 @@ pauses with a toast and resumes the next day. Status, plan and approval events s
 A content refusal produces “(withheld: the ticket system refused this text)” once; that replacement cannot
 produce another replacement.
 
-Permission notifications and pending chief permission prompts set `input` once, a blocked task sets
-`blocked`, approval sets `approval`, and the next chief turn sets `working`. A finished or archived plan
-queues `done`, which ends its conversation, and polling stops; when another open plan on the same ticket
+Permission notifications and pending chief permission prompts set `input` once. A blocked task sets
+`blocked`, or `input` when every blocked task waits on its worker's question. Each activity is posted only
+when it changes: a second open question, or a second blocked task, posts nothing. When the last blocker
+clears, `working` follows if a task is running; with no task running, no activity is posted and the
+conversation keeps the last one. Approval sets `approval`, and the next chief turn sets `working`. A
+finished or archived plan queues `done`, which ends its conversation, and polling stops; when another open plan on the same ticket
 takes the conversation over, nothing ends. Delivery statuses ("delivered to the chief", "held …") carry no
 activity, so an open approval request stays open. Status messages contain fixed copy, never permission commands or
 worker text. Remote steering still cannot answer permission menus or authorize sensitive operations.

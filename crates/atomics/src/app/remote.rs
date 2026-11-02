@@ -1330,6 +1330,36 @@ mod tests {
     }
 
     #[test]
+    fn a_second_open_question_or_blocked_task_does_not_post_again() {
+        with_app("app::remote::tests::a_second_open_question_or_blocked_task_does_not_post_again", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = remote_app(app, dir.path(), |_| {});
+            let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+            let blocked = |id: &str, report: &str| atomics_core::plan::Task {
+                id: id.into(),
+                status: TaskStatus::Blocked,
+                report: Some(atomics_core::plan::Report { status: report.into(), ..Default::default() }),
+                ..Default::default()
+            };
+            let count = |path: &Path, text: &str| posts(path).iter().filter(|post| *post == text).count();
+            app.runtime.plans[index].tasks.push(blocked("first-question", "question"));
+            settle(app, 3);
+            assert_eq!(count(&path, "A worker asked a question"), 1);
+            // The conversation already waits for input: another question changes nothing there.
+            app.runtime.plans[index].tasks.push(blocked("second-question", "question"));
+            settle(app, 3);
+            assert_eq!(count(&path, "A worker asked a question"), 1, "{:?}", posts(&path));
+            assert_eq!(app.runtime.tickets.remote.plans["remote-plan"].blocked.len(), 2);
+            app.runtime.plans[index].tasks.push(blocked("first-blocked", "blocked"));
+            settle(app, 3);
+            app.runtime.plans[index].tasks.push(blocked("second-blocked", "blocked"));
+            settle(app, 3);
+            assert_eq!(count(&path, "A task is blocked"), 1, "{:?}", posts(&path));
+            assert_eq!(count(&path, "A worker asked a question"), 1, "{:?}", posts(&path));
+        });
+    }
+
+    #[test]
     fn approval_request_contract_and_scope_updates() {
         with_app("app::remote::tests::approval_request_contract_and_scope_updates", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();

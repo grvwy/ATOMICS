@@ -16,7 +16,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +36,17 @@ fn shown(value: Option<&RefValue>) -> String {
         Some(RefValue::Object(object)) => object.chars().take(12).collect(),
         Some(RefValue::Symbolic(target)) => format!("a link to {target}"),
         None => "absent".into(),
+    }
+}
+
+/// The git command that puts `name` back at `value`, what a check found and restored: an object, or absent.
+/// A restore cannot tell who wrote it: git run on this machine in a sandboxed worktree, or moving a branch
+/// no checkout here has checked out, leaves no trace a check trusts, and is put back like an agent's.
+fn keep_command(name: &str, value: Option<&RefValue>) -> Option<String> {
+    match value {
+        Some(RefValue::Object(object)) => Some(format!("git update-ref {name} {object}")),
+        None => Some(format!("git update-ref -d {name}")),
+        Some(RefValue::Symbolic(_)) => None,
     }
 }
 
@@ -486,7 +496,8 @@ impl RefGuard {
             {
                 self.refs.insert(kept.clone(), value.clone());
             }
-            alerts.push(match (result, before, kept) {
+            let restored = result.is_ok();
+            let alert = match (result, before, kept) {
                 (Ok(()), None, Some(kept)) => format!("Restored {name}: moved it to {kept} (it pointed to {found})"),
                 (Ok(()), None, None) => format!("Restored {name}: removed it (it was {found})"),
                 (Ok(()), _, _) if after.is_none() => format!("Restored {name}: recreated it at {expected}"),
@@ -497,6 +508,14 @@ impl RefGuard {
                 (Err(error), _, _) => {
                     format!("RESTORE FAILED for {name}: {error:#}; expected {expected}, found {found}")
                 }
+            };
+            // Quarantine refs are ATOMICS's own record, never a change of yours to keep.
+            alerts.push(match keep_command(&name, after).filter(|_| restored && !name.starts_with(QUARANTINE)) {
+                Some(command) => format!(
+                    "{alert}. It may have been written on this machine, not in the sandbox: to keep it, close this \
+                     repository's sandboxed sessions, then run `{command}`"
+                ),
+                None => alert,
             });
         }
         // Do not change the pinned branch if the agent switches HEAD to another task's branch.
@@ -510,15 +529,6 @@ impl RefGuard {
         self.checked = Some(started);
         self.save()?;
         Ok(alerts)
-    }
-
-    /// Takes the refs as they are for the baseline, without restoring anything: for a session that ran
-    /// nothing since the last check, so whatever moved was not its doing.
-    fn adopt(&mut self) -> Result<()> {
-        let started = now();
-        self.refs = read_refs(&self.cwd)?;
-        self.checked = Some(started);
-        self.save()
     }
 
     /// Takes the values ATOMICS left under `names`, ref names or prefixes, as this guard's baseline for them.
@@ -546,9 +556,6 @@ pub struct Shared {
     pub common: PathBuf,
     pub branch: Option<String>,
     guard: Arc<Mutex<RefGuard>>,
-    /// Whether the session may have written since the last check: a sandbox that sat idle cannot
-    /// have moved a ref, so a check of it blames nobody. Starts set, for the check before its first turn.
-    ran: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -558,28 +565,11 @@ impl Shared {
         let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
         open.retain(|open| open.strong_count() > 0);
         open.push(Arc::downgrade(&guard));
-        Self { common, branch, guard, ran: Arc::new(AtomicBool::new(true)) }
-    }
-
-    /// Notes that the session ran, or may have: a turn began or ended, or a command ran in its sandbox.
-    pub fn mark_ran(&self) {
-        self.ran.store(true, Ordering::SeqCst);
+        Self { common, branch, guard }
     }
 
     /// Runs git: call it on [`Checks`]' thread.
     pub fn check(&self, exempt: &Exempt) -> Result<Vec<String>> {
-        if !self.ran.swap(false, Ordering::SeqCst) {
-            let mut guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
-            return guard.adopt().map(|()| Vec::new());
-        }
-        let checked = self.check_ran(exempt);
-        if checked.is_err() {
-            self.mark_ran();
-        }
-        checked
-    }
-
-    fn check_ran(&self, exempt: &Exempt) -> Result<Vec<String>> {
         let mut concurrent = exempt.resolve(&self.common);
         let (pending, written) = host_writes(&self.common);
         concurrent.extend(pending);
@@ -796,7 +786,6 @@ mod tests {
         assert!(guard.check(&Default::default()).unwrap().is_empty());
         git::git(&repo, &["update-ref", "refs/tags/host-made", initial.trim()]).unwrap();
         drop(write);
-        guard.mark_ran();
         let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.iter().any(|a| a.contains("Restored refs/tags/untouched")), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "untouched"]).unwrap(), initial);
@@ -964,7 +953,6 @@ mod tests {
         git::git(&repo, &["add", "scratch"]).unwrap();
         git::git(&repo, &["stash", "-q"]).unwrap();
 
-        guard.mark_ran();
         let alerts = guard.check(&Exempt::default()).unwrap();
         assert_eq!(alerts.len(), 2, "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap().trim(), mine);
@@ -989,7 +977,6 @@ mod tests {
         let write = host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);
         git::git(&repo, &["fetch", "-q", "--no-write-fetch-head", "origin"]).unwrap();
         drop(write);
-        guard.mark_ran();
         assert!(guard.check(&Exempt::default()).unwrap().is_empty());
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
         git::git(
@@ -1002,7 +989,6 @@ mod tests {
             &["fetch", "-q", "--no-write-fetch-head", &origin.display().to_string(), "+main:refs/remotes/origin/main"],
         )
         .unwrap();
-        guard.mark_ran();
         let alerts = guard.check(&Exempt::default()).unwrap();
         assert!(alerts.len() == 1 && alerts[0].contains("Restored refs/remotes/origin/main"), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
@@ -1013,7 +999,6 @@ mod tests {
         std::fs::write(repo.join("scratch"), "more work").unwrap();
         git::git(&repo, &["add", "scratch"]).unwrap();
         git::git(&repo, &["stash", "-q"]).unwrap();
-        guard.mark_ran();
         let alerts = guard.check(&Exempt::default()).unwrap();
         assert!(alerts.len() == 1 && alerts[0].contains("Restored refs/heads/later"), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "later"]).unwrap().trim(), mine);

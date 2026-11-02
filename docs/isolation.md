@@ -867,11 +867,10 @@ tests there, in a worktree that starts from the integration branch.
   unfinished plan tasks are exempt so legitimate commits survive. A done task's branch is not: moving it
   is restored. This is recovery after a turn, not write isolation: shared refs cannot
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
-  Only a session that ran can be blamed: a check of a sandbox that was idle since its last check (no turn,
-  no command run in it) takes the refs as they are and restores nothing, so a ref you moved from the host
-  while it sat idle, such as a fast-forward in another worktree, is never undone or quarantined on its
-  account. A report from the agent, progress or done, clears the session's needs-you state, the task's
-  Blocked status and its red alert; a blocked or question report sets them again.
+  Every check is strict, whether the session ran a turn since the last one or sat idle: a process the
+  agent left running in its sandbox can write at any time, and a turn's own writes are checked after its
+  status already shows done. A report from the agent, progress or done, clears the session's needs-you
+  state, the task's Blocked status and its red alert; a blocked or question report sets them again.
 - **What this machine wrote is kept.** A check keeps, since the previous check:
   - refs ATOMICS wrote itself: integrations, new task branches, cleanup, and the Clean up… dialog's
     `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values ATOMICS left;
@@ -898,9 +897,15 @@ tests there, in a worktree that starts from the integration branch.
   not proof that a push happened.
 - **Nothing is deleted.** Putting a ref back keeps the value it replaces at
   `refs/atomics/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
-  moved there rather than deleted, and a value restored over is kept there. If it was yours, take it back
-  with `git branch -f <branch> refs/atomics/quarantine/…`. Checks accept new quarantine refs,
+  moved there rather than deleted, and a value restored over is kept there. Checks accept new quarantine refs,
   but restore changes or deletions of values already observed: quarantine is append-only while guarded.
+- **A change of yours can be put back too.** A restore cannot tell your git from the agent's, so a change
+  this machine made without a trace above is restored like an agent's, for example a `git merge --ff-only`
+  run in a worktree a sandbox works in. The alert says which ref changed, that the change may have been
+  written on this machine, and the command that keeps it: `git update-ref <ref> <object>`, or
+  `git update-ref -d <ref>` for a deletion. Run it after closing this repository's sandboxed sessions, since
+  an open one restores it again at its next check. A session that reattaches to a sandbox later checks
+  against the snapshot that sandbox saved, and restores it too, until the sandbox is removed.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
   and config, which do run on your machine, are out of reach, and git on your machine finds them through
   ATOMICS's record, not the files the agent can write (see

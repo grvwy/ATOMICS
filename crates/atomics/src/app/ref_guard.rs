@@ -45,13 +45,6 @@ impl State {
 
     fn queue_ref_check(&self, index: usize, exempt: Exempt) {
         let Some(guard) = self.sessions[index].ref_guard.clone() else { return };
-        // A turn under way or just finished, or an agent too quick to show busy, may have written refs; one that sat idle cannot have.
-        let session = &self.sessions[index];
-        if session.screen_busy
-            || matches!(session.status, AgentStatus::Starting | AgentStatus::Working | AgentStatus::Exited)
-        {
-            guard.mark_ran();
-        }
         let (id, actions) = (self.sessions[index].id.clone(), self.action_tx.clone());
         self.ref_checks.run(move || {
             let alerts =
@@ -330,10 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn a_host_side_fast_forward_of_another_worktrees_branch_is_left_alone() {
+    fn a_host_fast_forward_in_a_worktree_no_sandbox_works_in_is_kept() {
         let (_dir, repo, _guarded, other, ahead, shared) = guarded_with_an_ahead_branch();
         git::git(&other, &["merge", "--ff-only", "ahead"]).unwrap();
-        shared.mark_ran();
         let alerts = shared.check(&Default::default()).unwrap();
         assert!(alerts.is_empty(), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap().trim(), ahead);
@@ -342,37 +334,146 @@ mod tests {
     }
 
     #[test]
-    fn a_sandboxs_own_illegal_ref_write_is_still_restored_but_an_idle_one_is_not_blamed() {
-        let (_dir, repo, guarded, _other, ahead, shared) = guarded_with_an_ahead_branch();
+    fn a_host_fast_forward_in_a_sandboxed_worktree_is_restored_saying_how_to_keep_it() {
+        let (_dir, repo, _guarded, other, ahead, shared) = guarded_with_an_ahead_branch();
         let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
-        shared.mark_ran();
-        git::git(&guarded, &["update-ref", "refs/heads/other", &ahead]).unwrap();
-        let alerts = shared.check(&Default::default()).unwrap();
-        assert!(alerts.iter().any(|alert| alert.contains("Restored refs/heads/other")), "{alerts:?}");
+        // Another sandbox works in `other`: its HEAD log is no trace of this machine's, since that agent writes it.
+        let pins = git::resolve_pins(&other).unwrap();
+        git::pin(pins.clone());
+        // Run by hand, as in a terminal on this machine.
+        let merged = std::process::Command::new("git")
+            .args(["merge", "-q", "--ff-only", "ahead"])
+            .current_dir(&other)
+            .status()
+            .unwrap();
+        let alerts = shared.check(&Default::default());
+        git::unpin(&pins.work_tree);
+        assert!(merged.success());
+        let alerts = alerts.unwrap();
+        let alert = alerts.iter().find(|alert| alert.starts_with("Restored refs/heads/other:")).expect("restored");
+        assert!(alert.contains("It may have been written on this machine, not in the sandbox"), "{alert}");
+        let keep = format!("git update-ref refs/heads/other {ahead}");
+        assert!(alert.contains(&format!("close this repository's sandboxed sessions, then run `{keep}`")), "{alert}");
         assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original);
+        let kept = format!("refs/atomics/quarantine/snapshot/refs/heads/other@{}", &ahead[..12]);
+        assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap().trim(), ahead);
 
-        // Nothing ran since that check, so a ref that moved meanwhile was not the sandbox's doing.
-        git::git(&repo, &["update-ref", "refs/heads/other", &ahead]).unwrap();
-        let alerts = shared.check(&Default::default()).unwrap();
-        assert!(alerts.is_empty(), "{alerts:?}");
+        // The command it gives keeps the change once no guard is open.
+        drop(shared);
+        let command = alert.rsplit('`').nth(1).unwrap();
+        git::git(&repo, &command.split(' ').skip(1).collect::<Vec<_>>()).unwrap();
         assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap().trim(), ahead);
+    }
+
+    /// Puts `text` on session 0's terminal screen, as its agent would draw it there.
+    fn show(state: &mut State, cwd: &Path, text: &str) {
+        let terminal = crate::terminal::Terminal::spawn(
+            state.wake.clone(),
+            state.palette.terminal_colors(),
+            "/bin/sh".into(),
+            vec!["-c".into(), format!("printf '%s' '{text}'; exec sleep 600")],
+            cwd,
+            std::collections::HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
+        while !terminal.screen_text(60).contains(text) {
+            assert!(Instant::now() < deadline, "screen did not appear");
+            state.wake.wait_until(deadline.min(Instant::now() + Duration::from_millis(100)));
+        }
+        state.sessions[0].terminal = Some(terminal);
+    }
+
+    /// Runs the queued checks and what they report.
+    fn checked(state: &mut State) -> Option<String> {
+        state.ref_checks.finish();
+        state.drain_actions();
+        state.sessions[0].last_message.clone().filter(|message| message.contains("SANDBOX REF GUARD"))
+    }
+
+    #[test]
+    fn a_ref_the_sandbox_writes_during_a_turn_is_restored_when_the_poll_loop_ends_it() {
+        with_app(
+            "app::ref_guard::tests::a_ref_the_sandbox_writes_during_a_turn_is_restored_when_the_poll_loop_ends_it",
+            |app, _| {
+                let (_dir, repo, guarded, _other, ahead, shared) = guarded_with_an_ahead_branch();
+                let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
+                let mut sandboxed = session("sandboxed", AgentKind::Generic, AgentStatus::Idle, &guarded);
+                sandboxed.sandbox = Some("atomics-sandboxed".into());
+                sandboxed.ref_guard = Some(shared);
+                app.runtime.sessions = vec![sandboxed];
+                let track = |state: &mut State| {
+                    state.busy_checked = Instant::now() - Duration::from_secs(1);
+                    state.track_busy();
+                };
+                show(app.runtime, &guarded, "Working (esc to interrupt)");
+                track(app.runtime);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                assert_eq!(checked(app.runtime), None, "the turn starts from a clean baseline");
+
+                // The agent moves a branch it does not own, then its turn ends: the status is Done before
+                // the check that ending queued runs.
+                git::git(&guarded, &["update-ref", "refs/heads/other", &ahead]).unwrap();
+                show(app.runtime, &guarded, "Ready");
+                app.runtime.sessions[0].busy_absent_since = Some(Instant::now() - Duration::from_secs(1));
+                track(app.runtime);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                let alert = checked(app.runtime).expect("the turn's write was reported");
+                assert!(alert.contains("Restored refs/heads/other"), "{alert}");
+                assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original);
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    #[test]
+    fn a_ref_written_while_the_session_is_idle_is_restored() {
+        with_app("app::ref_guard::tests::a_ref_written_while_the_session_is_idle_is_restored", |app, _| {
+            let (_dir, repo, guarded, _other, ahead, shared) = guarded_with_an_ahead_branch();
+            let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
+            let mut sandboxed = session("sandboxed", AgentKind::Generic, AgentStatus::Idle, &guarded);
+            sandboxed.sandbox = Some("atomics-sandboxed".into());
+            sandboxed.ref_guard = Some(shared);
+            app.runtime.sessions = vec![sandboxed];
+            app.runtime.check_refs(0);
+            assert_eq!(checked(app.runtime), None);
+            // No turn runs, but a process the agent left running in its sandbox still can write.
+            git::git(&guarded, &["update-ref", "refs/heads/other", &ahead]).unwrap();
+            app.runtime.check_refs(0);
+            let alert = checked(app.runtime).expect("the idle write was reported");
+            assert!(alert.contains("Restored refs/heads/other"), "{alert}");
+            assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original);
+            app.runtime.sessions.clear();
+        });
     }
 
     #[test]
     fn a_progress_report_clears_the_ref_alert_and_the_blocked_task() {
         with_app("app::ref_guard::tests::a_progress_report_clears_the_ref_alert_and_the_blocked_task", |app, _| {
             let (dir, _repo) = repository();
-            app.runtime.sessions = vec![session("s", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
+            let mut sandboxed = session("s", AgentKind::Generic, AgentStatus::NeedsInput, dir.path());
+            sandboxed.sandbox = Some("atomics-s".into());
+            app.runtime.sessions = vec![sandboxed];
             let task = Task { id: "t".into(), session: Some("s".into()), ..Default::default() };
             app.runtime.plans = vec![Plan { id: "p".into(), tasks: vec![task], ..Default::default() }];
             for status in ["progress", "done"] {
                 app.runtime.ref_alert("s", "moved".into());
                 assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
                 assert!(app.runtime.plans[0].tasks[0].ref_alert.is_some());
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 app.runtime.report(Some("s"), status, "carrying on");
                 let task = &app.runtime.plans[0].tasks[0];
                 assert!(task.ref_alert.is_none(), "{status}");
                 assert_ne!(task.status, TaskStatus::Blocked, "{status}");
+                let session = &app.runtime.sessions[0];
+                assert_ne!(session.status, AgentStatus::NeedsInput, "{status}");
+                // The flip goes through the activity record: progress starts the working clock, done ends the turn.
+                let activity = &session.activity;
+                match status {
+                    "progress" => assert!(activity.working_since.is_some() && activity.wake_since.is_none()),
+                    _ => assert!(activity.turn_ended.is_some() && activity.wake_since.is_some()),
+                }
             }
             app.runtime.sessions.clear();
         });

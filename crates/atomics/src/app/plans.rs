@@ -1808,6 +1808,17 @@ mod tests {
                 assert!(request(app, json!({"cmd":"plan_close", "plan":plan, "status":"completed"})).ok);
                 app.runtime.sync_plan();
                 assert_eq!(request(app, json!({"cmd":"plan_get", "plan":plan})).result["status"], "completed");
+                // A request refused for its content leaves the plan as it was.
+                let invalid = request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":plan, "goal":"Ship", "tasks":[{"id":"a"}, {"id":"a"}]}),
+                );
+                assert!(!invalid.ok);
+                assert!(invalid.error.as_deref().is_some_and(|e| e.contains("Task id a appears more than once")));
+                let unchanged = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                assert_eq!(unchanged.result["status"], "completed");
+                let tasks = unchanged.result["tasks"].as_array().unwrap();
+                assert_eq!(tasks.iter().filter(|t| t["id"] == "a").count(), 1, "{tasks:?}");
                 let set = request(
                     app,
                     json!({"cmd":"plan_set", "plan":plan, "goal":"Ship",
