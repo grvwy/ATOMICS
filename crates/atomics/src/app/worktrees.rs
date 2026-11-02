@@ -87,6 +87,79 @@ impl State {
         });
     }
 
+    /// A button of the open cleanup dialog: `fetch` (`git fetch --prune`), `prune` (worktrees whose folder
+    /// is gone) or `reload`.
+    pub(super) fn cleanup_action(&mut self, action: &str) {
+        if let Some(mut cleanup) = self.cleanup.take() {
+            match action {
+                "fetch" => self.cleanup_git(
+                    &mut cleanup,
+                    "fetch --prune",
+                    &["fetch", "--prune", "--quiet"],
+                    &["refs/remotes/", "refs/tags/"],
+                ),
+                "prune" => self.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"], &[]),
+                "reload" => self.load_cleanup(&mut cleanup),
+                _ => {}
+            }
+            self.cleanup = Some(cleanup);
+        }
+    }
+
+    /// Removes `worktrees` of the open cleanup dialog, each with the sandboxes working there, and the
+    /// sandboxes `orphans` whose worktree is gone; with the worktrees' branches if `delete`.
+    pub(super) fn remove_worktrees(&mut self, worktrees: &[PathBuf], orphans: Vec<String>, delete: bool) {
+        let Some(cleanup) = &self.cleanup else { return };
+        let Some(rows) = &cleanup.rows else { return };
+        let sandboxes = &cleanup.sandboxes;
+        let targets: Vec<(PathBuf, Option<String>, Vec<String>)> = rows
+            .iter()
+            .filter(|r| worktrees.contains(&r.path))
+            .map(|r| {
+                let names = sandboxes.attached.iter().filter(|(path, _)| *path == r.path).map(|(_, n)| n.clone());
+                (r.path.clone(), r.branch.clone(), names.collect())
+            })
+            .collect();
+        let (tx, repo) = (cleanup.tx.clone(), cleanup.repo.clone());
+        let sbx = resolve_program(&self.sbx);
+        let scope = Scope {
+            sandboxes: targets.iter().flat_map(|(_, _, names)| names.iter().cloned()).chain(orphans.clone()).collect(),
+            worktrees: Some(targets.iter().map(|(path, _, _)| path.clone()).collect()),
+        };
+        self.lifecycle(scope, move || {
+            let remove_sandbox = |name: String| {
+                let result = crate::sandbox::remove(&paths::atomics_home(), &sbx, &name).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(CleanupEvent::SandboxRemoved(name, result));
+            };
+            for (path, branch, _) in targets {
+                let mut names = Vec::new();
+                let result = (|| -> anyhow::Result<()> {
+                    anyhow::ensure!(
+                        git::git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),
+                        "uncommitted changes"
+                    );
+                    if crate::sandbox::installed(&sbx) {
+                        names = crate::sandbox::in_worktree(&paths::atomics_home(), &sbx, &path)?;
+                        for name in &names {
+                            crate::sandbox::stop(&paths::atomics_home(), &sbx, name)?;
+                        }
+                    }
+                    let _write = crate::ref_guard::host_write(&repo, branch.iter().filter(|_| delete));
+                    git::remove_worktree(&repo, &path, branch.as_deref(), delete)
+                })()
+                .map_err(|e| format!("{e:#}"));
+                let removed = !path.exists();
+                let _ = tx.send(CleanupEvent::Removed(path, result));
+                // A worktree's sandbox goes with it; a kept worktree keeps its sandbox.
+                if removed {
+                    names.into_iter().for_each(remove_sandbox);
+                }
+            }
+            orphans.into_iter().for_each(remove_sandbox);
+            let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
+        });
+    }
+
     /// Runs a git maintenance command for the dialog in the background. It writes `refs`, names or
     /// prefixes ending in `/`, which ref guards then keep as ATOMICS's own.
     fn cleanup_git(&self, cleanup: &mut Cleanup, label: &str, args: &'static [&'static str], refs: &[&str]) {
@@ -171,7 +244,7 @@ impl Desktop<'_> {
         let name = cleanup.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut open = true;
         let mut remove = false;
-        let mut action: Option<&str> = None;
+        let mut action = None;
         egui::Window::new(format!("Clean up worktrees · {name}"))
             .open(&mut open)
             .collapsible(false)
@@ -185,17 +258,17 @@ impl Desktop<'_> {
                         .on_hover_text("Refresh which remote branches are gone (completed PRs)")
                         .clicked()
                     {
-                        action = Some("fetch");
+                        action = Some(Command::CleanupFetch);
                     }
                     if ui
                         .add_enabled(idle, egui::Button::new("prune missing"))
                         .on_hover_text("Forget worktrees whose folder no longer exists")
                         .clicked()
                     {
-                        action = Some("prune");
+                        action = Some(Command::CleanupPrune);
                     }
                     if ui.add_enabled(idle, egui::Button::new("reload")).clicked() {
-                        action = Some("reload");
+                        action = Some(Command::CleanupReload);
                     }
                     if let Some(busy) = &cleanup.busy {
                         ui.spinner();
@@ -360,85 +433,24 @@ impl Desktop<'_> {
             });
 
         if let Some(action) = action {
-            self.post(move |state| {
-                if let Some(mut cleanup) = state.cleanup.take() {
-                    match action {
-                        "fetch" => state.cleanup_git(
-                            &mut cleanup,
-                            "fetch --prune",
-                            &["fetch", "--prune", "--quiet"],
-                            &["refs/remotes/", "refs/tags/"],
-                        ),
-                        "prune" => state.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"], &[]),
-                        "reload" => state.load_cleanup(&mut cleanup),
-                        _ => {}
-                    }
-                    state.cleanup = Some(cleanup);
-                }
-            });
+            self.send(action);
         }
         if remove && let Some(rows) = &cleanup.rows {
-            let sandboxes = &cleanup.sandboxes;
-            let targets: Vec<(PathBuf, Option<String>, Vec<String>)> = rows
+            let worktrees: Vec<PathBuf> = rows
                 .iter()
                 .filter(|r| self.client.cleanup_selected.contains(&r.path))
-                .map(|r| {
-                    let names = sandboxes.attached.iter().filter(|(path, _)| *path == r.path).map(|(_, n)| n.clone());
-                    (r.path.clone(), r.branch.clone(), names.collect())
-                })
+                .map(|r| r.path.clone())
                 .collect();
-            let orphans: Vec<String> = sandboxes
+            let orphans = cleanup
+                .sandboxes
                 .orphans
                 .iter()
                 .filter(|o| self.client.cleanup_sandboxes.contains(&o.name) && !live_sandboxes.contains(&o.name))
                 .map(|o| o.name.clone())
                 .collect();
-            cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
-            let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), self.client.cleanup_delete_branches);
-            let sbx = resolve_program(&self.runtime.sbx);
-            let scope = Scope {
-                sandboxes: targets
-                    .iter()
-                    .flat_map(|(_, _, names)| names.iter().cloned())
-                    .chain(orphans.clone())
-                    .collect(),
-                worktrees: Some(targets.iter().map(|(path, _, _)| path.clone()).collect()),
-            };
-            self.post(move |state| {
-                state.lifecycle(scope, move || {
-                    let remove_sandbox = |name: String| {
-                        let result =
-                            crate::sandbox::remove(&paths::atomics_home(), &sbx, &name).map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(CleanupEvent::SandboxRemoved(name, result));
-                    };
-                    for (path, branch, _) in targets {
-                        let mut names = Vec::new();
-                        let result = (|| -> anyhow::Result<()> {
-                            anyhow::ensure!(
-                                git::git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),
-                                "uncommitted changes"
-                            );
-                            if crate::sandbox::installed(&sbx) {
-                                names = crate::sandbox::in_worktree(&paths::atomics_home(), &sbx, &path)?;
-                                for name in &names {
-                                    crate::sandbox::stop(&paths::atomics_home(), &sbx, name)?;
-                                }
-                            }
-                            let _write = crate::ref_guard::host_write(&repo, branch.iter().filter(|_| delete));
-                            git::remove_worktree(&repo, &path, branch.as_deref(), delete)
-                        })()
-                        .map_err(|e| format!("{e:#}"));
-                        let removed = !path.exists();
-                        let _ = tx.send(CleanupEvent::Removed(path, result));
-                        // A worktree's sandbox goes with it; a kept worktree keeps its sandbox.
-                        if removed {
-                            names.into_iter().for_each(remove_sandbox);
-                        }
-                    }
-                    orphans.into_iter().for_each(remove_sandbox);
-                    let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
-                });
-            });
+            cleanup.busy = Some(format!("removing {} worktrees…", worktrees.len()));
+            let delete_branches = self.client.cleanup_delete_branches;
+            self.send(Command::RemoveWorktrees { worktrees, orphans, delete_branches });
         }
         self.client.cleanup_open = open;
         self.runtime.cleanup = Some(cleanup);

@@ -142,6 +142,31 @@ pub enum Command {
         text: String,
     },
 
+    // ── Projects and worktrees ───────────────────────────────────────────────────────────────────────
+    OpenProject(PathBuf),
+    CloseProject(PathBuf),
+    OpenWorkspace(String),
+    /// Save the open projects as a workspace.
+    SaveWorkspace(String),
+    /// Look for merged or abandoned worktrees of a project, with one picked already if given.
+    OpenCleanup {
+        repo: PathBuf,
+        preselect: Option<PathBuf>,
+    },
+    /// In the open worktree cleanup: `git fetch --prune`, to learn which remote branches are gone.
+    CleanupFetch,
+    /// In the open worktree cleanup: forget worktrees whose folder no longer exists.
+    CleanupPrune,
+    /// Read the open worktree cleanup's list again.
+    CleanupReload,
+    /// Remove these worktrees of the open cleanup, each with its sandboxes, and these sandboxes whose
+    /// worktree is gone; with the worktrees' branches if `delete_branches`.
+    RemoveWorktrees {
+        worktrees: Vec<PathBuf>,
+        orphans: Vec<String>,
+        delete_branches: bool,
+    },
+
     // ── Not sent yet: the desktop carries these out itself ──────────────────────────────────────────
     /// A task brief on the board has the keyboard this frame: the host holds off a restart until the edit
     /// is done.
@@ -166,14 +191,8 @@ pub enum Command {
     PickProject,
     /// Ask where to create a new worktree of a project.
     NewWorktree(PathBuf),
-    CloseProject(PathBuf),
     /// Show the diff of a worktree or main checkout no session is active in.
     ShowRoot(PathBuf),
-    /// Look for merged or abandoned worktrees of a project, with one picked already if given.
-    OpenCleanup {
-        repo: PathBuf,
-        preselect: Option<PathBuf>,
-    },
     /// Close a plan's tab: an open plan asks to be closed first, a finished one is archived.
     ClosePlanTab(usize),
     /// Show a finished plan's board, read-only.
@@ -190,10 +209,6 @@ pub enum Command {
     NewSession,
     /// Show or hide the plan board.
     TogglePlan,
-    OpenProject(PathBuf),
-    OpenWorkspace(String),
-    /// Save the open projects as a workspace.
-    SaveWorkspace(String),
 }
 
 impl Command {

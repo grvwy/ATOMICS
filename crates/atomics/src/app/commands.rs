@@ -197,6 +197,17 @@ impl Local<'_> {
                     }
                 });
             }
+            Command::OpenProject(root) => state.post(move |state| state.open_project(&root)),
+            Command::CloseProject(root) => state.post(move |state| state.close_project(&root)),
+            Command::OpenWorkspace(name) => state.post(move |state| state.open_workspace(&name)),
+            Command::SaveWorkspace(name) => state.post(move |state| state.save_workspace(&name)),
+            Command::OpenCleanup { repo, preselect } => state.post(move |state| state.open_cleanup(repo, preselect)),
+            Command::CleanupFetch => state.post(|state| state.cleanup_action("fetch")),
+            Command::CleanupPrune => state.post(|state| state.cleanup_action("prune")),
+            Command::CleanupReload => state.post(|state| state.cleanup_action("reload")),
+            Command::RemoveWorktrees { worktrees, orphans, delete_branches } => {
+                state.post(move |state| state.remove_worktrees(&worktrees, orphans, delete_branches))
+            }
             Command::CleanUpPlan(plan) => state.post_plan(plan, |state, index| state.open_plan_cleanup(index)),
             Command::ReloadPlanCleanup => state.post(State::reload_plan_cleanup),
             Command::RemovePlanBranches { plan, branches } => {
@@ -220,9 +231,9 @@ impl Desktop<'_> {
         result
     }
 
-    /// Carries out a command now: an approval, plan, review or session command through the in-process
-    /// backend, the others with the posts and view-hint writes the desktop's code made, until their domains
-    /// reach it too.
+    /// Carries out a command now: an approval, plan, review, session or project command through the
+    /// in-process backend, the others with the posts and view-hint writes the desktop's code made, until
+    /// their domains reach it too.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::EditingPlan => self.runtime.plan_edit_open = true,
@@ -242,13 +253,11 @@ impl Desktop<'_> {
                     dialog.repo = paths::display(&root);
                 }
             }
-            Command::CloseProject(root) => self.close_project(&root),
             Command::ShowRoot(root) => {
                 self.runtime.active = None;
                 self.runtime.diff_root = Some(root);
                 self.runtime.diff_open = true;
             }
-            Command::OpenCleanup { repo, preselect } => self.open_cleanup(repo, preselect),
             Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
             Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
             Command::SetView(view) => self.runtime.set_view(view),
@@ -260,9 +269,6 @@ impl Desktop<'_> {
             Command::ToggleDiff => self.runtime.diff_open = !self.runtime.diff_open,
             Command::NewSession => self.open_new_dialog(None),
             Command::TogglePlan => self.runtime.toggle_plan(),
-            Command::OpenProject(root) => self.open_project(&root),
-            Command::OpenWorkspace(name) => self.open_workspace(&name),
-            Command::SaveWorkspace(name) => self.save_workspace(&name),
             command => self.runtime.backend().send(command),
         }
     }
@@ -291,33 +297,9 @@ impl Desktop<'_> {
         self.post(State::save_chief_preferences);
     }
 
-    pub(super) fn open_project(&self, root: &Path) {
-        let root = root.to_path_buf();
-        self.post(move |state| state.open_project(&root));
-    }
-
-    pub(super) fn close_project(&self, root: &Path) {
-        let root = root.to_path_buf();
-        self.post(move |state| state.close_project(&root));
-    }
-
     pub(super) fn pick_project(&mut self) {
         self.client.project_picker = Some(
             self.runtime.repos.first().and_then(|r| r.parent()).map(Path::to_path_buf).unwrap_or_else(paths::home),
         );
-    }
-
-    pub(super) fn open_workspace(&self, name: &str) {
-        let name = name.to_string();
-        self.post(move |state| state.open_workspace(&name));
-    }
-
-    pub(super) fn save_workspace(&self, name: &str) {
-        let name = name.to_string();
-        self.post(move |state| state.save_workspace(&name));
-    }
-
-    pub(super) fn open_cleanup(&self, repo: PathBuf, preselect: Option<PathBuf>) {
-        self.post(move |state| state.open_cleanup(repo, preselect));
     }
 }
