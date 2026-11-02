@@ -7,7 +7,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::app::State;
-use crate::app::projection::DiffSummaries;
+use crate::app::projection::{DiffBodies, DiffSummaries};
+use crate::protocol;
 use crate::ipc::{ControlMessage, ControlOutcome};
 use atomics_core::control::ControlRequest;
 use atomics_core::projection::Projections;
@@ -21,14 +22,19 @@ pub struct Host {
     thread: Option<JoinHandle<()>>,
     commands: Sender<ControlMessage>,
     projections: Arc<Projections>,
+    /// Only when `[remote] enabled`; otherwise there is no thread and no socket.
+    protocol: Option<protocol::Server>,
 }
 
 impl Host {
     pub(crate) fn start(state: State, wake: Wake, ctx: egui::Context, commands: Sender<ControlMessage>) -> Self {
+        let projections = Arc::new(Projections::default());
+        let bodies = Arc::new(DiffBodies::default());
+        let protocol = start_protocol(&state.remote_access(), &projections, &bodies);
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
-        let projections = Arc::new(Projections::default());
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
+        let bodies = bodies.clone();
         let thread = std::thread::Builder::new()
             .name("atomics-runtime".into())
             .spawn(move || {
@@ -42,14 +48,14 @@ impl Host {
                         if let Some(delay) = state.take_output_delay() {
                             ctx.request_repaint_after(delay);
                         }
-                        state.publish_projections(&published, &mut summaries);
+                        state.publish_projections(&published, &mut summaries, &bodies);
                         state.runtime_deadline()
                     };
                     signal.wait_until(deadline);
                 }
             })
             .expect("runtime thread");
-        Self { state, wake, stopped, thread: Some(thread), commands, projections }
+        Self { state, wake, stopped, thread: Some(thread), commands, projections, protocol }
     }
 
     /// Borrow the in-process native model. Desktop actions are sent to the host
@@ -59,7 +65,7 @@ impl Host {
     }
 
     /// The published projections. Readers load `Arc` snapshots; none of this takes the `State` lock.
-    #[allow(dead_code)] // Read by the protocol server thread (H1b).
+    #[allow(dead_code)] // Tests read it directly.
     pub fn projections(&self) -> Arc<Projections> {
         self.projections.clone()
     }
@@ -74,7 +80,16 @@ impl Host {
         response
     }
 
+    /// Where the protocol server listens, when it is on.
+    #[allow(dead_code)] // Read by tests.
+    pub fn protocol_addr(&self) -> Option<std::net::SocketAddr> {
+        self.protocol.as_ref().map(protocol::Server::addr)
+    }
+
     pub fn stop(&mut self) {
+        if let Some(server) = &mut self.protocol {
+            server.stop();
+        }
         self.stopped.store(true, Ordering::Release);
         self.wake.notify();
         if let Some(thread) = self.thread.take() {
@@ -87,6 +102,30 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.stop();
         self.state.lock().unwrap().shutdown();
+    }
+}
+
+fn start_protocol(
+    config: &atomics_core::config::RemoteAccessConfig,
+    projections: &Arc<Projections>,
+    bodies: &Arc<DiffBodies>,
+) -> Option<protocol::Server> {
+    if !config.enabled {
+        return None;
+    }
+    let server_config = protocol::ServerConfig {
+        port: config.port,
+        allowed_origins: config.allowed_origins.clone(),
+        advertise: Some(atomics_core::paths::atomics_home().join("protocol.json")),
+        ..protocol::ServerConfig::default()
+    };
+    match protocol::Server::start(server_config, projections.clone(), bodies.clone()) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            // The desktop is useful without it; say why and carry on.
+            eprintln!("atomics: the protocol server did not start: {e}");
+            None
+        }
     }
 }
 

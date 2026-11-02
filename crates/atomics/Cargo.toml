@@ -29,6 +29,8 @@ uuid = { version = "1.29.0", features = ["v4"] }
 # The ticket layer's MCP client speaks streamable HTTP too.
 # Browser sign-in for those servers (MCP authorization spec): S256 PKCE, URLs and base64url.
 ring = "0.17.14"
+# The protocol server's loopback WebSocket; blocking, on its own threads, no TLS (loopback only).
+tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 url = "2.5.8"
 base64 = "0.22.1"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }

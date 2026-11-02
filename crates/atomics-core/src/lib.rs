@@ -32,6 +32,7 @@ pub mod mcp_import;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod mirror;
 pub mod projection;
 pub mod remote;
 pub mod repo_workflow;

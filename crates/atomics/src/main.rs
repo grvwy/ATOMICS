@@ -23,6 +23,7 @@ mod ipc;
 mod lifecycle;
 mod mcp;
 mod mcp_client;
+mod protocol;
 mod ref_guard;
 mod relay;
 mod restart;

@@ -4,6 +4,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
+use atomics_core::diff::FileDiff;
+use atomics_core::diff_data::Prepared;
 
 use atomics_core::projection::{
     ApprovalInfo, DiffSummary, PlanInfo, Projections, ReportInfo, SessionInfo, TaskInfo, TaskLink,
@@ -16,14 +20,49 @@ use super::State;
 #[derive(Default)]
 pub(crate) struct DiffSummaries(HashMap<PathBuf, (u64, DiffSummary)>);
 
+/// The accepted diff content per worktree, published so the protocol thread can answer `diff_get`
+/// without the `State` lock. Holds `Arc`s of what the diff worker already built.
+#[derive(Default)]
+pub(crate) struct DiffBodies(RwLock<HashMap<String, (u64, Arc<Prepared>)>>);
+
+impl DiffBodies {
+    fn replace(&self, entries: HashMap<String, (u64, Arc<Prepared>)>) {
+        let same = {
+            let current = self.0.read().unwrap_or_else(|e| e.into_inner());
+            current.len() == entries.len()
+                && entries.iter().all(|(k, (r, p))| current.get(k).is_some_and(|(cr, cp)| cr == r && Arc::ptr_eq(cp, p)))
+        };
+        if !same {
+            *self.0.write().unwrap_or_else(|e| e.into_inner()) = entries;
+        }
+    }
+}
+
+impl crate::protocol::DiffSource for DiffBodies {
+    fn file(&self, worktree: &str, path: &str) -> Option<(u64, FileDiff)> {
+        let (revision, prepared) = self.0.read().unwrap_or_else(|e| e.into_inner()).get(worktree)?.clone();
+        let file = prepared
+            .diff
+            .files
+            .iter()
+            .find(|f| f.new_path.as_deref() == Some(path) || f.old_path.as_deref() == Some(path))?;
+        Some((revision, file.clone()))
+    }
+}
+
 fn text(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
 impl State {
+    /// The `[remote]` settings, for the host to decide whether to start the protocol server.
+    pub(crate) fn remote_access(&self) -> atomics_core::config::RemoteAccessConfig {
+        self.config.remote.clone()
+    }
+
     /// Publish sessions, plans, approvals and diff summaries. Each collection's revision moves
     /// only when its content does.
-    pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut DiffSummaries) {
+    pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
         let task_of = |session: &str| {
             self.plans.iter().find_map(|plan| {
                 plan.tasks
@@ -100,8 +139,10 @@ impl State {
         );
         cache.0.retain(|root, _| self.diffs.contains_key(root));
         let mut diffs = Vec::new();
+        let mut contents = HashMap::new();
         for (root, data) in &self.diffs {
             let Some(prepared) = &data.prepared else { continue };
+            contents.insert(text(root), (data.revision, prepared.clone()));
             let entry = match cache.0.get(root) {
                 Some((revision, summary)) if *revision == data.revision => summary.clone(),
                 _ => {
@@ -113,6 +154,8 @@ impl State {
             diffs.push(entry);
         }
         diffs.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+        // Bodies first: a client told about a revision can always fetch it.
+        bodies.replace(contents);
         out.publish_diffs(diffs);
     }
 }

@@ -162,6 +162,23 @@ impl DiffSummary {
         }
     }
 
+    /// The event for a worktree whose diff is gone: no files and no base, at the last revision + 1.
+    /// `wire` has no removal message for diffs, so this marks it.
+    pub fn tombstone(worktree: &str, revision: u64) -> Self {
+        Self {
+            worktree: worktree.into(),
+            revision,
+            base_ref: String::new(),
+            base: String::new(),
+            partial: false,
+            files: Vec::new(),
+        }
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.base.is_empty() && self.base_ref.is_empty() && self.files.is_empty()
+    }
+
     pub fn additions(&self) -> usize {
         self.files.iter().map(|f| f.additions).sum()
     }

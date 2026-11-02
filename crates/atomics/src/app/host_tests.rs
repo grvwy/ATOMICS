@@ -658,3 +658,42 @@ fn delayed_file_open_keeps_the_hosts_resolved_target() {
         }
     });
 }
+
+#[test]
+fn the_protocol_server_is_off_by_default() {
+    with_state("app::host_tests::the_protocol_server_is_off_by_default", |state, _| {
+        assert!(!state.config.remote.enabled);
+        let host = state.into_host();
+        assert!(host.protocol_addr().is_none(), "no flag, no listener");
+        assert!(!paths::atomics_home().join("protocol.json").exists(), "and nothing advertised");
+    });
+}
+
+#[test]
+fn the_protocol_serves_the_board_while_the_state_lock_is_held() {
+    with_state("app::host_tests::the_protocol_serves_the_board_while_the_state_lock_is_held", |mut state, _| {
+        use crate::protocol::tests::TestClient;
+        state.config.remote.enabled = true;
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let host = state.into_host();
+        let addr = host.protocol_addr().expect("the flag starts the server");
+        let advert: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(paths::atomics_home().join("protocol.json")).unwrap()).unwrap();
+        let token = advert["token"].as_str().unwrap().to_string();
+
+        let mut first = TestClient::connect(addr, &token);
+        first.hello();
+        first.sync_until(|m| m.sessions.contains_key("worker"));
+
+        // With the model locked, as it is for a whole frame of drawing, the protocol thread still
+        // connects a new client and sends the board: it never asks for this lock.
+        let guard = host.state();
+        let mut second = TestClient::connect(addr, &token);
+        second.hello();
+        second.sync_until(|m| m.sessions.contains_key("worker"));
+        drop(guard);
+
+        // And the host still answers its own clients with a client attached.
+        assert_eq!(host.state().sessions.len(), 1);
+    });
+}
