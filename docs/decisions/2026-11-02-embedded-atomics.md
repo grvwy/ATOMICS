@@ -228,10 +228,9 @@ from a phone is in release 1, so the terminal is the part of the mode that gets 
   copy; pinch changes the font size; a hardware keyboard (iPad) works without the bar.
 - **Typing state is visible:** the lease holder is shown on every client; "typing from iPhone" shows on the desktop,
   which takes the lease back with one click (`daemon.md:161-163`).
-- **Soft keyboard and IME** in an egui canvas are the main risk **[SPIKE]**. eframe's web backend uses a hidden text
-  input; its iOS behaviour (autocorrect and autocapitalise off, composition, dictation) is checked on a real device.
-  The fallback is a native `<textarea>` in the iframe that forwards composed text as `terminal_input`. Because
-  typing is in release 1, this spike decides the input design before stream C starts its terminal work (9).
+- **Soft keyboard and IME** in an egui canvas were the main risk **[SPIKE, decided]**. Terminal input goes through a
+  native `<textarea>` over the terminal in the iframe, which forwards committed text as `terminal_input` and
+  composition as preedit; eframe's hidden text input is not used for terminals ("Spike results" below).
 - **Offline:** cached content shows as disconnected and input is disabled until synchronised (`daemon.md:150`);
   input is never replayed across a disconnect (`daemon.md:109`).
 
@@ -242,32 +241,30 @@ hosting app's `Permissions-Policy` must allow the camera on the pairing page) an
 Android and desktop browsers, where the link opens the same profile. The spike also confirms that an iframe on a
 same-site dedicated origin keeps its storage inside the standalone PWA.
 
-**Spike results (pending device run).** The page is `spikes/wasm` (README, "iPhone test", with the checklist the
-rows below follow). It feeds one egui terminal widget from three paths: **a** eframe's text agent as shipped (an
-`<input>` with only `autocapitalize="off"`), **a+** the same input with `autocorrect`, `autocomplete` and
-`spellcheck` off, set by the page, and **b** a transparent `<textarea>` over the terminal that forwards committed
-text, composition (as preedit) and Backspace/Return. The key bar follows `visualViewport`. Each run's event log is
-saved on the serving machine, not in the repository.
+**Spike results (2026-11-02).** The page is `spikes/wasm` (README, "iPhone test", with the
+checklist). It feeds one egui terminal widget from three paths: **a** eframe's text agent as shipped (an `<input>`
+with only `autocapitalize="off"`), **a+** the same input with `autocorrect`, `autocomplete` and `spellcheck` off,
+set by the page, and **b** a transparent `<textarea>` over the terminal that forwards committed text, composition
+(as preedit) and Backspace/Return. The key bar follows `visualViewport`. Event logs stay on the serving machine.
 
-Device: iPhone ___, iOS ___, run on ___.
+Device: an iPhone on iOS 26.7.2 (from the logged user agent).
 
-| Check | Safari a | Safari a+ | Safari b | PWA a+ | PWA b |
-| --- | --- | --- | --- | --- | --- |
-| 1. Tap opens the keyboard; no page jump or zoom | | | | | |
-| 2. No autocapitalise, autocorrect or smart punctuation | | | | | |
-| 3. Backspace (tap and hold) and Return send once each | | | | | |
-| 4. `åäö ÅÄÖ` once and precomposed; emoji sequences intact | | | | | |
-| 4b. IME composition (optional): preedit, then one commit | | | | | |
-| 5. Dictation arrives once; revisions not duplicated | | | | | |
-| 6. Key bar sits on the keyboard, keeps it up; Ctrl then `c` is `^C` | | | | | |
-| 7. Pinch on the terminal changes the font; the page never zooms | | | | | |
+| Run | Result |
+| --- | --- |
+| Safari, **b** | Pass, by the user's report ("works pretty well"). No per-check notes, no log uploaded |
+| Chrome on iOS, **b** | Pass, by the same report. No per-check notes, no log uploaded |
+| Installed PWA, **b** | Pass, by the user's report. No per-check notes, no log uploaded |
+| **a** and **a+**, any browser | Not run against the checklist |
 
-Cells: pass, fail with a one-line note, or not run.
+One Chrome session on the default page (**a**) was logged in passing: text, Return, `åäö` (precomposed) and five
+emoji each arrived once, and the key bar's Tab and arrows sent their sequences, though it was pressed with the
+keyboard closed. Chrome on iOS shrinks the layout viewport for the keyboard (`innerHeight` 681 → 382), and the key
+bar's position followed it.
 
-Findings: pending.
-
-Decision (pending): stream C uses the egui text agent if **a+** passes every row in Safari and in the PWA (the
-attributes then go upstream to eframe or are set by the client); otherwise the `<textarea>` overlay (**b**).
+**Decision: C4 uses the `<textarea>` overlay (b).** The browser owns the native input, composition and dictation,
+and the client sets the input's attributes itself instead of relying on eframe's text agent, which as shipped leaves
+autocorrect on. **a** and **a+** are not pursued. Final: **b** passed in iOS Safari, iOS Chrome and the installed
+PWA.
 
 ### 4.5 The entry point
 
@@ -578,7 +575,7 @@ Reads are done (sections 0, 1.2).
 
 | Repo | Task | Acceptance |
 | --- | --- | --- |
-| ATOMICS | eframe wasm32 build of a minimal UI with `wgpu` and with `glow`; sizes; `snow` building for wasm32; **iOS Safari soft keyboard, IME and dictation into a terminal-like egui widget** | Sizes per renderer, a go/no-go on the egui keyboard vs the `<textarea>` fallback |
+| ATOMICS | eframe wasm32 build of a minimal UI with `wgpu` and with `glow`; sizes; `snow` building for wasm32; **iOS Safari soft keyboard, IME and dictation into a terminal-like egui widget** | Sizes per renderer, a go/no-go on the egui keyboard vs the `<textarea>` fallback. **Done:** the `<textarea>` overlay (4.4, "Spike results") |
 | The hosting app, on an iPhone | Camera-app QR opens Safari, not the PWA; in-PWA `getUserMedia` scanner; IndexedDB survival in the installed PWA, including a same-site iframe | Confirms or corrects 4.4's pairing rule |
 | The relay | Measure WebSocket idle behaviour through its ingress with a test route (no product change) | The idle close in seconds, or "none" |
 
@@ -608,7 +605,7 @@ Starts on day one, in parallel with H1, against an in-process `Backend` first.
 - **C3, the shared cell-snapshot terminal painter (6-8):** used by the desktop as well; selection, wide and
   combining cells, cursor shapes.
 - **C4, mobile UX mode (6-8):** 4.4 in full: compact layout, key bar, touch, pan and zoom, lease indicator, the
-  soft-keyboard path chosen in Phase 0.
+  `<textarea>` overlay chosen in Phase 0 (4.4, "Spike results").
 - **C5, the browser transport and the `atomics-web` artifact (2).**
 
 ### Stream R: the hosting side (about 13-16 days)

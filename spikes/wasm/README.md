@@ -6,8 +6,8 @@ iOS soft-keyboard question (egui text agent vs hidden `<textarea>`).
 **Status:** all four variants build for wasm32 (rustc 1.99.0, eframe 0.37.0, wasm-bindgen 0.2.130, binaryen 133, snow 0.10.0).
 The lock now pins wasm-bindgen 0.2.129 (js-sys/web-sys 0.3.106) to match the CLI on the test machine; the sizes
 below were measured with 0.2.130.
-The `snow` handshake is unverified at runtime. The phone test page (below) runs in desktop Chrome on both input
-paths, with the key bar; its iPhone run is pending.
+The `snow` handshake is unverified at runtime. The iPhone test (below) is done: path **b**, the `<textarea>`
+overlay, passed in iOS Safari, iOS Chrome and the installed PWA, and is the chosen input path (design §4.4).
 
 ## Build (toolchain 1.99.0, `-j ${JOBS:-2}`)
 
