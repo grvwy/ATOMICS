@@ -554,11 +554,11 @@ atomics://open?ticket=<key or ticket URL>&system=<name>   the ticket's plan, or 
 With `ticket=`, ATOMICS resolves the ticket through the configured `[tickets]` profile: a key such as `ABC-12`, or a
 web address that matches the profile's `link_url`. If an open plan links the ticket, that plan is selected.
 Otherwise the chief opens with `Plan ABC-12: <title>` typed into its prompt, never sent: you read it and press
-Enter. A `system` that is not the configured ticket system, or a ticket system you are not signed in to, shows a
+Enter (appended to anything already typed there). A `system` that is not the configured ticket system, or a ticket system you are not signed in to, shows a
 toast asking you to sign in. A link only opens and focuses; anything else in it (another scheme or host, an unknown
 parameter, a repeated one, both `plan` and `ticket`) is refused with a toast.
 `atomics 'atomics://open?plan=…'` does the same from a terminal. When ATOMICS is already running, the link goes to it
-over its control socket and the second process exits; otherwise ATOMICS starts and opens the link once it has loaded.
+over its control socket and the second process exits (on Windows there is no socket forwarding, so every link starts a new instance); otherwise ATOMICS starts and opens the link once it has loaded.
 
 Registration: `scripts/linux-install.sh` adds `MimeType=x-scheme-handler/atomics;` and `%u` to the desktop entry and
 runs `xdg-mime default atomics.desktop x-scheme-handler/atomics`; `scripts/macos-app.sh` declares the scheme in

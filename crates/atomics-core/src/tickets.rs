@@ -1400,6 +1400,12 @@ fn finish_url_link(mut link: TicketLink, id: Option<String>, key: Option<String>
     Some(link)
 }
 
+/// Whether text can be a ticket key or id taken from a link: no whitespace or address
+/// characters (`/ \ ? & #`), at most 128 characters.
+pub fn is_plain_key(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 128 && !text.chars().any(|c| c.is_whitespace() || "/\\?&#".contains(c))
+}
+
 fn key_number(key: &str) -> Option<&str> {
     key.rsplit('-').next().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
@@ -1585,18 +1591,18 @@ impl TicketConfig {
             if next.is_empty() && !template.is_empty() {
                 return None;
             }
-            let captured = if template.is_empty() {
-                std::mem::take(&mut rest)
-            } else {
-                let at = rest.find(next)?;
-                let (head, tail) = rest.split_at(at);
-                rest = tail;
-                head
-            };
+            // A capture never reaches past the next `/ ? # &`.
+            let stop = rest.find(['/', '?', '#', '&']).unwrap_or(rest.len());
+            let at = if template.is_empty() { stop } else { rest.find(next).filter(|at| *at <= stop)? };
+            let (captured, tail) = rest.split_at(at);
+            rest = tail;
             if captured.is_empty() {
                 return None;
             }
             let value = percent_decode(captured);
+            if matches!(name, "id" | "uuid" | "key") && !is_plain_key(&value) {
+                return None;
+            }
             match name {
                 "id" | "uuid" => id = Some(value),
                 "key" => key = Some(value),
@@ -2838,6 +2844,36 @@ mod tests {
         assert!(config("https://tickets.example/{key_number}").link_from_url("https://tickets.example/12").is_none());
         assert!(config("https://tickets.example/{id}{key}").link_from_url("https://tickets.example/12").is_none());
         assert!(TicketConfig::default().link_from_url("https://tickets.example/browse/ABC-12").is_none());
+    }
+
+    #[test]
+    fn a_capture_stops_at_address_characters_and_must_be_a_plain_key() {
+        let config = |template: &str| TicketConfig {
+            system: "Example".into(),
+            link_url: Some(template.into()),
+            ..Default::default()
+        };
+        let last = config("https://tickets.example/browse/{key}");
+        for wrong in [
+            "https://tickets.example/browse/ABC-12/comments",
+            "https://tickets.example/browse/ABC-12?x=1",
+            "https://tickets.example/browse/ABC-12#top",
+            "https://tickets.example/browse/ABC-12&x=1",
+            "https://tickets.example/browse/ABC%2F12",
+            "https://tickets.example/browse/ABC%5C12",
+            "https://tickets.example/browse/ABC%3F12",
+            "https://tickets.example/browse/ABC%2012",
+            "https://tickets.example/browse/A%0A1",
+            &format!("https://tickets.example/browse/{}", "A".repeat(129)),
+        ] {
+            assert!(last.link_from_url(wrong).is_none(), "{wrong}");
+        }
+        assert!(last.link_from_url(&format!("https://tickets.example/browse/{}", "A".repeat(128))).is_some());
+        let middle = config("https://tickets.example/t/{id}/view");
+        assert!(middle.link_from_url("https://tickets.example/t/7f/view").is_some());
+        assert!(middle.link_from_url("https://tickets.example/t/7f/x/view").is_none());
+        assert!(middle.link_from_url("https://tickets.example/t/7 f/view").is_none());
+        assert!(middle.link_from_url("https://tickets.example/t/7f?a=/view").is_none());
     }
 
     #[test]

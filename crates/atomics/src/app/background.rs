@@ -26,14 +26,9 @@ impl State {
         // Links from macOS share the slot the command line fills; a newer one replaces an older.
         #[cfg(target_os = "macos")]
         if let Some(url) = crate::open_link::macos::take().pop() {
-            self.pending_link = Some(crate::open_link::parse(&url));
+            self.hold_link(crate::open_link::parse(&url));
         }
-        if self.ticket_state_known()
-            && let Some(link) = self.pending_link.take()
-        {
-            let _ = self.open_link(link);
-            changed = true;
-        }
+        changed |= self.release_pending_link();
         self.flush_chief_draft();
         self.refresh_integrations();
         self.serve_dispatches();

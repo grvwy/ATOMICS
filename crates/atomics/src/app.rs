@@ -581,6 +581,8 @@ pub(crate) struct State {
     toast: Option<(String, Instant)>,
     /// A link the launch was given, or macOS delivered, opened once the ticket state is known.
     pending_link: Option<crate::open_link::Incoming>,
+    /// When the pending link was first seen waiting; one waiting too long is dropped with a toast.
+    pending_link_since: Option<Instant>,
     /// Text for the chief's prompt that is typed but never sent, once the chief is up.
     chief_draft: Option<String>,
     pending_open: Vec<(String, PathBuf)>,
@@ -1016,6 +1018,7 @@ impl State {
             watch_rx,
             toast: None,
             pending_link: options.link,
+            pending_link_since: None,
             chief_draft: None,
             pending_open: options.open,
             resume: Vec::new(),

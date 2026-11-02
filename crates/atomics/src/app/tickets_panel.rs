@@ -3251,7 +3251,7 @@ mod tests {
             app.runtime.link_card_read(card("DEMO-2"), Some("DEMO-1".into()));
             assert_eq!(toasted(app), "No such ticket");
             assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
-            // The same key in another case is the ticket; an address was resolved by the profile already.
+            // The same key in another case is the ticket; one with no confirmation (a card the app asked for itself) is taken.
             app.runtime.link_card_read(card("DEMO-1"), Some("demo-1".into()));
             assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-1"));
             app.runtime.link_card_read(card("DEMO-3"), None);
@@ -3283,6 +3283,100 @@ mod tests {
                 app.runtime.runtime_tick(ctx);
                 assert!(app.runtime.pending_link.is_none());
                 assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
+            },
+        );
+    }
+
+    /// A server that signs in, whose sign-in state has not been read: the ticket state is unknown.
+    fn cold_ticket_state(app: &mut Desktop<'_>) -> crate::test_support::TempDir {
+        let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+        let mut config: TicketConfig = toml::from_str("system = \"echo\"").unwrap();
+        config.server.url = Some("https://tickets.example/mcp".into());
+        config.server.oauth = true;
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        app.runtime.tickets.sign.override_oauth(oauth);
+        assert!(!app.runtime.ticket_state_known());
+        dir
+    }
+
+    #[test]
+    fn a_ticket_link_over_the_socket_waits_for_the_ticket_state() {
+        with_app("app::tickets_panel::tests::a_ticket_link_over_the_socket_waits_for_the_ticket_state", |app, ctx| {
+            let _dir = cold_ticket_state(app);
+            let reply = super::super::tests::request(app, json!({"cmd":"open_link", "ticket": "DEMO-1"}));
+            assert!(reply.ok, "{:?}", reply.error);
+            assert!(app.runtime.pending_link.is_some());
+            assert!(!toasted(app).contains("Sign in"), "{}", toasted(app));
+
+            app.runtime.runtime_tick(ctx);
+            assert!(app.runtime.pending_link.is_some(), "the link was handled before the state was known");
+            assert!(app.runtime.ticket_state_known());
+            app.runtime.runtime_tick(ctx);
+            assert!(app.runtime.pending_link.is_none());
+            assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
+        });
+    }
+
+    #[test]
+    fn a_link_held_too_long_without_a_ticket_state_times_out_with_a_toast() {
+        with_app(
+            "app::tickets_panel::tests::a_link_held_too_long_without_a_ticket_state_times_out_with_a_toast",
+            |app, _| {
+                let _dir = cold_ticket_state(app);
+                let link = crate::open_link::OpenLink { ticket: Some("DEMO-1".into()), ..Default::default() };
+                app.runtime.hold_link(Ok(link));
+                // The state is unknown: the link keeps waiting, quietly.
+                assert!(!app.runtime.release_pending_link());
+                assert!(app.runtime.pending_link.is_some() && app.runtime.pending_link_since.is_some());
+                assert!(!toasted(app).contains("did not answer"), "{}", toasted(app));
+                // Past the limit, with the state still unknown, it is dropped and says so.
+                app.runtime.pending_link_since = Instant::now().checked_sub(Duration::from_secs(31));
+                assert!(app.runtime.release_pending_link());
+                assert!(app.runtime.pending_link.is_none() && app.runtime.pending_link_since.is_none());
+                assert!(toasted(app).contains("did not answer in time"), "{}", toasted(app));
+            },
+        );
+    }
+
+    #[test]
+    fn an_address_read_is_confirmed_against_the_key_or_id_it_held() {
+        with_app("app::tickets_panel::tests::an_address_read_is_confirmed_against_the_key_or_id_it_held", |app, _| {
+            quiet_chief(app);
+            let card = |id: &str, key: Option<&str>| {
+                let link = TicketLink { id: id.into(), key: key.map(str::to_string), ..Default::default() };
+                Ok(TicketOutput::Card(Box::new(TicketCard { link, ..Default::default() })))
+            };
+            // The address held an id; the read answers another ticket.
+            app.runtime.link_card_read(card("9z", Some("DEMO-9")), Some("7f".into()));
+            assert_eq!(toasted(app), "No such ticket");
+            assert!(app.runtime.chief_draft.is_none());
+            // The id (or the key) of the card is the one asked for.
+            app.runtime.link_card_read(card("7f", Some("DEMO-7")), Some("7f".into()));
+            assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-7"));
+            app.runtime.link_card_read(card("7f", Some("DEMO-7")), Some("DEMO-7".into()));
+            assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-7"));
+        });
+    }
+
+    #[test]
+    fn an_address_that_swallows_more_than_a_key_is_refused_before_any_read() {
+        with_app(
+            "app::tickets_panel::tests::an_address_that_swallows_more_than_a_key_is_refused_before_any_read",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                fake_profile(app, dir.path());
+                app.runtime.config.tickets.link_url = Some("https://tickets.example/?selected={id}".into());
+                app.runtime.apply_ticket_config();
+                for url in [
+                    "https://tickets.example/?selected=1&x=2",
+                    "https://tickets.example/?selected=1/../2",
+                    "https://tickets.example/?selected=1%202",
+                ] {
+                    assert!(open(app, url, None).is_err(), "{url}");
+                }
+                assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
             },
         );
     }
