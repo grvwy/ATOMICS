@@ -242,9 +242,9 @@ a section of d2.
 | --- | --- | --- |
 | H1 conversation needs a ticket link and an MCP surface | **Resolved in d2** | Relay's side builds an item conversation that any agent connection opens, visible and steerable only by its named steering humans, with MCP tools to open, post, read steering after a revision, acknowledge, and list the steering humans (§5.1). ATOMICS maps them as generic `conversation_*` operations (§3.1). Comment threads and `list_ticket_comments` are gone. Events are ≤ 2000 characters throughout (§3.6). |
 | H2 push to the phone | **Resolved in d2** | A build on Relay's side (§5.3); ATOMICS needs nothing for it. |
-| H3 attention comments can't notify; mention pushes leak text | **Resolved in d2** | **Chose the dedicated notification path** (§5.1.5): mention pushes put comment text on the lock screen, mentions live in main comments that every reader sees, and explicit MCP mentions would let any agent push to any human. Attention comments and `notify_mention` are deleted. Conversation activity (waiting for approval, waiting for input, failed) and Completed push to the steering humans with a generic title and no body. CI failed and deployed arrive as item notices, also with no body. |
-| H4 the doc kept what Q3 and Q4 rejected; two Q1 details wrong | **Resolved in d2** | Gone: main-comment steering, `steer = "comments"`, `steer_prefix`, state approval (Option B), `target = "comments"` and `require_kind = ""`. The approval request and `/approve` live in the Conversation (§3.5). Only steering humans see the conversation (§4.2, §5.1.4). §4.1 states the user's Q1 rule in their words. G-R3 is deleted (whoami already reports a personal agent's owner). The chip names both identities (§3.2). The ATOMICS security model now covers only conversation items (§3.4). |
-| H5 ATOMICS branches miss Relay's development links | **Resolved in d2** | The ATOMICS side is config only: `[tickets] branch = "relay/{key_number}-{slug}"` in the user's profile, using the existing template support, which already covers the ticket-mode integration branch and the `-<task>` suffix (§3.8). No Relay names in code. The board-mode integration branch can be passed to `plan_set`. Connecting the repositories is an operator step on Relay's side (§6). `record_stage` stays with the ticket-writes plan's A5. |
+| H3 attention comments can't notify; mention pushes leak text | **Resolved in d2** | **Chose the dedicated notification path** (§5.2): mention pushes put comment text on the lock screen, mentions live in main comments that every reader sees, and explicit MCP mentions would let any agent push to any human. Attention comments and `notify_mention` are deleted. Conversation activity (waiting for approval, waiting for input, failed) and Completed push to the steering humans with a generic title and no body. CI failed and deployed arrive as item notices, also with no body. |
+| H4 the doc kept what Q3 and Q4 rejected; two Q1 details wrong | **Resolved in d2** | Gone: main-comment steering, `steer = "comments"`, `steer_prefix`, state approval (Option B), `target = "comments"` and `require_kind = ""`. The approval request and `/approve` live in the Conversation (§3.5). Only steering humans see the conversation (§4.2, §5.1). §4.1 states the user's Q1 rule in their words. G-R3 is deleted (whoami already reports a personal agent's owner). The chip names both identities (§3.2). The ATOMICS security model now covers only conversation items (§3.4). |
+| H5 ATOMICS branches miss Relay's development links | **Resolved in d2** | The ATOMICS side is config only: `[tickets] branch = "relay/{key_number}-{slug}"` in the user's profile, using the existing template support, which already covers the ticket-mode integration branch and the `-<task>` suffix (§3.8). No Relay names in code. The board-mode integration branch can be passed to `plan_set`. Connecting the repositories is an operator step on Relay's side (§2.3). `record_stage` stays with the ticket-writes plan's A5. |
 
 ### Medium
 
@@ -257,8 +257,8 @@ a section of d2.
 | M5 X1 overlapped a1 | **Resolved in d2** | X1 depends on a1 merged to main, and keeps only what a1 didn't cover: whoami, comment identity fields, typed placeholders, the sidecar outbox and mention escaping (§6 X1). `create` stays unmapped. |
 | M6 restart replay and outbox placement | **Resolved in d2** | Delivery intent is saved before `deliver`, the acknowledgement follows the outcome, and a restart never pastes again (§3.4). Remote state lives in a sidecar file outside `plan_json` (§3.3). |
 | M7 `@alias` in agent-written comments is refused | **Resolved in d2** | The mirror never writes main comments. a1's lifecycle comments still do, so a generic `[tickets] escape_mentions` inserts U+2060 after `@`; the Relay profile sets it (§3.9). |
-| M8 a sequence cursor can skip rows | **Resolved in d2** | The cursor is the steering revision, commit-ordered on Relay's side (§5.1.2). ATOMICS deduplicates by id as well (§3.4). |
-| M9 unbounded polling cost | **Resolved in d2** | Only the cursor read polls, every 5 s while the plan is "active" (defined in §3.7) and every 60 s otherwise. Polling stops when the plan or the conversation ends, and backs off on 429. No `get_ticket` poll exists. Relay rate-limits MCP per identity (§5.1.7). |
+| M8 a sequence cursor can skip rows | **Resolved in d2** | The cursor is the steering revision, commit-ordered on Relay's side (§5.1). ATOMICS deduplicates by id as well (§3.4). |
+| M9 unbounded polling cost | **Resolved in d2** | Only the cursor read polls, every 5 s while the plan is "active" (defined in §3.7) and every 60 s otherwise. Polling stops when the plan or the conversation ends, and backs off on 429. No `get_ticket` poll exists. Relay rate-limits MCP per identity (§5.4). |
 
 ### Low
 
@@ -289,8 +289,8 @@ a section of d2.
   event kinds, activity states, `itemType = "ticket"`) appears only in the example profile (§3.1, §3.2). The
   approval text is ATOMICS's own contract (§3.5).
 - **Task list (§3 above): resolved in d2.** d1's X5 (attention comments and `record_stage`) is removed: branch
-  linking is config (§3.8, O1), `record_stage` stays with the ticket-writes plan's A5, and attention became
+  linking is config (§3.8, §2.3), `record_stage` stays with the ticket-writes plan's A5, and attention became
   conversation activity (X4). d2's X5 is d1's X6. The work runs in five waves, to keep at most two build-heavy
   tasks at once.
 
-Still open after d2: only the offline shell (d2 §7).
+Still open after d2: only the offline shell, which is a question for Relay (d2 §7).

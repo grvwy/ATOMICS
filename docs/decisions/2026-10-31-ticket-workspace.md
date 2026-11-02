@@ -125,13 +125,13 @@ Widths are for a ~110-column window. The chief is docked in the examples that ne
 │    │  Sign in with the browser     │   the OS keychain, never in a file, and the agents      │
 │    └───────────────────────────────┘   never see it.                                         │
 │                                                                                              │
-│    system: relay  ·  https://relay.atomisk.ai/mcp                                            │
+│    system: relay  ·  https://tickets.example.com/mcp                                         │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 
  while waiting:
 │    Waiting for the browser…                                              [Cancel]  (4:32)    │
 │    No browser here (SSH, headless)?  Open this link anywhere:                                │
-│      https://relay.atomisk.ai/oauth/authorize?response_type=code&client_id=…  [Copy link]    │
+│      https://tickets.example.com/oauth/authorize?response_type=code&client_id=…  [Copy link] │
 │    Then paste the address the browser ends on:                                               │
 │      [ http://127.0.0.1:53682/callback?code=…&state=…                          ] [Use it]    │
 
@@ -617,7 +617,7 @@ ids): the lane draws the task graph from the call, not from the reply, so it app
 ```
 Plan and implement ticket DEMO-1 (system: relay), plan id <plan-id>.
 Title: Relay × ATOMICS: end-to-end integration and personal-agent MCP sign-in
-URL: https://relay.atomisk.ai/tickets?…
+URL: https://tickets.example.com/tickets?…
 Mode: board (the ticket has children; each child ticket becomes one task) | ticket (one plan for this ticket).
 
 1. Read the ticket in full with atomics_ticket_read, including its comments and children.
