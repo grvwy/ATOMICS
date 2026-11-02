@@ -16,6 +16,15 @@ use atomics_core::store::SessionRecord;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    // ── Approvals ──────────────────────────────────────────────────────────────────────────────────
+    /// Answer a permission request of the session at `session` of the last session list read. The request
+    /// is named, so the host refuses a decision made for an earlier one.
+    Decide {
+        session: usize,
+        approval: String,
+        decision: Decision,
+    },
+
     // ── Plans ────────────────────────────────────────────────────────────────────────────────────────
     /// A planned task's brief, as edited on its card.
     EditBrief {
@@ -87,13 +96,6 @@ pub enum Command {
     },
     /// Show a task's session, with its diff.
     OpenTaskSession(String),
-    /// Answer a permission request of the session at `session` of the last session list read. The request
-    /// is named, so the host refuses a decision made for an earlier one.
-    Decide {
-        session: usize,
-        approval: String,
-        decision: Decision,
-    },
     /// The review comments on a worktree's diff changed from `before` to `after`.
     EditComments {
         root: PathBuf,

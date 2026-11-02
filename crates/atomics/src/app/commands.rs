@@ -64,6 +64,21 @@ impl Local<'_> {
     pub(super) fn run(&self, command: Command) {
         let state = self.0;
         match command {
+            // The desktop's decision goes through the journal and `State::decide` like a protocol
+            // client's, so the two can race and exactly one wins.
+            Command::Decide { session, approval, decision } => {
+                let session = state.sessions[session].id.clone();
+                state.post(move |state| {
+                    let outcome = state.mutate_desktop(|op| {
+                        let decide = ApprovalDecide { op, approval: approval.clone(), decision, message: None };
+                        ops::Command::ApprovalDecide(decide)
+                    });
+                    if let Outcome::Refused { message, .. } = outcome {
+                        state.toast(message);
+                    }
+                    state.client_events.push(ClientEvent::ApprovalDecided { session, approval });
+                });
+            }
             Command::EditBrief { plan, task, brief } => {
                 state.post_plan(plan, move |state, index| state.edit_task_brief(index, &task, brief))
             }
@@ -153,8 +168,8 @@ impl Desktop<'_> {
         result
     }
 
-    /// Carries out a command now: a plan command through the in-process backend, the others with the
-    /// posts and view-hint writes the desktop's code made, until their domains reach the backend too.
+    /// Carries out a command now: an approval or plan command through the in-process backend, the others
+    /// with the posts and view-hint writes the desktop's code made, until their domains reach it too.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::EditingPlan => self.runtime.plan_edit_open = true,
@@ -163,7 +178,6 @@ impl Desktop<'_> {
                 self.activate(&session, true);
                 self.runtime.panel = PanelMode::Diff;
             }
-            Command::Decide { session, approval, decision } => self.approve_request(session, approval, decision),
             Command::EditComments { root, before, after } => self.post(move |runtime| {
                 runtime.diffs.entry(root).or_default().edit_comments(before, after);
             }),
@@ -216,24 +230,6 @@ impl Desktop<'_> {
             Command::SaveWorkspace(name) => self.save_workspace(&name),
             command => self.runtime.backend().send(command),
         }
-    }
-
-    /// The desktop's decision goes through the journal and `State::decide` like a protocol
-    /// client's, so the two can race and exactly one wins.
-    pub(super) fn approve_request(&mut self, index: usize, approval: String, decision: Decision) {
-        let session = self.runtime.sessions[index].id.clone();
-        if !self.client.approval_decisions.insert((session.clone(), approval.clone())) {
-            return;
-        }
-        self.post(move |state| {
-            let outcome = state.mutate_desktop(|op| {
-                ops::Command::ApprovalDecide(ApprovalDecide { op, approval: approval.clone(), decision, message: None })
-            });
-            if let Outcome::Refused { message, .. } = outcome {
-                state.toast(message);
-            }
-            state.client_events.push(ClientEvent::ApprovalDecided { session, approval });
-        });
     }
 
     pub(super) fn activate(&mut self, id: &str, open_diff: bool) {
