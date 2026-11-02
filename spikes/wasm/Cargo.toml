@@ -22,9 +22,9 @@ eframe = { version = "0.37", default-features = false, features = ["default_font
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
-snow = { version = "0.10", default-features = false, features = ["default-resolver"], optional = true }
-# snow's rand_core 0.6 uses getrandom 0.2, which needs `js` on wasm32-unknown-unknown.
-getrandom = { version = "0.2", features = ["js"], optional = true }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"], optional = true }
+# snow's getrandom 0.3 needs the wasm_js backend on wasm32-unknown-unknown (see .cargo/config.toml).
+getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
 
 [profile.release]
 opt-level = "s"

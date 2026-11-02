@@ -71,7 +71,7 @@ impl App {
         if focused {
             // Asks the web backend to show its hidden text input (the "text agent").
             ui.ctx().output_mut(|o| {
-                o.ime = Some(egui::output::IMEOutput { rect, cursor_rect: egui::Rect::from_min_size(rect.min, Vec2::new(10.0, 18.0)) })
+                o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Terminal, should_interrupt_composition: false, rect, cursor_rect: egui::Rect::from_min_size(rect.min, Vec2::new(10.0, 18.0)) })
             });
             let events = ui.input(|i| i.events.clone());
             for ev in events {
@@ -82,7 +82,7 @@ impl App {
                     }
                     Event::Ime(ime) => {
                         match &ime {
-                            egui::ImeEvent::Preedit(s) => self.preedit = s.clone(),
+                            egui::ImeEvent::Preedit { text, .. } => self.preedit = text.clone(),
                             egui::ImeEvent::Commit(s) => {
                                 self.preedit.clear();
                                 self.screen.push_str(s);
@@ -112,8 +112,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("egui keyboard test");
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.mode, Mode::Terminal, "terminal widget");
@@ -142,8 +142,8 @@ impl eframe::App for App {
 fn noise_report() -> String {
     const P: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
     let run = || -> Result<usize, snow::Error> {
-        let mut i = snow::Builder::new(P.parse()?);
-        let mut r = snow::Builder::new(P.parse()?);
+        let i = snow::Builder::new(P.parse()?);
+        let r = snow::Builder::new(P.parse()?);
         let (ik, rk) = (i.generate_keypair()?, r.generate_keypair()?);
         let mut i = i.local_private_key(&ik.private)?.build_initiator()?;
         let mut r = r.local_private_key(&rk.private)?.build_responder()?;

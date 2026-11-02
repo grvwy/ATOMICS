@@ -5,11 +5,20 @@ cd "$(dirname "$0")"
 renderer=${1:?wgpu or glow}; extra=${2:-}
 features=$renderer${extra:+,$extra}
 env -u CARGO_MAKEFLAGS cargo build --release --target wasm32-unknown-unknown --no-default-features --features "$features" -j 2
-raw=target/wasm32-unknown-unknown/release/atomics_wasm_spike.wasm
+raw=${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/atomics_wasm_spike.wasm
 out=target/out-$renderer${extra:+-$extra}
 rm -rf "$out"
 wasm-bindgen --target web --no-typescript --out-dir "$out" "$raw"
-command -v wasm-opt >/dev/null && wasm-opt -Oz -o "$out/atomics_wasm_spike_bg.wasm" "$out/atomics_wasm_spike_bg.wasm"
+sizes() { # label file
+  local b=n/a
+  command -v brotli >/dev/null && b=$(brotli -c -q 11 "$2" | wc -c)
+  echo "$features $1 raw=$(stat -c%s "$2") gzip=$(gzip -9c "$2" | wc -c) brotli=$b"
+}
 w=$out/atomics_wasm_spike_bg.wasm
-echo "$features raw=$(stat -c%s "$w") gzip=$(gzip -9c "$w" | wc -c) brotli=$(brotli -c -q 11 "$w" | wc -c)"
+sizes bindgen "$w"
+if command -v wasm-opt >/dev/null; then
+  wasm-opt -Oz --all-features -o "$out/opt.wasm" "$w"
+  sizes wasm-opt "$out/opt.wasm"
+  mv "$out/opt.wasm" "$w"   # the served bundle is the optimised one
+fi
 rm -rf www/pkg && cp -r "$out" www/pkg

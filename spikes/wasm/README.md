@@ -3,13 +3,14 @@
 Standalone crate, outside the ATOMICS workspace. Answers: bundle size per renderer, `snow` on wasm32, and the
 iOS soft-keyboard question (egui text agent vs hidden `<textarea>`).
 
-**Status: written, not yet built or measured.** Builds were held until the host cooled down. The results table
-below is empty and the code has not been compiled, so expect small API fixes on the first build.
+**Status:** all four variants build for wasm32 (rustc 1.99.0, eframe 0.37.0, wasm-bindgen 0.2.130, binaryen 133, snow 0.10.0).
+Nothing has been run in a browser yet: the page and the `snow` handshake are unverified at runtime.
 
 ## Build (toolchain 1.99.0, `-j 2`)
 
-Needs `rustup target add wasm32-unknown-unknown`, `cargo install wasm-bindgen-cli` (same version as the
-`wasm-bindgen` in `Cargo.lock`), and optionally `wasm-opt` (binaryen) and `brotli`.
+Needs the wasm32 target, `cargo install wasm-bindgen-cli --version 0.2.130 --locked` (same version as the
+`wasm-bindgen` in `Cargo.lock`), and optionally `wasm-opt` (binaryen) and `brotli`. `.cargo/config.toml` sets the
+`getrandom_backend="wasm_js"` cfg that `snow` needs.
 
 ```
 ./build.sh wgpu          # eframe wgpu: WebGPU, WebGL2 fallback in one bundle
@@ -22,12 +23,19 @@ The page shows the `snow` handshake result in the egui window when built with `s
 
 ## Results
 
-| build | raw | gzip -9 | brotli -11 |
-|---|---|---|---|
-| wgpu | | | |
-| glow | | | |
-| wgpu + snow | | | |
-| glow + snow | | | |
+`.wasm` size in bytes, `opt-level = "s"`, LTO, `panic = "abort"`. `wasm-opt -Oz --all-features` is applied after
+wasm-bindgen. Brotli was not available in the VM (not measured).
+
+| build | raw | raw + wasm-opt | gzip -9 | gzip -9 + wasm-opt |
+|---|---|---|---|---|
+| wgpu (WebGPU + WebGL2) | 5,423,029 | 4,975,276 | 2,035,906 | 2,039,606 |
+| glow (WebGL2) | 3,340,268 | 3,063,804 | 1,284,384 | 1,281,741 |
+| wgpu + snow | 5,481,187 | 5,029,889 | 2,056,573 | 2,062,436 |
+| glow + snow | 3,398,461 | 3,118,417 | 1,305,483 | 1,304,465 |
+
+- **snow delta** (Noise_XX, X25519, ChaChaPoly, BLAKE2s, RustCrypto, no `ring`): +58 KB raw (+1.1% on wgpu, +1.7% on glow), about +20 KB gzip.
+- **wgpu vs glow:** glow is 38% smaller raw and 37% smaller gzipped (about 750 KB less over the wire).
+- **wasm-opt** saves 8-9% raw but nothing once gzipped (gzip +/- 0.2%), so it matters little for transfer.
 
 ## iPhone test
 
