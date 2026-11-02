@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ATOMICS soft-keyboard spike</title>
+<style>
+  body { margin: 0; font: 14px system-ui; background: #111; color: #ddd; }
+  nav { display: flex; gap: 8px; padding: 8px; }
+  nav a { color: #9f9; padding: 6px 10px; border: 1px solid #363; border-radius: 6px; text-decoration: none; }
+  nav a.on { background: #242; }
+  #egui { width: 100vw; height: 70vh; display: block; touch-action: none; }
+  #ta-page { padding: 8px; }
+  #term { position: relative; background: #000; color: #9f9; font: 16px ui-monospace, monospace;
+          height: 160px; padding: 6px; white-space: pre-wrap; overflow: auto; border: 1px solid #363; border-radius: 4px; }
+  /* Hidden but focusable: not display:none, or iOS will not raise the keyboard. */
+  #hidden-ta { position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; font-size: 16px; }
+  #log { font: 12px ui-monospace, monospace; white-space: pre-wrap; max-height: 25vh; overflow: auto; padding: 8px; }
+</style>
+</head>
+<body>
+<nav>
+  <a id="m-egui" href="?mode=egui">egui text agent</a>
+  <a id="m-ta" href="?mode=textarea">hidden &lt;textarea&gt;</a>
+</nav>
+<canvas id="egui" hidden></canvas>
+<div id="ta-page" hidden>
+  <div id="term" tabindex="-1">tap here, then type, dictate or compose
+<textarea id="hidden-ta" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" enterkeyhint="send"></textarea></div>
+</div>
+<div id="log"></div>
+<script type="module">
+  const mode = new URLSearchParams(location.search).get("mode") || "egui";
+  document.getElementById(mode === "egui" ? "m-egui" : "m-ta").classList.add("on");
+  const log = document.getElementById("log");
+  const say = (s) => { log.textContent += s + "\n"; log.scrollTop = log.scrollHeight; };
+  say(`ua: ${navigator.userAgent}`);
+  say(`secure context: ${isSecureContext}, WebGPU: ${"gpu" in navigator}`);
+
+  if (mode === "egui") {
+    const canvas = document.getElementById("egui");
+    canvas.hidden = false;
+    const { default: init, start } = await import("./pkg/atomics_wasm_spike.js");
+    await init();
+    try { await start("egui"); say("eframe started"); } catch (e) { say("eframe failed: " + e); }
+  } else {
+    document.getElementById("ta-page").hidden = false;
+    const term = document.getElementById("term");
+    const ta = document.getElementById("hidden-ta");
+    let screen = "", composing = false;
+    const draw = (pre = "") => { term.firstChild.nodeValue = "$ " + screen + pre + "█"; };
+    term.firstChild.nodeValue = "$ █";
+    term.addEventListener("click", () => ta.focus());
+    // What the host would get as terminal_input: committed text only. Reset the textarea after each commit so it stays empty.
+    const send = (t) => { if (t) { screen += t; say(`terminal_input ${JSON.stringify(t)}`); } draw(); };
+    ta.addEventListener("compositionstart", () => { composing = true; say("compositionstart"); });
+    ta.addEventListener("compositionupdate", (e) => { say(`compositionupdate ${JSON.stringify(e.data)}`); draw(e.data); });
+    ta.addEventListener("compositionend", (e) => { composing = false; say(`compositionend ${JSON.stringify(e.data)}`); send(e.data); ta.value = ""; });
+    ta.addEventListener("beforeinput", (e) => {
+      say(`beforeinput ${e.inputType} ${JSON.stringify(e.data)}`);
+      if (composing) return;
+      if (e.inputType === "deleteContentBackward") { screen = screen.slice(0, -1); draw(); e.preventDefault(); }
+      else if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") { send("\n"); e.preventDefault(); }
+      else if (e.inputType.startsWith("insert") && e.data) { send(e.data); e.preventDefault(); }
+    });
+    ta.addEventListener("keydown", (e) => say(`keydown ${e.key} code=${e.code}`));
+    ta.addEventListener("input", (e) => { if (!composing) ta.value = ""; });
+    if (window.visualViewport) {
+      visualViewport.addEventListener("resize", () => say(`visualViewport h=${Math.round(visualViewport.height)}`));
+    }
+  }
+</script>
+</body>
+</html>

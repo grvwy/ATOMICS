@@ -1,0 +1,34 @@
+# RELAY-11973 Phase 0 spike. Standalone: the empty [workspace] table keeps it out of the ATOMICS workspace.
+[workspace]
+
+[package]
+name = "atomics-wasm-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Exactly one renderer per build: `wgpu` (WebGPU, falls back to WebGL2) or `glow` (WebGL2 only).
+wgpu = ["eframe/wgpu"]
+glow = ["eframe/glow"]
+# Adds an in-memory Noise_XX handshake (snow, pure-Rust RustCrypto resolver) to measure the size delta.
+snow = ["dep:snow", "dep:getrandom"]
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver"], optional = true }
+# snow's rand_core 0.6 uses getrandom 0.2, which needs `js` on wasm32-unknown-unknown.
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
