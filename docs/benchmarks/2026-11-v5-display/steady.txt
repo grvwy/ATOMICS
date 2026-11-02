@@ -1,0 +1,16 @@
+== scroll-vsync: Apple M5 Max Metal IntegratedGpu AutoVsync, 6 windows, px [3024.0, 1834.0]
+   fps 119.2-120.0  interval p50 8.3  p95 8.4-8.5  p99 8.5-8.6 ms  >20ms 0-1  >34ms 0-1  cpu p50 1.2-1.3 p95 1.4-1.6 ms
+== scroll-novsync: Apple M5 Max Metal IntegratedGpu AutoNoVsync, 6 windows, px [3024.0, 1834.0]
+   fps 255.9-333.9  interval p50 1.7-3.3  p95 4.5-10.0  p99 9.1-10.6 ms  >20ms 0-8  >34ms 0-2  cpu p50 1.1-1.5 p95 1.3-1.9 ms
+== keystroke-vm: Apple M5 Max Metal IntegratedGpu AutoVsync, 6 windows, px [3024.0, 1834.0]
+   fps 43.3-111.0  interval p50 8.3-34.0  p95 8.8-36.3  p99 35.1-37.7 ms  >20ms 15-124  >34ms 14-109  cpu p50 1.3-2.3 p95 2.9-3.7 ms
+   echo probe n=24 p50 7.7 p95 9.2 max 10.9 ms
+== keystroke-local: Apple M5 Max Metal IntegratedGpu AutoVsync, 6 windows, px [3024.0, 1834.0]
+   fps 43.1-111.0  interval p50 8.3-34.3  p95 8.8-37.3  p99 36.2-38.0 ms  >20ms 14-118  >34ms 13-110  cpu p50 1.4-3.0 p95 3.2-4.6 ms
+   echo probe n=24 p50 7.4 p95 9.1 max 9.4 ms
+== pty-write-vm: Apple M5 Max Metal IntegratedGpu AutoVsync, 6 windows, px [3024.0, 1834.0]
+   fps 39.1-110.4  interval p50 8.3-34.3  p95 8.8-36.6  p99 35.3-37.2 ms  >20ms 15-126  >34ms 15-111  cpu p50 1.5-1.9 p95 1.8-3.7 ms
+   echo probe n=24 p50 35.0 p95 35.7 max 35.8 ms
+== pty-write-local: Apple M5 Max Metal IntegratedGpu AutoVsync, 6 windows, px [3024.0, 1834.0]
+   fps 38.9-110.2  interval p50 8.3-35.1  p95 8.5-36.1  p99 35.3-36.4 ms  >20ms 15-126  >34ms 15-115  cpu p50 1.6-2.2 p95 2.1-2.4 ms
+   echo probe n=24 p50 35.3 p95 35.8 max 35.9 ms

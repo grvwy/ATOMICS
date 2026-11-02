@@ -1,0 +1,6 @@
+local cat #1: n=300 p50=0.04 p90=0.05 p99=0.09 max=0.13 ms
+local cat #2: n=300 p50=0.04 p90=0.05 p99=0.08 max=0.09 ms
+wrapper atomics-vm-run cat #1: n=300 p50=0.51 p90=0.61 p99=0.84 max=0.88 ms
+wrapper atomics-vm-run cat #2: n=300 p50=0.51 p90=0.62 p99=0.91 max=2.02 ms
+plain ssh, OpenSSH defaults: n=300 p50=19.43 p90=28.41 p99=32.13 max=120.80 ms
+wrapper cat, 8 scroll.pl streams through ssh: n=300 p50=0.43 p90=0.67 p99=2.12 max=12.15 ms

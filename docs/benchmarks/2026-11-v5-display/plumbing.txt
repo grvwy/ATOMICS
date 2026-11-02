@@ -1,0 +1,27 @@
+v5 agent plumbing check, 2026-11-02, throwaway Lima VM atomics-v5 (test variant of nixosConfigurations.atomics-vm:
+shares limited to scratch folders, QA build of ATOMICS as the Mac executable, socket /tmp/atomics-v5qa/atomics.sock).
+No model turns: Claude and Codex were not signed in to the test VM; a live turn waits for atomics-onboard in `atomics`.
+
+limactl start (non-plain, guest agent from cidata, all port forwards ignored): READY in 17.5 s, exit 0
+check-atomics-vm.sh in the guest: both shares virtiofs at Mac paths (ro briefs, rw work), Linux atomics at the Mac
+  binary path, socket folder max 700, sshd StreamLocalBindUnlink yes, btrfs reflink, amd64 SQL Server 2022 ready: passed
+
+Isolated ATOMICS (QA queue) with the bundle's config.d.toml; tiles opened in a shared repo:
+  claude (bin/claude): Claude Code first-run screen in the tile; in the VM: cwd = the Mac folder, TERM/COLORTERM/
+    TERM_PROGRAM/COLORFGBG forwarded, no Mac PATH/relay/job server; --settings and --mcp-config JSON intact
+  codex (bin/codex): version probe through the wrapper "codex-cli 0.166.0" in 0.17 s -> launched with 8 hook events,
+    --no-daemon, hook command identical across panes, ATOMICS_HOOK_PANE=<its pane> in its environment in the VM
+  First run found a bug: the probe ran in ATOMICS's own folder (unshared) and failed -> codex without hooks.
+    Fixed: the probe runs in / (setup.rs, test version_probe_runs_in_the_root_folder).
+
+Hooks, each the agent's own command run in the VM with its environment and a synthetic payload, status via ctl:
+  claude: SessionStart -> context returned, starting -> idle; UserPromptSubmit -> working, last_prompt set; Stop -> turn done
+  codex:  SessionStart -> mapped (session id on the codex pane), idle; UserPromptSubmit -> working; Stop -> turn done
+  control: codex SessionStart without ATOMICS_HOOK_PANE -> phantom session ext:codex-without-pane outside ATOMICS
+MCP, each agent's own server command and env in the VM, JSON-RPC as the agent would:
+  claude and codex: tools [atomics_report, atomics_agent_ticket_get, atomics_agent_ticket_comment, atomics_mcp_connect];
+  atomics_report(done) -> "Reported. The orchestrator and the user can see it."
+Chief (show_chief): claude in the VM in the project folder, MCP --chief (36 tools), hooks --chief; argv 9 KB, inline
+In the VM, login shell: ATOMICS_SOCKET set; `atomics ctl list` over the forward 7 ms; `atomics queue --class test`
+  took a slot from the Mac's queue and ran in the VM
+Quitting ATOMICS ended the claude and codex processes in the VM.

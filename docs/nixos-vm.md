@@ -361,7 +361,8 @@ generated wrapper (a test VM with 14 vCPU and 24 GiB). The UI renders on Metal a
 refresh: 119–120 fps at 120 Hz while the diff scrolls and 8 tiles stream (frame p99 8.6 ms), and
 256–334 fps without vsync. A keystroke's echo is in a frame 7.7 ms p50 / 9.2 ms p95 after the key,
 against 7.4 / 9.1 ms for a tile on the Mac. The wrapper's PTY round trip is 0.51 ms p50; plain ssh with
-OpenSSH's defaults is 19.4 ms.
+OpenSSH's defaults is 19.4 ms. The results, the scene, the method and the raw runs are in
+[the v5 display benchmark](benchmarks/2026-11-v5-display/README.md).
 
 ## Verify in the booted guest
 

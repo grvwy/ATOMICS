@@ -10,7 +10,8 @@ to a scratch copy only.
 [the NixOS VM setup](../nixos-vm.md)). Measured again with the same scene, every tile running in the VM
 through the generated wrapper: 119–120 fps at 120 Hz on the built-in display, keystroke echo in a frame
 7.7 ms p50 / 9.2 ms p95, wrapper PTY round trip 0.51 ms p50 (summarised in
-[the NixOS VM setup](../nixos-vm.md#measured)). Building it changed three things this record
+[the NixOS VM setup](../nixos-vm.md#measured); the full record is
+[the v5 display benchmark](../benchmarks/2026-11-v5-display/README.md)). Building it changed three things this record
 assumed: Lima's plain mode drops mounts, so the guest leaves plain mode and runs Lima's guest agent;
 Lima's virtiofs tags are hashes, read from cidata; and Codex hooks get their pane from
 `ATOMICS_HOOK_PANE`, since their command must stay identical across panes and ancestry stops at ssh.
