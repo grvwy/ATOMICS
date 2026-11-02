@@ -81,6 +81,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `welcome` | Chosen version, capabilities, limits, epoch, client role and resume/reset decision. |
 | Client → host | `subscribe`, `unsubscribe` | Session screens, worktree diffs/files and plans of interest; visible/focused hints. |
 | Host → client | `state_snapshot` | Sessions, projects, plan summaries and pending approvals at a single event cursor. |
+| Host → client | `skipped` | An event cursor the client's `diff`/`plan` topics left out, so cursors stay consecutive. |
 | Host → client | `session_upsert`, `session_removed` | Stable session ID, agent, title, cwd, worktree, status, chief flag and task link. |
 | Client → host | `session_command` | Start, close, steer or open an editor; return `command_result` with delivery state. |
 | Client → host | `lease_acquire`, `lease_renew`, `lease_release` | Session ID, takeover or the lease's fencing token. |
@@ -203,14 +204,26 @@ port = 0                 # 0 picks a free port
 allowed_origins = []     # exact Origin values; a native client sends none
 ```
 
-- **Where it listens.** `127.0.0.1` only. On start the app writes `protocol.json` (`{url, token, pid}`, mode 0600) in its
-  state directory and removes it on exit; the token is new on every start and is never logged. The headless host
-  removes one an earlier run left behind as it starts, so with `[remote]` off no stale advert remains.
+- **Where it listens.** `127.0.0.1` only. On start the app writes `protocol.json` in its state directory (mode 0600):
+  `{url, token, pid, pid_start, started_at}`. The token is new on every start and is never logged; `pid_start` is the
+  process start time (clock ticks since boot, from `/proc`, on Linux) and `started_at` is Unix seconds. On exit the app
+  removes the file only if it still holds its token, since another app on the same state directory may have replaced
+  it. A client reads it with `atomics_core::advert::read`, which accepts it only while that pid is alive and, where
+  `pid_start` is known, still the same process; a file a crashed app left (or whose pid was recycled) is removed and
+  reported as stale. The headless host removes one an earlier run left behind as it starts, so with `[remote]` off no
+  stale advert remains.
 - **Upgrade.** Refused with 403/401/400 unless the `Host` header is the loopback address and port, any `Origin` is
   listed, `Authorization: Bearer <token>` matches (constant-time) and the client offers the `atomics.v1` subprotocol.
-  At most four clients at once.
+  At most four authenticated clients at once (503 beyond that).
+- **Before authentication.** A connection takes a place in a separate pre-auth pool (4) and claims a client place only
+  once its token is accepted, so peers that never authenticate cannot use up the real clients' places; past the pool,
+  connections are closed unread. The whole upgrade must finish within 5 s of accept, and every read is cut off at that
+  deadline, so a peer that trickles bytes is dropped like one that sends none. A local process that keeps the pool full
+  can still delay *new* connections; connected clients are unaffected, and the token is still required to get in.
 - **No locks across I/O.** The runtime thread publishes `Arc` projections (and the accepted diff content) and the
-  protocol thread only reads them; it never takes the `State` mutex. `hub.rs` turns published changes into numbered
+  protocol thread only reads them; it never takes the `State` mutex. Every runtime pass rebuilds the projections,
+  but a collection's revision moves only when its content does, so a pass with nothing new sends no event.
+  `hub.rs` turns published changes into numbered
   events and keeps a replay ring (200 events, 8 MiB, 5 minutes); its mutex guards memory only. Every socket has its own
   thread, so a socket write blocks nothing but that client. That thread waits on its socket and a wake pipe, and
   queueing anything for the client wakes it, so frames are sent as soon as they are queued.
@@ -223,17 +236,34 @@ allowed_origins = []     # exact Origin values; a native client sends none
 - **Bad input.** Malformed JSON, unknown kinds, a wrong major version, an oversize frame (over 256 KiB, refused before
   it is buffered) and binary frames get a typed `error` frame; oversize frames and a ninth error end the connection.
   An error `code` or lease `reason` a peer does not know (a newer minor version's) decodes as `unknown`.
-  A first message other than `hello` ends it. Idle clients are pinged every 25 s and dropped after 60 s of silence.
-- **Not yet.** Chunked transfers of the board and diffs (a board or diff over one frame fails with `oversize`),
-  `file_get` (answers `not_found`), and every mutation (H4). A removed diff is sent as a
-  `diff_summary` with no files and no base (a tombstone), and a vanished approval as `approval_resolved` with
-  `withdrawn`.
+  A first message other than `hello` ends it, and so does a `hello` the host cannot attach (the error carries the
+  reason's own code). Idle clients are pinged every 25 s and dropped after 60 s of silence.
+- **Large boards.** A `state_snapshot` that does not fit in a frame is sent in parts, the same way a large
+  `screen_snapshot` is: each part has `part {index, count}`, the same `cursor` and `revisions`, and a slice of the
+  collections (sessions, then plans, approvals, diffs). `Mirror` collects the parts and replaces the board only when it
+  holds all of them; a client must not show a partial board. The parts are queued together, so live events follow the
+  last one. Only a single session, plan, approval or diff summary over the frame limit still fails (`oversize`).
+- **Large diffs.** `diff_get` takes an optional `offset` (diff lines to skip, counted across the file's hunks).
+  `diff_file` holds as many lines as fit; when lines remain it has `truncated: true` and `next_offset`, which the client
+  sends back as `offset`. A hunk cut at a page boundary continues on the next page under the same header, its start
+  lines those of its first line, so a client appends the pages' hunks in order. Pass the `revision` on every page: a
+  change in between answers `stale_revision`. An `offset` past the end is `not_found`, and a single line over the
+  frame limit is refused (`oversize`).
+- **Topics.** `diff` and `plan` topics narrow the board's live updates, each kind on its own: a client that has
+  subscribed to no `diff` topic gets every worktree's `diff_summary`, and once it has subscribed to any it gets only
+  those worktrees'. Likewise `plan` topics for `plan_upsert`, `plan_removed` and `task_report`. Sessions and approvals
+  are never narrowed, and snapshots always carry everything. An event left out is sent as `skipped {cursor}` so cursors
+  stay consecutive (`Mirror` only advances), and the client's copy of that diff or plan goes stale. Widening the set
+  (adding a topic to a narrowed kind, or removing its last one) means the client missed events, so the host answers
+  with a fresh `state_snapshot`. A client that subscribes to nothing gets everything, as before topics existed.
+- **Not yet.** `file_get` (answers `not_found`) and every mutation (H4). A removed diff is sent as a `diff_summary`
+  with no files and no base (a tombstone), and a vanished approval as `approval_resolved` with `withdrawn`.
 
 ### Terminal screens
 
 Stream H2. A client that negotiated the `terminals` capability subscribes to `{"topic": "screen", "session", "focused"}`
 and gets a `screen_snapshot`, then `screen_delta`s. A `subscribe` is checked whole first (the capability, every
-screen's terminal, the subscription limit), so a refused one subscribes to nothing. The types and the reference client (`Screen`, `ScreenMirror`) are in
+screen's terminal, the subscription limit of 256 topics of every kind together), so a refused one subscribes to nothing. The types and the reference client (`Screen`, `ScreenMirror`) are in
 `atomics_core::screen`; the host side is `protocol/screens.rs` and `terminal/screen.rs`.
 
 - **Who copies.** The runtime thread only publishes which terminals exist (`Terminals`), and only while the server runs;

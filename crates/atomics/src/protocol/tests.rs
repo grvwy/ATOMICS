@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atomics_core::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
-use atomics_core::mirror::Mirror;
+use atomics_core::mirror::{Applied, Mirror};
 use atomics_core::plan::PlanStatus;
 use atomics_core::projection::{
     ApprovalInfo, DiffFileSummary, DiffSummary, PlanInfo, Projections, SessionInfo,
@@ -136,14 +136,15 @@ fn config() -> ServerConfig {
 struct Fixture {
     server: Server,
     projections: Arc<Projections>,
+    diffs: Arc<FakeDiffs>,
 }
 
 fn start_with(config: ServerConfig) -> Fixture {
     let projections = Arc::new(Projections::default());
     let diffs = Arc::new(FakeDiffs::default());
     diffs.0.lock().unwrap().insert("/w/a".into(), (1, file_diff()));
-    let server = Server::start(config, projections.clone(), diffs, Arc::new(Terminals::default())).unwrap();
-    Fixture { server, projections }
+    let server = Server::start(config, projections.clone(), diffs.clone(), Arc::new(Terminals::default())).unwrap();
+    Fixture { server, projections, diffs }
 }
 
 fn start() -> Fixture {
@@ -277,13 +278,21 @@ fn a_loopback_client_gets_the_board_and_a_diff() {
     assert_eq!(client.mirror.diffs["/w/a"].files[0].new_path.as_deref(), Some("a.rs"));
 
     client.send(
-        &Envelope::new(Message::DiffGet { worktree: "/w/a".into(), path: "a.rs".into(), revision: Some(Seq(1)) })
-            .reply_to(Some("r1".into())),
+        &Envelope::new(Message::DiffGet {
+            worktree: "/w/a".into(),
+            path: "a.rs".into(),
+            revision: Some(Seq(1)),
+            offset: None,
+        })
+        .reply_to(Some("r1".into())),
     );
     let reply = client.step().unwrap();
     assert_eq!(reply.request_id.as_deref(), Some("r1"));
-    let Message::DiffFile { body } = reply.message else { panic!("expected diff_file, got {:?}", reply.message) };
+    let Message::DiffFile { body, truncated, next_offset } = reply.message else {
+        panic!("expected diff_file, got {:?}", reply.message)
+    };
     assert_eq!((body.revision, body.file), (1, file_diff()));
+    assert_eq!((truncated, next_offset), (false, None), "a small file is one page");
 
     // A later change arrives as an event and the copy follows it.
     f.projections.publish_sessions(vec![session("a", "fix the parser", AgentStatus::Done)]);
@@ -297,8 +306,15 @@ fn a_stale_or_unknown_diff_request_is_an_error_not_silence() {
     let mut client = TestClient::connect(f.server.addr(), f.server.token());
     client.hello();
     client.sync_until(|m| m.cursor > 0);
-    for (path, revision, code) in [("a.rs", Some(Seq(9)), ErrorCode::StaleRevision), ("nope.rs", None, ErrorCode::NotFound)] {
-        client.send(&Envelope::new(Message::DiffGet { worktree: "/w/a".into(), path: path.into(), revision }));
+    for (path, revision, code) in
+        [("a.rs", Some(Seq(9)), ErrorCode::StaleRevision), ("nope.rs", None, ErrorCode::NotFound)]
+    {
+        client.send(&Envelope::new(Message::DiffGet {
+            worktree: "/w/a".into(),
+            path: path.into(),
+            revision,
+            offset: None,
+        }));
         let Message::Error { code: got, .. } = client.step().unwrap().message else { panic!("expected an error") };
         assert_eq!(got, code);
     }
@@ -314,7 +330,12 @@ fn a_diff_file_that_never_existed_counts_but_one_a_later_revision_dropped_does_n
     client.hello();
     client.sync_until(|m| m.cursor > 0);
     let get = |path: &str, revision: u64| {
-        Envelope::new(Message::DiffGet { worktree: "/w/a".into(), path: path.into(), revision: Some(Seq(revision)) })
+        Envelope::new(Message::DiffGet {
+            worktree: "/w/a".into(),
+            path: path.into(),
+            revision: Some(Seq(revision)),
+            offset: None,
+        })
     };
     // Told of at revision 0 and gone at revision 1: a race, however often it happens.
     for _ in 0..5 {
@@ -593,17 +614,17 @@ fn a_full_queue_drops_the_backlog_and_resyncs_with_a_snapshot() {
     }
     assert!(matches!(attached.outbox.take(), Taken::Lagged), "five events into a queue of two");
     hub.resync(&attached.outbox).unwrap();
-    let Taken::Frames(frames) = attached.outbox.take() else { panic!("resynced") };
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!("resynced") };
     assert_eq!(frames.len(), 1, "a snapshot replaces the backlog");
     let mut mirror = Mirror::default();
-    mirror.apply(&wire::decode(&frames[0]).unwrap()).unwrap();
+    mirror.apply(&wire::decode(&frames[0].text).unwrap()).unwrap();
     assert_eq!((mirror.cursor, mirror.sessions["a"].title.as_str()), (hub.head(), "t4"));
 
     // Events after the resync are delivered normally again.
     p.publish_sessions(vec![session("a", "t5", AgentStatus::Done)]);
     hub.poll(&p);
-    let Taken::Frames(frames) = attached.outbox.take() else { panic!("live again") };
-    mirror.apply(&wire::decode(&frames[0]).unwrap()).unwrap();
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!("live again") };
+    mirror.apply(&wire::decode(&frames[0].text).unwrap()).unwrap();
     assert_eq!(mirror.sessions["a"].title, "t5");
 }
 
@@ -614,17 +635,17 @@ fn removals_become_events_and_a_removed_diff_is_a_tombstone() {
     populate(&p);
     hub.poll(&p);
     let attached = hub.attach(None, None).unwrap();
-    let Taken::Frames(frames) = attached.outbox.take() else { panic!() };
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!() };
     let mut mirror = Mirror::default();
-    mirror.apply(&wire::decode(&frames[0]).unwrap()).unwrap();
+    mirror.apply(&wire::decode(&frames[0].text).unwrap()).unwrap();
     p.publish_sessions(Vec::new());
     p.publish_plans(Vec::new());
     p.publish_approvals(Vec::new());
     p.publish_diffs(Vec::new());
     hub.poll(&p);
-    let Taken::Frames(frames) = attached.outbox.take() else { panic!() };
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!() };
     for frame in frames {
-        mirror.apply(&wire::decode(&frame).unwrap()).unwrap();
+        mirror.apply(&wire::decode(&frame.text).unwrap()).unwrap();
     }
     assert!(board_matches(&mirror, &p));
     assert_eq!(mirror.cursor, hub.head());
@@ -675,8 +696,317 @@ fn the_advertisement_is_private_and_goes_away_with_the_server() {
     let advert: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(advert["token"], f.server.token());
     assert_eq!(advert["url"], format!("ws://{}", f.server.addr()));
+    assert_eq!(advert["pid"], std::process::id());
+    assert!(advert["started_at"].as_u64().unwrap() > 0);
+    if let Some(start) = atomics_core::advert::process_start(std::process::id()) {
+        assert_eq!(advert["pid_start"], start, "the start time tells this process from a later one with its pid");
+    }
+    assert!(atomics_core::advert::read(&path).is_ok(), "a client accepts the live file");
     let addr = f.server.addr();
     f.server.stop();
     assert!(!path.exists());
     assert!(TcpStream::connect(addr).is_err(), "the listener is closed");
+}
+
+fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while !check() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_connection_that_never_finishes_the_upgrade_is_cut_off_and_cannot_take_client_places() {
+    use std::io::Write;
+    let mut cfg = config();
+    cfg.upgrade_deadline = Duration::from_millis(700);
+    cfg.max_pre_auth = 2;
+    cfg.max_clients = 1;
+    let f = start_with(cfg);
+    populate(&f.projections);
+    let (addr, token) = (f.server.addr(), f.server.token().to_string());
+    let mut real = TestClient::connect(addr, &token);
+    real.hello();
+    real.sync_until(|m| board_matches(m, &f.projections) && m.cursor > 0);
+    eventually("the real client holds the only client place", || f.server.active_clients() == 1);
+
+    // One peer trickles a request a byte at a time, faster than any per-read timeout; one is silent.
+    let started = Instant::now();
+    let mut trickler = TcpStream::connect(addr).unwrap();
+    let silent = TcpStream::connect(addr).unwrap();
+    trickler.write_all(b"GET / HTTP/1.1\r\nX-Pad: ").unwrap();
+    let writer = {
+        let mut stream = trickler.try_clone().unwrap();
+        std::thread::spawn(move || {
+            while stream.write_all(b"a").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    eventually("both peers are counted as upgrading", || f.server.pending_upgrades() == 2);
+    assert_eq!(f.server.active_clients(), 1, "unauthenticated peers take no client place");
+
+    // The pre-auth places are full, so a third connection is refused outright...
+    assert!(TestClient::try_connect(addr, Some(&token), None, true).is_err());
+    // ...but the authenticated client is not affected.
+    f.projections.publish_sessions(vec![session("a", "still served", AgentStatus::Done)]);
+    real.sync_until(|m| board_matches(m, &f.projections));
+
+    // The total deadline ends both, the trickler included, and frees their places.
+    eventually("the upgrades were not cut off", || f.server.pending_upgrades() == 0);
+    assert!(started.elapsed() < wait(Duration::from_secs(5)), "cut off after {:?}", started.elapsed());
+    writer.join().unwrap(); // it stops when a write fails: the server closed the connection
+    drop((trickler, silent));
+
+    // An authenticated client over the client limit is refused with 503, and gives its pre-auth
+    // place back.
+    assert_eq!(status_of(TestClient::try_connect(addr, Some(&token), None, true).err().unwrap()), 503);
+    eventually("the refused upgrade left the pool", || f.server.pending_upgrades() == 0);
+    drop(real);
+    eventually("the client place is free again", || f.server.active_clients() == 0);
+    assert!(TestClient::try_connect(addr, Some(&token), None, true).is_ok());
+}
+
+fn populate_but_sessions(p: &Projections) {
+    p.publish_plans(vec![plan("p1", "ship it")]);
+    p.publish_approvals(vec![approval("x1")]);
+    p.publish_diffs(vec![summary("/w/a", 1)]);
+}
+
+#[test]
+fn a_board_over_one_frame_is_sent_in_parts_and_applied_whole() {
+    let f = start_with(config());
+    let title = "t".repeat(120);
+    let sessions: Vec<_> = (0..2500).map(|i| session(&format!("s{i:04}"), &title, AgentStatus::Idle)).collect();
+    let bytes: usize = sessions.iter().map(wire::json_len).sum();
+    assert!(bytes > 2 * wire::MAX_FRAME_BYTES, "the fixture must not fit in a frame ({bytes} bytes)");
+    f.projections.publish_sessions(sessions);
+    populate_but_sessions(&f.projections);
+
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    // However the hub met this client (a snapshot, or events it lagged behind and a resync), the
+    // board arrives as a snapshot in parts.
+    let mut parts = 0;
+    let deadline = Instant::now() + wait(Duration::from_secs(20));
+    while !board_matches(&client.mirror, &f.projections) {
+        assert!(Instant::now() < deadline, "the client did not catch up");
+        let envelope = client.next().expect("connected");
+        let before = client.mirror.sessions.clone();
+        let applied = client.mirror.apply(&envelope).unwrap_or_else(|gap| panic!("gap {gap:?}"));
+        if let Message::StateSnapshot { part: Some(part), .. } = &envelope.message {
+            parts += 1;
+            if part.index + 1 < part.count {
+                assert_eq!(applied, Applied::Partial);
+                assert_eq!(client.mirror.sessions, before, "the board changes only when the last part lands");
+            }
+        }
+    }
+    assert!(parts >= 3, "{parts} parts");
+    assert_eq!(client.mirror.sessions.len(), 2500);
+
+    // A client that asks for a resync gets parts again, and live events still follow them.
+    client.mirror.sessions.clear();
+    client.send(&Envelope::new(Message::Resync { reason: None, screens: Vec::new() }));
+    client.sync_until(|m| board_matches(m, &f.projections));
+    f.projections.publish_plans(vec![plan("p1", "after the parts")]);
+    client.sync_until(|m| board_matches(m, &f.projections));
+}
+
+#[test]
+fn snapshot_parts_respect_the_budget_and_one_oversize_item_is_an_error() {
+    let p = Projections::default();
+    populate(&p);
+    p.publish_sessions((0..40).map(|i| session(&format!("s{i}"), &"x".repeat(60), AgentStatus::Idle)).collect());
+    let mut hub = Hub::new("e1".into(), RingLimits::default(), 64, 1 << 20).with_frame_budget(2000);
+    hub.poll(&p);
+    let attached = hub.attach(None, None).unwrap();
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!() };
+    assert!(frames.len() > 2, "{} parts", frames.len());
+    let mut mirror = Mirror::default();
+    let welcome = Message::Welcome {
+        version: VERSION,
+        capabilities: vec![],
+        limits: wire::Limits::default(),
+        role: wire::Role::Viewer,
+        resume: attached.resume,
+    };
+    mirror.apply(&Envelope::host("e1", welcome)).unwrap();
+    for (i, frame) in frames.iter().enumerate() {
+        assert!(frame.text.len() <= 2000, "part {i} is {} bytes", frame.text.len());
+        let envelope = wire::decode(&frame.text).unwrap();
+        let Message::StateSnapshot { part: Some(part), .. } = &envelope.message else { panic!("part {i}") };
+        assert_eq!((part.index as usize, part.count as usize), (i, frames.len()));
+        let last = i + 1 == frames.len();
+        assert_eq!(mirror.apply(&envelope), Ok(if last { Applied::Changed } else { Applied::Partial }));
+    }
+    assert!(board_matches(&mirror, &p));
+
+    let mut tight = Hub::new("e1".into(), RingLimits::default(), 64, 1 << 20).with_frame_budget(600);
+    p.publish_sessions(vec![session("big", &"y".repeat(5000), AgentStatus::Idle)]);
+    tight.poll(&p);
+    let error = tight.attach(None, None).err().expect("one session cannot be cut");
+    assert_eq!(error.code, ErrorCode::Oversize);
+}
+
+#[test]
+fn a_reorder_alone_sends_no_event_but_the_next_snapshot_shows_it() {
+    let p = Projections::default();
+    let mut hub = hub(64);
+    p.publish_sessions(vec![session("a", "A", AgentStatus::Idle), session("b", "B", AgentStatus::Idle)]);
+    hub.poll(&p);
+    let head = hub.head();
+    p.publish_sessions(vec![session("b", "B", AgentStatus::Idle), session("a", "A", AgentStatus::Idle)]);
+    hub.poll(&p);
+    assert_eq!(hub.head(), head, "a reorder is not an event");
+    let attached = hub.attach(None, None).unwrap();
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!() };
+    let Message::StateSnapshot { sessions, revisions, .. } = wire::decode(&frames[0].text).unwrap().message else {
+        panic!("expected a snapshot")
+    };
+    assert_eq!(sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+    assert_eq!(revisions.sessions, Seq(2));
+}
+
+fn big_file() -> FileDiff {
+    let mut file = file_diff();
+    file.new_path = Some("big.rs".into());
+    file.hunks = (0..3)
+        .map(|h| Hunk {
+            header: format!("@@ -{0},1500 +{0},1500 @@", h * 1500 + 1),
+            old_start: h * 1500 + 1,
+            new_start: h * 1500 + 1,
+            lines: (0..1500)
+                .map(|i| DiffLine {
+                    kind: LineKind::Added,
+                    old_no: None,
+                    new_no: Some(h * 1500 + i + 1),
+                    text: format!("line {} {}", h * 1500 + i, "z".repeat(90)),
+                    emphasis: Vec::new(),
+                })
+                .collect(),
+        })
+        .collect();
+    file
+}
+
+#[test]
+fn a_diff_over_one_frame_comes_in_pages_that_add_up_to_the_file() {
+    let f = start();
+    let whole = big_file();
+    assert!(wire::json_len(&whole) > 2 * wire::MAX_FRAME_BYTES);
+    f.diffs.0.lock().unwrap().insert("/w/big".into(), (1, whole.clone()));
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.sync_until(|m| m.cursor > 0);
+
+    let get =
+        |offset| Message::DiffGet { worktree: "/w/big".into(), path: "big.rs".into(), revision: Some(Seq(1)), offset };
+    let (mut offset, mut pages, mut lines) = (None, 0, Vec::new());
+    loop {
+        client.send(&Envelope::new(get(offset)));
+        let Message::DiffFile { body, truncated, next_offset } = client.step().unwrap().message else {
+            panic!("expected a page")
+        };
+        pages += 1;
+        assert_eq!(truncated, next_offset.is_some());
+        for hunk in &body.file.hunks {
+            assert!(whole.hunks.iter().any(|w| w.header == hunk.header), "a continuation keeps its header");
+            assert_eq!(Some(hunk.new_start), hunk.lines[0].new_no, "and starts at its first line");
+            lines.extend(hunk.lines.iter().cloned());
+        }
+        match next_offset {
+            Some(next) => {
+                assert_eq!(next as usize, lines.len(), "the next page starts where this one stopped");
+                offset = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert!(pages >= 3, "{pages} pages");
+    let all: Vec<_> = whole.hunks.iter().flat_map(|h| h.lines.iter().cloned()).collect();
+    assert_eq!(lines, all, "the pages add up to the file, in order");
+
+    // Past the end is an error, not an empty page.
+    client.send(&Envelope::new(get(Some(4500))));
+    let Message::Error { code, .. } = client.step().unwrap().message else { panic!("expected an error") };
+    assert_eq!(code, ErrorCode::NotFound);
+}
+
+/// Read until the next board frame (an event, a `skipped` or a snapshot) and return it.
+fn next_board(client: &mut TestClient) -> Message {
+    loop {
+        let message = client.step().expect("connected").message;
+        if !matches!(message, Message::Ping { .. } | Message::Pong { .. }) {
+            return message;
+        }
+    }
+}
+
+/// Wait until the host has handled everything sent before.
+fn ping(client: &mut TestClient) {
+    client.send(&Envelope::new(Message::Ping { nonce: Some("sync".into()) }));
+    while !matches!(client.step().expect("connected").message, Message::Pong { .. }) {}
+}
+
+#[test]
+fn subscribing_narrows_diff_and_plan_updates_and_widening_resyncs() {
+    let f = start();
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.sync_until(|m| board_matches(m, &f.projections) && m.cursor > 0);
+
+    // With no subscription the client gets everything, as before.
+    f.projections.publish_diffs(vec![summary("/w/a", 1), summary("/w/b", 1)]);
+    client.sync_until(|m| m.diffs.contains_key("/w/b"));
+
+    // One diff topic: only that worktree's updates; the other's arrives as `skipped`, in order.
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Diff { worktree: "/w/a".into() }] }));
+    ping(&mut client);
+    f.projections.publish_diffs(vec![summary("/w/a", 2), summary("/w/b", 2)]);
+    assert!(matches!(next_board(&mut client), Message::DiffSummary { summary, .. } if summary.worktree == "/w/a"));
+    let Message::Skipped { cursor } = next_board(&mut client) else { panic!("the other worktree's update is skipped") };
+    assert_eq!(cursor, Seq(client.mirror.cursor), "a skipped event still advances the cursor");
+    assert_eq!((client.mirror.diffs["/w/a"].revision, client.mirror.diffs["/w/b"].revision), (2, 1));
+
+    // Plans narrow separately; sessions and approvals never do.
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Plan { id: "p1".into() }] }));
+    ping(&mut client);
+    f.projections.publish_plans(vec![plan("p1", "changed"), plan("p2", "new")]);
+    assert!(matches!(next_board(&mut client), Message::PlanUpsert { plan, .. } if plan.id == "p1"));
+    assert!(matches!(next_board(&mut client), Message::Skipped { .. }), "p2 is not wanted");
+    f.projections.publish_sessions(vec![session("a", "still delivered", AgentStatus::Done)]);
+    client.sync_until(|m| m.sessions["a"].status == AgentStatus::Done);
+    assert!(!client.mirror.plans.contains_key("p2"));
+
+    // Widening the set means events were missed, so the host sends a fresh snapshot.
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Plan { id: "p2".into() }] }));
+    assert!(matches!(next_board(&mut client), Message::StateSnapshot { .. }), "widening resyncs");
+    assert!(board_matches(&client.mirror, &f.projections), "and the snapshot carries everything");
+
+    // Dropping the last topic of a kind goes back to every item of it, which also resyncs.
+    client.send(&Envelope::new(Message::Unsubscribe { topics: vec![wire::Topic::Diff { worktree: "/w/a".into() }] }));
+    assert!(matches!(next_board(&mut client), Message::StateSnapshot { .. }));
+    f.projections.publish_diffs(vec![summary("/w/a", 3), summary("/w/b", 3)]);
+    client.sync_until(|m| board_matches(m, &f.projections));
+
+    // Narrowing alone sends nothing extra: the client already has everything it keeps.
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Diff { worktree: "/w/b".into() }] }));
+    ping(&mut client);
+    f.projections.publish_diffs(vec![summary("/w/a", 4), summary("/w/b", 4)]);
+    assert!(matches!(next_board(&mut client), Message::Skipped { .. }), "/w/a is left out now");
+    assert!(matches!(next_board(&mut client), Message::DiffSummary { summary, .. } if summary.revision == 4));
+}
+
+#[test]
+fn the_advertisement_a_stopped_server_removes_is_only_its_own() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let path = dir.path().join("protocol.json");
+    let mut f = start_with(ServerConfig { advertise: Some(path.clone()), ..config() });
+    // Another instance replaced the file after this one wrote it.
+    let theirs = atomics_core::advert::Advertisement::current("ws://127.0.0.1:9", "theirs");
+    std::fs::write(&path, serde_json::to_vec(&theirs).unwrap()).unwrap();
+    f.server.stop();
+    assert!(path.exists(), "a file that is not this server's stays");
 }

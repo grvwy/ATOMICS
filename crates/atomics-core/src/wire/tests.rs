@@ -150,7 +150,9 @@ fn every_message() -> Vec<Message> {
             plans: vec![plan()],
             approvals: vec![approval()],
             diffs: vec![summary()],
+            part: Some(Part { index: 1, count: 3 }),
         },
+        Message::Skipped { cursor: Seq(12) },
         Message::SessionUpsert { cursor: Seq(4), session: session() },
         Message::SessionRemoved { cursor: Seq(5), id: "s1".into() },
         Message::PlanUpsert { cursor: Seq(6), plan: plan() },
@@ -159,8 +161,8 @@ fn every_message() -> Vec<Message> {
         Message::ApprovalPending { cursor: Seq(9), approval: approval() },
         Message::ApprovalResolved { cursor: Seq(10), id: "a1".into(), disposition: Disposition::AllowedAlways },
         Message::DiffSummary { cursor: Seq(11), summary: summary() },
-        Message::DiffGet { worktree: "/w/a".into(), path: "x.rs".into(), revision: Some(Seq(4)) },
-        Message::DiffFile { body: file_body() },
+        Message::DiffGet { worktree: "/w/a".into(), path: "x.rs".into(), revision: Some(Seq(4)), offset: Some(120) },
+        Message::DiffFile { body: file_body(), truncated: true, next_offset: Some(240) },
         Message::FileGet { worktree: "/w/a".into(), path: "x.rs".into() },
         Message::FileContent {
             worktree: "/w/a".into(),
@@ -373,7 +375,8 @@ fn collection_and_identifier_bounds_are_enforced() {
     assert_eq!(decode(&frame).unwrap_err().code, ErrorCode::TooMany);
     let ok = vec![Topic::Plan { id: "p".into() }; MAX_SUBSCRIPTIONS];
     assert!(decode(&serde_json::to_string(&Envelope::new(Message::Subscribe { topics: ok })).unwrap()).is_ok());
-    let long = Message::DiffGet { worktree: "w".into(), path: "p".repeat(MAX_ID_BYTES + 1), revision: None };
+    let long =
+        Message::DiffGet { worktree: "w".into(), path: "p".repeat(MAX_ID_BYTES + 1), revision: None, offset: None };
     assert_eq!(decode(&serde_json::to_string(&Envelope::new(long)).unwrap()).unwrap_err().code, ErrorCode::Oversize);
     let mut envelope = Envelope::new(Message::Ping { nonce: None });
     envelope.request_id = Some("r".repeat(MAX_ID_BYTES + 1));
@@ -417,9 +420,10 @@ fn a_state_snapshot_carries_the_cursor_and_revisions_it_was_loaded_at() {
     let envelope = Envelope::snapshot("boot", &p.load());
     let decoded = decode(&encode(&envelope).unwrap()).unwrap();
     assert_eq!(decoded.epoch.as_deref(), Some("boot"));
-    let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs } = decoded.message else {
+    let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, part } = decoded.message else {
         panic!("snapshot")
     };
+    assert_eq!(part, None, "a board that fits is one frame");
     assert_eq!(cursor, Seq(5));
     assert_eq!(revisions, Revisions { sessions: Seq(2), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) });
     assert_eq!((sessions.len(), plans.len(), approvals.len(), diffs.len()), (0, 1, 1, 1));
@@ -451,8 +455,15 @@ fn mutated_frames_never_panic_and_accepted_ones_round_trip() {
             prior_epoch: Some("boot".into()),
             prior_cursor: Some(Seq(3)),
         }),
-        Envelope::new(Message::DiffGet { worktree: "/w".into(), path: "a.rs".into(), revision: Some(Seq(2)) }),
-        Envelope::new(Message::Subscribe { topics: vec![Topic::Diff { worktree: "/w".into() }, Topic::Plan { id: "p".into() }] }),
+        Envelope::new(Message::DiffGet {
+            worktree: "/w".into(),
+            path: "a.rs".into(),
+            revision: Some(Seq(2)),
+            offset: None,
+        }),
+        Envelope::new(Message::Subscribe {
+            topics: vec![Topic::Diff { worktree: "/w".into() }, Topic::Plan { id: "p".into() }],
+        }),
         Envelope::new(Message::Ping { nonce: Some("n".into()) }).reply_to(Some("r".into())),
     ]
     .iter()
@@ -564,4 +575,138 @@ fn input_frames_keep_their_bounds() {
     // Acquiring without `takeover` is the default: opening a screen never steals control.
     let frame = r#"{"v":{"major":1,"minor":0},"kind":"lease_acquire","session":"s"}"#;
     assert_eq!(decode(frame).unwrap().message, Message::LeaseAcquire { session: "s".into(), takeover: false });
+}
+
+/// A file of added lines numbered from 1 across `hunks` hunks of the given lengths.
+fn numbered_file(hunks: &[usize]) -> FileDiff {
+    use crate::diff::{DiffLine, LineKind};
+    let mut next = 1;
+    FileDiff {
+        old_path: None,
+        new_path: Some("n.rs".into()),
+        status: FileStatus::Added,
+        binary: false,
+        hunks: hunks
+            .iter()
+            .enumerate()
+            .map(|(h, count)| Hunk {
+                header: format!("@@ hunk {h} @@"),
+                old_start: 0,
+                new_start: next,
+                lines: (0..*count)
+                    .map(|_| {
+                        next += 1;
+                        DiffLine {
+                            kind: LineKind::Added,
+                            old_no: None,
+                            new_no: Some(next - 1),
+                            text: format!("line {}", next - 1),
+                            emphasis: vec![],
+                        }
+                    })
+                    .collect(),
+            })
+            .collect(),
+        omitted: 0,
+    }
+}
+
+#[test]
+fn diff_pages_cover_the_file_exactly_and_a_continuation_keeps_its_header() {
+    let file = numbered_file(&[7, 0, 9]);
+    assert_eq!(diff_page(&file, 0, usize::MAX).unwrap(), (file.clone(), None), "a roomy budget is one page");
+
+    let (mut offset, mut pages, mut seen, mut empty_hunks) = (0, 0, Vec::new(), 0);
+    loop {
+        let (page, next) = diff_page(&file, offset, 420).unwrap();
+        pages += 1;
+        let lines: usize = page.hunks.iter().map(|h| h.lines.len()).sum();
+        assert!(json_len(&page) <= 420 || lines == 1, "page {pages} is {} bytes", json_len(&page));
+        for hunk in &page.hunks {
+            let Some(first) = hunk.lines.first() else {
+                empty_hunks += 1;
+                continue;
+            };
+            assert_eq!(Some(hunk.new_start), first.new_no, "a hunk starts at its first line");
+            assert!(file.hunks.iter().any(|h| h.header == hunk.header), "a continuation keeps its header");
+            seen.extend(hunk.lines.iter().cloned());
+        }
+        match next {
+            Some(n) => {
+                assert!(n > offset, "every page makes progress");
+                assert_eq!(n, seen.len(), "the next page starts where this one stopped");
+                offset = n;
+            }
+            None => break,
+        }
+    }
+    assert!(pages > 2, "{pages} pages");
+    let all: Vec<_> = file.hunks.iter().flat_map(|h| h.lines.iter().cloned()).collect();
+    assert_eq!(seen, all, "the pages add up to the file, in order");
+    assert_eq!(empty_hunks, 1, "an empty hunk is on exactly one page");
+
+    // A continuation starts at its first line's numbers and keeps the original header.
+    let (page, _) = diff_page(&file, 3, usize::MAX).unwrap();
+    assert_eq!(
+        (page.hunks[0].header.as_str(), page.hunks[0].new_start, page.hunks[0].lines.len()),
+        ("@@ hunk 0 @@", 4, 4)
+    );
+    assert_eq!(diff_page(&file, 16, usize::MAX).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(diff_page(&numbered_file(&[]), 0, 10).unwrap().1, None, "an empty file is one empty page");
+}
+
+#[test]
+fn a_board_that_fits_is_one_snapshot_frame() {
+    let loaded = Projections::default().load();
+    let frames = snapshot_frames("e", &loaded, 4096).unwrap();
+    assert_eq!(frames.len(), 1);
+    let Message::StateSnapshot { part, .. } = decode(&frames[0]).unwrap().message else { panic!("a snapshot") };
+    assert_eq!(part, None);
+}
+
+#[test]
+fn a_board_over_the_budget_is_cut_into_numbered_parts_of_one_cursor() {
+    let p = Projections::default();
+    p.publish_sessions(
+        (0..40).map(|i| SessionInfo { id: format!("s{i}"), title: "t".repeat(60), ..session() }).collect(),
+    );
+    p.publish_plans(vec![plan()]);
+    p.publish_approvals(vec![approval()]);
+    p.publish_diffs(vec![summary()]);
+    let loaded = p.load();
+    let frames = snapshot_frames("e", &loaded, 2000).unwrap();
+    assert!(frames.len() > 2, "{} parts", frames.len());
+    let mut ids = Vec::new();
+    let mut rest = (0, 0, 0);
+    for (i, frame) in frames.iter().enumerate() {
+        assert!(frame.len() <= 2000, "part {i} is {} bytes", frame.len());
+        let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, part } =
+            decode(frame).unwrap().message
+        else {
+            panic!("a snapshot part")
+        };
+        assert_eq!(part, Some(Part { index: i as u16, count: frames.len() as u16 }));
+        assert_eq!(cursor, Seq(loaded.cursor));
+        assert_eq!(revisions.sessions, Seq(loaded.sessions.revision));
+        ids.extend(sessions.into_iter().map(|s| s.id));
+        rest = (rest.0 + plans.len(), rest.1 + approvals.len(), rest.2 + diffs.len());
+    }
+    let all: Vec<_> = loaded.sessions.data.iter().map(|s| s.id.clone()).collect();
+    assert_eq!(ids, all, "the parts hold every session once, in order");
+    assert_eq!(rest, (1, 1, 1));
+
+    // One item that cannot fit any part is refused, not cut.
+    p.publish_sessions(vec![SessionInfo { title: "y".repeat(5000), ..session() }]);
+    assert_eq!(snapshot_frames("e", &p.load(), 2000).unwrap_err().code, ErrorCode::Oversize);
+}
+
+#[test]
+fn a_snapshot_part_out_of_range_is_malformed() {
+    for part in [Part { index: 0, count: 0 }, Part { index: 2, count: 2 }] {
+        let mut envelope = Envelope::snapshot("e", &Projections::default().load());
+        let Message::StateSnapshot { part: slot, .. } = &mut envelope.message else { unreachable!() };
+        *slot = Some(part);
+        let frame = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(decode(&frame).unwrap_err().code, ErrorCode::Malformed, "{part:?}");
+    }
 }

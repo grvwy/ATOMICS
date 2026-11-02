@@ -1,8 +1,9 @@
 //! A client's copy of the host's board, kept current by applying `atomics.v1` messages in order.
 //!
-//! Browser-safe and I/O free. Events carry consecutive cursors; a snapshot replaces everything.
-//! A gap (a missing event, or an epoch that changed under a replay) is reported, never guessed
-//! over: the caller sends `resync` and applies the snapshot that answers.
+//! Browser-safe and I/O free. Events carry consecutive cursors; a snapshot replaces everything,
+//! and one sent in parts replaces it only once the last part is in. A gap (a missing event, or an
+//! epoch that changed under a replay) is reported, never guessed over: the caller sends `resync`
+//! and applies the snapshot that answers.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +26,8 @@ pub enum Applied {
     Changed,
     /// An event already applied (a replay overlapping a snapshot).
     Duplicate,
+    /// One part of a snapshot sent in parts; the board changes when the last part arrives.
+    Partial,
     /// A message that does not change the board.
     Ignored,
 }
@@ -39,6 +42,26 @@ pub struct Mirror {
     /// By worktree.
     pub diffs: BTreeMap<String, DiffSummary>,
     awaiting_snapshot: bool,
+    /// The parts of a snapshot received so far. Only one is ever kept: a part of another
+    /// snapshot starts over.
+    assembly: Option<Assembly>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Assembly {
+    epoch: Option<String>,
+    cursor: u64,
+    count: u16,
+    parts: BTreeMap<u16, Board>,
+}
+
+/// One snapshot's (or one part's) collections.
+#[derive(Debug, Clone, PartialEq)]
+struct Board {
+    sessions: Vec<SessionInfo>,
+    plans: Vec<PlanInfo>,
+    approvals: Vec<ApprovalInfo>,
+    diffs: Vec<DiffSummary>,
 }
 
 impl Mirror {
@@ -70,20 +93,51 @@ impl Mirror {
             return Err(Gap::Epoch);
         }
         let cursor = match &envelope.message {
-            Message::StateSnapshot { cursor, sessions, plans, approvals, diffs, .. } => {
+            Message::StateSnapshot { cursor, sessions, plans, approvals, diffs, part, .. } => {
+                let board = Board {
+                    sessions: sessions.clone(),
+                    plans: plans.clone(),
+                    approvals: approvals.clone(),
+                    diffs: diffs.clone(),
+                };
+                let parts = match part {
+                    None => {
+                        self.assembly = None;
+                        vec![board]
+                    }
+                    Some(part) if part.index >= part.count => return Ok(Applied::Ignored),
+                    Some(part) => {
+                        let key = (&envelope.epoch, cursor.0, part.count);
+                        if self.assembly.as_ref().is_none_or(|a| (&a.epoch, a.cursor, a.count) != key) {
+                            self.assembly = Some(Assembly {
+                                epoch: envelope.epoch.clone(),
+                                cursor: cursor.0,
+                                count: part.count,
+                                parts: BTreeMap::new(),
+                            });
+                        }
+                        let assembly = self.assembly.as_mut().expect("just set");
+                        assembly.parts.insert(part.index, board);
+                        if assembly.parts.len() < usize::from(assembly.count) {
+                            return Ok(Applied::Partial);
+                        }
+                        self.assembly.take().expect("complete").parts.into_values().collect()
+                    }
+                };
                 self.epoch = envelope.epoch.clone().or_else(|| self.epoch.take());
                 self.cursor = cursor.0;
                 self.awaiting_snapshot = false;
-                self.sessions = sessions.iter().map(|s| (s.id.clone(), s.clone())).collect();
-                self.plans = plans.iter().map(|p| (p.id.clone(), p.clone())).collect();
-                self.approvals = approvals.iter().map(|a| (a.id.clone(), a.clone())).collect();
-                self.diffs = diffs.iter().map(|d| (d.worktree.clone(), d.clone())).collect();
+                self.sessions = parts.iter().flat_map(|b| &b.sessions).map(|s| (s.id.clone(), s.clone())).collect();
+                self.plans = parts.iter().flat_map(|b| &b.plans).map(|p| (p.id.clone(), p.clone())).collect();
+                self.approvals = parts.iter().flat_map(|b| &b.approvals).map(|a| (a.id.clone(), a.clone())).collect();
+                self.diffs = parts.iter().flat_map(|b| &b.diffs).map(|d| (d.worktree.clone(), d.clone())).collect();
                 return Ok(Applied::Changed);
             }
             Message::SessionUpsert { cursor, .. }
             | Message::SessionRemoved { cursor, .. }
             | Message::PlanUpsert { cursor, .. }
             | Message::PlanRemoved { cursor, .. }
+            | Message::Skipped { cursor }
             | Message::TaskReport { cursor, .. }
             | Message::ApprovalPending { cursor, .. }
             | Message::ApprovalResolved { cursor, .. }
@@ -125,7 +179,8 @@ impl Mirror {
                     self.diffs.insert(summary.worktree.clone(), summary.clone());
                 }
             }
-            // A report is already inside the plan it belongs to; it only advances the cursor.
+            // A report is already inside the plan it belongs to, and a skipped event is one the
+            // client asked not to see: both only advance the cursor.
             _ => {}
         }
         self.cursor = cursor;
@@ -197,6 +252,61 @@ mod tests {
         assert_eq!(m.apply(&upsert(8, "b")), Err(Gap::NoSnapshot));
         m.apply(&snapshot()).unwrap();
         assert_eq!(m.apply(&upsert(2, "b")), Ok(Applied::Changed));
+    }
+
+    /// `snapshot()`'s board with one more session, cut into `count` parts holding one session each.
+    fn parts(cursor: u64) -> Vec<Envelope> {
+        let sessions = [session("a", AgentStatus::Done), session("b", AgentStatus::Idle)];
+        let count = sessions.len() as u16;
+        sessions
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                let mut envelope = snapshot();
+                let Message::StateSnapshot { cursor: c, sessions, part, .. } = &mut envelope.message else {
+                    unreachable!()
+                };
+                *c = Seq(cursor);
+                *sessions = vec![s.clone()];
+                *part = Some(crate::wire::Part { index: index as u16, count });
+                envelope
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_snapshot_in_parts_changes_the_board_only_when_the_last_part_lands() {
+        let mut m = Mirror::default();
+        m.apply(&snapshot()).unwrap();
+        let held = m.clone();
+        let [first, last] = <[Envelope; 2]>::try_from(parts(9)).unwrap();
+        assert_eq!(m.apply(&last), Ok(Applied::Partial), "parts may come in any order");
+        assert_eq!((&m.sessions, m.cursor), (&held.sessions, held.cursor), "nothing shows before the last part");
+        assert_eq!(m.apply(&first), Ok(Applied::Changed));
+        assert_eq!(m.cursor, 9);
+        assert_eq!(m.sessions.keys().collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(m.sessions["a"].status, AgentStatus::Done);
+
+        // A part of a newer snapshot abandons a half-received one.
+        let [stale, _] = <[Envelope; 2]>::try_from(parts(10)).unwrap();
+        let [_, newer] = <[Envelope; 2]>::try_from(parts(11)).unwrap();
+        assert_eq!(m.apply(&stale), Ok(Applied::Partial));
+        assert_eq!(m.apply(&newer), Ok(Applied::Partial), "one part of 11 does not complete 10");
+        assert_eq!(m.cursor, 9);
+    }
+
+    #[test]
+    fn a_skipped_event_only_advances_the_cursor() {
+        let mut m = Mirror::default();
+        m.apply(&snapshot()).unwrap();
+        let board = m.clone();
+        assert_eq!(m.apply(&Envelope::host("e", Message::Skipped { cursor: Seq(2) })), Ok(Applied::Changed));
+        assert_eq!((m.cursor, &m.sessions), (2, &board.sessions));
+        assert_eq!(
+            m.apply(&Envelope::host("e", Message::Skipped { cursor: Seq(4) })),
+            Err(Gap::Missing { have: 2, got: 4 })
+        );
+        assert_eq!(m.apply(&upsert(3, "b")), Ok(Applied::Changed));
     }
 
     #[test]

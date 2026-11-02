@@ -11,6 +11,8 @@ mod test_support;
 #[cfg(all(test, feature = "native"))]
 mod platform_tests;
 
+#[cfg(feature = "native")]
+pub mod advert;
 pub mod approvals;
 #[cfg(feature = "native")]
 pub mod cleanup;

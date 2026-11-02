@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atomics_core::wire::MAX_FRAME_BYTES;
 use tungstenite::protocol::WebSocketConfig;
@@ -59,12 +59,15 @@ impl Waker {
 }
 
 /// A loopback TCP stream whose reads, once `wait` is set, wait for data or a [`Waker`], whichever
-/// comes first. Before that (the upgrade) it reads as a plain blocking socket.
+/// comes first. Before that (the upgrade) it reads as a plain blocking socket, every read cut off
+/// at the `deadline`, so a peer that trickles bytes cannot hold the upgrade open past it any more
+/// than one that sends nothing.
 pub struct Stream {
     tcp: TcpStream,
     rx: UnixStream,
     waker: Arc<Waker>,
     wait: Option<Duration>,
+    deadline: Option<Instant>,
 }
 
 impl Stream {
@@ -72,7 +75,14 @@ impl Stream {
         let (tx, rx) = UnixStream::pair()?;
         tx.set_nonblocking(true)?;
         rx.set_nonblocking(true)?;
-        Ok(Self { tcp, rx, waker: Arc::new(Waker { tx, pending: AtomicBool::new(false) }), wait: None })
+        let waker = Arc::new(Waker { tx, pending: AtomicBool::new(false) });
+        Ok(Self { tcp, rx, waker, wait: None, deadline: None })
+    }
+
+    /// End every read of the upgrade at `deadline`: a read that would wait past it times out.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// Empty the pipe, then clear `pending`, in that order. While `pending` is set no waker
@@ -94,7 +104,16 @@ impl Stream {
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let Some(wait) = self.wait else { return self.tcp.read(buf) };
+        let Some(wait) = self.wait else {
+            if let Some(deadline) = self.deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                self.tcp.set_read_timeout(Some(left))?;
+            }
+            return self.tcp.read(buf);
+        };
         let mut fds = [
             libc::pollfd { fd: self.tcp.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: self.rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
@@ -162,7 +181,9 @@ fn map(error: tungstenite::Error) -> LinkError {
 }
 
 impl WsLink {
-    pub fn new(socket: WebSocket<Stream>, write_timeout: Duration) -> io::Result<Self> {
+    pub fn new(mut socket: WebSocket<Stream>, write_timeout: Duration) -> io::Result<Self> {
+        // Upgraded: from here reads wait as `recv` asks, and the upgrade's deadline is over.
+        socket.get_mut().deadline = None;
         socket.get_ref().tcp.set_write_timeout(Some(write_timeout))?;
         socket.get_ref().tcp.set_nodelay(true)?;
         Ok(Self { socket })
@@ -224,6 +245,30 @@ mod tests {
         let error = stream.read(&mut [0u8; 16]).expect_err("the peer never writes");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         started.elapsed() < limit
+    }
+
+    #[test]
+    fn an_upgrade_read_ends_at_the_deadline_however_the_peer_trickles() {
+        let (stream, mut peer) = stream();
+        let mut stream = stream.with_deadline(Instant::now() + Duration::from_millis(300));
+        let trickle = std::thread::spawn(move || {
+            // Faster than any per-read timeout would ever notice.
+            while peer.write_all(b"a").is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        let error = loop {
+            match stream.read(&mut [0u8; 1]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // a read that met the deadline
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5), "reads went on for {:?}", started.elapsed());
+        drop(stream);
+        trickle.join().unwrap();
     }
 
     #[test]

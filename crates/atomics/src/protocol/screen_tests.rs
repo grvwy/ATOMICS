@@ -337,13 +337,13 @@ fn a_backlog_of_deltas_is_replaced_by_one_current_snapshot() {
             })
             .collect()
     };
-    let Taken::Frames(frames) = outbox.take() else { panic!() };
+    let Taken::Frames { screens: frames, .. } = outbox.take() else { panic!() };
     assert_eq!(apply(frames, &mut mirror), ["snapshot"]);
 
     // A reader keeping up gets deltas.
     terminal.feed(b"one\r\n");
     screens.poll();
-    let Taken::Frames(frames) = outbox.take() else { panic!() };
+    let Taken::Frames { screens: frames, .. } = outbox.take() else { panic!() };
     assert_eq!(apply(frames, &mut mirror), ["delta"]);
 
     // One that does not keep up: more deltas than its slot holds.
@@ -351,14 +351,14 @@ fn a_backlog_of_deltas_is_replaced_by_one_current_snapshot() {
         terminal.feed(format!("busy {i}\r\n").as_bytes());
         screens.poll();
     }
-    let Taken::Frames(frames) = outbox.take() else { panic!() };
+    let Taken::Frames { screens: frames, .. } = outbox.take() else { panic!() };
     assert_eq!(apply(frames, &mut mirror), ["snapshot"], "superseded deltas are discarded");
     assert!(same_view(mirror.screen.as_ref().unwrap(), &truth(&terminal)));
 
     // And it follows with deltas again from that snapshot.
     terminal.feed(b"calm\r\n");
     screens.poll();
-    let Taken::Frames(frames) = outbox.take() else { panic!() };
+    let Taken::Frames { screens: frames, .. } = outbox.take() else { panic!() };
     assert_eq!(apply(frames, &mut mirror), ["delta"]);
     assert!(same_view(mirror.screen.as_ref().unwrap(), &truth(&terminal)));
 }
@@ -708,4 +708,43 @@ fn a_subscribe_list_is_checked_whole_before_anything_is_subscribed() {
     assert_eq!(viewer.snapshots, 0, "the screen listed before the refused one was not subscribed");
     viewer.subscribe("s1", true);
     viewer.until_shows("s1", &terminal);
+}
+
+#[test]
+fn one_subscription_limit_spans_screens_and_board_topics() {
+    let terminal = Detached::new(20, 4, 10);
+    terminal.feed(b"here");
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let mut viewer = Viewer::connect(&f);
+    // Board topics fill all places but one, and the screen takes that one.
+    let topic = |i: usize| match i % 2 {
+        0 => Topic::Plan { id: format!("p{i}") },
+        _ => Topic::Diff { worktree: format!("/w/{i}") },
+    };
+    let board: Vec<Topic> = (0..wire::MAX_SUBSCRIPTIONS - 1).map(topic).collect();
+    viewer.client.send(&Envelope::new(Message::Subscribe { topics: board }));
+    viewer.subscribe("s1", true);
+    viewer.until_shows("s1", &terminal);
+    assert!(viewer.errors.is_empty(), "{:?}", viewer.messages);
+
+    // Full, whatever the kind of the topic asked for; following the screen again takes no place.
+    let one_more = || Message::Subscribe { topics: vec![Topic::Plan { id: "one more".into() }] };
+    viewer.client.send(&Envelope::new(one_more()));
+    viewer.until(|v| !v.errors.is_empty());
+    assert_eq!(viewer.errors[0].0, ErrorCode::TooMany);
+    viewer.subscribe("s1", false);
+
+    // Leaving the screen frees its place for a board topic.
+    let screen = vec![Topic::Screen { session: "s1".into(), focused: false }];
+    viewer.client.send(&Envelope::new(Message::Unsubscribe { topics: screen }));
+    viewer.client.send(&Envelope::new(one_more()));
+    viewer.client.send(&Envelope::new(Message::Ping { nonce: Some("after".into()) }));
+    loop {
+        match viewer.client.step().expect("connected").message {
+            Message::Pong { .. } => break,
+            Message::Error { code, message } => panic!("refused {code:?}: {message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(viewer.errors.len(), 1, "only the subscription over the limit was refused");
 }
