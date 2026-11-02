@@ -49,7 +49,7 @@ pub(super) struct Tickets {
     /// The effective `[tickets]`: the workspace file's, else the main config's.
     pub(super) config: Option<Arc<TicketConfig>>,
     /// The workspace file and its content's fingerprint when last read.
-    workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
+    pub(super) workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
     workspace_workflow: Option<atomics_core::workflow::Workflow>,
     /// The workspace file's `[isolation]`, merged over the main and host config's as it is read.

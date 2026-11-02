@@ -174,8 +174,8 @@ pub(super) struct TicketsPanel {
     pub tab: Option<usize>,
     /// The filter chips switched on, by their index in `[[tickets.filters]]`.
     pub chips: std::collections::BTreeSet<usize>,
-    /// The read an `atomics://open` link waits for: its job number.
-    pub(super) open_link: Option<u64>,
+    /// The read an `atomics://open` link waits for: its job number, and the bare key the card must name.
+    pub(super) open_link: Option<(u64, Option<String>)>,
     /// A ticket was opened: the panel takes the keys on the next frame.
     focus: bool,
     pub(super) seq: u64,
@@ -791,9 +791,9 @@ impl State {
                     _ => read.error = Some("unexpected ticket result".into()),
                 }
             }
-            Job::Link if panel.open_link == Some(seq) => {
-                panel.open_link = None;
-                self.link_card_read(result);
+            Job::Link if panel.open_link.as_ref().is_some_and(|(wait, _)| *wait == seq) => {
+                let confirm = panel.open_link.take().and_then(|(_, key)| key);
+                self.link_card_read(result, confirm);
             }
             _ => {}
         }
@@ -3236,6 +3236,53 @@ mod tests {
                 app.runtime.apply_ticket_config();
                 assert!(open(app, "DEMO-1", None).is_err());
                 assert!(toasted(app).contains("not configured"), "{}", toasted(app));
+            },
+        );
+    }
+
+    #[test]
+    fn a_ticket_key_the_read_does_not_confirm_drafts_nothing() {
+        with_app("app::tickets_panel::tests::a_ticket_key_the_read_does_not_confirm_drafts_nothing", |app, _| {
+            quiet_chief(app);
+            let card = |key: &str| {
+                let link = TicketLink { id: key.into(), key: Some(key.into()), ..Default::default() };
+                Ok(TicketOutput::Card(Box::new(TicketCard { link, ..Default::default() })))
+            };
+            app.runtime.link_card_read(card("DEMO-2"), Some("DEMO-1".into()));
+            assert_eq!(toasted(app), "No such ticket");
+            assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
+            // The same key in another case is the ticket; an address was resolved by the profile already.
+            app.runtime.link_card_read(card("DEMO-1"), Some("demo-1".into()));
+            assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-1"));
+            app.runtime.link_card_read(card("DEMO-3"), None);
+            assert_eq!(app.runtime.chief_draft.as_deref(), Some("Plan DEMO-3"));
+        });
+    }
+
+    #[test]
+    fn a_cold_link_waits_for_the_sign_in_state_instead_of_toasting_early() {
+        with_app(
+            "app::tickets_panel::tests::a_cold_link_waits_for_the_sign_in_state_instead_of_toasting_early",
+            |app, ctx| {
+                let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+                let mut config: TicketConfig = toml::from_str("system = \"echo\"").unwrap();
+                config.server.url = Some("https://tickets.example/mcp".into());
+                config.server.oauth = true;
+                app.runtime.config.tickets = config;
+                app.runtime.apply_ticket_config();
+                app.runtime.tickets.sign.override_oauth(oauth);
+                app.runtime.pending_link =
+                    Some(Ok(crate::open_link::OpenLink { ticket: Some("DEMO-1".into()), ..Default::default() }));
+
+                assert!(!app.runtime.ticket_state_known());
+                app.runtime.runtime_tick(ctx);
+                assert!(app.runtime.pending_link.is_some(), "the link was handled before the state was known");
+                assert!(!toasted(app).contains("Sign in"), "{}", toasted(app));
+
+                assert!(app.runtime.ticket_state_known());
+                app.runtime.runtime_tick(ctx);
+                assert!(app.runtime.pending_link.is_none());
+                assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
             },
         );
     }

@@ -10,6 +10,8 @@ mod connections;
 mod crash;
 mod credentials;
 mod diff_view;
+mod markdown;
+mod panel_nav;
 mod diff_worker;
 mod doctor;
 mod github;
@@ -19,11 +21,9 @@ mod hook_client;
 mod host;
 mod ipc;
 mod lifecycle;
-mod markdown;
 mod mcp;
 mod mcp_client;
 mod open_link;
-mod panel_nav;
 mod ref_guard;
 mod relay;
 mod restart;
@@ -298,10 +298,9 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        Some(Command::Tickets { command }) => std::process::exit(ticket_signin::run_cli(
-            matches!(command, TicketsCommand::Login),
-            cli.workspace.as_deref(),
-        )),
+        Some(Command::Tickets { command }) => {
+            std::process::exit(ticket_signin::run_cli(matches!(command, TicketsCommand::Login), cli.workspace.as_deref()))
+        }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane, chief }) => {
             hook_client::run(socket, pane, chief);
@@ -416,6 +415,9 @@ fn main() -> eframe::Result {
             descriptor
         });
     }
+    // Before the event loop: the Apple event that launches the app may arrive before the window exists.
+    #[cfg(target_os = "macos")]
+    open_link::macos::register();
     eframe::run_native("ATOMICS", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options, &icon)))))
 }
 

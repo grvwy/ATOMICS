@@ -37,11 +37,14 @@ impl State {
         if self.plan_needs_sign_in(&config) {
             return Err(format!("Sign in to {system} first"));
         }
+        // A bare key is only trusted once the read confirms it; an address names its ticket itself.
+        let mut confirm = None;
         let ticket = if reference.contains("://") {
             config.link_from_url(&reference).ok_or_else(|| format!("That address is not a {system} ticket"))?
         } else if reference.chars().any(|c| c.is_whitespace() || "/\\?&#".contains(c)) || reference.len() > 128 {
             return Err(format!("That is not a {system} ticket key"));
         } else {
+            confirm = Some(reference.clone());
             TicketLink {
                 system: config.system.clone(),
                 id: reference.clone(),
@@ -65,10 +68,16 @@ impl State {
         let panel = &mut self.tickets.panel;
         panel.seq += 1;
         let seq = panel.seq;
-        panel.open_link = Some(seq);
+        panel.open_link = Some((seq, confirm));
         let tag = self.panel_tag(&config, super::tickets_panel::Job::Link, seq);
         self.send_ticket(&config, TicketOp::ReadCard(ticket), tag);
         Ok(())
+    }
+
+    /// Whether the ticket config is applied and, for a server that signs in, its sign-in state read.
+    /// A link waits for both: before them, "not configured" and "sign in" would be guesses.
+    pub(super) fn ticket_state_known(&self) -> bool {
+        self.tickets.workspace_file.is_some() && (self.sign_server().is_none() || self.tickets.sign.state().is_some())
     }
 
     fn show_plan_at(&mut self, index: usize) {
@@ -77,8 +86,13 @@ impl State {
     }
 
     /// The answer to the read a link started: the draft "Plan KEY: title" for the chief.
-    pub(super) fn link_card_read(&mut self, result: Result<TicketOutput, (bool, String)>) {
+    pub(super) fn link_card_read(&mut self, result: Result<TicketOutput, (bool, String)>, confirm: Option<String>) {
         match result {
+            Ok(TicketOutput::Card(card))
+                if confirm.is_some_and(|wanted| !card.link.label().eq_ignore_ascii_case(&wanted)) =>
+            {
+                self.toast("No such ticket");
+            }
             Ok(TicketOutput::Card(card)) => {
                 let cleaner = self.cleaner();
                 let key = cleaner.field(card.link.label());

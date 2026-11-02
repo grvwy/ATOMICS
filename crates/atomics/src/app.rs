@@ -579,7 +579,7 @@ pub(crate) struct State {
     watch_tx: crate::host::Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
-    /// A link the launch was given, opened on the first tick after loading.
+    /// A link the launch was given, or macOS delivered, opened once the ticket state is known.
     pending_link: Option<crate::open_link::Incoming>,
     /// Text for the chief's prompt that is typed but never sent, once the chief is up.
     chief_draft: Option<String>,
@@ -792,9 +792,8 @@ impl App {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
-        // After launch, so this handler replaces the system's for links the Dock and Finder send.
         #[cfg(target_os = "macos")]
-        crate::open_link::macos::register(&cc.egui_ctx);
+        crate::open_link::macos::wake_with(&cc.egui_ctx);
         let client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
         Self { host: state.into_host(), client, replies: Vec::new() }
