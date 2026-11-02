@@ -68,6 +68,9 @@
   const asked = new URLSearchParams(location.search).get("input");
   const input = PATHS.includes(asked) ? asked : "agent";
   const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  // Every iOS browser is WebKit, but they differ (e.g. Chrome resizes the layout viewport for the keyboard).
+  const ua = navigator.userAgent;
+  const browser = standalone ? "pwa" : /CriOS/.test(ua) ? "chrome" : /FxiOS/.test(ua) ? "firefox" : /EdgiOS/.test(ua) ? "edge" : "safari";
   document.querySelector(`nav a[data-input="${input}"]`).classList.add("on");
 
   const canvas = document.getElementById("egui");
@@ -104,7 +107,7 @@
   addEventListener("unhandledrejection", (e) => say("page", `unhandled rejection ${e.reason}`));
 
   say("page", `ua ${navigator.userAgent}`);
-  say("page", `input=${input} standalone=${standalone} secure=${isSecureContext} dpr=${devicePixelRatio} `
+  say("page", `input=${input} browser=${browser} standalone=${standalone} secure=${isSecureContext} dpr=${devicePixelRatio} `
     + `screen=${screen.width}x${screen.height} inner=${innerWidth}x${innerHeight}`);
 
   // ---- every DOM input event, whoever receives it (capture on document, before the targets' own handlers)
@@ -196,7 +199,7 @@
   });
   document.getElementById("send").addEventListener("click", async () => {
     try {
-      const res = await fetch("log", { method: "POST", headers: { "X-Spike-Tag": `${input}-${standalone ? "pwa" : "safari"}` }, body: report() });
+      const res = await fetch("log", { method: "POST", headers: { "X-Spike-Tag": `${input}-${browser}` }, body: report() });
       say("page", res.ok ? `log sent: ${await res.text()}` : `send failed: HTTP ${res.status}`);
     } catch (e) { say("page", `send failed: ${e}`); }
   });
