@@ -31,6 +31,7 @@ pub mod mcp_import;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod projection;
 pub mod remote;
 pub mod repo_workflow;
 pub mod selfconfig;
@@ -43,5 +44,6 @@ pub mod trace;
 pub mod usage;
 #[cfg(feature = "native")]
 pub mod voice;
+pub mod wire;
 pub mod workflow;
 pub mod workspace;

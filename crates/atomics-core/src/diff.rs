@@ -4,6 +4,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 
 #[derive(Debug, Clone, Default)]
@@ -16,7 +17,8 @@ pub struct WorktreeDiff {
     pub partial: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FileStatus {
     Added,
     Deleted,
@@ -25,7 +27,7 @@ pub enum FileStatus {
     Untracked,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDiff {
     pub old_path: Option<String>,
     pub new_path: Option<String>,
@@ -36,7 +38,7 @@ pub struct FileDiff {
     pub omitted: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hunk {
     pub header: String,
     pub old_start: u32,
@@ -44,7 +46,8 @@ pub struct Hunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LineKind {
     Context,
     Added,
@@ -53,7 +56,7 @@ pub enum LineKind {
     Note,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,

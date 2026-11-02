@@ -52,6 +52,7 @@ mod integrations;
 mod plan_cleanup;
 mod plan_view;
 mod plans;
+pub(crate) mod projection;
 mod projects;
 mod ref_guard;
 mod remote;

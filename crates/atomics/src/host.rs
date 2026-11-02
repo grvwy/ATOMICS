@@ -7,8 +7,10 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::app::State;
+use crate::app::projection::DiffSummaries;
 use crate::ipc::{ControlMessage, ControlOutcome};
 use atomics_core::control::ControlRequest;
+use atomics_core::projection::Projections;
 
 /// Owns runtime state and the thread that services it. The desktop is an
 /// in-process client; closing the whole application still shuts down the host.
@@ -18,16 +20,19 @@ pub struct Host {
     stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     commands: Sender<ControlMessage>,
+    projections: Arc<Projections>,
 }
 
 impl Host {
     pub(crate) fn start(state: State, wake: Wake, ctx: egui::Context, commands: Sender<ControlMessage>) -> Self {
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
-        let (runtime, signal, stop) = (state.clone(), wake.clone(), stopped.clone());
+        let projections = Arc::new(Projections::default());
+        let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
         let thread = std::thread::Builder::new()
             .name("atomics-runtime".into())
             .spawn(move || {
+                let mut summaries = DiffSummaries::default();
                 while !stop.load(Ordering::Acquire) {
                     let deadline = {
                         let mut state = runtime.lock().unwrap();
@@ -37,19 +42,26 @@ impl Host {
                         if let Some(delay) = state.take_output_delay() {
                             ctx.request_repaint_after(delay);
                         }
+                        state.publish_projections(&published, &mut summaries);
                         state.runtime_deadline()
                     };
                     signal.wait_until(deadline);
                 }
             })
             .expect("runtime thread");
-        Self { state, wake, stopped, thread: Some(thread), commands }
+        Self { state, wake, stopped, thread: Some(thread), commands, projections }
     }
 
     /// Borrow the in-process native model. Desktop actions are sent to the host
     /// queue; this guard never services runtime work or waits for a command.
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap()
+    }
+
+    /// The published projections. Readers load `Arc` snapshots; none of this takes the `State` lock.
+    #[allow(dead_code)] // Read by the protocol server thread (H1b).
+    pub fn projections(&self) -> Arc<Projections> {
+        self.projections.clone()
     }
 
     pub fn wake(&self) {
