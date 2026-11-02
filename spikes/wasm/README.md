@@ -4,11 +4,14 @@ Standalone crate, outside the ATOMICS workspace. Answers: bundle size per render
 iOS soft-keyboard question (egui text agent vs hidden `<textarea>`).
 
 **Status:** all four variants build for wasm32 (rustc 1.99.0, eframe 0.37.0, wasm-bindgen 0.2.130, binaryen 133, snow 0.10.0).
-Nothing has been run in a browser yet: the page and the `snow` handshake are unverified at runtime.
+The lock now pins wasm-bindgen 0.2.129 (js-sys/web-sys 0.3.106) to match the CLI on the test machine; the sizes
+below were measured with 0.2.130.
+The `snow` handshake is unverified at runtime. The iPhone test (below) is done: path **b**, the `<textarea>`
+overlay, passed in iOS Safari, iOS Chrome and the installed PWA, and is the chosen input path (design §4.4).
 
-## Build (toolchain 1.99.0, `-j 2`)
+## Build (toolchain 1.99.0, `-j ${JOBS:-2}`)
 
-Needs the wasm32 target, `cargo install wasm-bindgen-cli --version 0.2.130 --locked` (same version as the
+Needs the wasm32 target, `cargo install wasm-bindgen-cli --version 0.2.129 --locked` (same version as the
 `wasm-bindgen` in `Cargo.lock`), and optionally `wasm-opt` (binaryen) and `brotli`. `.cargo/config.toml` sets the
 `getrandom_backend="wasm_js"` cfg that `snow` needs.
 
@@ -37,28 +40,50 @@ wasm-bindgen. Brotli was not available in the VM (not measured).
 - **wgpu vs glow:** glow is 38% smaller raw and 37% smaller gzipped (about 750 KB less over the wire).
 - **wasm-opt** saves 8-9% raw but nothing once gzipped (gzip +/- 0.2%), so it matters little for transfer.
 
-## iPhone test
+## iPhone test (design §4.4)
 
-Serve on the desktop (or the sandbox host): `PORT=8080 ./serve.sh`, then open `http://<tailnet-ip>:8080/` in
-Safari on the iPhone. Over plain http `navigator.gpu` is absent (not a secure context), so the page uses
-WebGL2 even in the wgpu build. For WebGPU use `tailscale serve --https=443 localhost:8080` and open the
-`https://<host>.<tailnet>.ts.net/` URL (iOS 26+ for WebGPU).
+One page, one egui terminal widget, three input paths (links at the top):
 
-Build `./build.sh glow` or `wgpu` first. The page has two modes (top links). The debug log at the bottom
-records every event, with the user agent on its first line. In each mode try the same steps and note the result:
+- **a: agent** - eframe's hidden text input as shipped (it sets only `autocapitalize="off"`).
+- **a+: agent, autocorrect off** - the same input with `autocorrect`, `autocomplete` and `spellcheck` turned off by the
+  page after eframe starts.
+- **b: textarea** - a transparent native `<textarea>` over the terminal. It forwards committed text, composition
+  (as preedit) and Backspace/Return to the app, and keeps itself empty.
 
-1. **Tap the black terminal box.** Does the keyboard come up? Does the page jump or zoom?
-2. **Type** `hello world` on the soft keyboard. Is each letter received once? Is the first letter capitalised
-   (it should not be), and are there autocorrect or smart-punctuation changes (`"`, `--`)?
-3. **Backspace** twice, then **Return**.
-4. **Predictive text:** tap a suggestion in the bar above the keyboard. Does the word arrive once, with no doubled space?
-5. **IME:** switch to the Japanese (Kana) or Chinese (Pinyin) keyboard, type `nihon` / `ni`, watch the
-   underlined composition, then pick a candidate. The log should show preedit then one commit.
-6. **Dictation:** tap the mic key and say a sentence. Does the text arrive, and in what events?
-7. **Hold a key** for the accented-letter popup (hold `e`, pick `é`).
-8. **Paste** (long-press the box if it offers it, or paste from the keyboard's clipboard bar).
-9. **Dismiss and reopen** the keyboard (tap elsewhere, then the box). Rotate the phone with the keyboard up.
-10. In the egui mode, also try the **TextEdit baseline** tab (a stock egui text field) and compare with the terminal widget.
+The key bar (Esc, Tab, sticky Ctrl, arrows) follows `visualViewport`, so it should sit on the soft keyboard. The
+log under the terminal shows every event, newest first: `dom` (key, beforeinput, input, composition, focus,
+gesture), `vv` (visualViewport and window resize/scroll), `egui` (what egui received), `ta` (what the textarea
+path forwarded), `bar`, and `pty` (the bytes the host would get as `terminal_input`). **send** saves the whole log
+on the serving machine in `logs/` (not committed); **copy** puts it on the clipboard; **mark** adds a separator.
 
-Send back: the iOS version, the mode that worked better, and anything from steps 1-10 that failed. The go/no-go
-(egui text agent vs `<textarea>`) is pending that result.
+Build (`./build.sh glow`; the renderer does not matter here), then serve on the tailnet only, never publicly:
+
+```
+./serve.py                                     # 127.0.0.1:8080
+tailscale serve --bg --https=<port> http://127.0.0.1:8080
+```
+
+and open `https://<host>.<tailnet>.ts.net:<port>/`. Without tailnet HTTPS, `HOST=<tailnet-ip> ./serve.py` and
+open `http://<tailnet-ip>:8080/` (copy then needs a secure context; send still works). To install the PWA: Share,
+Add to Home Screen, open it from the icon.
+
+### Checklist
+
+Runs: Safari **a**, **a+**, **b**; then the installed PWA **a+** and **b**. In each run, tap **mark** before every
+step and **send** at the end. Note the iOS version and, per step, pass or what went wrong.
+
+1. **Focus:** tap the black terminal. The keyboard comes up; the page does not jump or zoom.
+2. **Autocorrect and autocapitalise off:** type `hello wrold teh i "x" -- y` and a space. The terminal shows exactly
+   that: lowercase `h` and `i`, no corrections, straight quotes, `--` not a dash.
+3. **Backspace and Return:** tap Backspace three times (three DELs), hold it two seconds (repeats), then Return.
+4. **Swedish and emoji:** on the Swedish keyboard type `åäö ÅÄÖ`; on the English one long-press `a` for `å`; then
+   emoji `👍 👍🏽 👨‍👩‍👧`. Each arrives once; `å` is `U+00E5` (not `a` + `U+030A`); each emoji is one unbroken
+   sequence. Optional, for real composition: Japanese Romaji `nihon` → 日本 shows yellow preedit, then one commit.
+5. **Dictation:** tap the mic and say "list the files in my home directory". The sentence arrives once; words iOS
+   revises while you speak are not duplicated.
+6. **Key bar:** with the keyboard up the bar sits directly on it (no gap, not hidden). Esc, Tab and the arrows keep
+   the keyboard up and show `^[`, `^I`, `^[[D`…; Ctrl then `c` shows `^C`. Rotate with the keyboard up: the bar follows.
+7. **Pinch:** pinch on the terminal: the font size in the status line changes and the page does not zoom (`vv`
+   lines keep `scale=1.00`). Pinch on the log: the page does not zoom.
+
+The findings go into `docs/decisions/2026-11-02-embedded-atomics.md` §4.4, "Spike results".
