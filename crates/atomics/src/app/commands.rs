@@ -243,8 +243,8 @@ impl Local<'_> {
             Command::RemovePlanBranches { plan, branches } => {
                 state.post(move |state| state.remove_plan_branches(&plan, &branches))
             }
-            // Not sent to the backend yet: `Desktop::send` carries these out itself.
-            _ => {}
+            // The UI carries out its own view commands.
+            command => debug_assert!(command.is_view(), "Local does not run {command:?}"),
         }
     }
 }
@@ -261,20 +261,38 @@ impl Desktop<'_> {
         result
     }
 
-    /// Carries out a command now: a host's command through the in-process backend, the others with the
-    /// view-hint writes the desktop's code made.
+    /// Carries out a command now: a view command ([`Command::is_view`]) on this window, any other through
+    /// the in-process backend. Selection is immediate client state, projected into the native model
+    /// (`active`, `diff_root`, `diff_open`, `panel`, the tab) for ctl and the host's subscription and
+    /// scheduling decisions; dialogs open on this window's client.
     pub(super) fn send(&mut self, command: Command) {
         match command {
-            Command::EditingPlan => self.runtime.plan_edit_open = true,
-            Command::ShowTaskDiff { plan, task } => self.runtime.task_action(plan, task, "diff"),
+            Command::Activate { session, open_diff } => self.activate(&session, open_diff),
             Command::OpenTaskSession(session) => {
                 self.activate(&session, true);
                 self.runtime.panel = PanelMode::Diff;
             }
+            Command::ShowTaskDiff { plan, task } => self.runtime.task_action(plan, task, "diff"),
+            Command::ShowRoot(root) => {
+                self.runtime.active = None;
+                self.runtime.diff_root = Some(root);
+                self.runtime.diff_open = true;
+            }
+            Command::OpenDiff => self.runtime.diff_open = true,
             Command::CloseDiff => self.runtime.diff_open = false,
-            Command::Activate { session, open_diff } => self.activate(&session, open_diff),
-            Command::Rename(session) => self.begin_rename(&session),
-            Command::PickProject => self.pick_project(),
+            Command::ToggleDiff => self.runtime.diff_open = !self.runtime.diff_open,
+            Command::SetPanel(panel) => self.runtime.panel = panel,
+            Command::SetView(view) => self.runtime.set_view(view),
+            Command::ShowUngrouped => self.runtime.show_ungrouped(),
+            Command::ShowPlan(plan) => {
+                self.runtime.selected_plan = plan;
+                self.runtime.show_plan_fleet();
+            }
+            Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
+            Command::TogglePlan => self.runtime.toggle_plan(),
+            Command::EditingPlan => self.runtime.plan_edit_open = true,
+            Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
+            Command::NewSession => self.open_new_dialog(None),
             Command::NewWorktree(root) => {
                 self.open_new_dialog(Some(root.clone()));
                 if let Some(dialog) = &mut self.client.new_dialog {
@@ -282,29 +300,18 @@ impl Desktop<'_> {
                     dialog.repo = paths::display(&root);
                 }
             }
-            Command::ShowRoot(root) => {
-                self.runtime.active = None;
-                self.runtime.diff_root = Some(root);
-                self.runtime.diff_open = true;
+            Command::Rename(session) => self.begin_rename(&session),
+            Command::PickProject => self.pick_project(),
+            command => {
+                debug_assert!(!command.is_view(), "the desktop does not show {command:?}");
+                self.runtime.backend().send(command);
             }
-            Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
-            Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
-            Command::SetView(view) => self.runtime.set_view(view),
-            Command::ShowUngrouped => self.runtime.show_ungrouped(),
-            Command::ShowPlan(plan) => {
-                self.runtime.selected_plan = plan;
-                self.runtime.show_plan_fleet();
-            }
-            Command::ToggleDiff => self.runtime.diff_open = !self.runtime.diff_open,
-            Command::NewSession => self.open_new_dialog(None),
-            Command::TogglePlan => self.runtime.toggle_plan(),
-            command => self.runtime.backend().send(command),
         }
     }
 
+    /// Makes a session the active one; the diff panel follows it, and opens if `open_diff`. Not private:
+    /// a call from another module would then find `State::activate` through `Deref` instead.
     pub(super) fn activate(&mut self, id: &str, open_diff: bool) {
-        // Selection is immediate client state, projected into the native model
-        // for ctl and host subscription/scheduling decisions.
         self.runtime.active = Some(id.to_string());
         self.runtime.diff_root = None;
         self.runtime.diff_open |= open_diff;

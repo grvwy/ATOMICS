@@ -165,8 +165,8 @@ impl Desktop<'_> {
             }
         });
         match action {
-            Some("close") => self.runtime.diff_open = false,
-            Some("diff") => self.runtime.panel = PanelMode::Diff,
+            Some("close") => self.send(Command::CloseDiff),
+            Some("diff") => self.send(Command::SetPanel(PanelMode::Diff)),
             Some("hints") => {
                 if let Some(editor) = self.runtime.editors.get(root) {
                     editor.type_steps(self.runtime.config.editor.inlay_hints_keys.clone(), Duration::ZERO);

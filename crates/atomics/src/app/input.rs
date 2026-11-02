@@ -21,7 +21,7 @@ impl Desktop<'_> {
             self.runtime.toast("Voice: recording cancelled");
         }
         if pressed(&keys.toggle_diff) {
-            self.runtime.diff_open = !self.runtime.diff_open;
+            self.send(Command::ToggleDiff);
         }
         if pressed(&keys.focus_steer) {
             self.client.focus_steer = true;
@@ -32,7 +32,7 @@ impl Desktop<'_> {
             self.runtime.toast(super::github::READ_ONLY);
         } else if editor_pressed && let Some(root) = self.runtime.diff_target() {
             if self.runtime.panel == PanelMode::Editor {
-                self.runtime.panel = PanelMode::Diff;
+                self.send(Command::SetPanel(PanelMode::Diff));
             } else {
                 let state = self.client.diff_views.get(&root);
                 let file = state.and_then(|s| s.viewing.clone()).or_else(|| {
@@ -84,15 +84,15 @@ impl Desktop<'_> {
                 && self.runtime.github_pr_diff().is_some()
                 && let Some((_, state)) = self.client.github.pr_view.as_mut()
             {
-                self.runtime.diff_open = true;
-                self.client.focus_terminal = None;
-                self.client.focus_editor = false;
-                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 if hunk {
                     state.step_hunk(step);
                 } else {
                     state.step(step);
                 }
+                self.send(Command::OpenDiff);
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
             } else if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
                 // The Tickets panel takes Shift+↓/↑; it pages with PageUp/PageDown itself.
                 self.client.focus_terminal = None;
@@ -102,8 +102,8 @@ impl Desktop<'_> {
             } else if step != 0
                 && let Some(root) = self.runtime.diff_target()
             {
-                self.runtime.diff_open = true;
-                self.runtime.panel = PanelMode::Diff;
+                self.send(Command::OpenDiff);
+                self.send(Command::SetPanel(PanelMode::Diff));
                 self.client.focus_terminal = None;
                 self.client.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
@@ -116,7 +116,7 @@ impl Desktop<'_> {
             }
         }
         if pressed(&keys.toggle_plan) {
-            self.runtime.toggle_plan();
+            self.send(Command::TogglePlan);
         }
         // Plan with chief, from a ticket the panel is reading.
         if self.runtime.panel == PanelMode::Tickets
@@ -184,7 +184,7 @@ impl Desktop<'_> {
             self.client.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });
         }
         if pressed(&keys.new_session) {
-            self.open_new_dialog(None);
+            self.send(Command::NewSession);
         }
         if pressed(&keys.refresh_diff)
             && let Some(root) = self.runtime.diff_target()
@@ -197,8 +197,8 @@ impl Desktop<'_> {
             if let Some(i) =
                 (0..n).map(|k| (start + k) % n).find(|&i| self.runtime.sessions[i].status.needs_attention())
             {
-                let id = self.runtime.sessions[i].id.clone();
-                self.activate(&id, true);
+                let session = self.runtime.sessions[i].id.clone();
+                self.send(Command::Activate { session, open_diff: true });
             } else {
                 self.runtime.toast("Nothing needs you right now");
             }
@@ -220,7 +220,7 @@ impl Desktop<'_> {
             if ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
-                self.activate(&id, true);
+                self.send(Command::Activate { session: id.clone(), open_diff: true });
                 self.client.focus_terminal = None;
                 if self.runtime.panel == PanelMode::Editor {
                     self.client.focus_editor = true;
@@ -253,7 +253,7 @@ impl Desktop<'_> {
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 } else {
                     self.client.focus_editor = false;
-                    self.runtime.panel = PanelMode::Diff;
+                    self.send(Command::SetPanel(PanelMode::Diff));
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 }
             }
@@ -285,7 +285,7 @@ impl Desktop<'_> {
                 self.client.focus_terminal = self.runtime.active.clone();
                 // At the smallest window size the diff covers the terminal entirely.
                 if self.runtime.last_layout.is_some_and(|l| l.diff == DiffPlacement::Full) {
-                    self.runtime.diff_open = false;
+                    self.send(Command::CloseDiff);
                 }
             }
         }

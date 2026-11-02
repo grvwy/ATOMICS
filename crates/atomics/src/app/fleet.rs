@@ -138,8 +138,8 @@ impl Desktop<'_> {
                 }
             });
         });
-        if let Some(id) = clicked {
-            self.activate(&id, false);
+        if let Some(session) = clicked {
+            self.send(Command::Activate { session, open_diff: false });
         }
     }
 
@@ -423,11 +423,11 @@ impl Desktop<'_> {
             self.send(command);
         }
 
-        if let Some((id, open)) = activate {
-            self.activate(&id, open);
+        if let Some((session, open_diff)) = activate {
+            self.send(Command::Activate { session, open_diff });
         }
         if let Some(id) = rename {
-            self.begin_rename(&id);
+            self.send(Command::Rename(id));
         }
         if let Some(id) = close {
             // Closing a scratch session deletes its folder, so it asks even once the agent exited.

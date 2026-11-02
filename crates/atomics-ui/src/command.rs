@@ -1,11 +1,12 @@
 //! What the user asks for. The draw code records commands on the [`Client`](crate::Client) instead of
 //! changing the host's model; after the draw the platform carries them out in the order they were
-//! recorded: a host's command through [`Backend::send`](crate::Backend::send), a view command on the UI
-//! itself. A plan is addressed like a read, by its position in the last list read; a task by id, or by
-//! its position in the plan the board read.
+//! recorded: a view command ([`Command::is_view`]) on the UI itself, any other through
+//! [`Backend::send`](crate::Backend::send). A plan is addressed like a read, by its position in the last
+//! list read; a task by id, or by its position in the plan the board read.
 //!
 //! Commands are grouped by domain. Approvals, plans, review comments and sessions are the domains of
-//! atomics.v1's `approval_decide`, `plan_command`, `review_command` and `session_command`.
+//! atomics.v1's `approval_decide`, `plan_command`, `review_command` and `session_command`; the projects,
+//! the chief and the settings have no operation there yet.
 
 use std::path::PathBuf;
 
@@ -14,6 +15,8 @@ use atomics_core::config::ChiefDock;
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::steer::ReviewComment;
 use atomics_core::store::SessionRecord;
+
+use crate::PanelMode;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -208,51 +211,84 @@ pub enum Command {
         note: String,
     },
 
-    // ── Not sent yet: the desktop carries these out itself ──────────────────────────────────────────
-    /// A task brief on the board has the keyboard this frame: the host holds off a restart until the edit
-    /// is done.
-    EditingPlan,
-    /// Show a finished task's worktree in the diff panel; `task` is its position in the plan.
-    ShowTaskDiff {
-        plan: usize,
-        task: usize,
-    },
-    /// Show a task's session, with its diff.
-    OpenTaskSession(String),
-    /// Hide the diff panel.
-    CloseDiff,
+    // ── View: the UI's own, never sent to a host ───────────────────────────────────────────────────────
     /// Make a session the active one, opening the diff panel if `open_diff`.
     Activate {
         session: String,
         open_diff: bool,
     },
-    /// Ask for a session's new title.
-    Rename(String),
-    /// Ask the platform for a folder to open as a project.
-    PickProject,
-    /// Ask where to create a new worktree of a project.
-    NewWorktree(PathBuf),
+    /// Show a task's session, with its diff.
+    OpenTaskSession(String),
+    /// Show a finished task's worktree in the diff panel; `task` is its position in the plan.
+    ShowTaskDiff {
+        plan: usize,
+        task: usize,
+    },
     /// Show the diff of a worktree or main checkout no session is active in.
     ShowRoot(PathBuf),
-    /// Close a plan's tab: an open plan asks to be closed first, a finished one is archived.
-    ClosePlanTab(usize),
-    /// Show a finished plan's board, read-only.
-    ViewPlanHistory(usize),
+    /// Show the diff panel.
+    OpenDiff,
+    /// Hide the diff panel.
+    CloseDiff,
+    /// Show or hide the diff panel.
+    ToggleDiff,
+    /// Show the diff, the editor, the plan or the tickets in the diff panel.
+    SetPanel(PanelMode),
     /// Show every project's sessions, or one project's.
     SetView(Option<PathBuf>),
     /// Show the sessions outside any plan.
     ShowUngrouped,
     /// Show an open plan's sessions and board.
     ShowPlan(usize),
-    /// Show or hide the diff panel.
-    ToggleDiff,
-    /// Open the new-session dialog.
-    NewSession,
+    /// Show a finished plan's board, read-only.
+    ViewPlanHistory(usize),
     /// Show or hide the plan board.
     TogglePlan,
+    /// A task brief on the board has the keyboard this frame: the desktop's host holds off a restart until
+    /// the edit is done.
+    EditingPlan,
+    /// Close a plan's tab: an open plan asks to be closed first, a finished one is archived
+    /// ([`Command::ArchiveFinished`]).
+    ClosePlanTab(usize),
+    /// Open the new-session dialog.
+    NewSession,
+    /// Ask where to create a new worktree of a project.
+    NewWorktree(PathBuf),
+    /// Ask for a session's new title.
+    Rename(String),
+    /// Ask the platform for a folder to open as a project.
+    PickProject,
 }
 
 impl Command {
+    /// Whether the command is the UI's own: what its window shows, or a dialog it opens. The platform
+    /// carries it out itself; it never reaches [`Backend::send`](crate::Backend::send). The desktop keeps
+    /// these view hints in its host's model too, where ctl reads them.
+    pub fn is_view(&self) -> bool {
+        matches!(
+            self,
+            Command::Activate { .. }
+                | Command::OpenTaskSession(_)
+                | Command::ShowTaskDiff { .. }
+                | Command::ShowRoot(_)
+                | Command::OpenDiff
+                | Command::CloseDiff
+                | Command::ToggleDiff
+                | Command::SetPanel(_)
+                | Command::SetView(_)
+                | Command::ShowUngrouped
+                | Command::ShowPlan(_)
+                | Command::ViewPlanHistory(_)
+                | Command::TogglePlan
+                | Command::EditingPlan
+                | Command::ClosePlanTab(_)
+                | Command::NewSession
+                | Command::NewWorktree(_)
+                | Command::Rename(_)
+                | Command::PickProject
+        )
+    }
+
     /// A task card's `diff`, `resume` or `acknowledge_refs` button, for the task at position `task` of the
     /// plan at `plan`; `None` for any other action.
     pub fn task(plan: usize, task: usize, action: &str) -> Option<Command> {
