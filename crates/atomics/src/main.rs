@@ -23,6 +23,7 @@ mod ipc;
 mod lifecycle;
 mod mcp;
 mod mcp_client;
+mod open_link;
 mod protocol;
 mod ref_guard;
 mod relay;
@@ -49,7 +50,8 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Project (git repository) to open; any folder inside it or its worktrees works
+    /// Project (git repository) to open; any folder inside it or its worktrees works. An
+    /// `atomics://open?...` link opens ATOMICS at a plan or ticket instead.
     path: Option<PathBuf>,
     /// Open a saved workspace (a set of projects); `setup` and `doctor` take it after their name too
     #[arg(long, short, global = true)]
@@ -360,6 +362,15 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
+    // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
+    // once the app has loaded.
+    let link =
+        cli.path.as_deref().and_then(|path| path.to_str()).filter(|arg| open_link::is_link(arg)).map(open_link::parse);
+    if let Some(incoming) = &link
+        && let Some(code) = open_link::forward(&atomics_core::paths::socket_path(), incoming.clone())
+    {
+        std::process::exit(code);
+    }
     crash::install(&atomics_core::paths::atomics_home());
 
     let open = cli
@@ -371,7 +382,13 @@ fn main() -> eframe::Result {
     let size: Option<[f32; 2]> =
         cli.size.as_deref().and_then(|s| s.split_once('x')).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]));
     let options = app::Options {
-        projects: cli.path.iter().map(|p| atomics_core::paths::expand(&p.to_string_lossy())).collect(),
+        projects: cli
+            .path
+            .iter()
+            .filter(|_| link.is_none())
+            .map(|p| atomics_core::paths::expand(&p.to_string_lossy()))
+            .collect(),
+        link,
         workspace: cli.workspace,
         open,
         screenshot: cli.screenshot,
@@ -399,7 +416,20 @@ fn main() -> eframe::Result {
             descriptor
         });
     }
-    eframe::run_native("ATOMICS", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options, &icon)))))
+    // Before the event loop: the Apple event that launches the app may arrive before the window exists.
+    #[cfg(target_os = "macos")]
+    open_link::macos::register();
+    eframe::run_native(
+        "ATOMICS",
+        native,
+        Box::new(|cc| {
+            // Again once the window exists: AppKit's finishLaunching installs its own handler for the
+            // event, replacing the early one.
+            #[cfg(target_os = "macos")]
+            open_link::macos::register();
+            Ok(Box::new(app::App::new(cc, options, &icon)))
+        }),
+    )
 }
 
 fn load_icon() -> egui::IconData {
@@ -449,6 +479,22 @@ mod cli_tests {
         assert!(cli.workspace.is_none());
         let Some(Command::Queue { command, .. }) = cli.command else { panic!("queue command") };
         assert_eq!(command, ["make", "-w", "x"]);
+    }
+
+    #[test]
+    fn a_link_is_taken_for_the_path_argument() {
+        let cli = Cli::try_parse_from(["atomics", "atomics://open?plan=a"]).unwrap();
+        let path = cli.path.unwrap();
+        assert!(open_link::is_link(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_link_after_the_end_of_options_is_the_path_argument() {
+        let cli = Cli::try_parse_from(["atomics", "--", "atomics://open?plan=a"]).unwrap();
+        assert!(cli.command.is_none());
+        let path = cli.path.unwrap();
+        assert_eq!(path.to_str(), Some("atomics://open?plan=a"));
+        assert!(open_link::is_link(path.to_str().unwrap()));
     }
 
     #[test]

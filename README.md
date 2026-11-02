@@ -543,6 +543,29 @@ See [docs/tickets.md](docs/tickets.md) for the design, the
 config reference and examples, with step-by-step [Relay](docs/tickets.md#step-by-step-relay) and
 [Linear](docs/tickets.md#step-by-step-linear) setups.
 
+## Open from a link
+
+ATOMICS registers the `atomics://` URL scheme, so another tool can send you straight to the right place:
+
+```
+atomics://open                                        focus ATOMICS
+atomics://open?plan=<plan id>                         select that open plan's tab
+atomics://open?ticket=<key or ticket URL>&system=<name>   the ticket's plan, or offer to plan it
+```
+
+With `ticket=`, ATOMICS resolves the ticket through the configured `[tickets]` profile: a key such as `ABC-12`, or a
+web address that matches the profile's `link_url`. If an open plan links the ticket, that plan is selected.
+Otherwise the chief opens with `Plan ABC-12: <title>` typed into its prompt, never sent: you read it and press
+Enter (appended to anything already typed there). A `system` that is not the configured ticket system, or a ticket system you are not signed in to, shows a
+toast asking you to sign in. A link only opens and focuses; anything else in it (another scheme or host, an unknown
+parameter, a repeated one, both `plan` and `ticket`) is refused with a toast.
+`atomics 'atomics://open?plan=…'` does the same from a terminal. When ATOMICS is already running, the link goes to it
+over its control socket and the second process exits (on Windows there is no socket forwarding, so every link starts a new instance); otherwise ATOMICS starts and opens the link once it has loaded.
+
+Registration: `scripts/linux-install.sh` adds `MimeType=x-scheme-handler/atomics;` and `%u` to the desktop entry and
+runs `xdg-mime default atomics.desktop x-scheme-handler/atomics`; `scripts/macos-app.sh` declares the scheme in
+`CFBundleURLTypes`. For Windows, see [Open from a link](docs/tickets.md#open-from-a-link) for the registry keys.
+
 ## Agents in sandboxes
 
 By default each agent runs in its own [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM,

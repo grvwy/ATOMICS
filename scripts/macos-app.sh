@@ -48,6 +48,14 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>ai.atomisk.atomics</string>
+      <key>CFBundleURLSchemes</key>
+      <array><string>atomics</string></array>
+    </dict>
+  </array>
   <key>NSMicrophoneUsageDescription</key>
   <string>ATOMICS records your voice while you use the voice shortcut and sends the transcript to the chief agent.</string>
 </dict>

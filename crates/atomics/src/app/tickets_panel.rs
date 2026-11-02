@@ -28,6 +28,8 @@ pub(super) enum Job {
     Read,
     Children,
     Related,
+    /// The card an `atomics://open` link names, read to draft a plan for it.
+    Link,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,9 +174,11 @@ pub(super) struct TicketsPanel {
     pub tab: Option<usize>,
     /// The filter chips switched on, by their index in `[[tickets.filters]]`.
     pub chips: std::collections::BTreeSet<usize>,
+    /// The read an `atomics://open` link waits for: its job number, and the bare key the card must name.
+    pub(super) open_link: Option<(u64, Option<String>)>,
     /// A ticket was opened: the panel takes the keys on the next frame.
     focus: bool,
-    seq: u64,
+    pub(super) seq: u64,
 }
 
 /// The Plan with chief dialog: the ticket, whether to plan it alone, and the user's own words.
@@ -651,7 +655,7 @@ impl State {
     /// Whether the ticket system needs a sign-in before anything is sent: the sign-in state
     /// (`SignState`, read from the keychain when not yet polled) is not signed in, or the worker
     /// said a sign-in is required.
-    fn plan_needs_sign_in(&self, config: &TicketConfig) -> bool {
+    pub(super) fn plan_needs_sign_in(&self, config: &TicketConfig) -> bool {
         use crate::ticket_signin::SignState;
         let state = match self.tickets.sign.state() {
             Some(state) => state.clone(),
@@ -786,6 +790,10 @@ impl State {
                     (Job::Related, Err((_, error))) => read.related = Part::Failed(error),
                     _ => read.error = Some("unexpected ticket result".into()),
                 }
+            }
+            Job::Link if panel.open_link.as_ref().is_some_and(|(wait, _)| *wait == seq) => {
+                let confirm = panel.open_link.take().and_then(|(_, key)| key);
+                self.link_card_read(result, confirm);
             }
             _ => {}
         }
@@ -3087,6 +3095,290 @@ mod tests {
         assert_eq!(super::super::board::mode_label(&plan, &auto), "auto (deciding…)");
         let forced = TicketConfig { mode: TicketMode::Board, ..auto };
         assert_eq!(super::super::board::mode_label(&Plan::default(), &forced), "board");
+    }
+
+    fn toasted(app: &Desktop<'_>) -> String {
+        app.runtime.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default()
+    }
+
+    /// Gives the profile a `link_url` and returns the address it makes for the ticket.
+    fn with_link_url(app: &mut Desktop<'_>, ticket: &TicketLink) -> String {
+        app.runtime.config.tickets.link_url = Some("https://tickets.example/?selected={id}".into());
+        app.runtime.apply_ticket_config();
+        format!("https://tickets.example/?selected={}", ticket.id)
+    }
+
+    fn open(app: &mut Desktop<'_>, ticket: &str, system: Option<&str>) -> Result<(), String> {
+        let link = crate::open_link::OpenLink {
+            ticket: Some(ticket.into()),
+            system: system.map(str::to_string),
+            ..Default::default()
+        };
+        let result = app.runtime.open_link(Ok(link));
+        settle(app);
+        result
+    }
+
+    #[test]
+    fn a_plan_link_selects_that_plan_and_unknown_ones_toast() {
+        with_app("app::tickets_panel::tests::a_plan_link_selects_that_plan_and_unknown_ones_toast", |app, _| {
+            let id = |app: &mut Desktop<'_>, goal: &str| {
+                super::super::tests::request(app, json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a"}]})).result
+                    ["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let one = id(app, "One");
+            let two = id(app, "Two");
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, two);
+            let link = |plan: &str| crate::open_link::OpenLink { plan: Some(plan.into()), ..Default::default() };
+            app.runtime.open_link(Ok(link(&one))).unwrap();
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
+            assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Diff);
+            assert!(app.runtime.open_link(Ok(link("nope"))).is_err());
+            assert!(toasted(app).contains("No open plan nope"), "{}", toasted(app));
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
+            // A bare link only focuses.
+            app.runtime.open_link(Ok(Default::default())).unwrap();
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
+            // The control socket takes the same request, and a refused link becomes a toast.
+            let reply = super::super::tests::request(app, json!({"cmd":"open_link", "plan": two}));
+            assert!(reply.ok);
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, two);
+            let reply =
+                super::super::tests::request(app, json!({"cmd":"open_link", "rejected": "no path is accepted"}));
+            assert!(!reply.ok);
+            assert!(toasted(app).contains("no path is accepted"), "{}", toasted(app));
+            let reply = super::super::tests::request(app, json!({"cmd":"open_link", "plan": "a", "ticket": "A-1"}));
+            assert!(!reply.ok);
+        });
+    }
+
+    #[test]
+    fn a_ticket_link_selects_the_plan_that_links_it() {
+        with_app("app::tickets_panel::tests::a_ticket_link_selects_the_plan_that_links_it", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            quiet_chief(app);
+            let epic = read_epic(app, dir.path());
+            app.runtime.plan_with_chief(epic.clone(), TicketMode::Board, "").unwrap();
+            let planned = app.runtime.selected_plan;
+            super::super::tests::request(app, json!({"cmd":"plan_set", "goal":"Other", "tasks":[{"id":"a"}]}));
+            assert_ne!(app.runtime.selected_plan, planned);
+            let (plans, sent) = (app.runtime.plans.len(), sent_to_chief(app).len());
+
+            // By key, and by the address the profile's link_url makes.
+            open(app, "DEMO-1", None).unwrap();
+            assert_eq!(app.runtime.selected_plan, planned);
+            super::super::tests::request(app, json!({"cmd":"plan_set", "goal":"Other again", "tasks":[{"id":"a"}]}));
+            let url = with_link_url(app, &epic);
+            open(app, &url, Some("meaning-example")).unwrap();
+            assert_eq!(app.runtime.selected_plan, planned);
+
+            assert!(app.runtime.chief_draft.is_none());
+            assert_eq!((app.runtime.plans.len(), sent_to_chief(app).len()), (plans + 1, sent));
+        });
+    }
+
+    #[test]
+    fn a_ticket_link_without_a_plan_drafts_one_for_the_chief_and_never_sends_it() {
+        with_app(
+            "app::tickets_panel::tests::a_ticket_link_without_a_plan_drafts_one_for_the_chief_and_never_sends_it",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                let epic = read_epic(app, dir.path());
+                let (plans, selected) = (app.runtime.plans.len(), app.runtime.selected_plan);
+                app.runtime.chief_open = false;
+
+                open(app, "DEMO-1", Some("MEANING-example")).unwrap();
+                let draft = format!("Plan DEMO-1: {}", epic.title.as_deref().unwrap());
+                assert_eq!(app.runtime.chief_draft.as_deref(), Some(draft.as_str()));
+                assert!(app.runtime.chief_open);
+                // Typed into the prompt for the user to send; nothing went to the chief, no plan was made.
+                assert!(sent_to_chief(app).is_empty());
+                assert_eq!((app.runtime.plans.len(), app.runtime.selected_plan), (plans, selected));
+
+                // The same through an address.
+                app.runtime.chief_draft = None;
+                let url = with_link_url(app, &epic);
+                open(app, &url, None).unwrap();
+                assert_eq!(app.runtime.chief_draft.as_deref(), Some(draft.as_str()));
+                assert!(sent_to_chief(app).is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn a_ticket_link_for_another_or_signed_out_system_asks_to_sign_in_and_does_nothing_else() {
+        with_app(
+            "app::tickets_panel::tests::a_ticket_link_for_another_or_signed_out_system_asks_to_sign_in_and_does_nothing_else",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                fake_profile(app, dir.path());
+                let before = app.runtime.plans.len();
+
+                assert!(open(app, "DEMO-1", Some("elsewhere")).is_err());
+                assert!(toasted(app).contains("Sign in to elsewhere"), "{}", toasted(app));
+                app.runtime.tickets.panel.signin = true;
+                assert!(open(app, "DEMO-1", None).is_err());
+                assert!(toasted(app).contains("Sign in to meaning-example first"), "{}", toasted(app));
+                app.runtime.tickets.panel.signin = false;
+                // Neither a foreign address nor a malformed key is looked up.
+                assert!(open(app, "https://elsewhere.example/?selected=1", None).is_err());
+                assert!(open(app, "DEMO 1/../x", None).is_err());
+
+                assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
+                assert_eq!(app.runtime.plans.len(), before);
+                app.runtime.tickets.config = None;
+                app.runtime.config.tickets = Default::default();
+                app.runtime.apply_ticket_config();
+                assert!(open(app, "DEMO-1", None).is_err());
+                assert!(toasted(app).contains("not configured"), "{}", toasted(app));
+            },
+        );
+    }
+
+    #[test]
+    fn a_ticket_key_the_read_does_not_confirm_drafts_nothing() {
+        with_app("app::tickets_panel::tests::a_ticket_key_the_read_does_not_confirm_drafts_nothing", |app, _| {
+            quiet_chief(app);
+            let card = |key: &str| {
+                let link = TicketLink { id: key.into(), key: Some(key.into()), ..Default::default() };
+                Ok(TicketOutput::Card(Box::new(TicketCard { link, ..Default::default() })))
+            };
+            app.runtime.link_card_read(card("DEMO-2"), Some("DEMO-1".into()));
+            assert_eq!(toasted(app), "No such ticket");
+            assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
+            // The same key in another case is the ticket; one with no confirmation (a card the app asked for itself) is taken.
+            app.runtime.link_card_read(card("DEMO-1"), Some("demo-1".into()));
+            assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-1"));
+            app.runtime.link_card_read(card("DEMO-3"), None);
+            assert_eq!(app.runtime.chief_draft.as_deref(), Some("Plan DEMO-3"));
+        });
+    }
+
+    #[test]
+    fn a_cold_link_waits_for_the_sign_in_state_instead_of_toasting_early() {
+        with_app(
+            "app::tickets_panel::tests::a_cold_link_waits_for_the_sign_in_state_instead_of_toasting_early",
+            |app, ctx| {
+                let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+                let mut config: TicketConfig = toml::from_str("system = \"echo\"").unwrap();
+                config.server.url = Some("https://tickets.example/mcp".into());
+                config.server.oauth = true;
+                app.runtime.config.tickets = config;
+                app.runtime.apply_ticket_config();
+                app.runtime.tickets.sign.override_oauth(oauth);
+                app.runtime.pending_link =
+                    Some(Ok(crate::open_link::OpenLink { ticket: Some("DEMO-1".into()), ..Default::default() }));
+
+                assert!(!app.runtime.ticket_state_known());
+                app.runtime.runtime_tick(ctx);
+                assert!(app.runtime.pending_link.is_some(), "the link was handled before the state was known");
+                assert!(!toasted(app).contains("Sign in"), "{}", toasted(app));
+
+                assert!(app.runtime.ticket_state_known());
+                app.runtime.runtime_tick(ctx);
+                assert!(app.runtime.pending_link.is_none());
+                assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
+            },
+        );
+    }
+
+    /// A server that signs in, whose sign-in state has not been read: the ticket state is unknown.
+    fn cold_ticket_state(app: &mut Desktop<'_>) -> crate::test_support::TempDir {
+        let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+        let mut config: TicketConfig = toml::from_str("system = \"echo\"").unwrap();
+        config.server.url = Some("https://tickets.example/mcp".into());
+        config.server.oauth = true;
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        app.runtime.tickets.sign.override_oauth(oauth);
+        assert!(!app.runtime.ticket_state_known());
+        dir
+    }
+
+    #[test]
+    fn a_ticket_link_over_the_socket_waits_for_the_ticket_state() {
+        with_app("app::tickets_panel::tests::a_ticket_link_over_the_socket_waits_for_the_ticket_state", |app, ctx| {
+            let _dir = cold_ticket_state(app);
+            let reply = super::super::tests::request(app, json!({"cmd":"open_link", "ticket": "DEMO-1"}));
+            assert!(reply.ok, "{:?}", reply.error);
+            assert!(app.runtime.pending_link.is_some());
+            assert!(!toasted(app).contains("Sign in"), "{}", toasted(app));
+
+            app.runtime.runtime_tick(ctx);
+            assert!(app.runtime.pending_link.is_some(), "the link was handled before the state was known");
+            assert!(app.runtime.ticket_state_known());
+            app.runtime.runtime_tick(ctx);
+            assert!(app.runtime.pending_link.is_none());
+            assert!(toasted(app).contains("Sign in to echo first"), "{}", toasted(app));
+        });
+    }
+
+    #[test]
+    fn a_link_held_too_long_without_a_ticket_state_times_out_with_a_toast() {
+        with_app(
+            "app::tickets_panel::tests::a_link_held_too_long_without_a_ticket_state_times_out_with_a_toast",
+            |app, _| {
+                let _dir = cold_ticket_state(app);
+                let link = crate::open_link::OpenLink { ticket: Some("DEMO-1".into()), ..Default::default() };
+                app.runtime.hold_link(Ok(link));
+                // The state is unknown: the link keeps waiting, quietly.
+                assert!(!app.runtime.release_pending_link());
+                assert!(app.runtime.pending_link.is_some() && app.runtime.pending_link_since.is_some());
+                assert!(!toasted(app).contains("did not answer"), "{}", toasted(app));
+                // Past the limit, with the state still unknown, it is dropped and says so.
+                app.runtime.pending_link_since = Instant::now().checked_sub(Duration::from_secs(31));
+                assert!(app.runtime.release_pending_link());
+                assert!(app.runtime.pending_link.is_none() && app.runtime.pending_link_since.is_none());
+                assert!(toasted(app).contains("did not answer in time"), "{}", toasted(app));
+            },
+        );
+    }
+
+    #[test]
+    fn an_address_read_is_confirmed_against_the_key_or_id_it_held() {
+        with_app("app::tickets_panel::tests::an_address_read_is_confirmed_against_the_key_or_id_it_held", |app, _| {
+            quiet_chief(app);
+            let card = |id: &str, key: Option<&str>| {
+                let link = TicketLink { id: id.into(), key: key.map(str::to_string), ..Default::default() };
+                Ok(TicketOutput::Card(Box::new(TicketCard { link, ..Default::default() })))
+            };
+            // The address held an id; the read answers another ticket.
+            app.runtime.link_card_read(card("9z", Some("DEMO-9")), Some("7f".into()));
+            assert_eq!(toasted(app), "No such ticket");
+            assert!(app.runtime.chief_draft.is_none());
+            // The id (or the key) of the card is the one asked for.
+            app.runtime.link_card_read(card("7f", Some("DEMO-7")), Some("7f".into()));
+            assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-7"));
+            app.runtime.link_card_read(card("7f", Some("DEMO-7")), Some("DEMO-7".into()));
+            assert_eq!(app.runtime.chief_draft.take().as_deref(), Some("Plan DEMO-7"));
+        });
+    }
+
+    #[test]
+    fn an_address_that_swallows_more_than_a_key_is_refused_before_any_read() {
+        with_app(
+            "app::tickets_panel::tests::an_address_that_swallows_more_than_a_key_is_refused_before_any_read",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                fake_profile(app, dir.path());
+                app.runtime.config.tickets.link_url = Some("https://tickets.example/?selected={id}".into());
+                app.runtime.apply_ticket_config();
+                for url in [
+                    "https://tickets.example/?selected=1&x=2",
+                    "https://tickets.example/?selected=1/../2",
+                    "https://tickets.example/?selected=1%202",
+                ] {
+                    assert!(open(app, url, None).is_err(), "{url}");
+                }
+                assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
+            },
+        );
     }
 
     include!("ticket_demo.rs");

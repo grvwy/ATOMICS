@@ -56,16 +56,21 @@ else
 Type=Application
 Name=ATOMICS
 Comment=Review-first workspace for coding agents
-Exec="$executable"
+Exec="$executable" %u
 Icon=atomics
 Terminal=false
 Categories=Development;IDE;
 StartupNotify=true
 StartupWMClass=atomics
+MimeType=x-scheme-handler/atomics;
 EOF
   chmod 644 "$desktop"
 fi
 
+# Links such as atomics://open?plan=... open in ATOMICS.
+if [ "$action" = install ] && command -v xdg-mime >/dev/null 2>&1; then
+  xdg-mime default atomics.desktop x-scheme-handler/atomics || true
+fi
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$data/applications" || true
 fi

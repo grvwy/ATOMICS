@@ -84,6 +84,23 @@ impl State {
             ControlRequest::McpConnect { pane, server, url } => {
                 done(self.request_connection(pane, &server, url.as_deref()))
             }
+            ControlRequest::OpenLink { plan, ticket, system, rejected } => {
+                let incoming = match rejected {
+                    Some(reason) => Err(reason),
+                    None => crate::open_link::OpenLink { plan, ticket, system }.validate(),
+                };
+                // A ticket link that arrives before the ticket state is known waits for it, as one
+                // from the command line does: answering "not configured" would be a guess.
+                if matches!(&incoming, Ok(link) if link.ticket.is_some()) && !self.ticket_state_known() {
+                    self.hold_link(incoming);
+                    done(ControlResponse::ok(json!({})))
+                } else {
+                    done(match self.open_link(incoming) {
+                        Ok(()) => ControlResponse::ok(json!({})),
+                        Err(message) => ControlResponse::error(message),
+                    })
+                }
+            }
             ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {
