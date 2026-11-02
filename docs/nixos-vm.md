@@ -179,7 +179,7 @@ missing.
 ok       claude   Claude subscription (Claude Code login; includes claude.ai connectors)
 missing  codex    Codex (ChatGPT login): not signed in
 ok       gh       GitHub CLI and Git push to github.com (gh login)
-ok       private  Credential files private to this user (0600 files, 0700 folders)
+ok       private  Credential files private to this user (no group or other access)
 skipped  host     ATOMICS host over the forwarded socket: no forwarded socket
 ```
 
@@ -201,10 +201,11 @@ Mac's browser, and the code goes back into the terminal. Nothing needs a browser
    in `~/.config/gh/hosts.yml`. Check: `gh auth status --hostname github.com` succeeds and Git's helper
    for github.com is gh. A signed-in gh that is not Git's helper only gets `setup-git` again.
 4. **Private credential files** (`private`, after every sign-in). The sign-ins above keep plain-text
-   tokens in the home folder ([Trust and secrets](#trust-and-secrets)). Each one that exists must be
-   `0600` and its folder `0700`: `~/.claude/.credentials.json`, `~/.codex/auth.json` and
-   `~/.config/gh/hosts.yml`, with any a step file names. `--check` reports the first that another user
-   could open; a run without `--check` takes those modes away. `atomics-onboard` runs its sign-ins with
+   tokens in the home folder ([Trust and secrets](#trust-and-secrets)). Each one that exists, and its
+   folder, must give group and others no access (`0600` and `0700`, or stricter):
+   `~/.claude/.credentials.json`, `~/.codex/auth.json` and `~/.config/gh/hosts.yml`, with any a step
+   file names. `--check` reports the first that another user could open; a run without `--check` takes
+   that access away. `atomics-onboard` runs its sign-ins with
    `umask 077`, so files they create start private.
 5. **ATOMICS host** (`host`, check only, always last). In this layout the ATOMICS host stays on the Mac
    and holds the ticket system's credentials. With the socket forward on, the chief in the guest
@@ -234,8 +235,8 @@ containers) run as `<user>`, and each of them can reach all of the following:
 
 - **Plain-text credentials.** The guest has no keyring or Secret Service, so Claude Code, Codex and gh
   (and in the example, az, Git Credential Manager and the Azure Artifacts credential provider) keep their
-  tokens in plain-text files in `/home/<user>`. Those files are `0600` and their folders `0700`, which
-  `atomics-onboard --check` verifies. The modes keep other users out, not other processes of `<user>`:
+  tokens in plain-text files in `/home/<user>`. Those files and their folders give group and others no
+  access, which `atomics-onboard --check` verifies. The modes keep other users out, not other processes of `<user>`:
   any agent can read every sign-in in the VM, not only the one it uses.
 - **Passwordless sudo.** `<user>` is in `wheel`, which needs no password, so any agent can become root.
 - **The docker group.** `<user>` is in `docker`, which is root by another name: a container can mount

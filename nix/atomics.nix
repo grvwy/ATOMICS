@@ -16,10 +16,12 @@ let
   ];
   root = ../.;
   # Git-tracked files only, so build output, local state and anything untracked beside a checkout
-  # never reach the store. A flake's source is already a store copy of the tracked files, without
-  # .git, and a path: flake copies the whole folder; there the untracked folders are dropped by name.
+  # never reach the store. gitTracked needs the working tree itself. A flake is evaluated from a
+  # store copy instead: of the tracked files for a git flake (`nix build .`), or of the whole
+  # folder, .git included, for a path: flake (`nix build path:.`), and gitTracked refuses a store
+  # path. There the untracked folders are dropped by name.
   tracked =
-    if builtins.pathExists (root + "/.git") then
+    if !lib.path.hasStorePathPrefix root && builtins.pathExists (root + "/.git") then
       lib.fileset.gitTracked root
     else
       lib.fileset.difference root

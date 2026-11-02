@@ -156,7 +156,8 @@ The flake provides `packages.aarch64-linux.atomics` and `packages.x86_64-linux.a
 `~/.config/atomics/config.toml` only if it is missing; subsequent edits and `config.d/<host>.toml` stay in the
 writable config folder. With empty settings, the module does not create or replace a config file.
 The package puts the `atomics` CLI on PATH for
-hooks and MCP, and wraps the binary with its Wayland, X11, Vulkan, Mesa, font and audio libraries. A working
+hooks and MCP, and puts its Wayland, X11, Vulkan, Mesa, font and audio libraries in the binary's RUNPATH (not
+`LD_LIBRARY_PATH`, which agent terminals would inherit). A working
 GPU Vulkan driver and desktop session are still required for the accelerated UI. Run `nix flake check` to
 evaluate the sample NixOS configuration and build the package on supported Linux builders.
 

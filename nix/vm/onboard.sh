@@ -15,7 +15,8 @@
 #   onboard_option NAME HELP HANDLER   accept --NAME VALUE or --NAME=VALUE; HANDLER gets VALUE
 #   onboard_prepare FUNCTION           run FUNCTION before the sign-ins (never with --check)
 #   onboard_private PATH...            credential files or folders, relative to $HOME, that must be
-#                                      private: 0600 files in 0700 folders (the `private` item)
+#                                      private: no group or other access to them or their folders
+#                                      (the `private` item)
 #
 # check_NAME runs quietly and returns 0 when the item is done. Otherwise it sets $reason to a fixed
 # text, never a value, and sets skip=true when the item does not apply here. login_NAME signs in.
@@ -210,7 +211,7 @@ if [[ -d $steps_dir ]]; then
 fi
 unset step_file
 
-onboard_step private "Credential files private to this user (0600 files, 0700 folders)"
+onboard_step private "Credential files private to this user (no group or other access)"
 onboard_step host "ATOMICS host over the forwarded socket"
 
 # ── Arguments ─────────────────────────────────────────────────────────────────

@@ -191,7 +191,7 @@ chmod 755 "$HOME/.config/gh"
 run check-open --check
 expect "an open credential file is missing" test "$(state_of check-open private)" = missing
 expect "--check names the open file, not a value" grep -qx \
-  'missing  private  Credential files private to this user (0600 files, 0700 folders): .codex/auth.json in the home folder is open to other users (and 1 more)' \
+  'missing  private  Credential files private to this user (no group or other access): .codex/auth.json in the home folder is open to other users (and 1 more)' \
   "$logs/check-open"
 expect "--check changes no mode" test "$(stat -c %a "$HOME/.codex/auth.json")" = 644
 run fix-open
