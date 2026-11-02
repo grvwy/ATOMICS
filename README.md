@@ -9,10 +9,7 @@ Codex and shells side by side, each in its own git worktree. Click any agent's t
 against main, comment on lines, and send the review straight to the agent while it keeps working. Or let an
 orchestrating agent plan the work, hand out tasks and review the results while you approve and steer.
 
-An open-source atomisk.ai project. The name nods to Atom, the editor, and to ATOMISK. ATOMICS was called IMACS
-until v0.9: the first command you run (the app, setup, doctor) moves `~/.imacs`, `~/.local/state/imacs` and `~/.config/imacs` to their ATOMICS places,
-keeps reading the `imacs-credentials-v1` keychain item until it saves the new one, honors `IMACS_HOME`, `IMACS_CONFIG`
-and `IMACS_SOCKET`, and reads a repository's `IMACS.md` and `.imacs/` until it has `ATOMICS.md` and `.atomics/`.
+An open-source project.
 
 The command is `atomics`. `scripts/macos-app.sh` builds ATOMICS.app for the Dock; `scripts/linux-install.sh` installs
 the Linux desktop app. State stays in `~/.atomics` on macOS and existing installs; new Linux installs use
