@@ -198,7 +198,7 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("atomics.sock");
         // Nobody listens yet: the caller starts ATOMICS itself.
-        assert_eq!(forward(&socket, ok_link("atomics://open?plan=a")), None);
+        assert_eq!(forward(&socket, parse("atomics://open?plan=a")), None);
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -207,16 +207,12 @@ mod tests {
             (&stream).write_all(b"{\"ok\":true,\"result\":null}\n").unwrap();
             line
         });
-        assert_eq!(forward(&socket, ok_link("atomics://open?ticket=A-1&system=Example")), Some(0));
+        assert_eq!(forward(&socket, parse("atomics://open?ticket=A-1&system=Example")), Some(0));
         let request: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
         assert_eq!(request["cmd"], "open_link");
         assert_eq!(request["ticket"], "A-1");
         assert_eq!(request["system"], "Example");
         assert!(request["plan"].is_null());
-    }
-
-    fn ok_link(raw: &str) -> Incoming {
-        parse(raw)
     }
 
     #[test]

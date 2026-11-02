@@ -43,10 +43,14 @@ fn url_of(event: &AnyObject) -> Option<String> {
     }
 }
 
-/// Starts queueing links. Call once the application has launched (from the window's creation
-/// callback), so that the system's own handler is already in place and this one replaces it.
-pub fn register(ctx: &egui::Context) {
+/// Has the window repaint when a link arrives.
+pub fn wake_with(ctx: &egui::Context) {
     *WAKE.lock().unwrap() = Some(ctx.clone());
+}
+
+/// Starts queueing links. Call from `main` before the event loop starts: the event that launches
+/// the app can arrive before the window exists, and is lost without a handler.
+pub fn register() {
     let handler: objc2::rc::Retained<LinkHandler> = unsafe { msg_send![LinkHandler::alloc(), init] };
     // SAFETY: the manager is a singleton; the selector matches the handler's method.
     unsafe {
