@@ -993,6 +993,9 @@ impl State {
     /// next hook of sessions running elsewhere.
     pub(super) fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         self.check_refs(index);
+        if let Some(guard) = &self.sessions[index].ref_guard {
+            guard.mark_ran();
+        }
         let session = &mut self.sessions[index];
         if session.approval_hold
             || !session.approvals.is_empty()

@@ -2818,13 +2818,13 @@ mod tests {
             settle(app);
             app.runtime.ticket_heartbeat();
             settle(app);
+            app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Working, dir.path()));
+            app.runtime.plans[index].tasks[0].session = Some("agent-a".into());
+            app.runtime.report(Some("agent-a"), "progress", "Halfway there.");
             assert!(
                 request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"blocked", "note":"stuck"}))
                     .ok
             );
-            app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Working, dir.path()));
-            app.runtime.plans[index].tasks[0].session = Some("agent-a".into());
-            app.runtime.report(Some("agent-a"), "progress", "Halfway there.");
             settle(app);
             let (tx, rx) = channel();
             let comment =

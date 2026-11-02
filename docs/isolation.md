@@ -867,6 +867,11 @@ tests there, in a worktree that starts from the integration branch.
   unfinished plan tasks are exempt so legitimate commits survive. A done task's branch is not: moving it
   is restored. This is recovery after a turn, not write isolation: shared refs cannot
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
+  Only a session that ran can be blamed: a check of a sandbox that was idle since its last check (no turn,
+  no command run in it) takes the refs as they are and restores nothing, so a ref you moved from the host
+  while it sat idle, such as a fast-forward in another worktree, is never undone or quarantined on its
+  account. A report from the agent, progress or done, clears the session's needs-you state, the task's
+  Blocked status and its red alert; a blocked or question report sets them again.
 - **What this machine wrote is kept.** A check keeps, since the previous check:
   - refs ATOMICS wrote itself: integrations, new task branches, cleanup, and the Clean up… dialog's
     `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values ATOMICS left;
