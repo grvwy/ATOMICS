@@ -142,7 +142,7 @@ EOF
 
 feed_a=https://pkgs.dev.azure.com/contoso/_packaging/main/nuget/v3/index.json
 feed_b=https://contoso.pkgs.visualstudio.com/Platform/_packaging/tools/nuget/v3/index.json
-items="claude codex gh az ado-git nuget ado-mcp host"
+items="claude codex gh az ado-git nuget ado-mcp private host"
 settings_of() { printf '%s/.config/atomics/onboard/azure-devops.conf' "$1"; }
 logins() { grep -cE '^(az login|claude mcp add|CredentialProvider.Microsoft .* -V Information$)' "$logs/$1.calls" || true; }
 ado_helpers() { git config --global --get-all credential.https://dev.azure.com.helper | tr '\n' ,; }
@@ -157,8 +157,8 @@ input=
 run check-fresh --check
 expect "fresh --check fails" test "$status" -eq 1
 expect "fresh --check lists every item" test "$(all_states check-fresh)" \
-  = "claude=ok codex=ok gh=ok az=missing ado-git=missing nuget=missing ado-mcp=missing host=skipped "
-expect "fresh --check lists exactly eight lines" test "$(wc -l <"$logs/check-fresh")" -eq 8
+  = "claude=ok codex=ok gh=ok az=missing ado-git=missing nuget=missing ado-mcp=missing private=ok host=skipped "
+expect "fresh --check lists exactly nine lines" test "$(wc -l <"$logs/check-fresh")" -eq 9
 expect "fresh --check signs in to nothing" test "$(logins check-fresh)" -eq 0
 expect "fresh --check writes no settings" test ! -e "$(settings_of "$HOME")"
 expect "fresh --check leaves Git's config alone" test "$(cat "$HOME/.gitconfig")" = "$git_config"
@@ -175,7 +175,7 @@ printf -v input '%s\n' "$canary"
 run first --org contoso --feed "$feed_a" --feed "$feed_b"
 expect "first run succeeds (host skipped without a socket)" test "$status" -eq 0
 expect "first run ends with every item ok" test "$(all_states first)" \
-  = "claude=ok codex=ok gh=ok az=ok ado-git=ok nuget=ok ado-mcp=ok host=skipped "
+  = "claude=ok codex=ok gh=ok az=ok ado-git=ok nuget=ok ado-mcp=ok private=ok host=skipped "
 expect "first run signs in to az with a device code" called first \
   "az login --use-device-code --allow-no-subscriptions --output none"
 expect "first run signs in to both feeds" test "$(grep -c '^CredentialProvider.Microsoft -R -F Json -U .* -V Information$' "$logs/first.calls")" -eq 2
@@ -189,6 +189,9 @@ expect "the settings hold the organization and both feeds" test \
   "$(grep -v '^#' "$(settings_of "$HOME")" | tr '\n' ' ')" \
   = "organization=contoso nuget_feed=$feed_a nuget_feed=$feed_b "
 expect "the settings are private" test "$(stat -c %a "$(settings_of "$HOME")")" = 600
+expect "the token caches are private" test \
+  "$(stat -c %a "$HOME/.azure" "$HOME/.azure/msal_token_cache.json" "$HOME/.local/.IdentityService" \
+    "$HOME/.local/share/MicrosoftCredentialProvider" | tr '\n' ' ')" = "700 600 700 700 "
 
 # ── 3. Second run: nothing to do ──────────────────────────────────────────────
 
@@ -196,13 +199,18 @@ input=
 run second
 expect "second run succeeds" test "$status" -eq 0
 expect "second run signs in to nothing" test "$(logins second)" -eq 0
-expect "second run skips all seven finished steps" test "$(grep -c '^done before, skipped: ' "$logs/second")" -eq 7
+expect "second run skips all eight finished steps" test "$(grep -c '^done before, skipped: ' "$logs/second")" -eq 8
 expect "second run leaves Git's helpers as they were" test "$(ado_helpers)" = ",manager,"
 
 run check-done --check
 expect "--check after onboarding passes" test "$status" -eq 0
 expect "--check after onboarding lists every item" test "$(all_states check-done)" \
-  = "claude=ok codex=ok gh=ok az=ok ado-git=ok nuget=ok ado-mcp=ok host=skipped "
+  = "claude=ok codex=ok gh=ok az=ok ado-git=ok nuget=ok ado-mcp=ok private=ok host=skipped "
+chmod 755 "$HOME/.azure"
+run check-open --check
+expect "an open token cache folder is missing" test "$(state_of check-open private)" = missing
+run fix-open
+expect "a run makes it private again" test "$(stat -c %a "$HOME/.azure")" = 700
 
 # ── 4. A changed organization, an unpinned registration, bad settings ────────
 

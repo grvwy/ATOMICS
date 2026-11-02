@@ -1,6 +1,8 @@
 # ATOMICS runs natively on a Mac (Metal) and starts its agents and chief in this VM over ssh.
 # One definition generates both sides: the guest's shares, socket folder and Linux `atomics` at
-# the Mac's paths, and the Mac's wrappers, socket forward, Lima definition and config snippet.
+# the Mac's paths, and the Mac's wrappers, opt-in socket forward, Lima definition and config snippet.
+# The forward is off unless the Mac user starts it: it carries ATOMICS's whole control API and
+# makes this VM as trusted as the Mac account (docs/nixos-vm.md, The socket forward).
 { config, lib, pkgs, ... }:
 
 let
@@ -134,6 +136,8 @@ let
   forwardScript = preamble + ''
     # Forwards ATOMICS's control socket into the VM at the same path, so hooks, MCP servers and
     # `atomics ctl` there reach ATOMICS here. Runs until the VM goes away; launchd restarts it.
+    # Opt-in: the socket carries the whole control API (start agents, including a shell on this
+    # Mac, type into and approve any session), so every process in the VM can then act as you here.
     # Arguments name other sockets (an instance with its own ATOMICS_SOCKET); default:
     [ "$#" -gt 0 ] || set -- ${lib.escapeShellArg cfg.socket}
     for socket; do
@@ -241,8 +245,10 @@ let
     Installed in $target. Next:
       limactl create --name=${cfg.lima.instance} --set='.images[0].location = "/absolute/path/to/atomics-vm.raw"' $target/lima.yaml
       limactl start ${cfg.lima.instance}
-      launchctl bootstrap gui/\$(id -u) $target/launchd/${launchdLabel}.plist
     and copy $target/config.d.toml into ~/.config/atomics/config.d/\$(scutil --get LocalHostName).toml.
+    The control socket stays on this Mac. Forwarding it gives the VM's hooks, MCP and ctl access,
+    and every process in the VM the power to run commands here as you (docs/nixos-vm.md):
+      launchctl bootstrap gui/\$(id -u) $target/launchd/${launchdLabel}.plist
     EOF
   '';
 
@@ -323,8 +329,9 @@ in
       default = "${cfg.home}/.atomics/atomics.sock";
       defaultText = lib.literalExpression ''"''${home}/.atomics/atomics.sock"'';
       description = ''
-        ATOMICS's control socket on the Mac. The forward recreates it here at the same path, and
-        `ATOMICS_SOCKET` names it, so `atomics queue` and `atomics ctl` reach the Mac's ATOMICS.
+        ATOMICS's control socket on the Mac. The opt-in forward recreates it here at the same path,
+        and `ATOMICS_SOCKET` names it, so `atomics queue` and `atomics ctl` reach the Mac's ATOMICS.
+        Forwarded, it makes this machine as trusted as the Mac account (docs/nixos-vm.md).
       '';
     };
 
@@ -402,7 +409,7 @@ in
       type = types.package;
       readOnly = true;
       description = ''
-        The Mac side: wrappers in bin/, the socket forward and its launchd agent, lima.yaml,
+        The Mac side: wrappers in bin/, the opt-in socket forward and its launchd agent, lima.yaml,
         a config.d snippet and install.sh. Plain sh and macOS's ssh; it needs no Nix on the Mac.
       '';
     };

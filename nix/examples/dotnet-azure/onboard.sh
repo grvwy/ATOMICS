@@ -246,4 +246,7 @@ onboard_step az "Azure CLI (az login, Azure DevOps token)"
 onboard_step ado-git "Git push to Azure DevOps (Git Credential Manager)"
 onboard_step nuget "Azure Artifacts NuGet feeds (credential provider)"
 onboard_step ado-mcp "Azure DevOps MCP server for the chief (az auth)"
+# The plain-text token caches: az's, Git Credential Manager's (Microsoft's MSAL cache) and the
+# credential provider's session tokens.
+onboard_private .azure .azure/msal_token_cache.json .local/.IdentityService .local/share/MicrosoftCredentialProvider
 ado_load_settings

@@ -115,7 +115,17 @@ in
       "d /home/${cfg.user}/repos 0755 ${cfg.user} users - -"
       "L+ /bin/bash - - - - /run/current-system/sw/bin/bash"
     ];
-    services.openssh.enable = true;
+    # Keys only: Lima's key, imported by cloud-init, is the one way in. No root login.
+    services.openssh = {
+      enable = true;
+      settings = {
+        PasswordAuthentication = false;
+        KbdInteractiveAuthentication = false;
+        PermitRootLogin = "no";
+      };
+    };
+    # The VM is one trust domain (docs/nixos-vm.md, Trust and secrets): agents may use sudo and
+    # Docker, so either is as good as root here.
     security.sudo.wheelNeedsPassword = false;
 
     # Lima supplies only the SSH public key at boot. Credentials and user state

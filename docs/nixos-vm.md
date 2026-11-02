@@ -24,13 +24,15 @@ system, and the Mac's half into a bundle (`packages.aarch64-linux.atomics-vm-mac
 | UI | `ATOMICS.app`, Metal | none |
 | Agents and chief | `[[agents]] command` is a wrapper from the bundle (`bin/claude`, `bin/codex`) that runs `ssh -tt` into the VM | the same program, started through `atomics-vm-exec` in a login shell |
 | Worktrees | `~/repos` on APFS | mounted over virtiofs at the **same path** (`/Users/<mac-user>/repos`), so the folder ATOMICS gives an agent exists here |
-| Hooks, MCP, `atomics ctl`, `atomics queue` | the control socket, `~/.atomics/atomics.sock` | the same path, reverse-forwarded by `bin/atomics-vm-forward`; `ATOMICS_SOCKET` names it |
+| Hooks, MCP, `atomics ctl`, `atomics queue` | the control socket, `~/.atomics/atomics.sock` | off by default; with the opt-in forward (`bin/atomics-vm-forward`), the same path, and `ATOMICS_SOCKET` names it |
 | The `atomics` binary that hooks and MCP name | `~/Applications/ATOMICS.app/Contents/MacOS/atomics` | that path is a link to the guest's Linux `atomics` |
 | Long task briefs | `~/.atomics/briefs` | mounted read-only at the same path |
 | Builds, Docker, logins | none | all here |
 
-The VM sees the shared folders and nothing else of the Mac. It reaches ATOMICS's socket, which carries
-the full control API, exactly as an agent on the Mac does.
+The VM sees the shared folders and nothing else of the Mac. By default it cannot reach ATOMICS either:
+the control socket stays on the Mac unless you forward it, and forwarding it makes the VM as trusted as
+your Mac account ([The socket forward](#the-socket-forward)). Inside the VM there is one trust domain
+([Trust and secrets](#trust-and-secrets)).
 
 ## Settings
 
@@ -116,9 +118,11 @@ sh result-mac/install.sh            # copies the bundle to ~/.local/share/atomic
 limactl create --name=atomics \
   --set='.images[0].location = "/absolute/path/to/atomics-vm.raw"' ~/.local/share/atomics-vm/lima.yaml
 atomics queue --class qa -- limactl start atomics
-launchctl bootstrap gui/$(id -u) ~/.local/share/atomics-vm/launchd/ai.atomisk.atomics.vm-forward.atomics.plist
 limactl shell --workdir=/home/<user> atomics
 ```
+
+The control socket is not forwarded until you choose to; read [The socket forward](#the-socket-forward)
+first.
 
 `limactl create` also takes sizes for this one instance, without a rebuild:
 `--set='.cpus = 8 | .memory = "24GiB"'`.
@@ -142,7 +146,7 @@ answers, so `lima-guestagent.service` runs Lima's own agent from the cidata disk
 is ignored: the VM's listeners, such as a database container's published port, stay in the VM as in
 plain mode, and nothing shadows a port on the Mac. Cloud-init imports Lima's SSH public key at boot;
 the existing NixOS user owns the resulting account. The guest marks Lima's SSH and boot readiness after
-that and after the shares are mounted. The user can use `sudo` and Docker. Checkouts that stay in the
+that and after the shares are mounted. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
 VM belong in `~/repos` (`/home/<user>/repos`), on the guest's btrfs filesystem, so warm-folder clones
 can use reflinks; the Mac's worktrees are at `/Users/<mac-user>/repos`.
 
@@ -175,6 +179,7 @@ missing.
 ok       claude   Claude subscription (Claude Code login; includes claude.ai connectors)
 missing  codex    Codex (ChatGPT login): not signed in
 ok       gh       GitHub CLI and Git push to github.com (gh login)
+ok       private  Credential files private to this user (0600 files, 0700 folders)
 skipped  host     ATOMICS host over the forwarded socket: no forwarded socket
 ```
 
@@ -195,24 +200,52 @@ Mac's browser, and the code goes back into the terminal. Nothing needs a browser
    credential helper for `https://github.com`, so agents can push. Without a keyring, gh keeps its token
    in `~/.config/gh/hosts.yml`. Check: `gh auth status --hostname github.com` succeeds and Git's helper
    for github.com is gh. A signed-in gh that is not Git's helper only gets `setup-git` again.
-4. **ATOMICS host** (`host`, check only, always last). In this layout the ATOMICS host stays on the Mac
-   and holds the ticket system's credentials. The chief in the guest reaches the `atomics_ticket_*`
-   tools through the host's socket, forwarded into the guest, and needs no ticket sign-in of its own.
-   When a socket is there (`ATOMICS_SOCKET`, else the default path), `atomics ctl '{"cmd":"list"}'`
-   must answer; without one the item is `skipped`.
+4. **Private credential files** (`private`, after every sign-in). The sign-ins above keep plain-text
+   tokens in the home folder ([Trust and secrets](#trust-and-secrets)). Each one that exists must be
+   `0600` and its folder `0700`: `~/.claude/.credentials.json`, `~/.codex/auth.json` and
+   `~/.config/gh/hosts.yml`, with any a step file names. `--check` reports the first that another user
+   could open; a run without `--check` takes those modes away. `atomics-onboard` runs its sign-ins with
+   `umask 077`, so files they create start private.
+5. **ATOMICS host** (`host`, check only, always last). In this layout the ATOMICS host stays on the Mac
+   and holds the ticket system's credentials. With the socket forward on, the chief in the guest
+   reaches the `atomics_ticket_*` tools through the host's socket and needs no ticket sign-in of its
+   own. When a socket is there (`ATOMICS_SOCKET`, else the default path), `atomics ctl '{"cmd":"list"}'`
+   must answer; without one (the forward is off) the item is `skipped`.
 
 Once the host itself runs in the VM, its ticket sign-in needs the daemon's headless credential store
 from [the daemon design](daemon.md#container-state-and-credentials), not a desktop keychain. The guest
 has no Secret Service, and `atomics-onboard` does not add one.
 
 **Step files.** More items come from bash files in `/etc/atomics/onboard.d` (or `$ATOMICS_ONBOARD_DIR`),
-sourced in name order before the host check. `atomics.vm.onboardSteps` installs them:
-`atomics.vm.onboardSteps."50-my-registry" = ./my-registry.sh;`. A step file calls
+sourced in name order before the credential-file and host checks. `atomics.vm.onboardSteps` installs
+them: `atomics.vm.onboardSteps."50-my-registry" = ./my-registry.sh;`. A step file calls
 `onboard_step NAME LABEL` and defines `check_NAME` (quiet; returns 0 when done, else sets `$reason` to a
-fixed text) and `login_NAME`. `onboard_option NAME HELP HANDLER` adds a `--NAME VALUE` option, and
-`onboard_prepare FUNCTION` runs before the sign-ins, for instance to ask for settings. The header of
+fixed text) and `login_NAME`. `onboard_option NAME HELP HANDLER` adds a `--NAME VALUE` option,
+`onboard_prepare FUNCTION` runs before the sign-ins, for instance to ask for settings, and
+`onboard_private PATH...` adds credential files (and their folders), relative to the home folder, to the
+`private` check. The header of
 [`nix/vm/onboard.sh`](../nix/vm/onboard.sh) lists the helpers a step file may use;
 [`nix/examples/dotnet-azure/onboard.sh`](../nix/examples/dotnet-azure/onboard.sh) is a full example.
+
+### Trust and secrets
+
+The VM is one trust domain. Every agent, the chief and everything they run (builds, package scripts,
+containers) run as `<user>`, and each of them can reach all of the following:
+
+- **Plain-text credentials.** The guest has no keyring or Secret Service, so Claude Code, Codex and gh
+  (and in the example, az, Git Credential Manager and the Azure Artifacts credential provider) keep their
+  tokens in plain-text files in `/home/<user>`. Those files are `0600` and their folders `0700`, which
+  `atomics-onboard --check` verifies. The modes keep other users out, not other processes of `<user>`:
+  any agent can read every sign-in in the VM, not only the one it uses.
+- **Passwordless sudo.** `<user>` is in `wheel`, which needs no password, so any agent can become root.
+- **The docker group.** `<user>` is in `docker`, which is root by another name: a container can mount
+  the guest's `/`.
+
+There is no isolation between agents inside the VM. The boundary is between the VM and the Mac: the
+VM sees only the shares, and ATOMICS's control socket only if you forward it
+([The socket forward](#the-socket-forward)). So sign in here only with accounts and tokens you would
+give every agent, scoped to what they work on, and keep personal or administrative credentials on the
+Mac. sshd takes only Lima's key: password and keyboard-interactive logins and root logins are off.
 
 **Secrets.** You type each secret into the tool's own prompt, in the guest. `atomics-onboard` never
 reads, prints or stores one. Its checks discard the tools' output, and it writes no log. It never
@@ -258,17 +291,12 @@ uses it.
 
 **Hooks and MCP.** Claude's per-session `--settings` and `--mcp-config`, and Codex's `-c` overrides,
 name the Mac binary and the socket. In the VM the binary's path runs the Linux `atomics`, and the
-socket's path is the forward. Claude hooks carry `--pane`. Codex's hook definitions must stay
+socket's path is the forward, when it is on. Claude hooks carry `--pane`. Codex's hook definitions must stay
 identical across panes (Codex trusts them by their text), so ATOMICS puts the pane in the session's
 `ATOMICS_HOOK_PANE` instead and the wrapper passes it on; process ancestry, the fallback, cannot cross
 ssh. ATOMICS asks `codex --version` whether Codex supports hooks; it asks in `/`, a folder the VM has.
 Inside the VM, `atomics queue` and `atomics ctl` reach the Mac's ATOMICS through `ATOMICS_SOCKET`.
-
-**The socket forward.** `bin/atomics-vm-forward` holds one `ssh -N -R <socket>:<socket>` to the VM.
-The launchd agent restarts it when the VM stops or restarts (every 30 s at most, logging to
-`~/Library/Logs/atomics-vm-forward.log`). sshd's `StreamLocalBindUnlink yes` replaces a socket a dead
-forward left. A second ATOMICS instance with its own `ATOMICS_SOCKET`, such as a QA instance, needs
-its own forward: `atomics-vm-forward /path/to/its.sock`.
+All of this needs [the socket forward](#the-socket-forward), which is off by default.
 
 **Options** (`programs.atomics.macDesktop`, in [`nix/modules/mac-desktop.nix`](../nix/modules/mac-desktop.nix)):
 
@@ -277,7 +305,7 @@ its own forward: `atomics-vm-forward /path/to/its.sock`.
 | `user`, `home` | `atomics.vm.macUser`, `/Users/<user>` | the Mac account; the VM creates `home`, owned by the VM user |
 | `shares` | `<home>/repos` writable, `<home>/.atomics/briefs` | Mac folders mounted at the same path |
 | `executables` | `ATOMICS.app`'s binary in `~/Applications` and `/Applications` | Mac paths that run the VM's `atomics` |
-| `socket` | `<home>/.atomics/atomics.sock` | the forwarded control socket |
+| `socket` | `<home>/.atomics/atomics.sock` | the control socket the opt-in forward carries |
 | `agents` | `claude`, `codex` | wrappers to generate |
 | `forwardEnv` | the five variables above | what crosses from the Mac's terminal |
 | `installDir` | `<home>/.local/share/atomics-vm` | where the bundle lives on the Mac |
@@ -296,6 +324,35 @@ its own forward: `atomics-vm-forward /path/to/its.sock`.
 - A test instance's `ATOMICS_HOME` keeps its briefs elsewhere; add that folder to `shares` if its
   Codex agents get long briefs.
 
+## The socket forward
+
+**Off by default.** ATOMICS's control socket carries its whole control API, and the socket's file mode
+is its only check: whoever can connect may start agents (among them `mac-shell`, a shell on the Mac),
+type into any session (`send`), approve or deny its prompts (`approve`), run commands in sandboxes,
+read terminals and diffs, and use the ticket tools with the host's credentials. Forwarded into the VM,
+that is every process there. **Turning the forward on makes the VM as trusted as your Mac account**: a
+compromised agent, build script or container in the VM can then run commands on the Mac as you. A
+restricted forward that would carry only the agent tools, with a token per pane, is not built.
+
+**Without it**, agents in the VM run in their tiles as plain terminals. Their hooks and MCP servers
+cannot reach ATOMICS: no status, turn ends or approval prompts on the Mac (agents ask in their own
+terminal), no `atomics_report` or ticket tools, and a chief in the VM cannot start or steer agents.
+`atomics queue` in the VM runs its command at once, without a slot. `atomics-onboard` reports the host
+item as `skipped`.
+
+**Turning it on.** `bin/atomics-vm-forward` holds one `ssh -N -R <socket>:<socket>` to the VM. Load
+its launchd agent once you accept the trust above:
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/.local/share/atomics-vm/launchd/ai.atomisk.atomics.vm-forward.atomics.plist
+```
+
+The launchd agent restarts it when the VM stops or restarts (every 30 s at most, logging to
+`~/Library/Logs/atomics-vm-forward.log`); `launchctl bootout gui/$(id -u)/ai.atomisk.atomics.vm-forward.atomics`
+turns it off again. sshd's `StreamLocalBindUnlink yes` replaces a socket a dead forward left. A second
+ATOMICS instance with its own `ATOMICS_SOCKET`, such as a QA instance, needs its own forward:
+`atomics-vm-forward /path/to/its.sock`.
+
 ## Measured
 
 The built path, measured again with the display spike's scene and every tile in the VM through the
@@ -313,8 +370,8 @@ From a checkout in a shared folder on the Mac, run the check in the guest throug
 atomics queue --class qa -- limactl shell --workdir="$PWD" atomics bash --login -c 'exec bash scripts/check-atomics-vm.sh'
 ```
 
-The check requires an ARM guest and a btrfs root, confirms Rosetta's fix-binary registration, and
-finds the base tools. For the Mac side it reads `/etc/atomics/mac-desktop.env` and checks that each
+The check requires an ARM guest and a btrfs root, confirms Rosetta's fix-binary registration, finds
+the base tools, and checks that sshd takes keys only and no root login. For the Mac side it reads `/etc/atomics/mac-desktop.env` and checks that each
 share is mounted over virtiofs at its Mac path with the right access (writing a probe file in writable
 ones), that the Mac's ATOMICS paths run this guest's `atomics`, that the socket folder belongs to the
 user alone, and that sshd replaces stale sockets; with the forward running, it asks the Mac's ATOMICS
@@ -331,7 +388,9 @@ copy it as the start of your own module. It adds:
 - .NET SDK 9 with the .NET 8 and ASP.NET Core 8 runtimes, PowerShell, Azure CLI (with a Fabric
   patch backported for Invoke 3), Git Credential Manager and the Azure Artifacts credential provider,
   which NuGet discovers through `NUGET_PLUGIN_PATHS`;
-- four `atomics-onboard` steps ([`dotnet-azure/onboard.sh`](../nix/examples/dotnet-azure/onboard.sh));
+- four `atomics-onboard` steps ([`dotnet-azure/onboard.sh`](../nix/examples/dotnet-azure/onboard.sh)),
+  and its plain-text token caches (`~/.azure`, `~/.local/.IdentityService`,
+  `~/.local/share/MicrosoftCredentialProvider`) in the `private` check;
 - a check ([`dotnet-azure/check.sh`](../nix/examples/dotnet-azure/check.sh)) for those tools, the .NET
   9 SDK and both 8.0 runtimes, that starts a fresh `linux/amd64` SQL Server 2022 container and waits
   for `SQL Server is now ready for client connections`. Its random SA password exists only at runtime;

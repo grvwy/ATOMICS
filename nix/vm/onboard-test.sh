@@ -5,9 +5,10 @@
 #
 # It checks that the first run signs in to what is missing, that a second run skips every finished
 # step, that --check reports every item without values, that a step file adds an item, an option and
-# a preparation, and that the canary is found only in the tools' own credential files: not in
-# atomics-onboard's output or Git's config, nor in DIR... (such as /nix/store or this checkout) or,
-# with --journal, the systemd journal. The canary is never printed. onboard-test-lib.sh is the harness.
+# a preparation, that credential files stay private, and that the canary is found only in the
+# tools' own credential files: not in atomics-onboard's output or Git's config, nor in DIR... (such as
+# /nix/store or this checkout) or, with --journal, the systemd journal. The canary is never printed.
+# onboard-test-lib.sh is the harness.
 set -euo pipefail
 
 # shellcheck source=nix/vm/onboard-test-lib.sh
@@ -90,7 +91,7 @@ logins() { grep -cE '^(claude auth login|codex login --device-auth|gh auth login
 helpers() { git config --global --get-all credential.https://github.com.helper | sed 's#^!.*/gh #!gh #' | tr '\n' ,; }
 
 # A step file as a stack would add one: an item, an option and a preparation.
-mkdir -p "$work/steps" "$work/no-steps" "$work/bad-steps"
+mkdir -p "$work/steps" "$work/no-steps" "$work/bad-steps" "$work/abs-private"
 cat >"$work/steps/50-demo.sh" <<'EOF'
 # shellcheck shell=bash
 demo_name=
@@ -101,31 +102,33 @@ login_demo() { touch "$HOME/demo-done"; }
 onboard_option demo-name "a name for the demo step" demo_take_name
 onboard_prepare demo_prepare
 onboard_step demo "Demo step from a step file"
+onboard_private demo-done
 EOF
 printf 'not a step file, not sourced\n' >"$work/steps/README"
 printf 'onboard_step Bad "an invalid name"\n' >"$work/bad-steps/10-bad.sh"
+printf 'onboard_private /etc/shadow\n' >"$work/abs-private/10-abs.sh"
 
 # ── 1. --check on a fresh VM without step files: the built-in items only ─────
 
 fresh_home vm
 export ATOMICS_ONBOARD_DIR=$work/no-steps
-items="claude codex gh host"
+items="claude codex gh private host"
 input=
 run check-builtin --check
 expect "fresh --check fails" test "$status" -eq 1
 expect "fresh --check lists the built-in items" test "$(all_states check-builtin)" \
-  = "claude=missing codex=missing gh=missing host=skipped "
-expect "fresh --check lists exactly four lines" test "$(wc -l <"$logs/check-builtin")" -eq 4
+  = "claude=missing codex=missing gh=missing private=ok host=skipped "
+expect "fresh --check lists exactly five lines" test "$(wc -l <"$logs/check-builtin")" -eq 5
 expect "fresh --check signs in to nothing" test "$(logins check-builtin)" -eq 0
 expect "fresh --check leaves Git's config alone" test ! -e "$HOME/.gitconfig"
 
 # ── 2. A step file adds its item before the host check ───────────────────────
 
 export ATOMICS_ONBOARD_DIR=$work/steps
-items="claude codex gh demo host"
+items="claude codex gh demo private host"
 run check-fresh --check
 expect "a step file's item is listed" test "$(all_states check-fresh)" \
-  = "claude=missing codex=missing gh=missing demo=missing host=skipped "
+  = "claude=missing codex=missing gh=missing demo=missing private=ok host=skipped "
 expect "the host check stays last" test "$(tail -n 1 "$logs/check-fresh" | awk '{print $2}')" = host
 run help --help
 expect "--help lists a step file's option" grep -q -- '--demo-name VALUE' "$logs/help"
@@ -139,7 +142,7 @@ printf -v input '%s\n' "$canary" "$canary" "$canary"
 run first --demo-name alpha
 expect "first run succeeds (host skipped without a socket)" test "$status" -eq 0
 expect "first run ends with every item ok" test "$(all_states first)" \
-  = "claude=ok codex=ok gh=ok demo=ok host=skipped "
+  = "claude=ok codex=ok gh=ok demo=ok private=ok host=skipped "
 expect "first run signs in to Claude" called first "claude auth login"
 expect "first run signs in to Codex with a device code" called first "codex login --device-auth"
 expect "first run signs in to GitHub in the browser" called first \
@@ -148,6 +151,10 @@ expect "first run makes gh Git's helper for github.com" called first "gh auth se
 expect "Git asks only gh for github.com" test "$(helpers)" = ",!gh auth git-credential,"
 expect "a step file's option reaches its preparation" test "$(cat "$HOME/demo-name")" = alpha
 expect "a step file's sign-in ran" test -e "$HOME/demo-done"
+expect "sign-ins create private credential files" test \
+  "$(stat -c %a "$HOME/.codex/auth.json" "$HOME/.codex" "$HOME/.config/gh/hosts.yml" "$HOME/.config/gh" | tr '\n' ' ')" \
+  = "600 700 600 700 "
+expect "a step file's credential file is private" test "$(stat -c %a "$HOME/demo-done")" = 600
 
 # ── 4. Second run: nothing to do ──────────────────────────────────────────────
 
@@ -155,13 +162,13 @@ input=
 run second
 expect "second run succeeds" test "$status" -eq 0
 expect "second run signs in to nothing" test "$(logins second)" -eq 0
-expect "second run skips all four finished steps" test "$(grep -c '^done before, skipped: ' "$logs/second")" -eq 4
+expect "second run skips all five finished steps" test "$(grep -c '^done before, skipped: ' "$logs/second")" -eq 5
 expect "second run leaves Git's helpers as they were" test "$(helpers)" = ",!gh auth git-credential,"
 
 run check-done --check
 expect "--check after onboarding passes" test "$status" -eq 0
 expect "--check after onboarding lists every item" test "$(all_states check-done)" \
-  = "claude=ok codex=ok gh=ok demo=ok host=skipped "
+  = "claude=ok codex=ok gh=ok demo=ok private=ok host=skipped "
 
 # ── 5. The forwarded socket, gh without Git, a non-subscription login, options ──
 
@@ -177,6 +184,23 @@ expect "gh without Git's helper is missing" test "$(state_of check-no-helper gh)
 run fix-helper
 expect "a signed-in gh is only made Git's helper again" test "$(logins fix-helper)" -eq 0
 expect "a signed-in gh becomes Git's helper" test "$(helpers)" = ",!gh auth git-credential,"
+
+# A credential file or folder others can open: --check names the first, a run fixes the modes.
+chmod 644 "$HOME/.codex/auth.json"
+chmod 755 "$HOME/.config/gh"
+run check-open --check
+expect "an open credential file is missing" test "$(state_of check-open private)" = missing
+expect "--check names the open file, not a value" grep -qx \
+  'missing  private  Credential files private to this user (0600 files, 0700 folders): .codex/auth.json in the home folder is open to other users (and 1 more)' \
+  "$logs/check-open"
+expect "--check changes no mode" test "$(stat -c %a "$HOME/.codex/auth.json")" = 644
+run fix-open
+expect "a run makes credential files private again" test "$(state_of fix-open private)" = ok
+expect "the file and the folder are private again" test \
+  "$(stat -c %a "$HOME/.codex/auth.json" "$HOME/.config/gh" | tr '\n' ' ')" = "600 700 "
+expect "fixing modes signs in to nothing" test "$(logins fix-open)" -eq 0
+ATOMICS_ONBOARD_DIR=$work/abs-private run abs-private --check
+expect "a step file's private path must be relative" test "$status" -eq 2
 
 STUB_CLAUDE_METHOD=api_key run check-api-key --check
 expect "Claude with an API key is not a subscription" test "$(state_of check-api-key claude)" = missing

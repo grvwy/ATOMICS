@@ -152,15 +152,20 @@ was not measured.
 **Setup.** One VZ VM, which Lima, vfkit or a NixOS module can describe declaratively. On the Mac:
 - the existing `ATOMICS.app`;
 - per agent, an ssh wrapper in `[[agents]] command` that `cd`s to the identical path;
-- one long-lived reverse forward of the socket;
+- optionally, one long-lived reverse forward of the socket (see below: it makes the VM as trusted as the
+  Mac account, so the built bundle leaves it off);
 - a virtiofs share of the worktree root.
 
 The VM was ready, with Docker, .NET and build tools installed, 5 min 19 s after `limactl start`.
 
 **What the boundary protects.** Agent and chief processes, their logins and their builds run only in the VM.
-The VM sees the shared worktree root (writable) and nothing else of the Mac. It reaches ATOMICS's socket,
-which carries the full control API, exactly as a bare agent does today. ATOMICS runs git on the Mac in
-worktrees the VM writes. That is the case `docs/isolation.md` handles for sandboxes, so git pinning and the
+The VM sees the shared worktree root (writable) and nothing else of the Mac. A forwarded socket would change
+that: it carries the full control API (start any agent, `mac-shell` among them; type into and approve any
+session), and its file mode is its only check, so every process in the VM could act as the Mac user, as a
+bare agent on the Mac can today. The built bundle (`docs/nixos-vm.md`) therefore keeps the forward off and
+says plainly that turning it on makes the VM as trusted as the Mac account; without it, VM agents run without
+hooks, MCP and ctl. A forward restricted to the agent tools, with a token per pane, would keep the boundary
+and is not built. ATOMICS runs git on the Mac in worktrees the VM writes. That is the case `docs/isolation.md` handles for sandboxes, so git pinning and the
 ref guard should cover VM worktrees too. The Mac keychain, the credential relay and other repositories stay
 out of reach unless forwarded.
 
@@ -258,9 +263,10 @@ To keep that move easy, C should avoid:
   (`diff_get`, `file_get`), not the filesystem.
 - **Mac-only filesystem tricks for worktrees.** Warm templates and copies that rely on APFS clones won't
   exist on ext4 in the VM (no reflink); keep them behind the host and filesystem-agnostic.
-- **Widening the forwarded socket.** It carries the full control API. Keep the restricted
-  `atomics mcp --agent` surface separate from the chief's, as now. Don't expose the socket over TCP to make
-  forwarding easier. In the end state it is local to the VM.
+- **Widening the forwarded socket.** It carries the full control API, so forwarding it at all trusts the
+  whole VM. Keep the restricted `atomics mcp --agent` surface separate from the chief's, as now; a forward
+  limited to that surface, with a per-pane token, is the way to give VM agents hooks and tools without that
+  trust. Don't expose the socket over TCP to make forwarding easier. In the end state it is local to the VM.
 - **Tying credentials to the Mac.** Give the VM's agents and chief their logins in the VM (`az`, MCP sign-in),
   as the plan already says, rather than forwarding the Mac relay into the VM. The relay then moves with the host.
 - **Forgetting the ssh lesson in the protocol.** Keystrokes in phase 3 cross a WebSocket. Send them

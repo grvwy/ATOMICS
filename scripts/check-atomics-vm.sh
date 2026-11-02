@@ -10,6 +10,13 @@ for tool in node git gh claude codex cargo rustc rustup docker atomics-onboard j
   command -v "$tool"
 done
 
+# sshd takes keys only and no root login.
+sshd_config=$(sudo sshd -T)
+for setting in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'permitrootlogin no'; do
+  grep -qix "$setting" <<<"$sshd_config"
+done
+printf 'sshd: keys only, no root login\n'
+
 # ATOMICS on the Mac (programs.atomics.macDesktop): shares at the Mac's paths, its binary path
 # runs this machine's atomics, and sshd replaces a stale forwarded socket.
 if [ -r /etc/atomics/mac-desktop.env ]; then
@@ -31,11 +38,13 @@ if [ -r /etc/atomics/mac-desktop.env ]; then
   done
   test "$ATOMICS_SOCKET" = "$ATOMICS_MAC_SOCKET"
   test "$(stat -c '%U %a' "${ATOMICS_MAC_SOCKET%/*}")" = "$(id -un) 700"
-  sudo sshd -T | grep -qix 'streamlocalbindunlink yes'
+  grep -qix 'streamlocalbindunlink yes' <<<"$sshd_config"
   command -v atomics-vm-exec
   if [ -S "$ATOMICS_MAC_SOCKET" ]; then
     atomics ctl '{"cmd":"list"}' >/dev/null
     printf 'forwarded socket: ATOMICS on the Mac answers\n'
+  else
+    printf 'forwarded socket: off (the default; docs/nixos-vm.md, The socket forward)\n'
   fi
 fi
 

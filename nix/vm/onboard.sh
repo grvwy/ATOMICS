@@ -14,12 +14,16 @@
 #   onboard_step NAME LABEL            add an item; it defines check_NAME and login_NAME ('-' becomes '_')
 #   onboard_option NAME HELP HANDLER   accept --NAME VALUE or --NAME=VALUE; HANDLER gets VALUE
 #   onboard_prepare FUNCTION           run FUNCTION before the sign-ins (never with --check)
+#   onboard_private PATH...            credential files or folders, relative to $HOME, that must be
+#                                      private: 0600 files in 0700 folders (the `private` item)
 #
 # check_NAME runs quietly and returns 0 when the item is done. Otherwise it sets $reason to a fixed
 # text, never a value, and sets skip=true when the item does not apply here. login_NAME signs in.
 # Step files may use quiet, installed, warn, die and ask. nix/examples/dotnet-azure/onboard.sh is an
 # example.
 set -euo pipefail
+# Files the sign-ins create start private to this user (the `private` item checks the rest).
+umask 077
 
 # A check waits this long for a tool; a sign-in waits for the person.
 readonly check_seconds=60
@@ -74,6 +78,16 @@ onboard_option() {
 onboard_prepare() {
   (($# == 1)) || die "onboard_prepare takes a function name"
   prepare_hooks+=("$1")
+}
+
+private_paths=()
+onboard_private() {
+  (($# > 0)) || die "onboard_private takes paths relative to the home folder"
+  local path
+  for path; do
+    [[ -n $path && $path != /* && /$path/ != */../* ]] || die "onboard_private: '$path' is not relative to the home folder"
+    private_paths+=("$path")
+  done
 }
 
 # ── Built-in items: a quiet check that sets $reason, and a sign-in ────────────
@@ -144,13 +158,46 @@ check_host() {
   return 1
 }
 login_host() {
-  warn "start ATOMICS on the Mac and forward its socket into the VM; nothing to sign in here"
+  warn "nothing to sign in here; the forward is optional and makes this VM as trusted as the Mac (docs/nixos-vm.md)"
   return 1
+}
+
+# Every credential file and folder that exists has no group or other permissions: each existing
+# file and its folder, and each folder named. Not recursive. Sets $private_open to what is not.
+private_open=()
+find_open() {
+  private_open=()
+  local path target mode
+  for path in "${private_paths[@]}"; do
+    for target in "$HOME/$path" "$(dirname -- "$HOME/$path")"; do
+      [[ -e $target && ($target == "$HOME/$path" || -f $HOME/$path) ]] || continue
+      [[ $target != "$HOME" ]] || continue
+      mode=$(stat -L -c %a -- "$target" 2>/dev/null) || continue
+      ((8#$mode & 8#077)) || continue
+      [[ " ${private_open[*]} " == *" $target "* ]] || private_open+=("$target")
+    done
+  done
+}
+check_private() {
+  find_open
+  ((${#private_open[@]} == 0)) && return 0
+  # A fixed path in the home folder, never a value.
+  reason="${private_open[0]#"$HOME/"} in the home folder is open to other users"
+  ((${#private_open[@]} == 1)) || reason+=" (and $((${#private_open[@]} - 1)) more)"
+  return 1
+}
+login_private() {
+  find_open
+  local target
+  for target in "${private_open[@]}"; do
+    chmod go= -- "$target" && printf 'made private: %s in the home folder\n' "${target#"$HOME/"}"
+  done
 }
 
 onboard_step claude "Claude subscription (Claude Code login; includes claude.ai connectors)"
 onboard_step codex "Codex (ChatGPT login)"
 onboard_step gh "GitHub CLI and Git push to github.com (gh login)"
+onboard_private .claude/.credentials.json .codex/auth.json .config/gh/hosts.yml
 
 # ── Step files ────────────────────────────────────────────────────────────────
 
@@ -163,6 +210,7 @@ if [[ -d $steps_dir ]]; then
 fi
 unset step_file
 
+onboard_step private "Credential files private to this user (0600 files, 0700 folders)"
 onboard_step host "ATOMICS host over the forwarded socket"
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
