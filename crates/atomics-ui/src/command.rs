@@ -110,6 +110,38 @@ pub enum Command {
         line: Option<u32>,
     },
 
+    // ── Sessions ───────────────────────────────────────────────────────────────────────────────────────
+    /// Type a message into each of these sessions, by id, as one steer each; a toast says how it went.
+    Steer {
+        sessions: Vec<String>,
+        text: String,
+    },
+    /// Start a configured agent in a folder.
+    StartAgent {
+        agent: String,
+        folder: PathBuf,
+    },
+    /// End a session, by id, and close its tab.
+    CloseSession(String),
+    /// Start a session again from its record.
+    Resume(SessionRecord),
+    /// Give a session, by id, a new title.
+    RenameSession {
+        session: String,
+        title: String,
+    },
+    /// Close a project's idle sessions that no plan task uses.
+    CloseIdle(PathBuf),
+    /// The user looked at a session, by id: a finished one becomes idle.
+    SeeSession(String),
+    /// Hide a session's banner, by id, about the MCP servers it needs.
+    DismissMcp(String),
+    /// What the user said, for the session at `session` of the last session list read.
+    VoiceToSession {
+        session: usize,
+        text: String,
+    },
+
     // ── Not sent yet: the desktop carries these out itself ──────────────────────────────────────────
     /// A task brief on the board has the keyboard this frame: the host holds off a restart until the edit
     /// is done.
@@ -130,15 +162,8 @@ pub enum Command {
     },
     /// Ask for a session's new title.
     Rename(String),
-    /// Start a session again from its record.
-    Resume(SessionRecord),
     /// Ask the platform for a folder to open as a project.
     PickProject,
-    /// Start a configured agent in a folder.
-    StartAgent {
-        agent: String,
-        folder: PathBuf,
-    },
     /// Ask where to create a new worktree of a project.
     NewWorktree(PathBuf),
     CloseProject(PathBuf),
@@ -159,8 +184,6 @@ pub enum Command {
     ShowUngrouped,
     /// Show an open plan's sessions and board.
     ShowPlan(usize),
-    /// Close a project's idle sessions that no plan task uses.
-    CloseIdle(PathBuf),
     /// Show or hide the diff panel.
     ToggleDiff,
     /// Open the new-session dialog.

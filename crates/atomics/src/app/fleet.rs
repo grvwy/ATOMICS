@@ -394,11 +394,7 @@ impl Desktop<'_> {
             self.post(move |state| state.connect_server(&name, store_env, url));
         }
         if let Some(id) = dismiss {
-            self.post(move |state| {
-                if let Some(index) = state.find(&id) {
-                    state.sessions[index].mcp_needed.clear();
-                }
-            });
+            self.send(Command::DismissMcp(id));
         }
         let mut task_action = None;
         for (offset, (plan, task)) in self.runtime.completed_tasks().into_iter().take(layout.completed).enumerate() {
@@ -440,7 +436,7 @@ impl Desktop<'_> {
                 .iter()
                 .find(|s| s.id == id)
                 .is_some_and(|s| s.scratch.is_some() || s.terminal.as_ref().is_some_and(|t| !t.exited()));
-            if ask { self.client.confirm_close = Some(id) } else { self.close(&id) }
+            if ask { self.client.confirm_close = Some(id) } else { self.send(Command::CloseSession(id)) }
         }
         if let Some(index) = resume {
             let s = &self.runtime.sessions[index];
@@ -461,8 +457,8 @@ impl Desktop<'_> {
             if self.runtime.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
                 self.runtime.store.upsert(record.clone());
             }
-            self.close(&id);
-            self.post(move |state| state.resume.push(record));
+            self.send(Command::CloseSession(id));
+            self.send(Command::Resume(record));
         }
     }
 }

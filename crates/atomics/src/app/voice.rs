@@ -78,15 +78,7 @@ impl Desktop<'_> {
                     .active_index()
                     .filter(|&i| self.runtime.sessions[i].is_agent() && self.runtime.sessions[i].can_receive())
                 {
-                    self.post_session(index, move |state, index| {
-                        if state.deliver(index, &text) != Delivery::Unavailable {
-                            state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
-                        } else {
-                            state
-                                .client_events
-                                .push(ClientEvent::VoiceFailed { text, error: "No active agent to send to".into() });
-                        }
-                    });
+                    self.send(Command::VoiceToSession { session: index, text });
                 } else {
                     self.voice_failed(&text, "No active agent to send to");
                 }

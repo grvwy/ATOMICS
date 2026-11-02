@@ -160,6 +160,43 @@ impl Local<'_> {
                 data.file_error = None;
             }),
             Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
+            Command::Steer { sessions, text } => state.post(move |state| state.steer_sessions(sessions, text)),
+            Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
+            Command::CloseSession(id) => state.post(move |state| state.close(&id)),
+            Command::Resume(record) => state.post(move |state| state.resume.push(record)),
+            Command::RenameSession { session, title } => state.post(move |state| {
+                if let Some(found) = state.sessions.iter_mut().find(|s| s.id == session) {
+                    found.rename(&title);
+                }
+                state.remember(&session);
+            }),
+            Command::CloseIdle(root) => state.post(move |state| {
+                let closed = state.close_idle(&root);
+                state.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
+            }),
+            Command::SeeSession(id) => state.post(move |state| {
+                if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id)
+                    && session.status == AgentStatus::Done
+                {
+                    session.status = AgentStatus::Idle;
+                }
+            }),
+            Command::DismissMcp(id) => state.post(move |state| {
+                if let Some(index) = state.find(&id) {
+                    state.sessions[index].mcp_needed.clear();
+                }
+            }),
+            Command::VoiceToSession { session, text } => {
+                let quoted = format!("“{}”", truncate(&text, 60));
+                state.post_session(session, move |state, index| {
+                    if state.deliver(index, &text) != Delivery::Unavailable {
+                        state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
+                    } else {
+                        let error = "No active agent to send to".into();
+                        state.client_events.push(ClientEvent::VoiceFailed { text, error });
+                    }
+                });
+            }
             Command::CleanUpPlan(plan) => state.post_plan(plan, |state, index| state.open_plan_cleanup(index)),
             Command::ReloadPlanCleanup => state.post(State::reload_plan_cleanup),
             Command::RemovePlanBranches { plan, branches } => {
@@ -183,8 +220,9 @@ impl Desktop<'_> {
         result
     }
 
-    /// Carries out a command now: an approval, plan or review command through the in-process backend, the
-    /// others with the posts and view-hint writes the desktop's code made, until their domains reach it too.
+    /// Carries out a command now: an approval, plan, review or session command through the in-process
+    /// backend, the others with the posts and view-hint writes the desktop's code made, until their domains
+    /// reach it too.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::EditingPlan => self.runtime.plan_edit_open = true,
@@ -196,9 +234,7 @@ impl Desktop<'_> {
             Command::CloseDiff => self.runtime.diff_open = false,
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
             Command::Rename(session) => self.begin_rename(&session),
-            Command::Resume(record) => self.post(move |state| state.resume.push(record)),
             Command::PickProject => self.pick_project(),
-            Command::StartAgent { agent, folder } => self.runtime.pending_open.push((agent, folder)),
             Command::NewWorktree(root) => {
                 self.open_new_dialog(Some(root.clone()));
                 if let Some(dialog) = &mut self.client.new_dialog {
@@ -221,10 +257,6 @@ impl Desktop<'_> {
                 self.runtime.selected_plan = plan;
                 self.runtime.show_plan_fleet();
             }
-            Command::CloseIdle(root) => self.post(move |state| {
-                let closed = state.close_idle(&root);
-                state.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
-            }),
             Command::ToggleDiff => self.runtime.diff_open = !self.runtime.diff_open,
             Command::NewSession => self.open_new_dialog(None),
             Command::TogglePlan => self.runtime.toggle_plan(),
@@ -244,19 +276,7 @@ impl Desktop<'_> {
         if self.runtime.sessions.iter().any(|s| s.id == id && s.terminal.is_some()) {
             self.client.focus_terminal = Some(id.to_string());
         }
-        let id = id.to_string();
-        self.post(move |state| {
-            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id)
-                && session.status == AgentStatus::Done
-            {
-                session.status = AgentStatus::Idle;
-            }
-        });
-    }
-
-    pub(super) fn close(&self, id: &str) {
-        let id = id.to_string();
-        self.post(move |state| state.close(&id));
+        self.send(Command::SeeSession(id.to_string()));
     }
 
     pub(super) fn toggle_chief(&self, _ctx: &egui::Context) {

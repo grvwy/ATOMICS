@@ -370,7 +370,7 @@ impl Desktop<'_> {
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Close session").clicked() {
-                            self.close(&id);
+                            self.send(Command::CloseSession(id.clone()));
                             self.client.confirm_close = None;
                         }
                         if ui.button("Cancel").clicked() {
@@ -535,13 +535,8 @@ impl Desktop<'_> {
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Rename").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                        let (id, title) = (rename.session.clone(), rename.title.clone());
-                        self.post(move |state| {
-                            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                                session.rename(&title);
-                            }
-                            state.remember(&id);
-                        });
+                        let (session, title) = (rename.session.clone(), rename.title.clone());
+                        self.send(Command::RenameSession { session, title });
                         keep = false;
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {

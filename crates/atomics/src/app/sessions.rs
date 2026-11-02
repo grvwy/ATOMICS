@@ -1280,45 +1280,49 @@ impl Desktop<'_> {
             self.runtime.toast("No session to send to");
             return;
         }
-        let targets: Vec<String> = targets.into_iter().map(|i| self.runtime.sessions[i].id.clone()).collect();
+        let sessions: Vec<String> = targets.into_iter().map(|i| self.runtime.sessions[i].id.clone()).collect();
         self.client.steer_text.clear();
-        // Each target is one steer operation, through the journal as a protocol client's is.
-        self.post(move |state| {
-            use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
-            let mut typed = 0;
-            let mut queued = 0;
-            let mut held = 0;
-            let mut verifying = 0;
-            for id in targets {
-                let steer = |op| {
-                    let action = SessionAction::Steer { session: id.clone(), text: text.clone() };
-                    Command::SessionCommand(SessionCommand { op, action })
-                };
-                match state.mutate_desktop(steer) {
-                    Outcome::Accepted => verifying += 1,
-                    Outcome::Done { result } if result["held"] == true => held += 1,
-                    Outcome::Done { result } if result["queued_until_next_hook"] == true => queued += 1,
-                    Outcome::Done { .. } => typed += 1,
-                    _ => {}
-                }
+        self.send(Command::Steer { sessions, text });
+    }
+}
+
+impl State {
+    /// Steers each of `sessions`, by id, with `text`, and says in a toast how it went. Each target is one
+    /// steer operation, through the journal as a protocol client's is.
+    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String) {
+        use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
+        let mut typed = 0;
+        let mut queued = 0;
+        let mut held = 0;
+        let mut verifying = 0;
+        for id in sessions {
+            let steer = |op| {
+                let action = SessionAction::Steer { session: id.clone(), text: text.clone() };
+                Command::SessionCommand(SessionCommand { op, action })
+            };
+            match self.mutate_desktop(steer) {
+                Outcome::Accepted => verifying += 1,
+                Outcome::Done { result } if result["held"] == true => held += 1,
+                Outcome::Done { result } if result["queued_until_next_hook"] == true => queued += 1,
+                Outcome::Done { .. } => typed += 1,
+                _ => {}
             }
-            let mut parts = Vec::new();
-            if verifying > 0 {
-                parts.push(format!("Verifying delivery to {verifying} session(s)"));
-            }
-            if typed > 0 {
-                parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
-            }
-            if queued > 0 {
-                parts.push(format!("Queued for {queued} outside ATOMICS"));
-            }
-            if held > 0 {
-                parts.push(format!("Held for {held} until the session is ready"));
-            }
-            let summary =
-                if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
-            state.toast(summary);
-        });
+        }
+        let mut parts = Vec::new();
+        if verifying > 0 {
+            parts.push(format!("Verifying delivery to {verifying} session(s)"));
+        }
+        if typed > 0 {
+            parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
+        }
+        if queued > 0 {
+            parts.push(format!("Queued for {queued} outside ATOMICS"));
+        }
+        if held > 0 {
+            parts.push(format!("Held for {held} until the session is ready"));
+        }
+        let summary = if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
+        self.toast(summary);
     }
 }
 
