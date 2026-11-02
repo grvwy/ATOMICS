@@ -24,19 +24,21 @@ mod session;
 #[cfg(test)]
 pub(crate) mod tests;
 
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use atomics_core::advert::{self, Advertisement};
 use atomics_core::projection::Projections;
 use atomics_core::wire::{self, MAX_QUEUED_FRAMES, Role};
 use ring::rand::SecureRandom;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tungstenite::http;
+use tungstenite::{HandshakeError, http};
 
 pub use hub::RingLimits;
 pub use lease::{Lease, TerminalControl};
@@ -48,9 +50,16 @@ pub struct ServerConfig {
     /// 0 picks a free port.
     pub port: u16,
     pub allowed_origins: Vec<String>,
-    /// Where to write `{url, token}` for local clients; removed on stop.
+    /// Where to write the advertisement (`atomics_core::advert`) for local clients; removed on
+    /// stop while it is still this server's.
     pub advertise: Option<PathBuf>,
+    /// Authenticated clients at once.
     pub max_clients: usize,
+    /// Connections still inside the upgrade, counted apart from `max_clients` so that ones that
+    /// never authenticate cannot take the real clients' places.
+    pub max_pre_auth: usize,
+    /// How long a connection has, from accept, to finish the whole upgrade.
+    pub upgrade_deadline: Duration,
     /// What this listener's clients may do. They hold the bearer token from `protocol.json`, so
     /// on loopback they are controllers; view-only devices arrive with the rendezvous.
     pub role: Role,
@@ -58,6 +67,8 @@ pub struct ServerConfig {
     pub poll_interval: Duration,
     pub queue_frames: usize,
     pub queue_bytes: usize,
+    /// The most bytes a board frame may hold; a snapshot or diff over it is sent in parts or pages.
+    pub frame_budget: usize,
     pub ring: RingLimits,
     pub session: SessionConfig,
     pub screens: ScreenConfig,
@@ -71,11 +82,14 @@ impl Default for ServerConfig {
             allowed_origins: Vec::new(),
             advertise: None,
             max_clients: 4,
+            max_pre_auth: 4,
+            upgrade_deadline: Duration::from_secs(5),
             role: Role::Controller,
             write_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
             queue_frames: MAX_QUEUED_FRAMES,
             queue_bytes: 4 << 20,
+            frame_budget: wire::MAX_FRAME_BYTES,
             ring: RingLimits::default(),
             session: SessionConfig::default(),
             screens: ScreenConfig::default(),
@@ -94,6 +108,8 @@ pub struct Server {
     advertise: Option<PathBuf>,
     #[allow(dead_code)] // read by tests
     active: Arc<AtomicUsize>,
+    #[allow(dead_code)] // read by tests
+    pending: Arc<AtomicUsize>,
 }
 
 fn random_hex(bytes: usize) -> io::Result<String> {
@@ -117,18 +133,17 @@ impl Server {
         let token = random_hex(32)?;
         let epoch = random_hex(8)?;
         if let Some(path) = &config.advertise {
-            write_advertisement(path, &format!("ws://{addr}"), &token)?;
+            write_advertisement(path, &Advertisement::current(&format!("ws://{addr}"), &token))?;
         }
         let stop = Arc::new(AtomicBool::new(false));
         let screens = Arc::new(screens::Screens::new(terminals, epoch.clone(), config.screens.clone()));
-        let hub = Arc::new(Mutex::new(hub::Hub::new(
-            epoch,
-            config.ring.clone(),
-            config.queue_frames,
-            config.queue_bytes,
-        )));
+        let hub = Arc::new(Mutex::new(
+            hub::Hub::new(epoch, config.ring.clone(), config.queue_frames, config.queue_bytes)
+                .with_frame_budget(config.frame_budget),
+        ));
         let advertise = config.advertise.clone();
         let active = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
         let accept = Accept {
             shared: Arc::new(session::Shared {
                 hub: hub.clone(),
@@ -138,11 +153,13 @@ impl Server {
                 config: config.session.clone(),
                 lease: config.lease.clone(),
                 queue_frames: config.queue_frames,
+                frame_budget: config.frame_budget,
             }),
             token: token.clone(),
             addr,
             config: config.clone(),
             active: active.clone(),
+            pending: pending.clone(),
         };
         let thread = std::thread::Builder::new().name("atomics-protocol".into()).spawn({
             let stop = stop.clone();
@@ -180,12 +197,12 @@ impl Server {
                 stop.store(true, Ordering::Release);
                 let _ = thread.join();
                 if let Some(path) = &config.advertise {
-                    let _ = std::fs::remove_file(path);
+                    advert::remove_if_ours(path, &token);
                 }
                 return Err(e);
             }
         };
-        Ok(Self { addr, token, stop, thread: Some(thread), screens: Some(screens), advertise, active })
+        Ok(Self { addr, token, stop, thread: Some(thread), screens: Some(screens), advertise, active, pending })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -203,6 +220,12 @@ impl Server {
         self.active.load(Ordering::Acquire)
     }
 
+    /// Connections still inside the upgrade, for tests and diagnostics.
+    #[allow(dead_code)]
+    pub fn pending_upgrades(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         for thread in [self.thread.take(), self.screens.take()].into_iter().flatten() {
@@ -210,7 +233,8 @@ impl Server {
             let _ = thread.join();
         }
         if let Some(path) = self.advertise.take() {
-            let _ = std::fs::remove_file(path);
+            // Another instance may have replaced the file since; that one's stays.
+            advert::remove_if_ours(&path, &self.token);
         }
     }
 }
@@ -221,15 +245,15 @@ impl Drop for Server {
     }
 }
 
-/// `{url, token}` for clients on this machine, readable by this user only.
-fn write_advertisement(path: &Path, url: &str, token: &str) -> io::Result<()> {
+/// The advertisement for clients on this machine, readable by this user only.
+fn write_advertisement(path: &Path, advert: &Advertisement) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
     let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    file.write_all(serde_json::json!({ "url": url, "token": token, "pid": std::process::id() }).to_string().as_bytes())?;
+    file.write_all(serde_json::to_string(advert).map_err(io::Error::other)?.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(tmp, path)
 }
@@ -240,9 +264,21 @@ struct Accept {
     addr: SocketAddr,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
+    pending: Arc<AtomicUsize>,
 }
 
+/// A place in one of the connection counters, given back on drop.
 struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Slot> {
+        if counter.fetch_add(1, Ordering::AcqRel) >= limit {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Slot(counter.clone()))
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -250,44 +286,76 @@ impl Drop for Slot {
     }
 }
 
+/// What the upgrade of one connection needs.
+struct Upgrade {
+    token: String,
+    addr: SocketAddr,
+    role: Role,
+    origins: Vec<String>,
+    write_timeout: Duration,
+    deadline: Instant,
+    active: Arc<AtomicUsize>,
+    max_clients: usize,
+}
+
 impl Accept {
     fn client(&self, stream: TcpStream) {
-        if self.active.fetch_add(1, Ordering::AcqRel) >= self.config.max_clients {
-            self.active.fetch_sub(1, Ordering::AcqRel);
+        // Until its token is accepted a connection holds only a pre-auth place, so a local process
+        // that never finishes the upgrade cannot use up the places real clients need.
+        let Some(pre_auth) = Slot::take(&self.pending, self.config.max_pre_auth) else {
             return; // dropping the stream refuses the connection before any parsing
-        }
-        let slot = Slot(self.active.clone());
-        let (shared, token, addr) = (self.shared.clone(), self.token.clone(), self.addr);
-        let (origins, write_timeout, role) =
-            (self.config.allowed_origins.clone(), self.config.write_timeout, self.config.role);
+        };
+        let upgrade = Upgrade {
+            token: self.token.clone(),
+            addr: self.addr,
+            role: self.config.role,
+            origins: self.config.allowed_origins.clone(),
+            write_timeout: self.config.write_timeout,
+            deadline: Instant::now() + self.config.upgrade_deadline,
+            active: self.active.clone(),
+            max_clients: self.config.max_clients,
+        };
+        let shared = self.shared.clone();
         let spawned = std::thread::Builder::new().name("atomics-protocol-client".into()).spawn(move || {
-            let _slot = slot;
-            let _ = serve_stream(stream, &shared, &token, (addr, role), &origins, write_timeout);
+            let _ = serve_stream(stream, &shared, &upgrade, pre_auth);
         });
-        let _ = spawned;
+        if let Err(e) = spawned {
+            // The connection and its place went with the closure.
+            eprintln!("atomics: the protocol server could not start a client thread: {e}");
+        }
     }
 }
 
-fn serve_stream(
-    stream: TcpStream,
-    shared: &session::Shared,
-    token: &str,
-    (addr, role): (SocketAddr, Role),
-    origins: &[String],
-    write_timeout: Duration,
-) -> io::Result<()> {
+fn serve_stream(stream: TcpStream, shared: &session::Shared, up: &Upgrade, pre_auth: Slot) -> io::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(shared.config.handshake_timeout))?;
-    stream.set_write_timeout(Some(write_timeout))?;
+    stream.set_write_timeout(Some(up.write_timeout))?;
+    let claimed: Cell<Option<Slot>> = Cell::new(None);
     #[allow(clippy::result_large_err)] // the error type is tungstenite's callback contract
-    let socket = tungstenite::accept_hdr_with_config(
-        link::Stream::new(stream)?,
-        |request: &Request, response: Response| authorise(request, response, token, addr, origins),
-        Some(link::socket_config()),
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    let mut link = link::WsLink::new(socket, write_timeout)?;
-    session::serve(&mut link, role, shared);
+    let authenticate = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        let response = authorise(request, response, &up.token, up.addr, &up.origins)?;
+        // Authenticated: only now does the connection take one of the client places.
+        claimed.set(Some(Slot::take(&up.active, up.max_clients).ok_or_else(|| refuse(503, "too many clients"))?));
+        Ok(response)
+    };
+    let stream = link::Stream::new(stream)?.with_deadline(up.deadline);
+    let mut attempt = tungstenite::accept_hdr_with_config(stream, authenticate, Some(link::socket_config()));
+    let socket = loop {
+        match attempt {
+            Ok(socket) => break socket,
+            // A read timed out: at the deadline, or a moment before it.
+            Err(HandshakeError::Interrupted(mid)) => {
+                if Instant::now() >= up.deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "the upgrade did not finish in time"));
+                }
+                attempt = mid.handshake();
+            }
+            Err(HandshakeError::Failure(e)) => return Err(io::Error::other(e.to_string())),
+        }
+    };
+    drop(pre_auth);
+    let _client = claimed.take();
+    let mut link = link::WsLink::new(socket, up.write_timeout)?;
+    session::serve(&mut link, up.role, shared);
     Ok(())
 }
 

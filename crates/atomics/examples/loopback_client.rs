@@ -43,10 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [url, token] => (url.clone(), token.clone()),
         [] => {
             let path = atomics_core::paths::atomics_home().join("protocol.json");
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("{}: {e} (is [remote] enabled = true in the config, and ATOMICS running?)", path.display()))?;
-            let advert: serde_json::Value = serde_json::from_str(&text)?;
-            (advert["url"].as_str().ok_or("no url")?.to_string(), advert["token"].as_str().ok_or("no token")?.to_string())
+            // Refuses (and removes) a file left by an app that has since exited.
+            let advert = atomics_core::advert::read(&path).map_err(|e| {
+                format!("{}: {e} (is [remote] enabled = true in the config, and ATOMICS running?)", path.display())
+            })?;
+            (advert.url, advert.token)
         }
         _ => return Err("usage: loopback_client [--follow] [--screen SESSION] [URL TOKEN]".into()),
     };
@@ -88,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 quiet_since = Instant::now();
                 let envelope = wire::decode(text.as_str()).map_err(|e| format!("bad frame from the host: {e}"))?;
                 match &envelope.message {
-                    Message::DiffFile { body } => {
+                    Message::DiffFile { body, truncated, next_offset } => {
                         println!("\ndiff {} @ revision {}", body.worktree, body.revision);
                         for hunk in &body.file.hunks {
                             println!("{}", hunk.header);
@@ -101,8 +102,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("{mark}{}", line.text);
                             }
                         }
-                        if !follow {
-                            return Ok(());
+                        match (truncated, next_offset) {
+                            // A long file comes in pages: ask for the next one at the same revision.
+                            (true, Some(offset)) => {
+                                let path = body
+                                    .file
+                                    .new_path
+                                    .clone()
+                                    .or_else(|| body.file.old_path.clone())
+                                    .unwrap_or_default();
+                                let request = Message::DiffGet {
+                                    worktree: body.worktree.clone(),
+                                    path,
+                                    revision: Some(Seq(body.revision)),
+                                    offset: Some(*offset),
+                                };
+                                send(&mut socket, request)?;
+                            }
+                            _ if !follow => return Ok(()),
+                            _ => {}
                         }
                     }
                     Message::Error { code, message } => eprintln!("host error {code:?}: {message}"),
@@ -129,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                         match first {
                             Some((worktree, path)) => {
-                                send(&mut socket, Message::DiffGet { worktree, path, revision: None })?;
+                                send(&mut socket, Message::DiffGet { worktree, path, revision: None, offset: None })?;
                                 continue;
                             }
                             None if !follow => {

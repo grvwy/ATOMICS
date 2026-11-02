@@ -18,8 +18,10 @@ use std::fmt;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::diff::{FileDiff, Hunk};
 use crate::lease::{self, GridSize, LeaseState};
 use crate::projection::{ApprovalInfo, DiffFileBody, DiffSummary, Loaded, PlanInfo, ReportInfo, SessionInfo};
+pub use crate::screen::Part;
 use crate::screen::{self, HistoryChunk, HistoryGet, ScreenDelta, ScreenSnapshot};
 
 /// The WebSocket subprotocol name.
@@ -228,9 +230,12 @@ pub enum Disposition {
     Withdrawn,
 }
 
-/// What a client may subscribe to. Diffs are per worktree; the board collections are always sent.
-/// A `screen` topic is a visible terminal pane: it gets a snapshot, then deltas at about 200 ms,
-/// or about 100 ms while `focused`. Subscribing again only updates `focused`.
+/// What a client may subscribe to. `diff` and `plan` topics narrow the board's live updates: a
+/// client that has subscribed to no `diff` topic gets every worktree's `diff_summary`, and once it
+/// has subscribed to any it gets only those worktrees' (likewise for plans). Sessions and
+/// approvals are always sent, and an event left out arrives as `skipped`. A `screen` topic is a
+/// visible terminal pane: it gets a snapshot, then deltas at about 200 ms, or about 100 ms while
+/// `focused`. Subscribing again only updates `focused`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "topic", rename_all = "snake_case")]
 pub enum Topic {
@@ -301,6 +306,11 @@ pub enum Message {
         plans: Vec<PlanInfo>,
         approvals: Vec<ApprovalInfo>,
         diffs: Vec<DiffSummary>,
+        /// Set when the board does not fit in one frame, as for `screen_snapshot`: every part has
+        /// the same `cursor` and `revisions` and a slice of the collections, and the client
+        /// applies the snapshot once it holds all `count` parts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part: Option<Part>,
     },
     SessionUpsert {
         cursor: Cursor,
@@ -317,6 +327,11 @@ pub enum Message {
     PlanRemoved {
         cursor: Cursor,
         id: String,
+    },
+    /// An event outside the topics the client narrowed itself to. It stands in for that event so
+    /// cursors stay consecutive, and changes nothing.
+    Skipped {
+        cursor: Cursor,
     },
     TaskReport {
         cursor: Cursor,
@@ -343,9 +358,18 @@ pub enum Message {
         /// The revision the client holds, so the host can say it is stale.
         #[serde(default)]
         revision: Option<Revision>,
+        /// Diff lines to skip, counted across the file's hunks: the `next_offset` of the page
+        /// before. Absent for the first page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u32>,
     },
     DiffFile {
         body: DiffFileBody,
+        /// This page stops short of the end of the file; ask again with `next_offset`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_offset: Option<u32>,
     },
     FileGet {
         worktree: String,
@@ -431,6 +455,7 @@ const KINDS: &[&str] = &[
     "session_removed",
     "plan_upsert",
     "plan_removed",
+    "skipped",
     "task_report",
     "approval_pending",
     "approval_resolved",
@@ -499,6 +524,7 @@ impl Envelope {
                 plans: loaded.plans.data.clone(),
                 approvals: loaded.approvals.data.clone(),
                 diffs: loaded.diffs.data.clone(),
+                part: None,
             },
         )
     }
@@ -535,6 +561,8 @@ impl Message {
             Message::DiffGet { worktree, path, .. } | Message::FileGet { worktree, path } => {
                 long("worktree", worktree).or_else(|| long("path", path))
             }
+            Message::StateSnapshot { part: Some(part), .. } => (part.count == 0 || part.index >= part.count)
+                .then(|| WireError::new(ErrorCode::Malformed, "a snapshot part is out of range")),
             Message::Resync { reason, screens } => too_many("screens", screens.len(), MAX_SUBSCRIPTIONS)
                 .or_else(|| reason.as_deref().and_then(|r| long("reason", r)))
                 .or_else(|| screens.iter().find_map(|s| long("session", s))),
@@ -564,6 +592,169 @@ impl Message {
         };
         failure.map_or(Ok(()), Err)
     }
+}
+
+/// Bytes `value` takes as JSON, without building the text.
+pub fn json_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_or(0, |()| count.0)
+}
+
+/// One part of a board cut into `state_snapshot` parts.
+#[derive(Default)]
+struct Slice {
+    sessions: Vec<SessionInfo>,
+    plans: Vec<PlanInfo>,
+    approvals: Vec<ApprovalInfo>,
+    diffs: Vec<DiffSummary>,
+}
+
+/// Cuts the board's items, in order, into slices that fit the budget with the part's own fields.
+struct Slicer {
+    budget: usize,
+    overhead: usize,
+    size: usize,
+    slices: Vec<Slice>,
+}
+
+impl Slicer {
+    /// The slice `item` goes in: the current one while it has room, else a new one.
+    fn room(&mut self, item: &impl Serialize, what: &str) -> Result<&mut Slice, WireError> {
+        let n = json_len(item) + 1; // and its comma
+        if self.overhead + n > self.budget {
+            return Err(WireError::new(ErrorCode::Oversize, format!("one {what} is over the frame limit")));
+        }
+        if self.size + n > self.budget {
+            self.slices.push(Slice::default());
+            self.size = self.overhead;
+        }
+        self.size += n;
+        Ok(self.slices.last_mut().expect("never empty"))
+    }
+}
+
+/// The board as `state_snapshot` frames of at most `budget` bytes: one when it fits, otherwise
+/// parts (`part {index, count}`, as `screen_snapshot` has) that each carry the same cursor and
+/// revisions and a slice of the collections, in order. A single session, plan, approval or diff
+/// summary over the budget cannot be cut and fails with `oversize`.
+pub fn snapshot_frames(epoch: &str, loaded: &Loaded, budget: usize) -> Result<Vec<String>, WireError> {
+    let budget = budget.min(MAX_FRAME_BYTES);
+    let whole = Envelope::snapshot(epoch, loaded);
+    if json_len(&whole) <= budget {
+        return Ok(vec![encode(&whole)?]);
+    }
+    let Message::StateSnapshot { cursor, revisions, .. } = whole.message else {
+        unreachable!("a snapshot is a state_snapshot")
+    };
+    let part = |slice: Slice, part: Option<Part>| {
+        let Slice { sessions, plans, approvals, diffs } = slice;
+        let message =
+            Message::StateSnapshot { cursor, revisions: revisions.clone(), sessions, plans, approvals, diffs, part };
+        Envelope::host(epoch, message)
+    };
+    // What a part costs before its items, with the longest part numbers it could have.
+    let overhead = json_len(&part(Slice::default(), Some(Part { index: u16::MAX, count: u16::MAX })));
+    let mut slicer = Slicer { budget, overhead, size: overhead, slices: vec![Slice::default()] };
+    for s in &loaded.sessions.data {
+        slicer.room(s, "session")?.sessions.push(s.clone());
+    }
+    for p in &loaded.plans.data {
+        slicer.room(p, "plan")?.plans.push(p.clone());
+    }
+    for a in &loaded.approvals.data {
+        slicer.room(a, "approval")?.approvals.push(a.clone());
+    }
+    for d in &loaded.diffs.data {
+        slicer.room(d, "diff summary")?.diffs.push(d.clone());
+    }
+    let count = u16::try_from(slicer.slices.len())
+        .map_err(|_| WireError::new(ErrorCode::Oversize, "the board needs more parts than a snapshot can have"))?;
+    slicer
+        .slices
+        .into_iter()
+        .enumerate()
+        .map(|(index, slice)| encode(&part(slice, (count > 1).then_some(Part { index: index as u16, count }))))
+        .collect()
+}
+
+/// One page of a file's diff: the lines from `offset` (counted across the hunks) that fit in
+/// `budget` bytes, and the offset of the next page when lines remain. A hunk cut at a page boundary
+/// continues on the next page under the same header, its start lines those of its first line.
+/// Fails with `not_found` when `offset` is past the end. A page always holds at least one line,
+/// so a single line larger than a frame is left for `encode` to refuse.
+pub fn diff_page(file: &FileDiff, offset: usize, budget: usize) -> Result<(FileDiff, Option<usize>), WireError> {
+    let total: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+    if offset > total || (offset == total && total > 0) {
+        return Err(WireError::new(
+            ErrorCode::NotFound,
+            format!("the file has {total} diff lines; offset {offset} is past the end"),
+        ));
+    }
+    let mut page = FileDiff {
+        old_path: file.old_path.clone(),
+        new_path: file.new_path.clone(),
+        status: file.status,
+        binary: file.binary,
+        hunks: Vec::new(),
+        omitted: file.omitted,
+    };
+    let mut size = json_len(&page);
+    let mut index = 0usize;
+    for hunk in &file.hunks {
+        let mut cut = Hunk {
+            header: hunk.header.clone(),
+            old_start: hunk.old_start,
+            new_start: hunk.new_start,
+            lines: Vec::new(),
+        };
+        let overhead = json_len(&cut) + 1;
+        if hunk.lines.is_empty() {
+            // It sits before line `index`, so it belongs to the page that reached it first.
+            if offset == 0 || index > offset {
+                page.hunks.push(cut);
+                size += overhead;
+            }
+            continue;
+        }
+        // The numbers the next line of this hunk has on each side.
+        let (mut old_next, mut new_next) = (hunk.old_start, hunk.new_start);
+        for line in &hunk.lines {
+            let at = index;
+            index += 1;
+            let numbers = (old_next, new_next);
+            old_next = line.old_no.map_or(old_next, |n| n + 1);
+            new_next = line.new_no.map_or(new_next, |n| n + 1);
+            if at < offset {
+                continue;
+            }
+            let cost = json_len(line) + 1 + if cut.lines.is_empty() { overhead } else { 0 };
+            if at > offset && size + cost > budget {
+                if !cut.lines.is_empty() {
+                    page.hunks.push(cut);
+                }
+                return Ok((page, Some(at)));
+            }
+            if cut.lines.is_empty() {
+                (cut.old_start, cut.new_start) = numbers;
+            }
+            size += cost;
+            cut.lines.push(line.clone());
+        }
+        if !cut.lines.is_empty() {
+            page.hunks.push(cut);
+        }
+    }
+    Ok((page, None))
 }
 
 /// Parse one frame. See the module docs for the order of the checks.

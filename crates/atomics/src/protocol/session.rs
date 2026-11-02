@@ -7,6 +7,10 @@
 //! The wait for the client's next frame ends early whenever something is queued for it (the
 //! outbox wakes the link), so a frame leaves as soon as it is ready.
 //!
+//! A client may narrow the board's live updates to the diffs and plans it subscribes to. The
+//! events it left out are sent as `skipped`, so its cursor still advances one by one, and when it
+//! widens its topics again it gets a fresh snapshot for what it missed.
+//!
 //! A client that negotiated `input` may hold the lease of a screen it follows (`lease.rs`). Its
 //! input is written to the PTY from this thread as soon as the frame is read, and the screens
 //! thread is woken to copy the echo. The loop also tells the client whenever a followed screen's
@@ -25,7 +29,7 @@ use atomics_core::wire::{
     VERSION, WireError,
 };
 
-use super::hub::{Hub, Outbox, Taken};
+use super::hub::{Hub, Outbox, Scope, Taken};
 use super::lease::{Client, Policy, TerminalControl};
 use super::link::{Link, LinkError};
 use super::screens::Screens;
@@ -99,6 +103,8 @@ pub struct Shared {
     pub config: SessionConfig,
     pub lease: Policy,
     pub queue_frames: usize,
+    /// The most bytes a frame this session builds (a diff page) may hold.
+    pub frame_budget: usize,
 }
 
 /// Connection numbers: a lease belongs to one connection and dies with it.
@@ -207,8 +213,9 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
     let attached = match lock(&shared.hub).attach(prior_epoch.as_deref(), *prior_cursor) {
         Ok(a) => a,
         Err(e) => {
+            let code = e.code;
             let _ = out.error(e, envelope.request_id.clone());
-            return Ended::Rejected(ErrorCode::Oversize);
+            return Ended::Rejected(code);
         }
     };
     let outbox = attached.outbox;
@@ -222,7 +229,7 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
         capabilities.retain(|c| c != INPUT);
     }
     let mut follows = Follows {
-        keys: HashSet::new(),
+        board: Narrowed::default(),
         screens: HashSet::new(),
         terminals,
         input: terminals && capabilities.iter().any(|c| c == INPUT),
@@ -271,9 +278,44 @@ fn refuse_link(out: &mut Out<'_>, error: LinkError) -> Ended {
     Ended::Rejected(code)
 }
 
+/// The board topics a client narrowed its live updates to. An empty set admits every item of
+/// its kind; sessions and approvals are never narrowed.
+#[derive(Debug, Default, Clone)]
+struct Narrowed {
+    diffs: HashSet<String>,
+    plans: HashSet<String>,
+}
+
+impl Narrowed {
+    /// The set a `diff` or `plan` topic goes in, and its name there; `None` for a screen.
+    fn entry<'a>(&mut self, topic: &'a Topic) -> Option<(&mut HashSet<String>, &'a str)> {
+        match topic {
+            Topic::Diff { worktree } => Some((&mut self.diffs, worktree.as_str())),
+            Topic::Plan { id } => Some((&mut self.plans, id.as_str())),
+            Topic::Screen { .. } => None,
+        }
+    }
+
+    fn admits(&self, scope: &Scope) -> bool {
+        match scope {
+            Scope::Open => true,
+            Scope::Diff(worktree) => self.diffs.is_empty() || self.diffs.contains(worktree),
+            Scope::Plan(id) => self.plans.is_empty() || self.plans.contains(id),
+        }
+    }
+
+    /// Whether `self` admits something `before` did not: the events for it were skipped, so the
+    /// client needs a fresh snapshot.
+    fn widens(&self, before: &Narrowed) -> bool {
+        let wider =
+            |now: &HashSet<String>, was: &HashSet<String>| !was.is_empty() && (now.is_empty() || !now.is_subset(was));
+        wider(&self.diffs, &before.diffs) || wider(&self.plans, &before.plans)
+    }
+}
+
 /// What one client follows, what it negotiated, and who it is to a lease.
 struct Follows {
-    keys: HashSet<String>,
+    board: Narrowed,
     /// Sessions whose screens it subscribed to.
     screens: HashSet<String>,
     terminals: bool,
@@ -286,6 +328,21 @@ struct Follows {
     /// Input refused with `slow_client`, by followed screen: its lease token and number. What the
     /// client had already sent behind it meets `out_of_order`, which does not count either.
     slowed: HashMap<String, (u64, u64)>,
+}
+
+impl Follows {
+    /// Topics of every kind, which `MAX_SUBSCRIPTIONS` bounds together.
+    fn count(&self) -> usize {
+        self.board.diffs.len() + self.board.plans.len() + self.screens.len()
+    }
+
+    fn has(&self, topic: &Topic) -> bool {
+        match topic {
+            Topic::Diff { worktree } => self.board.diffs.contains(worktree),
+            Topic::Plan { id } => self.board.plans.contains(id),
+            Topic::Screen { session, .. } => self.screens.contains(session),
+        }
+    }
 }
 
 /// Refusals a well-behaved client meets as a matter of course: another one races it for a lease,
@@ -334,8 +391,17 @@ fn conversation(
             return Err(Ended::Stopped);
         }
         match outbox.take() {
-            Taken::Frames(frames) => {
-                for frame in frames {
+            Taken::Frames { board, screens } => {
+                for frame in board {
+                    if subscriptions.board.admits(&frame.scope) {
+                        out.raw(&frame.text).map_err(link_ended)?;
+                    } else {
+                        // Left out, but its cursor still counts.
+                        let skipped = Envelope::host(&out.epoch, Message::Skipped { cursor: Seq(frame.cursor) });
+                        out.envelope(&skipped).map_err(link_ended)?;
+                    }
+                }
+                for frame in screens {
                     out.raw(&frame).map_err(link_ended)?;
                 }
             }
@@ -460,7 +526,7 @@ fn reply_lease(
 
 fn resync(out: &mut Out<'_>, shared: &Shared, outbox: &Outbox) -> Result<(), Ended> {
     if let Err(e) = lock(&shared.hub).resync(outbox) {
-        // The board no longer fits in one frame; say so rather than leave the client stale.
+        // One item of the board is over the frame limit; say so rather than leave the client stale.
         let code = e.code;
         let _ = out.error(e, None);
         return Err(Ended::Rejected(code));
@@ -508,12 +574,12 @@ fn handle(
                         return Err(if closed { gone(no_terminal()) } else { refused(no_terminal()) });
                     }
                 }
-                let key = topic.key();
-                if !subscriptions.keys.contains(&key) {
-                    fresh.insert(key);
+                if !subscriptions.has(topic) {
+                    fresh.insert(topic.key());
                 }
             }
-            if subscriptions.keys.len() + fresh.len() > MAX_SUBSCRIPTIONS {
+            // One limit spans screens and board topics.
+            if subscriptions.count() + fresh.len() > MAX_SUBSCRIPTIONS {
                 return Err(refuse(ErrorCode::TooMany, "too many subscriptions"));
             }
             let mut screens: Vec<String> = Vec::new();
@@ -525,18 +591,27 @@ fn handle(
                             subscriptions.screens.remove(&session);
                             shared.screens.unsubscribe(&session, outbox);
                         }
-                        subscriptions.keys.retain(|key| !fresh.contains(key));
                         return Err(gone(error));
                     }
                     if subscriptions.screens.insert(session.clone()) {
                         screens.push(session.clone());
                     }
                 }
-                subscriptions.keys.insert(topic.key());
+            }
+            // Board topics cannot fail, so they go in once every screen has.
+            let before = subscriptions.board.clone();
+            for topic in &topics {
+                if let Some((set, name)) = subscriptions.board.entry(topic) {
+                    set.insert(name.to_string());
+                }
+            }
+            if subscriptions.board.widens(&before) {
+                outbox_resync(shared, outbox).map_err(refused)?;
             }
             Ok(())
         }
         Message::Unsubscribe { topics } => {
+            let before = subscriptions.board.clone();
             for topic in topics {
                 if let Topic::Screen { session, .. } = &topic
                     && subscriptions.screens.remove(session)
@@ -549,7 +624,13 @@ fn handle(
                         control.disconnect(&subscriptions.me, LeaseReason::Disconnected);
                     }
                 }
-                subscriptions.keys.remove(&topic.key());
+                if let Some((set, name)) = subscriptions.board.entry(&topic) {
+                    set.remove(name);
+                }
+            }
+            // Dropping the last topic of a kind goes back to every item of it.
+            if subscriptions.board.widens(&before) {
+                outbox_resync(shared, outbox).map_err(refused)?;
             }
             Ok(())
         }
@@ -566,7 +647,7 @@ fn handle(
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
         }
-        Message::DiffGet { worktree, path, revision } => {
+        Message::DiffGet { worktree, path, revision, offset } => {
             let Some((current, file)) = shared.diffs.file(&worktree, &path) else {
                 // The diff may have changed since the revision the client was told of the file in.
                 let error = WireError::new(ErrorCode::NotFound, "no such diff file");
@@ -576,8 +657,14 @@ fn handle(
             if revision.is_some_and(|r| r != Seq(current)) {
                 return Err(refuse(ErrorCode::StaleRevision, &format!("the diff is at revision {current}")));
             }
-            let body = DiffFileBody { worktree, revision: current, file };
-            let reply = Envelope::host(&out.epoch, Message::DiffFile { body }).reply_to(id);
+            // The envelope, the worktree and the paging fields go alongside the lines.
+            let room = shared
+                .frame_budget
+                .saturating_sub(1024 + wire::json_len(&worktree) + id.as_deref().map_or(0, wire::json_len));
+            let (page, next) = wire::diff_page(&file, offset.map_or(0, |o| o as usize), room).map_err(refused)?;
+            let body = DiffFileBody { worktree, revision: current, file: page };
+            let message = Message::DiffFile { body, truncated: next.is_some(), next_offset: next.map(|n| n as u32) };
+            let reply = Envelope::host(&out.epoch, message).reply_to(id);
             match wire::encode(&reply) {
                 Ok(frame) => Ok(out.raw(&frame)?),
                 Err(e) => Err(Handled::Refused(e.into(), reply.request_id)),
