@@ -15,7 +15,7 @@ use atomics_core::store::{SessionRecord, Store};
 use atomics_core::{paths, steer, theme};
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
-use crate::diff_view::{self, DiffAction, DiffState, ExplorerState, Header};
+use crate::diff_view::{self, DiffAction, DiffState, Header};
 use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
@@ -33,7 +33,7 @@ use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
 use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use atomics_core::workspace::{self, Workspace};
-use atomics_ui::status::{status_color, status_dot};
+use atomics_ui::status::status_dot;
 use atomics_ui::text::truncate;
 use atomics_ui::{Backend, PlanRow};
 use serde_json::json;
@@ -664,17 +664,14 @@ struct Client {
     icon: egui::TextureHandle,
     load: (Instant, Option<f64>),
     workspace_input: String,
-    explorers: HashMap<PathBuf, ExplorerState>,
     split: Option<f32>,
     editor_file: HashMap<PathBuf, String>,
     focus_editor: bool,
     editor_id: Option<egui::Id>,
     terminal_views: HashMap<egui::Id, TerminalView>,
-    selected: HashSet<String>,
     steer_text: String,
     steer_target: SteerTarget,
     focus_steer: bool,
-    confirm_close: Option<String>,
     new_dialog: Option<NewDialog>,
     rename: Option<Rename>,
     quick_open: Option<QuickOpen>,
@@ -729,17 +726,14 @@ impl Client {
             icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
             load: (Instant::now() - Duration::from_secs(10), None),
             workspace_input: String::new(),
-            explorers: HashMap::new(),
             split: None,
             editor_file: HashMap::new(),
             focus_editor: false,
             editor_id: None,
             terminal_views: HashMap::new(),
-            selected: HashSet::new(),
             steer_text: String::new(),
             steer_target: SteerTarget::Active,
             focus_steer: false,
-            confirm_close: None,
             new_dialog: None,
             rename: None,
             quick_open: None,

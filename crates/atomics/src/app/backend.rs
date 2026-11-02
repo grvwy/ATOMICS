@@ -1,6 +1,9 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
-use atomics_ui::{ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, PlanRow, SessionRow, UiConfig};
+use atomics_ui::{
+    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, PlanRow, RecentSession, SessionRow, UiConfig, ViewHints,
+    WorktreeRow,
+};
 
 use super::*;
 
@@ -162,7 +165,68 @@ impl Backend for Local<'_> {
 
     fn ui_config(&self) -> UiConfig {
         let config = &self.0.config;
-        UiConfig { keys: config.keys.clone(), font: config.font.clone(), layout: config.layout.clone() }
+        UiConfig {
+            keys: config.keys.clone(),
+            font: config.font.clone(),
+            layout: config.layout.clone(),
+            agents: config.agents.iter().map(|agent| agent.name.clone()).collect(),
+        }
+    }
+
+    fn view_hints(&self) -> ViewHints {
+        ViewHints { active: self.0.active.clone(), diff_target: self.0.diff_target() }
+    }
+
+    fn visible_sessions(&self) -> Vec<usize> {
+        self.0.visible_sessions()
+    }
+
+    fn checkouts(&self) -> Vec<String> {
+        self.0.creating.iter().map(|(_, branch, _)| branch.clone()).collect()
+    }
+
+    fn recent_sessions(&self) -> Vec<RecentSession> {
+        let state = self.0;
+        let live_ids: HashSet<&str> = state.sessions.iter().filter_map(|s| s.claude_id.as_deref()).collect();
+        state
+            .store
+            .sessions
+            .iter()
+            .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
+            .filter(|r| state.project_of(&r.cwd).is_some())
+            .filter({
+                let mut seen = HashSet::new();
+                move |r| seen.insert((r.title.clone(), r.cwd.clone()))
+            })
+            .take(8)
+            .map(|record| RecentSession { folder: paths::display(&record.cwd), record: record.clone() })
+            .collect()
+    }
+
+    fn repos(&self) -> Vec<PathBuf> {
+        self.0.repos.clone()
+    }
+
+    fn project_of(&self, dir: &Path) -> Option<PathBuf> {
+        self.0.project_of(dir)
+    }
+
+    fn repo_workflow(&self, project: &Path) -> Option<atomics_core::repo_workflow::RepoWorkflow> {
+        self.0.repo_workflows.get(project).cloned()
+    }
+
+    fn worktrees(&self, project: &Path) -> Vec<WorktreeRow> {
+        let state = self.0;
+        state
+            .worktrees
+            .iter()
+            .filter(|w| w.path != project && state.worktree_project.get(&w.path).map(PathBuf::as_path) == Some(project))
+            .map(|w| WorktreeRow { path: w.path.clone(), branch: w.branch.clone() })
+            .collect()
+    }
+
+    fn display(&self, path: &Path) -> String {
+        paths::display(path)
     }
 }
 

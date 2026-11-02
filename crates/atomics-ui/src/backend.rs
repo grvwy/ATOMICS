@@ -7,8 +7,10 @@ use atomics_core::config::{AgentKind, FontConfig, KeyConfig};
 use atomics_core::diff_data::{FileView, Prepared};
 use atomics_core::layout::LayoutConfig;
 use atomics_core::plan::{Plan, PlanStatus};
+use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
+use atomics_core::store::SessionRecord;
 use atomics_core::tickets::TicketConfig;
 use egui::Color32;
 
@@ -179,6 +181,34 @@ pub struct UiConfig {
     /// Terminal and diff text sizes; a theme's sizes win over them.
     pub font: FontConfig,
     pub layout: LayoutConfig,
+    /// The configured agents, by name, in the config's order.
+    pub agents: Vec<String>,
+}
+
+/// What the host's model holds about what is on screen. The desktop writes these view hints into the
+/// model so that `atomics ctl` and the host's scheduling see them; the UI reads them back from there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewHints {
+    /// The active session, by id.
+    pub active: Option<String>,
+    /// The worktree whose diff the diff panel shows: the active session's, else one picked in the explorer.
+    pub diff_target: Option<PathBuf>,
+}
+
+/// A session that is no longer running, which the RECENT list offers to resume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentSession {
+    pub record: SessionRecord,
+    /// Its folder as the host writes paths, with the home folder as `~`.
+    pub folder: String,
+}
+
+/// A worktree of a project, beside its main checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRow {
+    pub path: PathBuf,
+    /// Its branch; `None` on a detached HEAD.
+    pub branch: Option<String>,
 }
 
 /// Everything the UI reads from a host. Methods take `&self` and return owned or shared data, so an
@@ -212,6 +242,33 @@ pub trait Backend {
     /// What the diff panel's header shows of the worktree at `root`.
     fn diff_heading(&self, root: &Path) -> DiffHeading;
 
-    /// The keys, fonts and layout the host's config sets.
+    /// The keys, fonts, layout and agents the host's config sets.
     fn ui_config(&self) -> UiConfig;
+
+    /// The view hints in the host's model.
+    fn view_hints(&self) -> ViewHints;
+
+    /// The sessions the current tab shows, as positions in [`session_list`](Backend::session_list).
+    fn visible_sessions(&self) -> Vec<usize>;
+
+    /// The branches of worktrees being checked out for new sessions.
+    fn checkouts(&self) -> Vec<String>;
+
+    /// Up to eight sessions of the open projects that no longer run, newest first, which can be resumed.
+    fn recent_sessions(&self) -> Vec<RecentSession>;
+
+    /// The main checkouts of the open projects (and the config's `repos`).
+    fn repos(&self) -> Vec<PathBuf>;
+
+    /// The open project `dir` belongs to, if any.
+    fn project_of(&self, dir: &Path) -> Option<PathBuf>;
+
+    /// The repository workflow of a project: its instructions, config and warnings, once read.
+    fn repo_workflow(&self, project: &Path) -> Option<RepoWorkflow>;
+
+    /// A project's worktrees other than its main checkout, as the host last listed them.
+    fn worktrees(&self, project: &Path) -> Vec<WorktreeRow>;
+
+    /// `path` as the host writes paths, with its home folder as `~`.
+    fn display(&self, path: &Path) -> String;
 }

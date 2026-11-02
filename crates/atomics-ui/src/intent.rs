@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use atomics_core::approvals::Decision;
 use atomics_core::plan::TaskStatus;
 use atomics_core::steer::ReviewComment;
+use atomics_core::store::SessionRecord;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
@@ -80,5 +81,36 @@ pub enum Intent {
         root: PathBuf,
         path: Option<String>,
         line: Option<u32>,
+    },
+    /// Make a session the active one, opening the diff panel if `open_diff`.
+    Activate {
+        session: String,
+        open_diff: bool,
+    },
+    /// Ask for a session's new title.
+    Rename(String),
+    /// Start a session again from its record.
+    Resume(SessionRecord),
+    /// Ask the platform for a folder to open as a project.
+    PickProject,
+    /// Start a configured agent in a folder.
+    StartAgent {
+        agent: String,
+        folder: PathBuf,
+    },
+    /// Ask where to create a new worktree of a project.
+    NewWorktree(PathBuf),
+    CloseProject(PathBuf),
+    /// Show the diff of a worktree or main checkout no session is active in.
+    ShowRoot(PathBuf),
+    /// Look for merged or abandoned worktrees of a project, with one picked already if given.
+    OpenCleanup {
+        repo: PathBuf,
+        preselect: Option<PathBuf>,
+    },
+    /// Show a file of a worktree whole in its diff view.
+    OpenFile {
+        root: PathBuf,
+        path: String,
     },
 }

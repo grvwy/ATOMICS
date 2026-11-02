@@ -90,6 +90,26 @@ impl Desktop<'_> {
                     let ctx = self.client.ctx.clone();
                     self.edit(&ctx, &root, path.as_deref(), line);
                 }
+                Intent::Activate { session, open_diff } => self.activate(&session, open_diff),
+                Intent::Rename(session) => self.begin_rename(&session),
+                Intent::Resume(record) => self.post(move |state| state.resume.push(record)),
+                Intent::PickProject => self.pick_project(),
+                Intent::StartAgent { agent, folder } => self.runtime.pending_open.push((agent, folder)),
+                Intent::NewWorktree(root) => {
+                    self.open_new_dialog(Some(root.clone()));
+                    if let Some(dialog) = &mut self.client.new_dialog {
+                        dialog.place = Place::Worktree;
+                        dialog.repo = paths::display(&root);
+                    }
+                }
+                Intent::CloseProject(root) => self.close_project(&root),
+                Intent::ShowRoot(root) => {
+                    self.runtime.active = None;
+                    self.runtime.diff_root = Some(root);
+                    self.runtime.diff_open = true;
+                }
+                Intent::OpenCleanup { repo, preselect } => self.open_cleanup(repo, preselect),
+                Intent::OpenFile { root, path } => self.open_file(&root, &path),
             }
         }
     }

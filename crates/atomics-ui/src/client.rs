@@ -9,7 +9,7 @@ use atomics_core::layout::DiffSplit;
 use atomics_core::plan::PlanStatus;
 
 use crate::Intent;
-use crate::diff_view::DiffState;
+use crate::diff_view::{DiffState, ExplorerState};
 use crate::theme::{Fonts, Palette};
 
 /// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
@@ -30,6 +30,12 @@ pub struct Client {
     pub diff_views: HashMap<PathBuf, DiffState>,
     /// Side by side or unified, picked in the diff header; wins over the config until the UI closes.
     pub diff_split: Option<DiffSplit>,
+    /// Each project's explorer: its filter, open folders and whether its worktrees show, by project.
+    pub explorers: HashMap<PathBuf, ExplorerState>,
+    /// The sessions picked to steer together, by id.
+    pub selected: HashSet<String>,
+    /// A session waiting for the user to confirm closing it, by id.
+    pub confirm_close: Option<String>,
 }
 
 impl Default for Client {
@@ -44,6 +50,9 @@ impl Default for Client {
             approval_decisions: HashSet::new(),
             diff_views: HashMap::new(),
             diff_split: None,
+            explorers: HashMap::new(),
+            selected: HashSet::new(),
+            confirm_close: None,
         }
     }
 }

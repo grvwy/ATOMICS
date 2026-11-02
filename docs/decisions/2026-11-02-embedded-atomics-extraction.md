@@ -246,6 +246,17 @@ Commits, one per file group:
    desktop until the panels it switches between move: the board (moved), the Tickets panel (S4), the pull
    request diff (`github.rs`), the changed-files column, whose clicks open the editor in editor mode, and
    the editor terminal.
+4. **Sidebar** (`sidebar.rs`). `atomics_ui::sidebar::sessions` is the AGENTS list (session rows, their menu,
+   worktrees being checked out) with RECENT, and `atomics_ui::sidebar::explorer` the EXPLORER (projects,
+   repository workflow, worktrees, files). New reads: `view_hints()` (`ViewHints`: the active session and
+   the diff target, as the model holds them), `visible_sessions()` (the current tab's sessions, by position;
+   the rule stays the host's, `control.rs` uses it too), `checkouts()`, `recent_sessions()` (the RECENT
+   filter, which checks folders on disk, with each folder as the host writes paths), `repos()`,
+   `project_of(dir)`, `repo_workflow(project)`, `worktrees(project)` (`WorktreeRow`: `git` is native-only)
+   and `display(path)`; `UiConfig` gains the agents' names. Clicks become intents: activate, rename,
+   resume, pick a project, start an agent in a folder, new worktree, close a project, show a folder's
+   diff, clean up worktrees, open a file. `selected`, `confirm_close` and `explorers` move to the client.
+   The sidebar frame (USAGE, the TICKETS section of S4) stays in the desktop and calls both.
 
 ## 5. The dependency test
 

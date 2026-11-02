@@ -1,4 +1,5 @@
 use atomics_ui::SessionRow;
+use atomics_ui::sidebar::section;
 
 use super::*;
 
@@ -66,64 +67,6 @@ fn measure_divider(ui: &mut egui::Ui) -> f32 {
     super::topbar::measure(ui, |ui| {
         ui.separator();
     })
-}
-
-fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
-    ui.horizontal(|ui| {
-        // Painted rather than a "▍" glyph, which proportional UI fonts lack.
-        let (bar, _) = ui.allocate_exact_size(vec2(3.0, 12.0), Sense::hover());
-        ui.painter().rect_filled(bar, 0.0, p.accent);
-        ui.label(RichText::new(title).size(10.5).color(p.muted).strong());
-    });
-    ui.add_space(1.0);
-}
-
-fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, selected: bool) -> egui::Response {
-    let height = 38.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    let painter = ui.painter();
-    if active {
-        painter.rect_filled(rect, 2.0, lerp(p.panel, p.accent, 0.14));
-        painter.rect_filled(rect.with_max_x(rect.left() + 2.0), 0.0, p.accent);
-    } else if response.hovered() {
-        painter.rect_filled(rect, 2.0, p.raised);
-    }
-    let now = ui.input(|i| i.time);
-    painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
-    let clip = painter.with_clip_rect(rect.shrink2(vec2(2.0, 0.0)));
-    // The diff stats keep their corner; a long title is cut before them.
-    let stats_left = match s.changes {
-        Some((add, del)) => clip
-            .text(
-                pos2(rect.right() - 6.0, rect.top() + 5.0),
-                egui::Align2::RIGHT_TOP,
-                format!("+{add} −{del}"),
-                FontId::monospace(10.5),
-                p.muted,
-            )
-            .left(),
-        None => rect.right(),
-    };
-    painter.with_clip_rect(rect.shrink2(vec2(2.0, 0.0)).with_max_x(stats_left - 6.0)).text(
-        pos2(rect.left() + 20.0, rect.top() + 5.0),
-        egui::Align2::LEFT_TOP,
-        &s.title,
-        p.ui(13.0),
-        if active { p.accent } else { p.foreground },
-    );
-    let mut detail = if s.scratch {
-        format!("{} · scratch · {}", s.agent, s.status.label())
-    } else {
-        format!("{} · {}", s.agent, s.status.label())
-    };
-    if s.outside {
-        detail.push_str(" · outside");
-    }
-    if selected {
-        detail.push_str(" · ✔");
-    }
-    clip.text(pos2(rect.left() + 20.0, rect.top() + 21.0), egui::Align2::LEFT_TOP, detail, p.ui(11.0), p.muted);
-    response
 }
 
 /// What a plan's tab shows: its ticket's key with progress when it has one, else its goal.
@@ -692,283 +635,17 @@ impl Desktop<'_> {
         let total = ui.available_height();
         let sessions_height = if files_root.is_some() { (total * 0.46).max(150.0) } else { total };
         ui.add_space(6.0);
-        egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(ui, |ui| {
-            self.tickets_section(ui, &p);
-            section(ui, &p, "AGENTS");
-            let mut clicked: Option<String> = None;
-            let mut close: Option<String> = None;
-            let mut rename: Option<String> = None;
-            let sessions = self.runtime.backend().session_list();
-            let visible = self.runtime.visible_sessions();
-            for (index, session) in sessions.iter().enumerate() {
-                if !visible.contains(&index) {
-                    continue;
-                }
-                let active = self.runtime.active.as_deref() == Some(session.id.as_str());
-                let row = session_row(ui, &p, session, active, self.client.selected.contains(&session.id));
-                if row.clicked() {
-                    clicked = Some(session.id.clone());
-                }
-                row.context_menu(|ui| {
-                    let mut selected = self.client.selected.contains(&session.id);
-                    if ui.checkbox(&mut selected, "Include in “selected”").changed() {
-                        if selected { self.client.selected.insert(session.id.clone()); }
-                        else { self.client.selected.remove(&session.id); }
-                    }
-                    if !session.chief && ui.button("Rename…").clicked() {
-                        rename = Some(session.id.clone());
-                        ui.close();
-                    }
-                    if ui.button("Close").clicked() {
-                        close = Some(session.id.clone());
-                        ui.close();
-                    }
-                });
-            }
-            for (_, branch, _) in &self.runtime.creating {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new(format!("checking out {branch}…")).color(p.muted).size(12.0));
-                });
-            }
-            if sessions.is_empty() && self.runtime.creating.is_empty() {
-                ui.label(RichText::new("No agents yet. Start one with + New,\nor install hooks to see agents\nrunning in other terminals.").color(p.muted).size(12.0));
-            }
-            if let Some(id) = clicked {
-                self.activate(&id, true);
-            }
-            if let Some(id) = close {
-                self.client.confirm_close = Some(id);
-            }
-            if let Some(id) = rename {
-                self.begin_rename(&id);
-            }
-
-            let live_ids: HashSet<&str> = self.runtime.sessions.iter().filter_map(|s| s.claude_id.as_deref()).collect();
-            let recent: Vec<SessionRecord> = self
-                .store
-                .sessions
-                .iter()
-                .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
-                .filter(|r| self.runtime.project_of(&r.cwd).is_some())
-                .filter({
-                    let mut seen = HashSet::new();
-                    move |r| seen.insert((r.title.clone(), r.cwd.clone()))
-                })
-                .take(8)
-                .cloned()
-                .collect();
-            if !recent.is_empty() {
-                ui.add_space(10.0);
-                section(ui, &p, "RECENT · click to resume");
-                for record in recent {
-                    let hover = record.last_prompt.clone().unwrap_or_else(|| paths::display(&record.cwd));
-                    let response = ui.selectable_label(false, RichText::new(&record.title).color(p.muted).size(12.5)).on_hover_text(hover);
-                    if response.clicked() {
-                        self.pending_open_resume(record);
-                    }
-                }
-            }
-
-        });
+        egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(
+            ui,
+            |ui| {
+                self.tickets_section(ui, &p);
+                self.draw(|backend, client| atomics_ui::sidebar::sessions(ui, backend, client));
+            },
+        );
 
         ui.add_space(4.0);
         ui.separator();
-        self.explorer(ui, &p);
-    }
-
-    fn explorer(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let target = self.runtime.diff_target();
-        let focus =
-            target.as_deref().and_then(|t| self.runtime.project_of(t)).or_else(|| self.runtime.repos.first().cloned());
-        ui.horizontal(|ui| {
-            section(ui, p, "EXPLORER");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("+").on_hover_text("Open project…").clicked() {
-                    self.pick_project();
-                }
-            });
-        });
-        let sessions = self.runtime.backend().session_list();
-        let mut switch_to: Option<PathBuf> = None;
-        let mut close: Option<PathBuf> = None;
-        ui.horizontal_wrapped(|ui| {
-            for root in self.runtime.repos.clone() {
-                let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let agents = sessions.iter().filter(|s| s.project.as_ref() == Some(&root)).count();
-                let label = if agents > 0 { format!("{name} ·{agents}") } else { name };
-                let selected = focus.as_ref() == Some(&root);
-                let color = if selected { p.accent } else { p.foreground };
-                let response = ui.selectable_label(selected, RichText::new(label).color(color).size(12.5));
-                if response.clicked() && !selected {
-                    switch_to = Some(root.clone());
-                }
-                response.on_hover_text(paths::display(&root)).context_menu(|ui| {
-                    for agent in self.runtime.config.agents.clone() {
-                        if ui.button(format!("Start {} in the main checkout", agent.name)).clicked() {
-                            self.runtime.pending_open.push((agent.name.clone(), root.clone()));
-                            ui.close();
-                        }
-                    }
-                    if ui.button("New worktree…").clicked() {
-                        self.open_new_dialog(Some(root.clone()));
-                        if let Some(dialog) = &mut self.client.new_dialog {
-                            dialog.place = Place::Worktree;
-                            dialog.repo = paths::display(&root);
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Close project").clicked() {
-                        close = Some(root.clone());
-                        ui.close();
-                    }
-                });
-            }
-        });
-        if let Some(root) = switch_to {
-            self.runtime.active = None;
-            self.runtime.diff_root = Some(root);
-            self.runtime.diff_open = true;
-        }
-        if let Some(root) = close {
-            self.close_project(&root);
-            return;
-        }
-        let Some(project) = focus else {
-            ui.add_space(8.0);
-            ui.label(RichText::new("Open a project with + or Project › Open project…").color(p.muted).size(12.0));
-            return;
-        };
-
-        if let Some(workflow) = self.runtime.repo_workflows.get(&project) {
-            egui::CollapsingHeader::new("Repository workflow").id_salt(("repo-workflow", &project)).show(ui, |ui| {
-                for (file, text) in &workflow.instructions {
-                    ui.label(RichText::new(file).small()).on_hover_text(text);
-                }
-                if !workflow.config.table.is_empty() {
-                    ui.small(&workflow.config.path).on_hover_text(workflow.config_text());
-                }
-                for warning in &workflow.warnings {
-                    ui.label(warning);
-                }
-                if workflow.instructions.is_empty() {
-                    ui.small("No ATOMICS.md or .atomics/*.md");
-                }
-            });
-        }
-
-        // Worktrees of the focused project, folded by default (big repos have dozens).
-        let worktrees: Vec<WorktreeEntry> = self
-            .worktrees
-            .iter()
-            .filter(|w| w.path != project && self.runtime.worktree_project.get(&w.path) == Some(&project))
-            .cloned()
-            .collect();
-        let explorer = self.client.explorers.entry(project.clone()).or_default();
-        let arrow = if explorer.show_worktrees { "▾" } else { "▸" };
-        let mut open_cleanup = false;
-        ui.horizontal(|ui| {
-            let header = ui.add(
-                egui::Label::new(
-                    RichText::new(format!("{arrow} worktrees ({})", worktrees.len())).color(p.muted).size(12.0),
-                )
-                .sense(Sense::click()),
-            );
-            if header.clicked() {
-                explorer.show_worktrees = !explorer.show_worktrees;
-            }
-            if ui
-                .small_button("clean up…")
-                .on_hover_text("Find merged or abandoned worktrees and remove them")
-                .clicked()
-            {
-                open_cleanup = true;
-            }
-        });
-        if open_cleanup {
-            self.open_cleanup(project.clone(), None);
-            return;
-        }
-        let explorer = self.client.explorers.entry(project.clone()).or_default();
-        if explorer.show_worktrees {
-            let mut pick: Option<PathBuf> = None;
-            let mut remove_one: Option<PathBuf> = None;
-            egui::ScrollArea::vertical().id_salt(("worktrees", &project)).max_height(190.0).show(ui, |ui| {
-                let main_selected = target.as_ref() == Some(&project);
-                if ui.selectable_label(main_selected, RichText::new("main checkout").size(12.0)).clicked() {
-                    pick = Some(project.clone());
-                }
-                for wt in &worktrees {
-                    let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let agent = sessions.iter().find(|s| s.root == wt.path);
-                    let selected = target.as_ref() == Some(&wt.path);
-                    let response = ui
-                        .horizontal(|ui| {
-                            if let Some(agent) = agent {
-                                ui.label(RichText::new("●").color(status_color(agent.status, p)).size(10.0));
-                            }
-                            let response = ui.selectable_label(selected, RichText::new(&name).size(12.0));
-                            if let Some(branch) = &wt.branch {
-                                ui.label(RichText::new(branch).color(p.muted).size(10.5));
-                            }
-                            response
-                        })
-                        .inner;
-                    if response.clicked() {
-                        pick = Some(wt.path.clone());
-                    }
-                    response.context_menu(|ui| {
-                        for agent in self.runtime.config.agents.clone() {
-                            if ui.button(format!("Start {} here", agent.name)).clicked() {
-                                self.runtime.pending_open.push((agent.name.clone(), wt.path.clone()));
-                                ui.close();
-                            }
-                        }
-                        if ui.button("Remove worktree…").clicked() {
-                            remove_one = Some(wt.path.clone());
-                            ui.close();
-                        }
-                    });
-                }
-            });
-            if let Some(path) = remove_one {
-                self.open_cleanup(project.clone(), Some(path));
-                return;
-            }
-            if let Some(path) = pick {
-                match sessions.iter().find(|s| s.root == path).map(|s| s.id.clone()) {
-                    Some(id) => self.activate(&id, true),
-                    None => {
-                        self.runtime.active = None;
-                        self.runtime.diff_root = Some(path);
-                        self.runtime.diff_open = true;
-                    }
-                }
-            }
-        }
-
-        let review =
-            target.filter(|t| self.runtime.project_of(t).as_ref() == Some(&project)).unwrap_or_else(|| project.clone());
-        if review != project {
-            let name = review.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            ui.label(RichText::new(format!("changes from {name}")).color(p.accent).size(11.0));
-        }
-        let main = self.runtime.diffs.get(&project).and_then(|d| d.prepared.clone());
-        let changes = self.runtime.diffs.get(&review).and_then(|d| d.prepared.clone());
-        let viewing = self.client.diff_views.get(&review).and_then(|d| d.viewing.clone());
-        let (main, changes) = match (main, changes) {
-            (Some(main), Some(changes)) => (main, changes),
-            (Some(main), None) => (main.clone(), main),
-            (None, Some(changes)) => (changes.clone(), changes),
-            (None, None) => {
-                ui.label(RichText::new("Reading files…").color(p.muted).size(12.0));
-                return;
-            }
-        };
-        let explorer = self.client.explorers.entry(project).or_default();
-        if let Some(path) = diff_view::files_panel(ui, explorer, &main, &changes, viewing.as_deref(), p) {
-            self.open_file(&review, &path);
-        }
+        self.draw(|backend, client| atomics_ui::sidebar::explorer(ui, backend, client));
     }
 
     pub(super) fn project_menu(&mut self, ui: &mut egui::Ui) {
@@ -1060,9 +737,6 @@ impl Desktop<'_> {
         }
     }
 
-    fn pending_open_resume(&mut self, record: SessionRecord) {
-        self.post(move |state| state.resume.push(record));
-    }
 }
 
 #[cfg(test)]
