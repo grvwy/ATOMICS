@@ -203,6 +203,75 @@ Checked with screenshots before and after on macOS and Linux (Xvfb): a changed a
 comment, and on macOS also an unchanged file's whole-file view. The diff panel is identical pixel for pixel; the
 rest of the window differs only where two runs of the same build differ too (the load gauge, terminal text).
 
+### 4.6 S7
+
+The draw code moves into `atomics-ui` file by file. A moved view is a function of `(ui, …, &dyn Backend, &mut
+Client)`:
+
+- `atomics_ui::Client` holds the view state the moved code keeps (the palette to draw with, open cards,
+  confirmations). Fields leave the desktop's `Client` as the code that uses them moves; the desktop's `Client`
+  keeps the rest and holds the moved part as `ui`, and derefs to it, so desktop code and tests that name a
+  moved field read as before.
+- Writes are `atomics_ui::Intent` values the draw code records on the client: a plan by its position in the
+  last list read, as reads address it. `Desktop` is the shim that still holds `&mut State`: `Desktop::draw`
+  gives the client the host's palette, runs the moved code over the in-process `Backend` and then carries
+  out the recorded intents with the posts and view-hint writes the desktop code made (`app/intents.rs`).
+  So an intent runs in the same frame, when the draw function returns, rather than where the click was
+  handled; nothing the moved code reads changes in between. S8 turns intents into the protocol's commands.
+- Facts the draw code read from the host's disk or native modules come from the host on the view types.
+
+Commits, one per file group:
+
+1. **Board** (`board.rs`). `atomics_ui::board::draw` is `plan_panel`, the plan header and the kanban
+   columns, with `ticket_chip`, `stage_chip`, `mode_label`, `tracked_label` and `task_result`; its
+   clicks, which it already gathered and handled after drawing, become intents. `PlanState::color`
+   replaces the desktop's `PlanColor`, `atomics_ui::status` holds `status_color`, `status_dot` and
+   `task_color`, and `atomics_ui::text` holds `truncate`. `BoardView` gains what `task_result` read from the
+   host: `worktrees` (finished tasks whose worktree is still on disk), `codex` (tasks of a Codex agent, which
+   resume without a saved id) and `now`, the host's clock, which the ticket chip and a task's last report
+   compare against. The completed-task tiles (fleet, not moved yet) call `task_result` through a desktop
+   wrapper that works these out as before. `expanded_tasks` and `confirm_plan_close` move to the client.
+   `plan_with_chief_names_the_auto_decision_in_the_board_header` moved with the labels it tests.
+2. **Approvals** (`fleet.rs`). `atomics_ui::approvals::banner` is the permission banner of a session's tile:
+   it reads the session's `ApprovalRow` itself and records `Intent::Decide`, which runs `approve_request` as
+   before. `approval_decisions` moves to the client. The tile around it stays in the desktop until fleet moves.
+   The `cfg(test)` record of the banner's buttons is `cfg(feature = "test-support")` in `atomics-ui`; the
+   desktop's dev-dependency turns the feature on, as it does `atomics-core`'s.
+3. **Diff view** (`editor.rs`). `atomics_ui::diff_panel::draw` is the end of `diff_panel`: a worktree's diff
+   under its header. Two reads join the `Backend`: `diff_heading(root)` (the active session's title and
+   branch, else the worktree's, and whether an agent there can take a review) and `ui_config()` (the
+   config's `keys`, `font` and `layout`, which the header's shortcut, the diff's font and the split read).
+   Review comment edits, Send review, Refresh, Close and Edit become intents; the side-by-side toggle stays
+   on the client with `diff_views` and `diff_split`, which move. The rest of `diff_panel` stays in the
+   desktop until the panels it switches between move: the board (moved), the Tickets panel (S4), the pull
+   request diff (`github.rs`), the changed-files column, whose clicks open the editor in editor mode, and
+   the editor terminal.
+4. **Sidebar** (`sidebar.rs`). `atomics_ui::sidebar::sessions` is the AGENTS list (session rows, their menu,
+   worktrees being checked out) with RECENT, and `atomics_ui::sidebar::explorer` the EXPLORER (projects,
+   repository workflow, worktrees, files). New reads: `view_hints()` (`ViewHints`: the active session and
+   the diff target, as the model holds them), `visible_sessions()` (the current tab's sessions, by position;
+   the rule stays the host's, `control.rs` uses it too), `checkouts()`, `recent_sessions()` (the RECENT
+   filter, which checks folders on disk, with each folder as the host writes paths), `repos()`,
+   `project_of(dir)`, `repo_workflow(project)`, `worktrees(project)` (`WorktreeRow`: `git` is native-only)
+   and `display(path)`; `UiConfig` gains the agents' names. Clicks become intents: activate, rename,
+   resume, pick a project, start an agent in a folder, new worktree, close a project, show a folder's
+   diff, clean up worktrees, open a file. `selected`, `confirm_close` and `explorers` move to the client.
+   The sidebar frame (USAGE, the TICKETS section of S4) stays in the desktop and calls both.
+5. **Top bar** (`topbar.rs`, the tabs in `sidebar.rs`, the history in `plan_view.rs`). `atomics_ui::tabs` is
+   the navigation: the tabs, their overflow menu and the plan history (`view_tabs`, `urgent_tabs_label`,
+   `urgent_navigation_width`). `atomics_ui::topbar` gains the brand, the notice line, the diff, `+ New` and
+   Plan buttons and the Project menu. `ViewHints` gains the tab on screen (`plan_view`, `ungrouped`,
+   `project`, `selected_plan`) and the diff panel's `diff_open` and `panel`; `PanelMode` moves to
+   `atomics-ui`. New reads: `plan_date(index)` (the history's date: a file's time in the host's time zone),
+   `notices()`, `sandbox_load()` and `project_menu()` (recent projects that still exist, workspaces). The
+   buttons are three draw calls, so a click on Show diff reaches the Plan button drawn after it in the same
+   frame, as before. The tabs are one: a click on a tab takes effect once the strip is drawn, so in that
+   frame the tabs after it still show the old selection, as the tabs before it always did, and the next
+   frame shows the new one. `icon` and `workspace_input` move to the client, and `record_item` and the history's
+   records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stays in the desktop with the
+   items that have not moved: the chief pill, the Tickets button and sign-in (S4), the GitHub counter, the
+   load gauge and the Settings menu.
+
 ## 5. The dependency test
 
 `crates/atomics-ui/tests/dependencies.rs` runs `cargo tree --locked -p atomics-ui` for the host target and for

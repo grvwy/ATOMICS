@@ -48,4 +48,5 @@ objc2 = "0.6.5"
 
 [dev-dependencies]
 atomics-core = { path = "../atomics-core", features = ["test-support"] }
+atomics-ui = { path = "../atomics-ui", features = ["test-support"] }
 toml = "1.1.8"

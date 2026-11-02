@@ -2994,26 +2994,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plan_with_chief_names_the_auto_decision_in_the_board_header() {
-        let auto = TicketConfig { system: "demo".into(), mode: TicketMode::Auto, ..Default::default() };
-        let mut plan = Plan { ticket_mode: Some(TicketMode::Board), ..Default::default() };
-        assert_eq!(super::super::board::mode_label(&plan, &auto), "board (auto)");
-        assert_eq!(super::super::board::tracked_label(&plan, &auto), None);
-        plan.tasks = vec![
-            Task { ticket: Some(TicketLink { id: "1".into(), ..Default::default() }), ..Default::default() },
-            Task::default(),
-        ];
-        assert_eq!(super::super::board::tracked_label(&plan, &auto).as_deref(), Some("1 of 2 tasks tracked"));
-        plan.ticket_mode = Some(TicketMode::Ticket);
-        assert_eq!(super::super::board::mode_label(&plan, &auto), "ticket (auto)");
-        assert_eq!(super::super::board::tracked_label(&plan, &auto), None);
-        plan.ticket_mode = None;
-        assert_eq!(super::super::board::mode_label(&plan, &auto), "auto (deciding…)");
-        let forced = TicketConfig { mode: TicketMode::Board, ..auto };
-        assert_eq!(super::super::board::mode_label(&Plan::default(), &forced), "board");
-    }
-
     fn toasted(app: &Desktop<'_>) -> String {
         app.runtime.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default()
     }
