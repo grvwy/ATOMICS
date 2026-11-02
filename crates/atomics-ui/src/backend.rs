@@ -154,6 +154,8 @@ pub struct ApprovalRow {
 /// A worktree's diff as the host last published it, and the whole file open beside it.
 #[derive(Clone, Default)]
 pub struct DiffSnapshot {
+    /// The diff's revision, which a new review comment is anchored to.
+    pub revision: u64,
     pub prepared: Option<Arc<Prepared>>,
     pub error: Option<String>,
     pub loading: bool,
@@ -287,6 +289,10 @@ pub trait Backend {
 
     /// The board of the plan at `index` of [`plan_list`](Backend::plan_list).
     fn board(&self, index: usize) -> Option<BoardView>;
+
+    /// The digest of the approval scope of the plan at `index` of [`plan_list`](Backend::plan_list), which
+    /// approving it names.
+    fn plan_digest(&self, index: usize) -> Option<String>;
 
     /// Every session, in the host's order. The UI addresses a session by its position in this list.
     fn session_list(&self) -> Vec<SessionRow>;

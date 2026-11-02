@@ -123,6 +123,10 @@ impl Backend for Local<'_> {
         })
     }
 
+    fn plan_digest(&self, index: usize) -> Option<String> {
+        self.0.plans.get(index).map(Plan::digest)
+    }
+
     fn session_list(&self) -> Vec<SessionRow> {
         self.0.sessions.iter().map(|session| self.session(session)).collect()
     }
@@ -144,6 +148,7 @@ impl Backend for Local<'_> {
     fn diff(&self, root: &Path) -> Option<DiffSnapshot> {
         let data = self.0.diffs.get(root)?;
         Some(DiffSnapshot {
+            revision: data.revision,
             prepared: data.prepared.clone(),
             error: data.error.clone(),
             loading: data.loading,
@@ -290,6 +295,112 @@ impl Backend for Local<'_> {
 mod tests {
     use super::super::tests::{session, with_app};
     use super::*;
+
+    #[test]
+    fn commands_map_onto_atomics_v1() {
+        with_app("app::backend::tests::commands_map_onto_atomics_v1", |app, _| {
+            use atomics_core::ops::{
+                self, ApprovalDecide, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction,
+                SessionCommand,
+            };
+            use atomics_core::wire::Seq;
+            use atomics_ui::Remote;
+            let dir = crate::test_support::tempdir().unwrap();
+            let root = dir.path().join("work");
+            app.runtime.sessions = vec![session("agent", AgentKind::Claude, AgentStatus::Working, &root)];
+            let done =
+                |id: &str| Task { id: id.into(), status: TaskStatus::Done, branch: Some(id.into()), ..Task::default() };
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                goal: "Ship it".into(),
+                tasks: vec![done("a"), done("b"), Task { id: "c".into(), ..Task::default() }],
+                ..Plan::default()
+            }];
+            app.runtime.diffs.entry(root.clone()).or_default().revision = 7;
+            let comment = |body: &str| steer::ReviewComment {
+                path: "lib.rs".into(),
+                line: Some(3),
+                removed: false,
+                excerpt: "fn x()".into(),
+                body: body.into(),
+            };
+            let digest = app.runtime.plans[0].digest();
+            let worktree = root.to_string_lossy().into_owned();
+            let plan = |op: &str, action: PlanAction| {
+                let digest = matches!(action, PlanAction::Approve).then(|| digest.clone());
+                ops::Command::PlanCommand(PlanCommand { op: op.into(), plan: Some("plan".into()), digest, action })
+            };
+            let review = |op: &str, action: ReviewAction| {
+                ops::Command::ReviewCommand(ReviewCommand { op: op.into(), worktree: worktree.clone(), action })
+            };
+            let session = |op: &str, action: SessionAction| {
+                ops::Command::SessionCommand(SessionCommand { op: op.into(), action })
+            };
+
+            let backend = app.runtime.backend();
+            let mut count = 0;
+            let mut map = |command: Command| {
+                command.remote(&backend, &mut || {
+                    count += 1;
+                    format!("op-{count}")
+                })
+            };
+            assert_eq!(map(Command::ApprovePlan(0)), Remote::Send(vec![plan("op-1", PlanAction::Approve)]));
+            // One integration per accepted task, each its own operation.
+            assert_eq!(
+                map(Command::IntegrateAccepted(0)),
+                Remote::Send(vec![
+                    plan("op-2", PlanAction::Integrate { task: "a".into() }),
+                    plan("op-3", PlanAction::Integrate { task: "b".into() }),
+                ])
+            );
+            let status = Command::SetTaskStatus { plan: 0, task: "c".into(), status: TaskStatus::Blocked };
+            let update = PlanAction::Update { task: "c".into(), status: Some(TaskStatus::Blocked), note: None };
+            assert_eq!(map(status), Remote::Send(vec![plan("op-4", update)]));
+            assert_eq!(map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed }), Remote::Unsupported);
+            assert_eq!(map(Command::ApprovePlan(1)), Remote::Send(Vec::new()));
+            let decide = Command::Decide { session: 0, approval: "ask".into(), decision: Decision::Deny };
+            let answer =
+                ApprovalDecide { op: "op-5".into(), approval: "ask".into(), decision: Decision::Deny, message: None };
+            assert_eq!(map(decide), Remote::Send(vec![ops::Command::ApprovalDecide(answer)]));
+            // An edited comment is removed and added again, anchored to the diff's revision.
+            let edit = Command::EditComments {
+                root: root.clone(),
+                before: vec![comment("keep"), comment("old")],
+                after: vec![comment("keep"), comment("new")],
+            };
+            let (path, line, removed) = (String::from("lib.rs"), Some(3), false);
+            assert_eq!(
+                map(edit),
+                Remote::Send(vec![
+                    review("op-6", ReviewAction::Remove { path: path.clone(), line, removed, text: "old".into() }),
+                    review("op-7", ReviewAction::Add { revision: Seq(7), path, line, removed, text: "new".into() }),
+                ])
+            );
+            assert_eq!(map(Command::SendReview(root.clone())), Remote::Send(vec![review("op-8", ReviewAction::Send)]));
+            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into() };
+            assert_eq!(
+                map(Command::VoiceToSession { session: 0, text: "go".into() }),
+                Remote::Send(vec![session("op-9", steer)])
+            );
+            let close = SessionAction::Close { session: "agent".into() };
+            assert_eq!(map(Command::CloseSession("agent".into())), Remote::Send(vec![session("op-10", close)]));
+            assert_eq!(map(Command::ToggleDiff), Remote::Client);
+            assert_eq!(map(Command::ShowPlan(0)), Remote::Client);
+            assert_eq!(map(Command::OpenProject(root.clone())), Remote::Unsupported);
+            assert_eq!(map(Command::SyncTickets(0)), Remote::Unsupported);
+
+            // The host takes what the mapping sends: approving through the journal, as a protocol client does.
+            let Remote::Send(mut sent) = Command::ApprovePlan(0).remote(&app.runtime.backend(), &mut String::new)
+            else {
+                unreachable!()
+            };
+            let Some(ops::Command::PlanCommand(approve)) = sent.pop() else { unreachable!() };
+            let outcome = app.runtime.mutate_desktop(|op| ops::Command::PlanCommand(PlanCommand { op, ..approve }));
+            assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+            assert!(app.runtime.plans[0].approved);
+        });
+    }
 
     #[test]
     fn session_rows_follow_the_model() {

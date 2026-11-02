@@ -34,4 +34,4 @@ pub use backend::{
     RecentSession, SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
 };
 pub use client::Client;
-pub use command::Command;
+pub use command::{Command, Remote};

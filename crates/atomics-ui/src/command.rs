@@ -12,11 +12,15 @@ use std::path::PathBuf;
 
 use atomics_core::approvals::Decision;
 use atomics_core::config::ChiefDock;
+use atomics_core::ops::{
+    self, ApprovalDecide, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
+};
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::steer::ReviewComment;
 use atomics_core::store::SessionRecord;
+use atomics_core::wire::Seq;
 
-use crate::PanelMode;
+use crate::{Backend, PanelMode};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -289,6 +293,109 @@ impl Command {
         )
     }
 
+    /// What a client of a remote host does with this command: the atomics.v1 mutations to send, if it has
+    /// any. Positions are read from `backend`, the client's last snapshot; `op` gives each mutation its
+    /// operation ID. Approval, plan, review and session commands map onto `approval_decide`,
+    /// `plan_command`, `review_command` and `session_command`; a command whose action atomics.v1 lacks
+    /// is [`Remote::Unsupported`].
+    pub fn remote(&self, backend: &dyn Backend, op: &mut dyn FnMut() -> String) -> Remote {
+        if self.is_view() {
+            return Remote::Client;
+        }
+        let plan = |index: usize, action: PlanAction, op: &mut dyn FnMut() -> String| {
+            let row = backend.plan_row(index)?;
+            let digest = if matches!(action, PlanAction::Approve) { backend.plan_digest(index) } else { None };
+            Some(ops::Command::PlanCommand(PlanCommand { op: op(), plan: Some(row.id), digest, action }))
+        };
+        let review = |root: &PathBuf, action: ReviewAction, op: &mut dyn FnMut() -> String| {
+            let worktree = root.to_string_lossy().into_owned();
+            ops::Command::ReviewCommand(ReviewCommand { op: op(), worktree, action })
+        };
+        let session = |action: SessionAction, op: &mut dyn FnMut() -> String| {
+            ops::Command::SessionCommand(SessionCommand { op: op(), action })
+        };
+        let sent = match self {
+            Command::Decide { approval, decision, .. } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
+                op: op(),
+                approval: approval.clone(),
+                decision: *decision,
+                message: None,
+            })],
+            Command::ApprovePlan(index) => plan(*index, PlanAction::Approve, op).into_iter().collect(),
+            Command::StartTask { plan: index, task } => {
+                plan(*index, PlanAction::Dispatch { task: Some(task.clone()) }, op).into_iter().collect()
+            }
+            Command::DispatchReady(index) => {
+                plan(*index, PlanAction::Dispatch { task: None }, op).into_iter().collect()
+            }
+            Command::SetTaskStatus { plan: index, task, status } => {
+                let action = PlanAction::Update { task: task.clone(), status: Some(*status), note: None };
+                plan(*index, action, op).into_iter().collect()
+            }
+            Command::IntegrateTask { plan: index, task } => {
+                plan(*index, PlanAction::Integrate { task: task.clone() }, op).into_iter().collect()
+            }
+            Command::IntegrateAccepted(index) => {
+                let Some(board) = backend.board(*index) else { return Remote::Send(Vec::new()) };
+                let tasks: Vec<String> = board.plan.pending_integrations().iter().map(|t| t.id.clone()).collect();
+                tasks.into_iter().filter_map(|task| plan(*index, PlanAction::Integrate { task }, op)).collect()
+            }
+            Command::ArchivePlan(index)
+            | Command::ArchiveFinished(index)
+            | Command::ClosePlan { plan: index, status: PlanStatus::Archived } => {
+                plan(*index, PlanAction::Archive, op).into_iter().collect()
+            }
+            Command::EditComments { root, before, after } => {
+                let Some(revision) = backend.diff(root).map(|diff| Seq(diff.revision)) else {
+                    return Remote::Send(Vec::new());
+                };
+                let mut added = after.clone();
+                let mut removed = Vec::new();
+                for comment in before {
+                    match added.iter().position(|kept| kept == comment) {
+                        Some(at) => {
+                            added.remove(at);
+                        }
+                        None => removed.push(comment),
+                    }
+                }
+                let remove = removed.into_iter().map(|c| ReviewAction::Remove {
+                    path: c.path.clone(),
+                    line: c.line,
+                    removed: c.removed,
+                    text: c.body.clone(),
+                });
+                let add = added.into_iter().map(|c| ReviewAction::Add {
+                    revision,
+                    path: c.path,
+                    line: c.line,
+                    removed: c.removed,
+                    text: c.body,
+                });
+                remove.chain(add).map(|action| review(root, action, op)).collect()
+            }
+            Command::SendReview(root) => vec![review(root, ReviewAction::Send, op)],
+            Command::Steer { sessions, text } => sessions
+                .iter()
+                .map(|id| session(SessionAction::Steer { session: id.clone(), text: text.clone() }, op))
+                .collect(),
+            Command::VoiceToSession { session: index, text } => backend
+                .session_row(*index)
+                .map(|row| session(SessionAction::Steer { session: row.id, text: text.clone() }, op))
+                .into_iter()
+                .collect(),
+            Command::StartAgent { agent, folder } => {
+                let folder = Some(folder.to_string_lossy().into_owned());
+                let action =
+                    SessionAction::Start { agent: agent.clone(), folder, repo: None, branch: None, prompt: None };
+                vec![session(action, op)]
+            }
+            Command::CloseSession(id) => vec![session(SessionAction::Close { session: id.clone() }, op)],
+            _ => return Remote::Unsupported,
+        };
+        Remote::Send(sent)
+    }
+
     /// A task card's `diff`, `resume` or `acknowledge_refs` button, for the task at position `task` of the
     /// plan at `plan`; `None` for any other action.
     pub fn task(plan: usize, task: usize, action: &str) -> Option<Command> {
@@ -299,4 +406,15 @@ impl Command {
             _ => None,
         }
     }
+}
+
+/// What a client of a remote host does with a [`Command`] ([`Command::remote`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Remote {
+    /// Send these atomics.v1 mutations, in order. Empty when what the command names is gone.
+    Send(Vec<ops::Command>),
+    /// A view command: the client carries it out itself.
+    Client,
+    /// atomics.v1 has no operation for it yet, so a remote client does not offer it.
+    Unsupported,
 }
