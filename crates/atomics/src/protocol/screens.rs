@@ -27,6 +27,7 @@ use atomics_core::wire::{self, Envelope, ErrorCode, Message, Seq, WireError};
 
 use super::hub::Outbox;
 use super::lease::{TerminalControl, micros};
+use super::session::Departed;
 use crate::terminal::screen::{HistoryLines, Tracker};
 
 /// A terminal the protocol thread can stream. Implemented over the native emulator; tests use the
@@ -55,6 +56,8 @@ pub struct TerminalEntry {
 #[derive(Default)]
 pub struct Terminals {
     slot: RwLock<Arc<Vec<TerminalEntry>>>,
+    /// Sessions whose terminals closed lately.
+    closed: Departed,
 }
 
 impl Terminals {
@@ -72,7 +75,14 @@ impl Terminals {
     }
 
     pub fn publish(&self, entries: Vec<TerminalEntry>) {
-        *self.slot.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(entries);
+        let before = std::mem::replace(&mut *self.slot.write().unwrap_or_else(|e| e.into_inner()), Arc::new(entries));
+        let now = self.load();
+        self.closed.record(before.iter().map(|e| e.session.as_str()), |s| now.iter().any(|e| e.session == s));
+    }
+
+    /// Whether `session` had a terminal that closed lately, as opposed to never having had one.
+    pub fn closed(&self, session: &str) -> bool {
+        self.closed.contains(session)
     }
 
     fn find(&self, session: &str) -> Option<TerminalEntry> {

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use atomics_core::lease::{GridSize, LeaseReason, LeaseState, Typist};
+use atomics_core::lease::{GridSize, LeaseReason, LeaseState, MAX_INPUT_BYTES, Typist};
 use atomics_core::projection::Projections;
 use atomics_core::screen::ScreenMirror;
 use atomics_core::wire::{self, CAPABILITIES, Envelope, ErrorCode, Message, Role, Seq, Topic, VERSION};
@@ -600,6 +600,64 @@ fn input_a_program_has_not_read_is_bounded_and_answered_with_slow_client() {
     phone.raw_input("s1", lease, 2, "ok");
     phone.until(|t| t.screen_text("s1").is_some_and(|s| s.contains("ok")));
     assert_eq!(terminal.written(), "12345ok");
+}
+
+#[test]
+fn a_paste_the_program_does_not_read_is_typed_again_from_where_slow_client_stopped_it() {
+    let terminal = Detached::new(40, 6, 100);
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let mut phone = Typer::connect(&f, "phone");
+    phone.subscribe("s1");
+    phone.acquire("s1", false).unwrap();
+    let unread = Policy::default().max_unwritten;
+
+    // Twice what may wait unread, sent at once: the host takes the first half.
+    terminal.stall(true);
+    let paste = "0123456789abcdef".repeat(2 * unread / 16);
+    let ids = phone.type_text("s1", &paste);
+    let (pieces, taken) = (paste.len() / MAX_INPUT_BYTES, unread / MAX_INPUT_BYTES);
+    assert_eq!(phone.refusal(&ids[taken]), ErrorCode::SlowClient);
+    let tail = phone.typist("s1").refused(Seq(taken as u64 + 1), ErrorCode::SlowClient).expect("the refused tail");
+    assert_eq!(tail, paste[unread..]);
+    // Every piece already sent behind it meets out_of_order, more of them than the errors a
+    // client may make, and the client stays connected.
+    assert!(pieces - taken - 1 > SessionConfig::default().max_errors as usize);
+    for (seq, id) in (taken + 1..pieces).zip(&ids[taken + 1..pieces]) {
+        assert_eq!(phone.refusal(id), ErrorCode::OutOfOrder);
+        assert_eq!(phone.typist("s1").refused(Seq(seq as u64 + 1), ErrorCode::OutOfOrder), None);
+    }
+    assert_eq!(terminal.written(), paste[..unread]);
+
+    // Once the program reads, the tail goes through under the numbers it was refused at.
+    terminal.stall(false);
+    phone.type_text("s1", &tail);
+    phone.until(|_| terminal.written().len() == paste.len());
+    assert_eq!(terminal.written(), paste);
+    phone.idle(Duration::from_millis(100));
+    assert_eq!(phone.errors.len(), pieces - taken, "nothing typed again was refused: {:?}", phone.errors.last());
+}
+
+#[test]
+fn subscribing_to_a_terminal_that_never_existed_counts_but_to_one_that_closed_does_not() {
+    let terminal = Detached::new(40, 6, 100);
+    let mut cfg = config();
+    cfg.session.max_errors = 2;
+    let f = start_with(cfg, &[("s1", &terminal)]);
+    let mut phone = Typer::connect(&f, "phone");
+    f.terminals.publish(Vec::new());
+    let screen = |s: &str| Message::Subscribe { topics: vec![Topic::Screen { session: s.into(), focused: true }] };
+    for _ in 0..5 {
+        let id = phone.send(screen("s1"));
+        assert_eq!(phone.refusal(&id), ErrorCode::NotFound, "its terminal closed: a race, not a mistake");
+    }
+    for _ in 0..6 {
+        phone.send(screen("nope"));
+    }
+    let mut refused = 0;
+    while let Some(envelope) = phone.client.next() {
+        refused += matches!(envelope.message, Message::Error { code: ErrorCode::NotFound, .. }) as u32;
+    }
+    assert_eq!(refused, 3, "a session that never had a terminal counts: the third ends the connection");
 }
 
 #[test]

@@ -12,7 +12,7 @@
 //! thread is woken to copy the echo. The loop also tells the client whenever a followed screen's
 //! lease changes hands, and when the connection ends, so does any lease it held.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -34,6 +34,39 @@ use super::screens::Screens;
 pub trait DiffSource: Send + Sync {
     /// The diff revision and the file whose new or old path is `path`.
     fn file(&self, worktree: &str, path: &str) -> Option<(u64, FileDiff)>;
+    /// Whether `worktree`'s diff is no longer at `revision`, or went away lately: a file a client
+    /// was told of at that revision may be gone. A source that cannot tell says no.
+    fn moved_on(&self, _worktree: &str, _revision: u64) -> bool {
+        false
+    }
+}
+
+/// Names that went away lately (closed terminals, removed worktrees), so a request naming one is
+/// a race a client meets, not a mistake. Keeps the newest few; older ones are forgotten.
+#[derive(Default)]
+pub struct Departed(Mutex<VecDeque<String>>);
+
+impl Departed {
+    const KEPT: usize = 64;
+
+    /// The names were `before`; `present` says which exist now. Remember those that left and
+    /// forget those that came back.
+    pub fn record<'a>(&self, before: impl IntoIterator<Item = &'a str>, present: impl Fn(&str) -> bool) {
+        let mut gone = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        gone.retain(|name| !present(name));
+        for name in before {
+            if !present(name) && !gone.iter().any(|g| g == name) {
+                gone.push_back(name.to_string());
+            }
+        }
+        while gone.len() > Self::KEPT {
+            gone.pop_front();
+        }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|g| g == name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +229,7 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
         role,
         me: Client { id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1, label: client_id.as_str().into() },
         told: HashMap::new(),
+        slowed: HashMap::new(),
     };
     let welcome = Envelope::host(
         &attached.epoch,
@@ -249,6 +283,9 @@ struct Follows {
     me: Client,
     /// The lease last told for each followed screen: the terminal's identity and lease version.
     told: HashMap<String, (usize, u64)>,
+    /// Input refused with `slow_client`, by followed screen: its lease token and number. What the
+    /// client had already sent behind it meets `out_of_order`, which does not count either.
+    slowed: HashMap<String, (u64, u64)>,
 }
 
 /// Refusals a well-behaved client meets as a matter of course: another one races it for a lease,
@@ -265,7 +302,8 @@ struct Refusal {
 
 impl Refusal {
     /// What the request named went away meanwhile (its terminal closed, its diff file changed):
-    /// a well-behaved client meets that too, so it does not count.
+    /// a well-behaved client meets that too, so it does not count. Something that never existed
+    /// is not gone, and counts.
     fn gone(error: WireError) -> Self {
         Self { error, counts: false }
     }
@@ -463,8 +501,11 @@ fn handle(
                     if !subscriptions.terminals {
                         return Err(no_terminals());
                     }
-                    if shared.screens.terminals().control(session).is_none() {
-                        return Err(gone(no_terminal()));
+                    let terminals = shared.screens.terminals();
+                    if terminals.control(session).is_none() {
+                        // Its terminal may have closed since the client heard of it.
+                        let closed = terminals.closed(session);
+                        return Err(if closed { gone(no_terminal()) } else { refused(no_terminal()) });
                     }
                 }
                 let key = topic.key();
@@ -502,6 +543,7 @@ fn handle(
                 {
                     shared.screens.unsubscribe(session, outbox);
                     subscriptions.told.remove(session);
+                    subscriptions.slowed.remove(session);
                     // Typing needs the screen: no longer following it ends the lease.
                     if let Some((_, control)) = shared.screens.terminals().control(session) {
                         control.disconnect(&subscriptions.me, LeaseReason::Disconnected);
@@ -526,8 +568,10 @@ fn handle(
         }
         Message::DiffGet { worktree, path, revision } => {
             let Some((current, file)) = shared.diffs.file(&worktree, &path) else {
-                // The diff may have changed since the client was told of the file.
-                return Err(gone(WireError::new(ErrorCode::NotFound, "no such diff file")));
+                // The diff may have changed since the revision the client was told of the file in.
+                let error = WireError::new(ErrorCode::NotFound, "no such diff file");
+                let told = revision.is_some_and(|r| shared.diffs.moved_on(&worktree, r.0));
+                return Err(if told { gone(error) } else { refused(error) });
             };
             if revision.is_some_and(|r| r != Seq(current)) {
                 return Err(refuse(ErrorCode::StaleRevision, &format!("the diff is at revision {current}")));
@@ -557,9 +601,22 @@ fn handle(
         }
         Message::TerminalInput { session, lease, seq, data } => {
             let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
-            control
-                .input(&subscriptions.me, (lease.0, seq.0), data.into_bytes(), Instant::now(), &shared.lease)
-                .map_err(refused)?;
+            let typed = (lease.0, seq.0);
+            let admitted = control.input(&subscriptions.me, typed, data.into_bytes(), Instant::now(), &shared.lease);
+            if let Err(error) = admitted {
+                // A client sends a long paste at once, so pieces it sent behind one refused as
+                // `slow_client` meet `out_of_order`; it types them again from the refused one.
+                let behind = |&(token, refused): &(u64, u64)| token == lease.0 && seq.0 > refused;
+                let counts = match error.code {
+                    ErrorCode::OutOfOrder => !subscriptions.slowed.get(&session).is_some_and(behind),
+                    code => !expected(code),
+                };
+                if error.code == ErrorCode::SlowClient {
+                    subscriptions.slowed.insert(session, typed);
+                }
+                return Err(refusal(Refusal { error, counts }));
+            }
+            subscriptions.slowed.remove(&session);
             // The echo is copied as soon as it shows; queueing it wakes this thread to send it.
             shared.screens.wake();
             Ok(())

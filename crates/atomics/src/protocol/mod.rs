@@ -41,7 +41,7 @@ use tungstenite::http;
 pub use hub::RingLimits;
 pub use lease::{Lease, TerminalControl};
 pub use screens::{ScreenConfig, ScreenSource, TerminalEntry, Terminals};
-pub use session::{DiffSource, SessionConfig};
+pub use session::{Departed, DiffSource, SessionConfig};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {

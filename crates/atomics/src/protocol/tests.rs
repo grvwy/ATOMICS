@@ -112,6 +112,10 @@ impl DiffSource for FakeDiffs {
         let (revision, file) = files.get(worktree)?;
         (file.new_path.as_deref() == Some(path)).then(|| (*revision, file.clone()))
     }
+
+    fn moved_on(&self, worktree: &str, revision: u64) -> bool {
+        self.0.lock().unwrap().get(worktree).is_some_and(|(current, _)| *current != revision)
+    }
 }
 
 fn populate(p: &Projections) {
@@ -298,6 +302,38 @@ fn a_stale_or_unknown_diff_request_is_an_error_not_silence() {
         let Message::Error { code: got, .. } = client.step().unwrap().message else { panic!("expected an error") };
         assert_eq!(got, code);
     }
+}
+
+#[test]
+fn a_diff_file_that_never_existed_counts_but_one_a_later_revision_dropped_does_not() {
+    let mut cfg = config();
+    cfg.session.max_errors = 2;
+    let f = start_with(cfg);
+    populate(&f.projections);
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.sync_until(|m| m.cursor > 0);
+    let get = |path: &str, revision: u64| {
+        Envelope::new(Message::DiffGet { worktree: "/w/a".into(), path: path.into(), revision: Some(Seq(revision)) })
+    };
+    // Told of at revision 0 and gone at revision 1: a race, however often it happens.
+    for _ in 0..5 {
+        client.send(&get("gone.rs", 0));
+        let code = loop {
+            if let Message::Error { code, .. } = client.step().expect("still connected").message {
+                break code;
+            }
+        };
+        assert_eq!(code, ErrorCode::NotFound);
+    }
+    for _ in 0..6 {
+        client.send(&get("nope.rs", 1));
+    }
+    let mut refused = 0;
+    while let Some(envelope) = client.next() {
+        refused += matches!(envelope.message, Message::Error { code: ErrorCode::NotFound, .. }) as u32;
+    }
+    assert_eq!(refused, 3, "a file the diff never had counts: the third ends the connection");
 }
 
 #[test]

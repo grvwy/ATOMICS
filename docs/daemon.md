@@ -321,7 +321,9 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   Input, a resize, a renew or a release naming an ended lease gets `fenced` and is not applied. `fenced`,
   `lease_held` and `slow_client` never count towards disconnecting a client: one that races another, or types faster
   than a program reads, meets them as a matter of course. Nor does `not_found` for something that went away meanwhile:
-  the terminal of a screen the client follows or subscribes to, or a diff file it was told of.
+  the terminal of a screen the client follows or subscribes to (the host remembers the last 64 that closed), or a
+  diff file it was told of, once the diff has moved on from the revision `diff_get` names or its worktree's diff
+  went away. A session that never had a terminal, or a file missing from the revision named, counts.
 - **Order, and no replay.** `seq` starts at 1 in each lease and must be the next one; a repeat or a gap gets
   `out_of_order` and is not applied. The client's own thread writes admitted input to the PTY under the lease's lock,
   so input admitted under an old lease can never land after a takeover. Nothing is replayed across a disconnect: the
@@ -333,7 +335,11 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   256 KiB frame limit. 8-bit meta bytes cannot be sent. Remote input does not move the desktop's scrolled view.
 - **A program that does not read.** Admitted input the PTY has not taken yet is bounded at 1 MiB per terminal
   (counted as the PTY writes it). Above that, input gets `slow_client` and is not applied; its number is not used, so
-  the client sends the same input again once the program reads (its echo shows).
+  the client sends the same input again once the program reads (its echo shows). A long paste is sent at once, so
+  the pieces behind the refused one meet `out_of_order`; after a `slow_client` those do not count either.
+  `Typist::refused` rewinds to the refused number and hands back the text from that piece on, to type again before
+  anything newer. `Typist` keeps what it sent until it knows it was applied: a `lease_state` with `next` for the
+  same lease says so, and `Typist` sends a `lease_renew` after every MiB of input to get one.
 - **Resizing only when asked.** Taking the lease or typing never resizes. `terminal_resize` with a `size` ("fit to
   this screen") resizes for the holder; without one it returns to the host's own size. The holder's size lasts as
   long as its lease: however the lease ends, the terminal returns to the desktop's size (the pane's last size, or

@@ -56,7 +56,13 @@ struct Slot {
     /// The client was told this screen does not fit in a frame; it is told again only after a
     /// snapshot of it has been sent.
     oversize: bool,
+    /// Snapshots of this screen a newer copy overtook while they were encoded, in a row.
+    overtaken: u32,
 }
+
+/// How often in a row a snapshot overtaken while it was encoded is encoded again from the newer
+/// copy before it is sent as it is.
+const SNAPSHOT_RETRIES: u32 = 3;
 
 impl Slot {
     fn supersede(&mut self, total: &mut usize) {
@@ -64,6 +70,18 @@ impl Slot {
         self.deltas.clear();
         self.bytes = 0;
         self.snapshot = true;
+    }
+
+    /// Whether to encode the snapshot again because a newer copy was published while it was
+    /// encoded. After [`SNAPSHOT_RETRIES`] in a row the one encoded is sent as it is, so a screen
+    /// that changes faster than it encodes still reaches the client.
+    fn encode_again(&mut self, overtaken: bool) -> bool {
+        if overtaken && self.overtaken < SNAPSHOT_RETRIES {
+            self.overtaken += 1;
+            return true;
+        }
+        self.overtaken = 0;
+        false
     }
 }
 
@@ -139,7 +157,9 @@ impl Outbox {
     /// with an `oversize` error naming the session, and tried again at the screen's next change.
     ///
     /// Snapshots are encoded with the queue unlocked, so the threads that push to it never wait
-    /// for an encoding. One the feed replaced meanwhile is not sent; the next call takes the newer.
+    /// for an encoding. One the feed replaced meanwhile is not sent and the next call takes the
+    /// newer, up to [`SNAPSHOT_RETRIES`] times in a row; then the older one is sent, and the newer
+    /// one still follows it.
     pub fn take(&self) -> Taken {
         let wanted: Vec<(String, Arc<Current>)> = {
             let q = self.queue();
@@ -172,12 +192,15 @@ impl Outbox {
         for (session, snapshot, encoded_from) in encoded {
             let Some(slot) = q.screens.get_mut(&session).filter(|slot| slot.snapshot) else { continue };
             // A newer copy (or a new terminal) was published meanwhile: its delta was not queued,
-            // so only its own snapshot will do.
-            if !current(&slot.feed).is_some_and(|now| Arc::ptr_eq(&now, &encoded_from)) {
+            // so only its own snapshot brings the client up to date. Sent as it is after a few
+            // tries, the older snapshot keeps the slot waiting for that one.
+            let overtaken = !current(&slot.feed).is_some_and(|now| Arc::ptr_eq(&now, &encoded_from));
+            if slot.encode_again(overtaken) {
                 again = true;
                 continue;
             }
-            slot.snapshot = false;
+            slot.snapshot = overtaken;
+            again |= overtaken;
             match snapshot {
                 Some(snapshot) => {
                     frames.extend(snapshot.iter().cloned());
@@ -207,7 +230,15 @@ impl Outbox {
             let q = &mut *q;
             let old = q.screens.insert(
                 session.to_string(),
-                Slot { feed: feed.clone(), deltas: Vec::new(), bytes: 0, snapshot: true, at: None, oversize: false },
+                Slot {
+                    feed: feed.clone(),
+                    deltas: Vec::new(),
+                    bytes: 0,
+                    snapshot: true,
+                    at: None,
+                    oversize: false,
+                    overtaken: 0,
+                },
             );
             q.screen_bytes -= old.map_or(0, |s| s.bytes);
         }
@@ -520,4 +551,29 @@ fn with_cursor(mut message: Message, to: Cursor) -> Message {
         _ => {}
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_overtaken_snapshot_is_encoded_again_only_a_few_times_in_a_row() {
+        let mut slot = Slot {
+            feed: Feed::default(),
+            deltas: Vec::new(),
+            bytes: 0,
+            snapshot: true,
+            at: None,
+            oversize: false,
+            overtaken: 0,
+        };
+        for _ in 0..SNAPSHOT_RETRIES {
+            assert!(slot.encode_again(true));
+        }
+        assert!(!slot.encode_again(true), "then the one encoded is sent as it is");
+        assert!(slot.encode_again(true), "and the count starts again");
+        assert!(!slot.encode_again(false), "one not overtaken is sent");
+        assert_eq!(slot.overtaken, 0);
+    }
 }

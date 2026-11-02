@@ -14,7 +14,7 @@ use atomics_core::projection::{
 };
 
 use super::State;
-use crate::protocol::{TerminalEntry, Terminals};
+use crate::protocol::{Departed, TerminalEntry, Terminals};
 
 /// Diff summaries already built, by worktree and the diff revision they were built from, so an
 /// unchanged diff is not walked again on every runtime pass.
@@ -22,9 +22,10 @@ use crate::protocol::{TerminalEntry, Terminals};
 pub(crate) struct DiffSummaries(HashMap<PathBuf, (u64, DiffSummary)>);
 
 /// The accepted diff content per worktree, published so the protocol thread can answer `diff_get`
-/// without the `State` lock. Holds `Arc`s of what the diff worker already built.
+/// without the `State` lock. Holds `Arc`s of what the diff worker already built, and remembers
+/// worktrees whose diff went away lately.
 #[derive(Default)]
-pub(crate) struct DiffBodies(RwLock<HashMap<String, (u64, Arc<Prepared>)>>);
+pub(crate) struct DiffBodies(RwLock<HashMap<String, (u64, Arc<Prepared>)>>, Departed);
 
 impl DiffBodies {
     fn replace(&self, entries: HashMap<String, (u64, Arc<Prepared>)>) {
@@ -34,7 +35,9 @@ impl DiffBodies {
                 && entries.iter().all(|(k, (r, p))| current.get(k).is_some_and(|(cr, cp)| cr == r && Arc::ptr_eq(cp, p)))
         };
         if !same {
-            *self.0.write().unwrap_or_else(|e| e.into_inner()) = entries;
+            let before = std::mem::replace(&mut *self.0.write().unwrap_or_else(|e| e.into_inner()), entries);
+            let now = self.0.read().unwrap_or_else(|e| e.into_inner());
+            self.1.record(before.keys().map(String::as_str), |w| now.contains_key(w));
         }
     }
 }
@@ -48,6 +51,13 @@ impl crate::protocol::DiffSource for DiffBodies {
             .iter()
             .find(|f| f.new_path.as_deref() == Some(path) || f.old_path.as_deref() == Some(path))?;
         Some((revision, file.clone()))
+    }
+
+    fn moved_on(&self, worktree: &str, revision: u64) -> bool {
+        match self.0.read().unwrap_or_else(|e| e.into_inner()).get(worktree) {
+            Some((current, _)) => *current != revision,
+            None => self.1.contains(worktree),
+        }
     }
 }
 
