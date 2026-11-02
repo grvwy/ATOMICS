@@ -17,6 +17,7 @@ pub mod cleanup;
 pub mod config;
 pub mod control;
 pub mod diff;
+pub mod diff_data;
 pub mod doctor;
 pub mod files;
 #[cfg(feature = "native")]

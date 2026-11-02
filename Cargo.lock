@@ -489,6 +489,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "atomics-core",
+ "atomics-ui",
  "base64 0.22.1",
  "clap",
  "cpal",
@@ -531,6 +532,13 @@ dependencies = [
  "toml_edit",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "atomics-ui"
+version = "0.1.0"
+dependencies = [
+ "atomics-core",
 ]
 
 [[package]]

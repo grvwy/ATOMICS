@@ -7,15 +7,7 @@ use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
 use two_face::theme::EmbeddedThemeName;
 
-/// A colored byte range of a line. Small, since every line of a diff keeps a few.
-#[derive(Clone, Copy)]
-pub struct Span {
-    pub start: u32,
-    pub end: u32,
-    pub color: [u8; 4],
-}
-
-pub type Spans = Vec<Span>;
+pub use atomics_core::diff_data::{Span, Spans};
 
 pub struct Highlighter {
     syntaxes: SyntaxSet,

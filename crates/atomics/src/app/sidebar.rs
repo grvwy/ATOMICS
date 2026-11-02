@@ -203,14 +203,15 @@ impl Desktop<'_> {
     /// Tabs share a bounded navigation slot. First shorten labels, then move
     /// excess tabs into a menu, keeping the selected tab in the visible row.
     pub(super) fn urgent_tabs_label(&self) -> (String, Color32) {
-        self.tabs_summary(self.runtime.plans.iter().enumerate().map(|(index, _)| index))
+        let rows = self.runtime.backend().plan_list();
+        self.tabs_summary(&rows, 0..rows.len())
     }
 
-    fn tabs_summary(&self, indices: impl Iterator<Item = usize>) -> (String, Color32) {
+    fn tabs_summary(&self, rows: &[PlanRow], indices: impl Iterator<Item = usize>) -> (String, Color32) {
         let mut needs = 0;
         let mut running = 0;
         for index in indices {
-            match self.runtime.plan_state(index) {
+            match rows[index].state {
                 PlanState::NeedsYou => needs += 1,
                 PlanState::Running(count) => running += count,
                 _ => {}
@@ -236,20 +237,16 @@ impl Desktop<'_> {
         let menu = super::topbar::measure(ui, |ui| {
             ui.menu_button("Tabs", |_| {});
         });
-        let protected = self
-            .runtime
-            .plans
+        let rows = self.runtime.backend().plan_list();
+        let protected = rows
             .iter()
-            .enumerate()
-            .map(|(index, _)| (index, self.runtime.plan_state(index)))
-            .filter(|(_, state)| state.urgency() > 0)
-            .map(|(index, state)| {
-                let marker = if self.runtime.changed_plans.contains(&self.runtime.plans[index].id) { " *" } else { "" };
-                self.plan_label_width(ui, &format!("{}{marker}", state.label("…"))) + gap
+            .filter(|row| row.state.urgency() > 0)
+            .map(|row| {
+                let marker = if row.changed { " *" } else { "" };
+                self.plan_label_width(ui, &format!("{}{marker}", row.state.label("…"))) + gap
             })
             .sum::<f32>();
-        let history = if protected > 0.0
-            && self.runtime.plans.iter().any(|plan| !plan.id.is_empty() && plan.status != PlanStatus::Open)
+        let history = if protected > 0.0 && rows.iter().any(|row| !row.id.is_empty() && row.status != PlanStatus::Open)
         {
             super::topbar::measure(ui, |ui| {
                 ui.menu_button("History", |_| {});
@@ -261,15 +258,14 @@ impl Desktop<'_> {
     }
 
     pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
+        let rows = self.runtime.backend().plan_list();
         let mut tabs = vec![ViewTab::All, ViewTab::Ungrouped, ViewTab::Repos];
         tabs.extend(
-            self.runtime
-                .plans
-                .iter()
+            rows.iter()
                 .enumerate()
-                .filter(|(index, plan)| {
-                    !plan.id.is_empty()
-                        && (plan.status != PlanStatus::Archived
+                .filter(|(index, row)| {
+                    !row.id.is_empty()
+                        && (row.status != PlanStatus::Archived
                             || self.runtime.plan_view && self.runtime.selected_plan == *index)
                 })
                 .map(|(index, _)| ViewTab::Plan(index)),
@@ -282,11 +278,10 @@ impl Desktop<'_> {
             .zip(&widths)
             .map(|(tab, width)| {
                 if let ViewTab::Plan(index) = tab {
-                    let state = self.runtime.plan_state(*index);
-                    if state.urgency() > 0 {
-                        let marker =
-                            if self.runtime.changed_plans.contains(&self.runtime.plans[*index].id) { " *" } else { "" };
-                        return self.plan_label_width(ui, &format!("{}{marker}", state.label("…")));
+                    let row = &rows[*index];
+                    if row.state.urgency() > 0 {
+                        let marker = if row.changed { " *" } else { "" };
+                        return self.plan_label_width(ui, &format!("{}{marker}", row.state.label("…")));
                     }
                 }
                 width.min(90.0)
@@ -294,17 +289,17 @@ impl Desktop<'_> {
             .collect();
         let mut priority: Vec<usize> = (0..tabs.len()).collect();
         priority.sort_by_key(|&index| match &tabs[index] {
-            ViewTab::Plan(plan) if self.runtime.plan_state(*plan) == PlanState::NeedsYou => 0,
-            ViewTab::Plan(plan) if matches!(self.runtime.plan_state(*plan), PlanState::Running(_)) => 1,
+            ViewTab::Plan(plan) if rows[*plan].state == PlanState::NeedsYou => 0,
+            ViewTab::Plan(plan) if matches!(rows[*plan].state, PlanState::Running(_)) => 1,
             ViewTab::All | ViewTab::Ungrouped | ViewTab::Repos if self.view_tab_selected(&tabs[index]) => 2,
             ViewTab::All | ViewTab::Ungrouped | ViewTab::Repos => 3,
             ViewTab::Plan(_) if self.view_tab_selected(&tabs[index]) => 4,
-            ViewTab::Plan(plan) if self.runtime.plans[*plan].status == PlanStatus::Open => 5,
+            ViewTab::Plan(plan) if rows[*plan].status == PlanStatus::Open => 5,
             _ => 6,
         });
         let has_plans = tabs.iter().any(|tab| matches!(tab, ViewTab::Plan(_)));
         let divider = if has_plans { measure_divider(ui) + gap } else { 0.0 };
-        let closed = self.runtime.plans.iter().any(|plan| !plan.id.is_empty() && plan.status != PlanStatus::Open);
+        let closed = rows.iter().any(|row| !row.id.is_empty() && row.status != PlanStatus::Open);
         let history_width = if closed {
             super::topbar::measure(ui, |ui| {
                 ui.menu_button("History", |_| {});
@@ -320,7 +315,7 @@ impl Desktop<'_> {
             .zip(&minimum)
             .filter_map(|(tab, width)| {
                 if let ViewTab::Plan(index) = tab
-                    && self.runtime.plan_state(*index).urgency() > 0
+                    && rows[*index].state.urgency() > 0
                 {
                     Some(width + gap)
                 } else {
@@ -349,9 +344,7 @@ impl Desktop<'_> {
                 let urgent: Vec<usize> = priority
                     .iter()
                     .copied()
-                    .filter(
-                        |&index| matches!(tabs[index],ViewTab::Plan(plan) if self.runtime.plan_state(plan).urgency()>0),
-                    )
+                    .filter(|&index| matches!(tabs[index],ViewTab::Plan(plan) if rows[plan].state.urgency()>0))
                     .collect();
                 let full_urgent_width = urgent.iter().map(|&index| widths[index]).sum::<f32>()
                     + gap * urgent.len().saturating_sub(1) as f32;
@@ -374,15 +367,18 @@ impl Desktop<'_> {
                         break;
                     }
                 }
-                (menu_label, menu_color) = self.tabs_summary(tabs.iter().enumerate().filter_map(|(index, tab)| {
-                    if !visible.contains(&index)
-                        && let ViewTab::Plan(plan) = tab
-                    {
-                        Some(*plan)
-                    } else {
-                        None
-                    }
-                }));
+                (menu_label, menu_color) = self.tabs_summary(
+                    &rows,
+                    tabs.iter().enumerate().filter_map(|(index, tab)| {
+                        if !visible.contains(&index)
+                            && let ViewTab::Plan(plan) = tab
+                        {
+                            Some(*plan)
+                        } else {
+                            None
+                        }
+                    }),
+                );
                 let measured = super::topbar::measure(ui, |ui| {
                     ui.menu_button(RichText::new(&menu_label).color(menu_color), |_| {});
                 });
@@ -524,6 +520,10 @@ impl Desktop<'_> {
         }
         let p = self.runtime.palette.clone();
         let selected = self.view_tab_selected(tab);
+        let plan_row = match tab {
+            ViewTab::Plan(index) => self.runtime.backend().plan_row(*index),
+            _ => None,
+        };
         let (label, hover, color) = match tab {
             ViewTab::All => {
                 let agents = self.runtime.sessions.iter().filter(|s| !s.chief).count();
@@ -544,11 +544,11 @@ impl Desktop<'_> {
                 )
             }
             ViewTab::Repos => unreachable!(),
-            ViewTab::Plan(index) => {
-                let plan = &self.runtime.plans[*index];
-                let state = self.runtime.plan_state(*index);
-                let marker = if self.runtime.changed_plans.contains(&plan.id) { " *" } else { "" };
-                let mut name: String = plan_tab_name(plan).chars().take(28).collect();
+            ViewTab::Plan(_) => {
+                let row = plan_row.as_ref().expect("a plan tab has a plan");
+                let state = row.state;
+                let marker = if row.changed { " *" } else { "" };
+                let mut name: String = row.tab_name.chars().take(28).collect();
                 if state.urgency() > 0
                     && let Some(width) = width
                 {
@@ -572,10 +572,10 @@ impl Desktop<'_> {
                         }
                     }
                 }
-                (format!("{}{marker}", state.label(&name)), plan.goal.clone(), state.color(&p))
+                (format!("{}{marker}", state.label(&name)), row.goal.clone(), state.color(&p))
             }
         };
-        let state = if let ViewTab::Plan(index) = tab { Some(self.runtime.plan_state(*index)) } else { None };
+        let state = plan_row.as_ref().map(|row| row.state);
         let mut text = egui::text::LayoutJob::default();
         let mut rest = label.as_str();
         if matches!(state, Some(PlanState::Running(_))) {
@@ -614,7 +614,7 @@ impl Desktop<'_> {
         if let ViewTab::Plan(index) = tab {
             let close =
                 Rect::from_center_size(pos2(response.rect.right() - 12.0, response.rect.center().y), vec2(18.0, 18.0));
-            let _id = egui::Id::NULL.with(("plan-close", self.runtime.plans[*index].id.as_str()));
+            let _id = egui::Id::NULL.with(("plan-close", plan_row.as_ref().map_or("", |row| row.id.as_str())));
             let hit = ui.interact(close, response.id.with("close"), Sense::click());
             over_close = ui.input(|input| input.pointer.hover_pos().is_some_and(|pos| close.contains(pos)));
             if selected || response.hovered() || hit.hovered() {
@@ -648,7 +648,7 @@ impl Desktop<'_> {
                 ViewTab::Project(root) => self.runtime.set_view(Some(root.clone())),
                 ViewTab::Repos => unreachable!(),
                 ViewTab::Plan(index) => {
-                    if self.runtime.plans[*index].status == PlanStatus::Open {
+                    if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Open) {
                         self.runtime.selected_plan = *index;
                         self.runtime.show_plan_fleet();
                     } else {
@@ -677,7 +677,7 @@ impl Desktop<'_> {
                     }
                 });
             }
-            ViewTab::Plan(index) if self.runtime.plans[*index].status == PlanStatus::Completed => {
+            ViewTab::Plan(index) if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Completed) => {
                 response.context_menu(|ui| {
                     if ui.button("Archive plan").clicked() {
                         self.close_plan_tab(*index);

@@ -33,9 +33,11 @@ use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
 use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use atomics_core::workspace::{self, Workspace};
+use atomics_ui::{Backend, PlanRow};
 use serde_json::json;
 
 mod approvals;
+mod backend;
 mod background;
 mod board;
 mod chief;
@@ -75,7 +77,7 @@ mod worktrees;
 use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};
 use editor::save_png;
 use fleet::queue_note;
-use plan_view::PlanState;
+use plan_view::{PlanColor, PlanState};
 
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
@@ -1475,15 +1477,17 @@ impl Desktop<'_> {
     }
 
     fn sync_diffs(&mut self) {
-        for (root, data) in &self.runtime.diffs {
-            let view = self.client.diff_views.entry(root.clone()).or_default();
-            view.prepared = data.prepared.clone();
-            view.error = data.error.clone();
+        let backend = self.runtime.backend();
+        for root in backend.diff_roots() {
+            let Some(data) = backend.diff(&root) else { continue };
+            let view = self.client.diff_views.entry(root).or_default();
+            view.prepared = data.prepared;
+            view.error = data.error;
             view.loading = data.loading;
-            view.comments = data.comments.clone();
+            view.comments = data.comments;
             if view.viewing == data.viewing {
-                view.file = data.file.clone();
-                view.file_error = data.file_error.clone();
+                view.file = data.file;
+                view.file_error = data.file_error;
             }
         }
     }

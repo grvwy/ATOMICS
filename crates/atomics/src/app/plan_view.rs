@@ -1,41 +1,20 @@
 //! Shared plan presentation and client navigation. Selection is independent of activity.
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PlanState {
-    Running(usize),
-    NeedsYou,
-    Idle,
-    Completed,
-    Archived,
+pub(super) use atomics_ui::PlanState;
+
+/// A plan state's color is the desktop palette's business, not the shared state's.
+pub(super) trait PlanColor {
+    fn color(self, palette: &Palette) -> Color32;
 }
 
-impl PlanState {
-    pub(super) fn urgency(self) -> u8 {
-        match self {
-            Self::NeedsYou => 2,
-            Self::Running(_) => 1,
-            _ => 0,
-        }
-    }
-
-    pub(super) fn color(self, palette: &Palette) -> Color32 {
+impl PlanColor for PlanState {
+    fn color(self, palette: &Palette) -> Color32 {
         match self {
             Self::Running(_) => palette.accent,
             Self::NeedsYou => palette.warning,
             Self::Idle => palette.foreground,
             Self::Completed | Self::Archived => palette.muted,
-        }
-    }
-
-    pub(super) fn label(self, goal: &str) -> String {
-        let name: String = goal.chars().take(28).collect();
-        match self {
-            Self::Running(count) => format!("● {name} · {count} running"),
-            Self::NeedsYou => format!("◆ {name} · needs you"),
-            Self::Idle => format!("{name} · idle"),
-            Self::Completed => format!("✓ {name}"),
-            Self::Archived => format!("✓ {name} · archived"),
         }
     }
 }

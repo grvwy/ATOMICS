@@ -1,5 +1,5 @@
 //! Host diff preparation, coalescing and cache. Publishes results to the runtime.
-use crate::highlight::{Highlighter, Spans};
+use crate::highlight::Highlighter;
 use atomics_core::diff::{FileDiff, WorktreeDiff};
 use atomics_core::git::WorktreeFile;
 use std::collections::{HashMap, HashSet};
@@ -8,29 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
-pub struct Prepared {
-    pub diff: WorktreeDiff,
-    /// Per file, per hunk, per line.
-    pub highlights: Vec<Arc<FileHighlights>>,
-    pub longest_line: usize,
-    /// Lines added and removed, counted once rather than every frame.
-    pub additions: usize,
-    pub deletions: usize,
-    /// Every file git shows in the worktree, for the file picker.
-    pub all_files: Arc<Vec<Arc<str>>>,
-}
 
-/// One file's colors, per hunk, per line.
-pub type FileHighlights = Vec<Vec<Spans>>;
-
-/// A whole file opened from the file picker.
-pub struct FileView {
-    pub lines: Vec<String>,
-    pub highlights: Vec<Spans>,
-    pub longest_line: usize,
-    /// Why the content is not shown (binary, too large).
-    pub note: Option<String>,
-}
+pub use atomics_core::diff_data::{FileHighlights, FileView, Prepared};
 
 pub enum WorkerResult {
     Diff { root: PathBuf, result: Result<Arc<Prepared>, String> },
