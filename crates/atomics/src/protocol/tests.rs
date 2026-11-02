@@ -48,6 +48,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
         approved: false,
         integration: None,
         tasks: Vec::new(),
+        digest: String::new(),
     }
 }
 
@@ -78,6 +79,7 @@ fn summary(worktree: &str, revision: u64) -> DiffSummary {
             deletions: 0,
             omitted: 0,
         }],
+        comments: Vec::new(),
     }
 }
 
@@ -143,7 +145,14 @@ fn start_with(config: ServerConfig) -> Fixture {
     let projections = Arc::new(Projections::default());
     let diffs = Arc::new(FakeDiffs::default());
     diffs.0.lock().unwrap().insert("/w/a".into(), (1, file_diff()));
-    let server = Server::start(config, projections.clone(), diffs.clone(), Arc::new(Terminals::default())).unwrap();
+    let server = Server::start(
+        config,
+        projections.clone(),
+        diffs.clone(),
+        Arc::new(Terminals::default()),
+        Arc::new(super::NoCommands),
+    )
+    .unwrap();
     Fixture { server, projections, diffs }
 }
 
@@ -831,6 +840,7 @@ fn snapshot_parts_respect_the_budget_and_one_oversize_item_is_an_error() {
         limits: wire::Limits::default(),
         role: wire::Role::Viewer,
         resume: attached.resume,
+        may: vec![],
     };
     mirror.apply(&Envelope::host("e1", welcome)).unwrap();
     for (i, frame) in frames.iter().enumerate() {

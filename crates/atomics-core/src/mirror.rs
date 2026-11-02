@@ -223,7 +223,14 @@ mod tests {
     fn welcome(resume: Resume) -> Envelope {
         Envelope::host(
             "e",
-            Message::Welcome { version: VERSION, capabilities: vec![], limits: Limits::default(), role: Role::Viewer, resume },
+            Message::Welcome {
+                version: VERSION,
+                capabilities: vec![],
+                limits: Limits::default(),
+                role: Role::Viewer,
+                resume,
+                may: vec![],
+            },
         )
     }
 

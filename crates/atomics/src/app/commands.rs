@@ -1,6 +1,7 @@
 //! Desktop actions are in-process commands. IDs are resolved when the host runs
 //! them, so a session or plan disappearing between paint and execution is safe.
 use super::*;
+use atomics_core::ops::{ApprovalDecide, Command, Outcome};
 
 pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
 
@@ -38,18 +39,19 @@ impl Desktop<'_> {
         });
     }
 
+    /// The desktop's decision goes through the journal and `State::decide` like a protocol
+    /// client's, so the two can race and exactly one wins.
     pub(super) fn approve_request(&mut self, index: usize, approval: String, decision: Decision) {
         let session = self.runtime.sessions[index].id.clone();
         if !self.client.approval_decisions.insert((session.clone(), approval.clone())) {
             return;
         }
         self.post(move |state| {
-            let result = state
-                .find(&session)
-                .ok_or_else(|| "session closed before its permission decision".to_string())
-                .and_then(|index| state.approve(index, &approval, decision, None));
-            if let Err(error) = result {
-                state.toast(error);
+            let outcome = state.mutate_desktop(|op| {
+                Command::ApprovalDecide(ApprovalDecide { op, approval: approval.clone(), decision, message: None })
+            });
+            if let Outcome::Refused { message, .. } = outcome {
+                state.toast(message);
             }
             state.client_events.push(ClientEvent::ApprovalDecided { session, approval });
         });

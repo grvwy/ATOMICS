@@ -40,6 +40,7 @@ fn plan() -> PlanInfo {
             deletions: 1,
             report: Some(report()),
         }],
+        digest: "cedf306324d4".into(),
     }
 }
 
@@ -73,6 +74,13 @@ fn summary() -> DiffSummary {
             additions: 2,
             deletions: 0,
             omitted: 0,
+        }],
+        comments: vec![crate::steer::ReviewComment {
+            path: "x.rs".into(),
+            line: Some(1),
+            removed: false,
+            excerpt: "fn a() {}".into(),
+            body: "name it".into(),
         }],
     }
 }
@@ -133,6 +141,7 @@ fn every_message() -> Vec<Message> {
             limits: Limits::default(),
             role: Role::Controller,
             resume: Resume::Reset { cursor: Seq(7), reason: ResetReason::NewClient },
+            may: vec![crate::ops::Grant::Type, crate::ops::Grant::Approve],
         },
         Message::Welcome {
             version: VERSION,
@@ -140,6 +149,7 @@ fn every_message() -> Vec<Message> {
             limits: Limits::default(),
             role: Role::Viewer,
             resume: Resume::Replay { after: Seq(5) },
+            may: vec![],
         },
         Message::Subscribe { topics: topics.clone() },
         Message::Unsubscribe { topics },
@@ -212,6 +222,67 @@ fn every_message() -> Vec<Message> {
             size: Some(crate::lease::GridSize { cols: 40, rows: 20, cell_width: Some(9), cell_height: None }),
         },
         Message::TerminalResize { session: "s1".into(), lease: Seq(3), size: None },
+        Message::ApprovalDecide(crate::ops::ApprovalDecide {
+            op: "o1".into(),
+            approval: "a1".into(),
+            decision: crate::approvals::Decision::Deny,
+            message: Some("not on main".into()),
+        }),
+        Message::PlanCommand(crate::ops::PlanCommand {
+            op: "o2".into(),
+            plan: Some("p".into()),
+            digest: Some("cedf306324d4".into()),
+            action: crate::ops::PlanAction::Update {
+                task: "t1".into(),
+                status: Some(crate::plan::TaskStatus::Done),
+                note: Some("checked".into()),
+            },
+        }),
+        Message::PlanCommand(crate::ops::PlanCommand {
+            op: "o3".into(),
+            plan: None,
+            digest: None,
+            action: crate::ops::PlanAction::Set {
+                goal: "g".into(),
+                tasks: vec![crate::plan::Task { id: "t1".into(), title: "do".into(), ..Default::default() }],
+                integration: Some("atomics/plan-g".into()),
+            },
+        }),
+        Message::ReviewCommand(crate::ops::ReviewCommand {
+            op: "o4".into(),
+            worktree: "/w/a".into(),
+            action: crate::ops::ReviewAction::Add {
+                revision: Seq(4),
+                path: "x.rs".into(),
+                line: Some(3),
+                removed: true,
+                text: "why?".into(),
+            },
+        }),
+        Message::ReviewCommand(crate::ops::ReviewCommand {
+            op: "o5".into(),
+            worktree: "/w/a".into(),
+            action: crate::ops::ReviewAction::Send,
+        }),
+        Message::SessionCommand(crate::ops::SessionCommand {
+            op: "o6".into(),
+            action: crate::ops::SessionAction::Start {
+                agent: "claude".into(),
+                folder: None,
+                repo: Some("/w".into()),
+                branch: Some("fix/a".into()),
+                prompt: Some("go".into()),
+            },
+        }),
+        Message::CommandResult(crate::ops::CommandResult { op: "o1".into(), outcome: crate::ops::Outcome::Accepted }),
+        Message::CommandResult(crate::ops::CommandResult {
+            op: "o6".into(),
+            outcome: crate::ops::Outcome::done(serde_json::json!({"sent": true})),
+        }),
+        Message::CommandResult(crate::ops::CommandResult {
+            op: "o7".into(),
+            outcome: crate::ops::Outcome::Uncertain { message: "the host stopped".into() },
+        }),
         Message::Ack { cursor: Seq(11) },
         Message::Resync { reason: Some("gap".into()), screens: vec![] },
         Message::Resync { reason: None, screens: vec!["s1".into()] },
@@ -321,10 +392,13 @@ fn an_error_code_from_a_newer_peer_decodes_as_unknown() {
 
 #[test]
 fn an_unknown_kind_fails_explicitly() {
-    let frame = r#"{"v":{"major":1,"minor":0},"kind":"approval_decide","id":"a1"}"#;
+    let frame = r#"{"v":{"major":1,"minor":0},"kind":"file_put","path":"a.rs"}"#;
     let error = decode(frame).unwrap_err();
     assert_eq!(error.code, ErrorCode::UnknownKind);
-    assert!(error.message.contains("approval_decide"));
+    assert!(error.message.contains("file_put"));
+    // A known mutation missing what it needs is malformed, never ignored.
+    let frame = r#"{"v":{"major":1,"minor":0},"kind":"approval_decide","approval":"a1"}"#;
+    assert_eq!(decode(frame).unwrap_err().code, ErrorCode::Malformed);
 }
 
 #[test]

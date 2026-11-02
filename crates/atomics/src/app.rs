@@ -32,6 +32,7 @@ use atomics_core::control::{ControlRequest, ControlResponse};
 use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
 use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
+use atomics_core::wire::{Disposition, ErrorCode, WireError};
 use atomics_core::workspace::{self, Workspace};
 use atomics_ui::status::{PULSE_STEP, status_dot};
 use atomics_ui::text::truncate;
@@ -54,6 +55,7 @@ mod heartbeat;
 mod input;
 mod integrations;
 mod intents;
+mod mutations;
 mod open_link;
 mod plan_cleanup;
 mod plan_view;
@@ -504,6 +506,14 @@ pub(crate) struct State {
     /// Account usage that sandboxed agents saw, read back from their VMs.
     sandbox_pull: crate::usage::SandboxPull,
     control_rx: Receiver<ControlMessage>,
+    /// Mutations from protocol clients, carried out in turn with everything else (`mutations.rs`).
+    op_tx: crate::host::Sender<crate::protocol::OpRequest>,
+    op_rx: Receiver<crate::protocol::OpRequest>,
+    /// The operation journal: in memory, or in a file while the protocol server runs.
+    ops: crate::protocol::journal::Journal,
+    in_flight: Vec<mutations::InFlight>,
+    /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
+    resolved: std::collections::VecDeque<(String, Disposition)>,
     hook_error: Option<String>,
     /// Machine-wide limits for the agents' heavy work.
     governor: Arc<Governor>,
@@ -924,6 +934,7 @@ impl State {
         let wake = crate::host::Wake::default();
         let (hook_tx, hook_rx) = wake.channel();
         let (control_tx, control_rx) = wake.channel();
+        let (op_tx, op_rx) = wake.channel();
         let (action_tx, action_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(window.clone());
         let sandbox_pull = crate::usage::SandboxPull::new(usage_tx.clone());
@@ -1021,6 +1032,11 @@ impl State {
             usage,
             sandbox_pull,
             control_rx,
+            op_tx,
+            op_rx,
+            ops: crate::protocol::journal::Journal::memory(),
+            in_flight: Vec::new(),
+            resolved: Default::default(),
             hook_error,
             governor,
             jobserver,

@@ -5,14 +5,17 @@
 //! moves only when its content does, so a reader can tell "nothing changed" by comparing numbers.
 //! Revisions and the cursor are opaque strings on the wire (`wire::Cursor`); here they are `u64`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{FileDiff, FileStatus, WorktreeDiff};
 use crate::plan::{PlanStatus, TaskStatus};
 use crate::session::AgentStatus;
+use crate::steer::ReviewComment;
+use crate::wire::Disposition;
 
 /// One published value and the revision it was published at. Never mutated after publication.
 #[derive(Debug, PartialEq, Eq)]
@@ -102,6 +105,11 @@ pub struct PlanInfo {
     pub approved: bool,
     pub integration: Option<String>,
     pub tasks: Vec<TaskInfo>,
+    /// The digest of the plan's approval scope (goal and planned tasks), as the remote
+    /// conversation's `/approve` uses it. `plan_command` `approve` and `set` name it, so the
+    /// user approves or replaces exactly the plan they saw. Empty for a closed plan.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +144,9 @@ pub struct DiffSummary {
     pub base: String,
     pub partial: bool,
     pub files: Vec<DiffFileSummary>,
+    /// Review comments on this worktree waiting to be sent to its agent, shared by every client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<ReviewComment>,
 }
 
 impl DiffSummary {
@@ -159,6 +170,7 @@ impl DiffSummary {
                     omitted: f.omitted,
                 })
                 .collect(),
+            comments: Vec::new(),
         }
     }
 
@@ -172,6 +184,7 @@ impl DiffSummary {
             base: String::new(),
             partial: false,
             files: Vec::new(),
+            comments: Vec::new(),
         }
     }
 
@@ -205,7 +218,12 @@ pub struct Projections {
     pub approvals: Published<Vec<ApprovalInfo>>,
     pub diffs: Published<Vec<DiffSummary>>,
     cursor: AtomicU64,
+    /// How approvals that left the board ended, newest last, so `approval_resolved` can say.
+    resolutions: Mutex<VecDeque<(String, Disposition)>>,
 }
+
+/// Approval outcomes kept for `approval_resolved`; an older one is reported as withdrawn.
+pub const MAX_RESOLUTIONS: usize = 256;
 
 /// Everything at one moment, as sent in a `state_snapshot` and as the protocol thread reads it.
 #[derive(Debug, Clone)]
@@ -244,6 +262,24 @@ impl Projections {
 
     pub fn publish_diffs(&self, data: Vec<DiffSummary>) -> bool {
         self.moved(self.diffs.publish(data))
+    }
+
+    /// Record how approvals ended (the newest `MAX_RESOLUTIONS`). Publish them before the
+    /// approvals that no longer list them, so a reader that sees one gone finds how it ended.
+    pub fn publish_resolutions(&self, resolved: &VecDeque<(String, Disposition)>) {
+        let mut kept = self.resolutions.lock().unwrap_or_else(|e| e.into_inner());
+        if *kept != *resolved {
+            kept.clone_from(resolved);
+            while kept.len() > MAX_RESOLUTIONS {
+                kept.pop_front();
+            }
+        }
+    }
+
+    /// How the approval `id` ended, if it was answered lately.
+    pub fn resolution(&self, id: &str) -> Option<Disposition> {
+        let kept = self.resolutions.lock().unwrap_or_else(|e| e.into_inner());
+        kept.iter().rev().find(|(i, _)| i == id).map(|(_, d)| *d)
     }
 
     /// Load every collection. The cursor is read first, so a publish racing the loads can only

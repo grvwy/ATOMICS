@@ -193,7 +193,14 @@ fn keystroke_echo_latency() {
         "server: focused cadence {:?}, client tick {:?}, poll {:?}, echo window {:?}",
         config.screens.focused, config.session.tick, config.poll_interval, config.screens.echo_window
     );
-    let server = Server::start(config, Arc::new(Projections::default()), Arc::new(NoDiffs), terminals).unwrap();
+    let server = Server::start(
+        config,
+        Arc::new(Projections::default()),
+        Arc::new(NoDiffs),
+        terminals,
+        Arc::new(super::NoCommands),
+    )
+    .unwrap();
 
     let mut client = TestClient::connect(server.addr(), server.token());
     client.ws.get_ref().set_nodelay(true).unwrap();

@@ -8,15 +8,20 @@
 //! an emulator that is busy parsing or being painted never delays board events. Each client has
 //! its own thread and a bounded queue; a client that stops reading is resynchronised or dropped
 //! and cannot delay the host or other clients. A client holding a terminal's lease (`lease.rs`)
-//! types into it from its own thread, straight to the PTY.
+//! types into it from its own thread, straight to the PTY. Mutations go to whatever carries them
+//! out (`ops.rs`; the runtime thread in the app), which journals them (`journal.rs`).
 
 #[cfg(test)]
 mod echo_bench;
 mod hub;
 #[cfg(test)]
 mod input_tests;
+pub mod journal;
 pub mod lease;
 mod link;
+#[cfg(test)]
+mod mutation_tests;
+pub mod ops;
 #[cfg(test)]
 mod screen_tests;
 mod screens;
@@ -42,6 +47,9 @@ use tungstenite::{HandshakeError, http};
 
 pub use hub::RingLimits;
 pub use lease::{Lease, TerminalControl};
+#[cfg(test)]
+pub use ops::NoCommands;
+pub use ops::{Commands, OpReply, OpRequest};
 pub use screens::{ScreenConfig, ScreenSource, TerminalEntry, Terminals};
 pub use session::{Departed, DiffSource, SessionConfig};
 
@@ -119,13 +127,15 @@ fn random_hex(bytes: usize) -> io::Result<String> {
 }
 
 impl Server {
-    /// Bind 127.0.0.1 and start serving. The caller keeps the returned handle for the server's life
-    /// and publishes the terminals it may stream into `terminals`.
+    /// Bind 127.0.0.1 and start serving. The caller keeps the returned handle for the server's life,
+    /// publishes the terminals it may stream into `terminals`, and carries out the mutations that
+    /// arrive on `commands`.
     pub fn start(
         config: ServerConfig,
         projections: Arc<Projections>,
         diffs: Arc<dyn DiffSource>,
         terminals: Arc<Terminals>,
+        commands: Arc<dyn Commands>,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))?;
         listener.set_nonblocking(true)?;
@@ -149,6 +159,7 @@ impl Server {
                 hub: hub.clone(),
                 diffs,
                 screens: screens.clone(),
+                commands,
                 stop: stop.clone(),
                 config: config.session.clone(),
                 lease: config.lease.clone(),
