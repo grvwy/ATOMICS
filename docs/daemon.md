@@ -631,7 +631,8 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   `not_paired` (4003), `no_pairing` (4004) or `slow` (4408); one the host cannot start gets `unavailable` (4002).
   Each channel may queue 1 MiB
   toward the service (a session waits up to 5 s for room, then ends as slow), and a channel whose session stops
-  reading 1 MiB of what arrives is closed as slow.
+  reading 1 MiB of what arrives is closed as slow. Stopping the rendezvous closes the tunnel and waits up to 2 s
+  for the channels' threads, so their sessions' last-seen times are written before the host goes.
 - **Renewal.** After each `expiry` the host renews at half the remaining admission, between 15 s and 150 s, so a
   skewed clock still renews in time. The renewal's MCP calls never stall the frames; a failed one is retried after
   15 s (a minute when throttled), and a revoked answer stops the host.
