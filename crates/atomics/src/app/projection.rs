@@ -227,8 +227,12 @@ impl State {
                         ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
                     })
                     .collect(),
-                // Only an open plan can be approved or replaced, so only its scope is hashed.
-                digest: if p.status == atomics_core::plan::PlanStatus::Open { p.digest() } else { String::new() },
+                // Only remote clients need the approval scope, and only open plans can be approved or replaced.
+                digest: if self.config.remote.enabled && p.status == atomics_core::plan::PlanStatus::Open {
+                    p.digest()
+                } else {
+                    String::new()
+                },
                 ticket: p.ticket.as_ref().map(|ticket| ticket.label().to_string()),
             })
             .collect()
@@ -345,10 +349,23 @@ mod tests {
     }
 
     #[test]
+    fn plan_digests_are_published_only_with_remote_on() {
+        with_state("app::projection::tests::plan_digests_are_published_only_with_remote_on", |mut state, _| {
+            state.plans = vec![Plan::default()];
+            assert!(state.plan_infos()[0].digest.is_empty());
+            state.config.remote.enabled = true;
+            assert_eq!(state.plan_infos()[0].digest, state.plans[0].digest());
+            state.plans[0].status = atomics_core::plan::PlanStatus::Completed;
+            assert!(state.plan_infos()[0].digest.is_empty());
+        });
+    }
+
+    #[test]
     fn every_pass_rebuilds_but_revisions_move_only_on_a_real_change() {
         with_state(
             "app::projection::tests::every_pass_rebuilds_but_revisions_move_only_on_a_real_change",
             |mut state, _| {
+                state.config.remote.enabled = true;
                 let root = state.launch_dir.clone();
                 state.sessions = vec![
                     session("a", AgentKind::Claude, AgentStatus::Working, &root),

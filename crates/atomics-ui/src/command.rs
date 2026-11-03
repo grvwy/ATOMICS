@@ -81,6 +81,7 @@ pub enum Command {
         status: PlanStatus,
     },
     /// Archive a plan that is no longer open; one reopened meanwhile stays open.
+    /// Desktop only until the protocol supports that execution-time guard.
     ArchiveFinished(usize),
     /// Preview what a completed plan's cleanup would remove.
     CleanUpPlan(usize),
@@ -340,9 +341,7 @@ impl Command {
                 let tasks: Vec<String> = board.plan.pending_integrations().iter().map(|t| t.id.clone()).collect();
                 tasks.into_iter().filter_map(|task| plan(*index, PlanAction::Integrate { task }, op)).collect()
             }
-            Command::ArchivePlan(index)
-            | Command::ArchiveFinished(index)
-            | Command::ClosePlan { plan: index, status: PlanStatus::Archived } => {
+            Command::ArchivePlan(index) | Command::ClosePlan { plan: index, status: PlanStatus::Archived } => {
                 plan(*index, PlanAction::Archive, op).into_iter().collect()
             }
             Command::EditComments { root, before, after } => {

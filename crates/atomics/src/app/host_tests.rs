@@ -662,10 +662,15 @@ fn delayed_file_open_keeps_the_hosts_resolved_target() {
 fn the_protocol_server_is_off_by_default() {
     with_state("app::host_tests::the_protocol_server_is_off_by_default", |state, _| {
         assert!(!state.config.remote.enabled);
+        let keychains = crate::relay::KEYCHAIN_ACCESSES.load(std::sync::atomic::Ordering::SeqCst);
         let host = state.into_host();
         assert!(host.protocol_addr().is_none(), "no flag, no listener");
         assert!(!paths::atomics_home().join("protocol.json").exists(), "and nothing advertised");
         assert!(!host.streams_terminals(), "and no terminal is published, copied or streamed");
+        drop(host); // Join all runtime work before checking for keychain access.
+        assert_eq!(crate::relay::KEYCHAIN_ACCESSES.load(std::sync::atomic::Ordering::SeqCst), keychains);
+        assert!(!paths::atomics_home().join("protocol-ops.jsonl").exists());
+        assert!(!paths::atomics_home().join("devices.json").exists());
     });
 }
 

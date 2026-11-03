@@ -232,7 +232,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
                     &crate::mcp_client::OAuth::new(credential_keychain.clone(), crate::connections::Browser::current()),
                     &tickets,
                 ));
-                lines.push(ticket_check(&tickets));
+                lines.push(ticket_check(&tickets, config.remote.rendezvous.enabled));
                 lines.extend(remote_check(&tickets));
             }
             Ok(_) => {}
@@ -309,7 +309,7 @@ fn ticket_config(config: &Config, workspace: Option<&str>) -> anyhow::Result<ato
     Ok(tickets.unwrap_or_else(|| config.tickets.clone()))
 }
 
-fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
+fn ticket_check(config: &atomics_core::tickets::TicketConfig, rendezvous: bool) -> String {
     let result = (|| {
         let mut client = crate::mcp_client::McpClient::connect(
             &config.server,
@@ -335,6 +335,7 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
             "rendezvous_pass",
         ]
         .into_iter()
+        .filter(|name| rendezvous || !name.starts_with("rendezvous_"))
         .filter_map(|name| {
             config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
         })
@@ -458,6 +459,19 @@ mod tests {
     }
 
     #[test]
+    fn ticket_check_requires_rendezvous_tools_only_when_enabled() {
+        use crate::mcp_client::tests::{example_profile, fake_state};
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = fake_state(dir.path(), serde_json::json!([]));
+        let mut config = example_profile("keyword-example", &state);
+        config.operations.rendezvous_register =
+            Some(atomics_core::tickets::Operation { tool: "missing_register".into(), ..Default::default() });
+        assert!(ticket_check(&config, false).starts_with('✓'));
+        let line = ticket_check(&config, true);
+        assert!(line.starts_with('✗') && line.contains("rendezvous_register → missing_register"), "{line}");
+    }
+
+    #[test]
     fn ticket_check_notes_missing_optional_workspace_operations() {
         use crate::mcp_client::tests::{example_profile, fake_state};
         let dir = crate::test_support::tempdir().unwrap();
@@ -472,7 +486,7 @@ mod tests {
                 "related" => config.operations.related = Some(operation),
                 _ => config.operations.read = Some(operation),
             }
-            let line = ticket_check(&config);
+            let line = ticket_check(&config, false);
             assert!(
                 line.starts_with('✓') && line.contains("note:") && line.contains(&format!("{name} → missing_{name}")),
                 "{line}"
@@ -530,7 +544,7 @@ mod tests {
             "echo \"bad key $API_KEY for https://me:pw@t.example\" >&2; exit 1".into(),
         ];
         config.server.env.insert("API_KEY".into(), "doctorkey-4e5f6a".into());
-        let line = ticket_check(&config);
+        let line = ticket_check(&config, false);
         assert!(line.starts_with('✗') && line.contains("bad key ***"), "{line}");
         assert!(!line.contains("doctorkey-4e5f6a") && !line.contains("pw@"), "{line}");
     }
@@ -546,16 +560,16 @@ mod tests {
             let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
             value["page_size"] = json!(2);
             std::fs::write(&state, value.to_string()).unwrap();
-            assert!(ticket_check(&config).starts_with('✓'));
+            assert!(ticket_check(&config, false).starts_with('✓'));
             if name == "meaning-example" {
                 assert!(config.escape_mentions);
                 assert_eq!(config.operation("whoami").unwrap().tool, "whoami");
             }
             config.operations.get.as_mut().unwrap().tool = "unknown_get".into();
-            let failed = ticket_check(&config);
+            let failed = ticket_check(&config, false);
             assert!(failed.starts_with('✗') && failed.contains("get → unknown_get"), "{failed}");
             config.server.command = vec![dir.path().join("absent-server").display().to_string()];
-            let failed = ticket_check(&config);
+            let failed = ticket_check(&config, false);
             assert!(failed.starts_with('✗') && failed.contains("starting"), "{failed}");
         }
         let mut config = example_profile("meaning-example", &state);
@@ -563,7 +577,7 @@ mod tests {
         let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         value["list_hang"] = json!(true);
         std::fs::write(&state, value.to_string()).unwrap();
-        let failed = ticket_check(&config);
+        let failed = ticket_check(&config, false);
         assert!(failed.starts_with('✗') && failed.contains("did not answer within 1 s"), "{failed}");
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         assert_eq!(value["calls"], json!([]), "doctor must never call mapped operations");
