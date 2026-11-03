@@ -98,13 +98,15 @@ enum Record {
 
 struct Log {
     path: PathBuf,
-    file: File,
+    file: std::sync::Arc<File>,
     lines: usize,
 }
 
 pub struct Journal {
     entries: HashMap<Key, Entry>,
     log: Option<Log>,
+    error: Option<String>,
+    pending_sync: bool,
 }
 
 /// A command's fingerprint: FNV-1a over its JSON. It tells a reused ID apart from a retry; it is
@@ -139,7 +141,11 @@ fn private_file(path: &Path, append: bool) -> io::Result<File> {
 impl Journal {
     /// A journal with no file: the desktop's own operations while the protocol server is off.
     pub fn memory() -> Self {
-        Self { entries: HashMap::new(), log: None }
+        Self { entries: HashMap::new(), log: None, error: None, pending_sync: false }
+    }
+
+    pub fn unwritable(error: String) -> Self {
+        Self { error: Some(error), ..Self::memory() }
     }
 
     /// Load the journal at `path` (mode 0600). An operation that began without ending is
@@ -175,9 +181,25 @@ impl Journal {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Remove a torn final record before any append. Compaction below also drops
+        // malformed complete lines and preserves valid legacy records without a newline.
+        if let Ok(bytes) = std::fs::read(path)
+            && !bytes.ends_with(b"\n")
+        {
+            let tail = bytes.rsplit(|b| *b == b'\n').next().unwrap_or_default();
+            if serde_json::from_slice::<Record>(tail).is_err() {
+                let len = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                std::fs::OpenOptions::new().write(true).open(path)?.set_len(len as u64)?;
+            }
+        }
         // Opened first only so that `compact` has a log to replace.
         let file = private_file(path, true)?;
-        let mut journal = Self { entries, log: Some(Log { path: path.to_path_buf(), file, lines: 0 }) };
+        let mut journal = Self {
+            entries,
+            log: Some(Log { path: path.to_path_buf(), file: std::sync::Arc::new(file), lines: 0 }),
+            error: None,
+            pending_sync: false,
+        };
         journal.expire(now);
         journal.compact()?;
         Ok(journal)
@@ -199,12 +221,13 @@ impl Journal {
             }
             return entry.outcome.clone().map_or(Begun::Running, Begun::Known);
         }
-        if self.entries.len() >= CAPACITY {
+        if self.entries.len() >= CAPACITY && key.origin != "desktop" {
             return Begun::Full;
         }
         let by = by.map(str::to_string);
         let record = Record::Begin { key: key.clone(), fingerprint: fingerprint.into(), at: now, by: by.clone() };
         if let Err(e) = self.append(&record) {
+            self.error = Some(e.to_string());
             return Begun::Unwritable(e.to_string());
         }
         self.entries.insert(key.clone(), Entry { fingerprint: fingerprint.into(), began: now, outcome: None, by });
@@ -214,11 +237,22 @@ impl Journal {
     /// Record how the operation ended, on disk before the caller answers with it. A failed write
     /// is reported and the outcome is still kept in memory; after a crash the operation would then
     /// read as `uncertain`, which is true.
+    #[cfg(test)]
     pub fn finish(&mut self, key: &Key, outcome: &Outcome) {
+        self.finish_deferred(key, outcome);
+        if let Some(file) = self.take_sync() {
+            let _ = file.sync_data();
+        }
+    }
+
+    /// Append the outcome while State is locked; the runtime syncs it before replying,
+    /// after releasing State. Begin records still sync before side effects.
+    pub fn finish_deferred(&mut self, key: &Key, outcome: &Outcome) {
         let Some(entry) = self.entries.get_mut(key) else { return };
         let outcome = kept(outcome);
         entry.outcome = Some(outcome.clone());
-        if let Err(e) = self.append(&Record::End { key: key.clone(), outcome }) {
+        if let Err(e) = self.append_inner(&Record::End { key: key.clone(), outcome }, false) {
+            self.error = Some(e.to_string());
             eprintln!("atomics: the operation journal could not record an outcome: {e}");
         }
         if self.log.as_ref().is_some_and(|log| log.lines > 2 * self.entries.len() + 64)
@@ -232,20 +266,42 @@ impl Journal {
         self.entries.retain(|_, e| e.outcome.is_none() || now.saturating_sub(e.began) < KEEP_SECS);
     }
 
+    pub fn take_sync(&mut self) -> Option<std::sync::Arc<File>> {
+        if !std::mem::take(&mut self.pending_sync) {
+            return None;
+        }
+        self.log.as_ref().map(|log| log.file.clone())
+    }
+
     fn append(&mut self, record: &Record) -> io::Result<()> {
+        self.append_inner(record, true)
+    }
+
+    fn append_inner(&mut self, record: &Record, sync: bool) -> io::Result<()> {
+        if let Some(error) = &self.error {
+            return Err(io::Error::other(error.clone()));
+        }
         let Some(log) = &mut self.log else { return Ok(()) };
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
         // One write per line, so a crash leaves at most the last line cut short; synced, so a power
         // cut cannot lose a beginning whose work went ahead.
-        log.file.write_all(&line)?;
-        log.file.sync_data()?;
+        log.file.as_ref().write_all(&line)?;
+        if sync {
+            log.file.sync_data()?;
+        } else {
+            self.pending_sync = true;
+        }
         log.lines += 1;
         Ok(())
     }
 
     /// Write what is remembered to a new file and put it in place of the log.
     fn compact(&mut self) -> io::Result<()> {
+        self.compact_with(|path| private_file(path, true))
+    }
+
+    fn compact_with(&mut self, reopen: impl FnOnce(&Path) -> io::Result<File>) -> io::Result<()> {
         let Some(log) = &mut self.log else { return Ok(()) };
         let tmp = log.path.with_extension("jsonl.tmp");
         let mut out = Vec::new();
@@ -274,9 +330,20 @@ impl Journal {
         drop(file);
         std::fs::rename(&tmp, &log.path)?;
         let dir = log.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        File::open(dir)?.sync_all()?;
-        log.file = private_file(&log.path, true)?;
+        let synced = File::open(dir).and_then(|file| file.sync_all());
+        // Once renamed, never keep an append handle to the old inode, even if syncing
+        // the directory or reopening the new file fails.
+        let reopened = reopen(&log.path);
+        match reopened {
+            Ok(file) => log.file = std::sync::Arc::new(file),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.log = None;
+                return Err(error);
+            }
+        }
         log.lines = lines;
+        synced?;
         Ok(())
     }
 }
@@ -296,6 +363,47 @@ mod tests {
 
     fn begin(journal: &mut Journal, command: &Command, now: u64) -> Begun {
         journal.begin(&Key::client("phone", command.op()), None, &fingerprint(command), now)
+    }
+
+    #[test]
+    fn failed_reopen_disables_writes_and_drops_the_stale_handle() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        let mut journal = Journal::open(&path, 0).unwrap();
+        assert_eq!(begin(&mut journal, &steer("old", "x"), 0), Begun::Fresh);
+        assert!(journal.compact_with(|_| Err(io::Error::other("injected reopen failure"))).is_err());
+        assert!(journal.log.is_none());
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(begin(&mut journal, &steer("new", "x"), 0), Begun::Unwritable(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn torn_tail_is_removed_before_new_records_are_appended() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        let mut original = Journal::open(&path, 0).unwrap();
+        assert_eq!(begin(&mut original, &steer("old", "x"), 0), Begun::Fresh);
+        drop(original);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"record\":\"beg").unwrap();
+        let mut journal = Journal::open(&path, 0).unwrap();
+        assert!(matches!(begin(&mut journal, &steer("old", "x"), 0), Begun::Known(Outcome::Uncertain { .. })));
+        assert_eq!(begin(&mut journal, &steer("new", "x"), 0), Begun::Fresh);
+        drop(journal);
+        assert_eq!(Journal::open(&path, 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outcome_sync_can_be_taken_and_run_without_the_journal_lock() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let mut journal = Journal::open(&dir.path().join("ops.jsonl"), 0).unwrap();
+        assert_eq!(begin(&mut journal, &steer("new", "x"), 0), Begun::Fresh);
+        assert!(journal.take_sync().is_none(), "begin was already synced");
+        journal.finish_deferred(&Key::client("phone", "new"), &Outcome::done(serde_json::Value::Null));
+        let barrier = journal.take_sync().expect("outcome needs sync outside State");
+        assert!(journal.take_sync().is_none());
+        drop(journal);
+        barrier.sync_data().unwrap();
     }
 
     #[test]
