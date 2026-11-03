@@ -713,10 +713,10 @@ fn a_device_racing_the_link_shows_another_code_and_is_refused() {
     let (mut raced, racer_code) = socket.pair(1, &link, &racer, "Phone").unwrap();
     let (name, shown) = host.prompt();
     assert_eq!((name.as_str(), shown.as_str()), ("Phone", racer_code.as_str()));
-    // The phone itself is refused while that pairing waits: one at a time.
+    // The phone itself is refused while that pairing waits: one at a time, and it may ask again.
     let phone = Secret::generate().unwrap();
-    assert_eq!(socket.pair(2, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
-    socket.send(service::left(2, close::NO_PAIRING));
+    assert_eq!(socket.pair(2, &link, &phone, "Phone").err(), Some(close::PAIRING_BUSY));
+    socket.send(service::left(2, close::PAIRING_BUSY));
     // The phone shows no code the user could match, so the user refuses.
     host.devices.decide(None);
     assert_eq!(socket.pair_answer(1, &mut raced), PairAnswer { paired: false, may: None });
@@ -724,7 +724,7 @@ fn a_device_racing_the_link_shows_another_code_and_is_refused() {
     assert!(host.devices.list().is_empty(), "never added");
     let mut later = socket.connect(3, &host.host_key(), &racer).expect("an answer");
     assert_eq!(socket.refused(3, &mut later), close::NOT_PAIRED);
-    // And the link is used up.
+    // And the link is used up: no longer busy, and asking again cannot help.
     assert_eq!(socket.pair(4, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
 }
 

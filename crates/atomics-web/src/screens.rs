@@ -75,9 +75,9 @@ pub enum Lost {
 pub enum Refused {
     /// This client neither holds the lease nor is asking for it (or is offline, or view only).
     NoLease,
-    /// Over [`MAX_TYPED_BYTES`] at once, or more than may wait: [`MAX_WAITING_BYTES`] for the grant, or
-    /// [`MAX_TYPED_BYTES`] behind input the program has not read yet.
-    TooMuch,
+    /// Over the limit that applied, in bytes: [`MAX_TYPED_BYTES`] at once or behind input the program
+    /// has not read yet, [`MAX_WAITING_BYTES`] waiting for the grant.
+    TooMuch(usize),
 }
 
 enum Request {
@@ -255,7 +255,7 @@ impl Screens {
             return Ok(());
         }
         if data.len() > MAX_TYPED_BYTES {
-            return Err(Refused::TooMuch);
+            return Err(Refused::TooMuch(MAX_TYPED_BYTES));
         }
         if term.typist.may_type() && term.waiting.is_empty() {
             self.send(session, data, out);
@@ -263,7 +263,7 @@ impl Screens {
         }
         let limit = if term.retype { MAX_TYPED_BYTES } else { MAX_WAITING_BYTES };
         if term.waiting.len() + data.len() > limit {
-            return Err(Refused::TooMuch);
+            return Err(Refused::TooMuch(limit));
         }
         term.waiting.push_str(data);
         Ok(())

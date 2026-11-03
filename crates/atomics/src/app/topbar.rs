@@ -86,13 +86,15 @@ impl Desktop<'_> {
 
     /// Phone and browser access through a rendezvous service, when `[remote.rendezvous]` is
     /// enabled: "Remote" in the success colour while online, with a dot in the warning colour while
-    /// it waits or has stopped, muted while it connects. The hover says why; a click opens Remote
-    /// devices (pairing and revoking).
+    /// it waits or has stopped, or while the operation journal cannot be written; muted while it
+    /// connects. The hover says why; a click opens Remote devices (pairing and revoking).
     fn rendezvous_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         use crate::protocol::rendezvous::Phase;
         let Some(status) = self.runtime.rendezvous_status() else { return };
         let palette = self.palette();
+        let journal = self.runtime.journal_problem();
         let (text, color) = match status.phase {
+            _ if journal.is_some() => ("Remote ●".to_string(), palette.warning),
             Phase::Online => ("Remote".to_string(), palette.success),
             Phase::Waiting | Phase::Stopped => ("Remote ●".to_string(), palette.warning),
             Phase::Starting | Phase::Registering | Phase::Connecting => ("Remote …".to_string(), palette.muted),
@@ -118,7 +120,7 @@ impl Desktop<'_> {
         if !status.registered && status.phase != Phase::Online {
             hover.push_str("\nThis host is not registered yet.");
         }
-        if let Some(note) = &status.note {
+        for note in status.note.iter().chain(&journal) {
             hover.push('\n');
             hover.push_str(note);
         }
@@ -642,5 +644,38 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn the_remote_indicator_warns_while_the_operation_journal_cannot_be_written() {
+        with_app(
+            "app::topbar::tests::the_remote_indicator_warns_while_the_operation_journal_cannot_be_written",
+            |app, ctx| {
+                use crate::protocol::journal::Journal;
+                use crate::protocol::rendezvous::{Phase, StatusCell};
+                let status = StatusCell::new(|| {});
+                status.update(|status| status.phase = Phase::Online);
+                app.runtime.set_remote_view(crate::host::RemoteView {
+                    enabled: true,
+                    rendezvous: Some(status),
+                    ..Default::default()
+                });
+                let label = |app: &mut Desktop<'_>| {
+                    let (_, output) = render(app, ctx, 2400.0, vec![]);
+                    let label = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(t) if t.galley.text().starts_with("Remote") => {
+                            Some(t.galley.text().to_string())
+                        }
+                        _ => None,
+                    });
+                    output.drop_without_applying_deltas();
+                    label.expect("the Remote indicator")
+                };
+                assert_eq!(label(app), "Remote", "online");
+                app.runtime.ops = Journal::unwritable("No space left on device".into());
+                assert_eq!(label(app), "Remote ●", "online, but clients cannot change anything");
+                assert!(app.runtime.journal_problem().unwrap().contains("No space left on device"));
+            },
+        );
     }
 }

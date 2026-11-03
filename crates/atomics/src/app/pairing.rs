@@ -31,7 +31,7 @@ impl Desktop<'_> {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_max_width(420.0);
-                if let Some(problem) = devices.problem() {
+                for problem in [self.runtime.journal_problem(), devices.problem()].into_iter().flatten() {
                     ui.colored_label(self.palette().warning, problem);
                     ui.add_space(6.0);
                 }
@@ -199,7 +199,69 @@ fn qr_code(ui: &mut egui::Ui, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::with_app;
     use super::*;
+    use crate::protocol::journal::Journal;
+    use crate::protocol::rendezvous::{Phase, StatusCell};
+
+    /// The rendezvous online, with an allowlist, and the operation journal unwritable.
+    fn unwritable_journal(app: &mut Desktop<'_>) {
+        let status = StatusCell::new(|| {});
+        status.update(|status| status.phase = Phase::Online);
+        let devices = Devices::open(atomics_core::paths::atomics_home().join("devices.json"), || {});
+        app.runtime.set_remote_view(crate::host::RemoteView {
+            enabled: true,
+            rendezvous: Some(status),
+            devices: Some(devices),
+            ..Default::default()
+        });
+        app.runtime.ops = Journal::unwritable("No space left on device".into());
+    }
+
+    fn texts(app: &mut Desktop<'_>, ctx: &egui::Context) -> Vec<String> {
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                    ..Default::default()
+                },
+                |ui| app.remote_devices_dialog(ui.ctx()),
+            );
+            texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            output.drop_without_applying_deltas();
+        }
+        texts
+    }
+
+    #[test]
+    fn remote_devices_says_when_the_operation_journal_cannot_be_written() {
+        with_app(
+            "app::pairing::tests::remote_devices_says_when_the_operation_journal_cannot_be_written",
+            |app, ctx| {
+                unwritable_journal(app);
+                app.client.remote_devices = true;
+                let shown = texts(app, ctx).join("\n");
+                assert!(
+                    shown.contains("operation journal cannot be written (No space left on device)")
+                        && shown.contains("until ATOMICS restarts"),
+                    "{shown}"
+                );
+                assert!(shown.contains("Pair a device"), "the rest of the dialog still shows: {shown}");
+                // A journal that works says nothing.
+                app.runtime.ops = Journal::memory();
+                let shown = texts(app, ctx).join("\n");
+                assert!(!shown.contains("journal"), "{shown}");
+            },
+        );
+    }
 
     #[test]
     fn times_read_as_people_say_them() {
