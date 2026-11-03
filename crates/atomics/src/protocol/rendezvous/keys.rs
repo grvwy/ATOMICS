@@ -1,14 +1,14 @@
 //! The host's device identity: an Ed25519 key that signs pass challenges, and an X25519 key that
-//! is its Noise static key (used from H5b on). Both are made on first use and kept in the OS
+//! is its Noise static key (`atomics_core::noise`). Both are made on first use and kept in the OS
 //! credential store (`credentials::Store::device_item`), one item per ATOMICS home, so two homes
 //! on one machine are two hosts. Only the public halves leave this module.
 
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
+use atomics_core::noise::{PublicKey, Secret};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use curve25519_dalek::montgomery::MontgomeryPoint;
 use ring::rand::SecureRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,9 @@ use crate::credentials::Store;
 /// Never Debug: it holds the private keys.
 pub struct DeviceKeys {
     signing: Ed25519KeyPair,
-    /// The Noise static key; the handshakes that use it arrive with H5b.
-    #[allow(dead_code)]
-    noise: Zeroizing<[u8; 32]>,
-    noise_public: [u8; 32],
+    /// The Noise static key: every channel's handshake answers with it.
+    noise: Secret,
+    noise_public: PublicKey,
 }
 
 /// The stored form: hex of the Ed25519 seed and of the X25519 secret. Never Debug.
@@ -79,7 +78,8 @@ impl DeviceKeys {
         let seed = unhex32(&stored.signing).ok_or_else(invalid)?;
         let noise = unhex32(&stored.noise).ok_or_else(invalid)?;
         let signing = Ed25519KeyPair::from_seed_unchecked(&seed[..]).map_err(|_| invalid())?;
-        let noise_public = MontgomeryPoint::mul_base_clamped(*noise).0;
+        let noise = Secret::from_bytes(&noise);
+        let noise_public = noise.public();
         Ok(Self { signing, noise, noise_public })
     }
 
@@ -90,7 +90,16 @@ impl DeviceKeys {
 
     /// The X25519 public key, base64url without padding.
     pub fn noise_public(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.noise_public)
+        self.noise_public.text()
+    }
+
+    pub fn noise_key(&self) -> PublicKey {
+        self.noise_public
+    }
+
+    /// The Noise static private key, for a channel's handshake.
+    pub fn noise_secret(&self) -> &Secret {
+        &self.noise
     }
 
     /// The signature (base64url) that buys a pass: over `atomics_core::tunnel::pass_message`.

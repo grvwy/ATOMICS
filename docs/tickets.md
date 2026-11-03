@@ -1241,7 +1241,8 @@ result = { id = "userId", kind = "kind", name = "displayName", owner_id = "owner
 # result = { steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 
 # Phone and browser access through Relay's rendezvous; see docs/daemon.md, "Rendezvous". Uncomment it with
-# [remote.rendezvous] in the main config: url = "wss://relay.atomisk.ai/api/v1/atomics/tunnel".
+# [remote.rendezvous] in the main config: url = "wss://relay.atomisk.ai/api/v1/atomics/tunnel" and
+# pair_url = "https://relay.atomisk.ai/atomics/pair#{pairing}".
 # [tickets.rendezvous]
 # label = "Relay"
 # errors = { code = "code", owner = ["atomics.owner_required"], unknown = ["atomics.host_unknown"], revoked = ["atomics.host_revoked"], challenge = ["atomics.nonce_invalid", "atomics.signature_invalid"], throttled = ["atomics.rate_limited"] }

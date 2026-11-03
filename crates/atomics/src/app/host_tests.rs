@@ -700,6 +700,26 @@ fn nothing_of_the_rendezvous_starts_or_dials_unless_it_is_enabled() {
         assert!(matches!(threads_named("atomics-rendez"), Some(0) | None), "no rendezvous or issuer thread");
         let remote = host.state().remote_json();
         assert!(remote["rendezvous"].is_null() && remote["protocol"]["url"].is_string(), "{remote}");
+        assert!(remote["paired"].is_null() && host.state().remote_devices().is_none(), "no pairing window");
+        assert!(!atomics_core::paths::atomics_home().join("devices.json").exists(), "no allowlist file");
+    });
+}
+
+#[test]
+fn with_remote_unset_there_is_no_allowlist_and_no_pairing() {
+    with_state("app::host_tests::with_remote_unset_there_is_no_allowlist_and_no_pairing", |state, _| {
+        assert_eq!(state.config.remote, Default::default(), "[remote] unset");
+        let allowlist = atomics_core::paths::atomics_home().join("devices.json");
+        // A file a started allowlist would read, and report as malformed.
+        std::fs::create_dir_all(allowlist.parent().unwrap()).unwrap();
+        std::fs::write(&allowlist, "not json").unwrap();
+        let host = state.into_host();
+        assert!(host.protocol_addr().is_none() && host.rendezvous_status().is_none(), "no server, no indicator");
+        assert!(host.state().remote_devices().is_none(), "nothing read the allowlist; no pairing window");
+        let remote = host.state().remote_json();
+        assert!(remote["paired"].is_null() && remote["rendezvous"].is_null(), "{remote}");
+        assert!(matches!(threads_named("atomics-pairin"), Some(0) | None), "no pairing timer");
+        assert_eq!(std::fs::read_to_string(&allowlist).unwrap(), "not json", "untouched");
     });
 }
 
@@ -721,6 +741,8 @@ fn an_enabled_rendezvous_without_the_protocol_server_says_why_and_starts_nothing
             assert!(matches!(service.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
             assert!(matches!(threads_named("atomics-rendez"), Some(0) | None));
             assert_eq!(host.state().remote_json()["rendezvous"]["phase"], "stopped");
+            assert!(host.state().remote_devices().is_none(), "the indicator says why; no pairing window");
+            assert!(!atomics_core::paths::atomics_home().join("devices.json").exists());
         },
     );
 }

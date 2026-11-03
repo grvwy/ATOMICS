@@ -821,7 +821,7 @@ Comments an agent leaves show inline in the diff panel before they are sent, so 
 
 `atomics ctl '<json>'` sends the same requests from a shell, e.g. `atomics ctl '{"cmd":"list"}'`. A few extras exist for
 scripting and testing: `show_diff`, `show_chief`, `show_settings` (the Settings menu and its theme picker), `resize`,
-`screenshot` and `remote` (the protocol server and the rendezvous: registered, online, channels). For example,
+`screenshot` and `remote` (the protocol server, the rendezvous: registered, online, channels, and the paired devices). For example,
 `atomics ctl '{"cmd":"show_chief","open":true,"dock":"docked","width":720}'` shows the dock and remembers its width.
 
 ## Shortcuts

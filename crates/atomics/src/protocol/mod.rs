@@ -266,21 +266,18 @@ impl Drop for Server {
     }
 }
 
-/// Serves clients whose link was made elsewhere, such as a rendezvous channel: each on a thread
-/// of its own, with the same session code, queues and limits as a loopback client after its
-/// upgrade. The server's stop ends them too.
+/// Serves clients whose link was made elsewhere, such as a rendezvous channel, with the same
+/// session code, queues and limits as a loopback client after its upgrade. The server's stop
+/// ends them too.
 #[derive(Clone)]
 pub struct Sessions {
     shared: Arc<session::Shared>,
 }
 
 impl Sessions {
-    pub(crate) fn serve(&self, mut link: Box<dyn link::Link>, role: Role) -> io::Result<()> {
-        let shared = self.shared.clone();
-        std::thread::Builder::new().name("atomics-protocol-channel".into()).spawn(move || {
-            session::serve(link.as_mut(), role, &shared);
-        })?;
-        Ok(())
+    /// Serve one client on the calling thread, until its session ends.
+    pub(crate) fn run(&self, link: &mut dyn link::Link, role: Role) {
+        session::serve(link, role, &self.shared);
     }
 }
 

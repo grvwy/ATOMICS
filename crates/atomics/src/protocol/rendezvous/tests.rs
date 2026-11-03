@@ -1,5 +1,7 @@
 //! The rendezvous against a fake service: an in-process WebSocket server that admits sockets with
-//! passes a fake issuer minted, speaks the tunnel's frames, and closes with every code. The
+//! passes a fake issuer minted, speaks the tunnel's frames, and closes with every code. Browsers
+//! on its channels speak `atomics_core::noise` as a web client does: pairing through the
+//! desktop's link and code, sessions of paired devices, and every way those are refused. The
 //! profile issuer is tested against an in-process MCP server.
 
 use std::collections::{HashSet, VecDeque};
@@ -10,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atomics_core::diff::FileDiff;
+use atomics_core::noise::{self, Access, Initiator, PairAnswer, PairRequest, Pairing, PublicKey, Secret};
 use atomics_core::projection::Projections;
 use atomics_core::session::AgentStatus;
 use atomics_core::tunnel::service::{self, FromHost};
@@ -22,6 +25,7 @@ use serde_json::{Value, json};
 use tungstenite::WebSocket;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 
+use super::devices::{Devices, PairingView};
 use super::issuer::{self, IssueError, IssueKind, Issuer, Pass, ProfileIssuer, Published};
 use super::keys::DeviceKeys;
 use super::{Ended, Next, Phase, Rendezvous, Settings, Status, StatusCell, after};
@@ -133,19 +137,55 @@ impl Admitted {
         None
     }
 
-    /// The next data frame on `channel`, as an envelope; other frames are passed over.
-    fn envelope(&mut self, channel: u32) -> Envelope {
+    /// The next body on `channel`, or the code the host closed it with; other frames are passed
+    /// over. A body the host sends is never plaintext `atomics.v1`.
+    fn body(&mut self, channel: u32) -> Result<Vec<u8>, u16> {
         loop {
             match self.next(Duration::from_secs(5)).expect("a frame from the host") {
                 FromHost::Data { channel: c, body } if c == channel => {
-                    return wire::decode(std::str::from_utf8(&body).unwrap()).expect("atomics.v1 in the body");
+                    let text = std::str::from_utf8(&body).ok();
+                    assert!(text.and_then(|t| wire::decode(t).ok()).is_none(), "plaintext on channel {channel}");
+                    return Ok(body);
                 }
+                FromHost::Close { channel: c, code } if c == channel => return Err(code),
                 _ => {}
             }
         }
     }
 
-    fn hello(&mut self, channel: u32) {
+    /// The code the host closes `channel` with, passing over what it sends first; the channel
+    /// then leaves, as the service would make it.
+    fn closed(&mut self, channel: u32) -> u16 {
+        loop {
+            if let Err(code) = self.body(channel) {
+                self.send(service::left(channel, code));
+                return code;
+            }
+        }
+    }
+
+    /// A browser's frame, sealed into its messages.
+    fn seal(&mut self, channel: u32, noise: &mut noise::Channel, frame: &[u8]) {
+        for message in noise.seal(frame).unwrap() {
+            self.send(tunnel::data(channel, &message));
+        }
+    }
+
+    /// The next whole frame the host sent on `channel`, or its close code.
+    fn open(&mut self, channel: u32, noise: &mut noise::Channel) -> Result<Vec<u8>, u16> {
+        loop {
+            if let Some(frame) = noise.open(&self.body(channel)?).expect("the host's messages authenticate") {
+                return Ok(frame);
+            }
+        }
+    }
+
+    fn envelope(&mut self, channel: u32, noise: &mut noise::Channel) -> Envelope {
+        let frame = self.open(channel, noise).expect("a frame, not a close");
+        wire::decode(std::str::from_utf8(&frame).unwrap()).expect("atomics.v1 inside the channel")
+    }
+
+    fn hello(&mut self, channel: u32, noise: &mut noise::Channel) {
         let hello = Envelope::new(Message::Hello {
             client_id: "browser".into(),
             versions: vec![VERSION],
@@ -153,7 +193,36 @@ impl Admitted {
             prior_epoch: None,
             prior_cursor: None,
         });
-        self.send(tunnel::data(channel, serde_json::to_string(&hello).unwrap().as_bytes()));
+        self.seal(channel, noise, serde_json::to_string(&hello).unwrap().as_bytes());
+    }
+
+    /// A paired device's session on a new channel: the established channel, or the close code.
+    fn connect(&mut self, channel: u32, host_key: &PublicKey, device: &Secret) -> Result<noise::Channel, u16> {
+        self.send(service::joined(channel));
+        let (initiator, first) = Initiator::connect(HOST, host_key, device).unwrap();
+        self.send(tunnel::data(channel, &first));
+        let answer = self.body(channel)?;
+        Ok(initiator.finish(&answer).expect("the host's answer authenticates").channel)
+    }
+
+    /// A device answering `link` on a new channel, as far as the code: it shows `code` and has
+    /// sent its name; the host's answer is next.
+    fn pair(&mut self, channel: u32, link: &str, device: &Secret, name: &str) -> Result<(noise::Channel, String), u16> {
+        let pairing = Pairing::read(link.split_once('#').expect("a fragment").1).expect("a link the browser reads");
+        assert_eq!(pairing.host_id, HOST);
+        self.send(service::joined(channel));
+        let (initiator, first) = Initiator::pair(&pairing, device).unwrap();
+        self.send(tunnel::data(channel, &first));
+        let answer = self.body(channel)?;
+        let mut done = initiator.finish(&answer).expect("the host proved it holds the psk");
+        let request = serde_json::to_vec(&PairRequest { name: name.into() }).unwrap();
+        self.seal(channel, &mut done.channel, &request);
+        Ok((done.channel, done.code))
+    }
+
+    /// The host's answer to a pairing.
+    fn pair_answer(&mut self, channel: u32, noise: &mut noise::Channel) -> PairAnswer {
+        serde_json::from_slice(&self.open(channel, noise).expect("an answer")).expect("a pairing answer")
     }
 
     fn close(&mut self, code: u16) {
@@ -248,8 +317,56 @@ struct Fixture {
     rendezvous: Rendezvous,
     status: Arc<StatusCell>,
     ledger: Shared,
+    devices: Arc<Devices>,
     _server: Server,
     _dir: crate::test_support::TempDir,
+}
+
+const PAIR_URL: &str = "https://service.example/atomics/pair#{pairing}";
+
+impl Fixture {
+    /// The host's Noise key, as it registered it.
+    fn host_key(&self) -> PublicKey {
+        let ledger = self.ledger.lock().unwrap();
+        PublicKey::parse(&ledger.registrations.last().expect("registered").2).unwrap()
+    }
+
+    /// "Pair a device" on the desktop, once the host is registered: the link it shows.
+    fn offer(&self) -> String {
+        let deadline = Instant::now() + wait(Duration::from_secs(10));
+        while self.devices.unready().is_some() {
+            assert!(Instant::now() < deadline, "never ready to pair");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.devices.offer(PAIR_URL).unwrap();
+        match self.devices.view() {
+            PairingView::Open { link, .. } => link.to_string(),
+            _ => panic!("the link is shown"),
+        }
+    }
+
+    /// The desktop's prompt for a device that proved the link: its name and code.
+    fn prompt(&self) -> (String, String) {
+        let deadline = Instant::now() + wait(Duration::from_secs(10));
+        loop {
+            if let PairingView::Confirm { name, code, .. } = self.devices.view() {
+                return (name, code);
+            }
+            assert!(Instant::now() < deadline, "the desktop never asked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Pair `device` through the desktop's link and code, with `access`; the channel then goes
+    /// on as its session.
+    fn paired(&self, socket: &mut Admitted, channel: u32, device: &Secret, access: Access) -> noise::Channel {
+        let link = self.offer();
+        let (mut secure, code) = socket.pair(channel, &link, device, "Test phone").unwrap();
+        assert_eq!(self.prompt(), ("Test phone".to_string(), code), "the desktop shows the device's own code");
+        self.devices.decide(Some(access));
+        assert_eq!(socket.pair_answer(channel, &mut secure), PairAnswer { paired: true, may: Some(access) });
+        secure
+    }
 }
 
 fn quick(url: &str) -> Settings {
@@ -288,15 +405,17 @@ fn fixture(service: &FakeService, ledger: &Shared, tune: impl FnOnce(&mut Settin
     let mut settings = quick(&service.url());
     tune(&mut settings);
     let status = StatusCell::new(|| {});
+    let devices = Devices::open(dir.path().join("devices.json"), || {});
     let rendezvous = Rendezvous::start(
         settings,
         server.sessions(),
+        devices.clone(),
         Box::new(FakeIssuer(ledger.clone())),
         Box::new(move || DeviceKeys::load_or_create(&store, &home)),
         status.clone(),
     )
     .unwrap();
-    Fixture { rendezvous, status, ledger: ledger.clone(), _server: server, _dir: dir }
+    Fixture { rendezvous, status, ledger: ledger.clone(), devices, _server: server, _dir: dir }
 }
 
 fn until(status: &StatusCell, what: &str, done: impl Fn(&Status) -> bool) -> Status {
@@ -312,7 +431,7 @@ fn until(status: &StatusCell, what: &str, done: impl Fn(&Status) -> bool) -> Sta
 }
 
 #[test]
-fn a_host_registers_dials_with_a_pass_and_serves_a_channel_as_a_viewer() {
+fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     let ledger = Shared::default();
     let service = FakeService::start(ledger.clone());
     let host = fixture(&service, &ledger, |_| {});
@@ -331,14 +450,14 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_channel_as_a_viewer() {
         (Phase::Online, true, Some(HOST), "Example service", "127.0.0.1")
     );
     socket.expiry_in(300_000);
-    socket.send(service::joined(1));
-    socket.hello(1);
-    let welcome = socket.envelope(1);
-    let Message::Welcome { role, may, capabilities, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
-    assert_eq!(*role, Role::Viewer, "until pairing, a channel only watches");
-    assert!(may.is_empty(), "and may change nothing, whatever it negotiated: {capabilities:?} {may:?}");
-    assert!(super::channel::PLAINTEXT && super::channel::ROLE == Role::Viewer, "the H5b seam still says so");
-    let snapshot = socket.envelope(1);
+    // Pair a device that may type and approve; its pairing channel goes on as its session.
+    let device = Secret::generate().unwrap();
+    let mut secure = host.paired(&mut socket, 1, &device, Access::Control);
+    socket.hello(1, &mut secure);
+    let welcome = socket.envelope(1, &mut secure);
+    let Message::Welcome { role, may, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
+    assert_eq!((*role, may.len()), (Role::Controller, 5), "{may:?}");
+    let snapshot = socket.envelope(1, &mut secure);
     assert!(matches!(snapshot.message, Message::StateSnapshot { .. }), "{snapshot:?}");
     until(&host.status, "one channel", |s| s.channels == 1);
     // Data for a channel that never joined, and frames from a newer service, change nothing.
@@ -346,10 +465,202 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_channel_as_a_viewer() {
     socket.send(vec![7, 0, 0, 0, 1]);
     socket.send(service::left(1, close::NORMAL));
     until(&host.status, "no channel", |s| s.channels == 0 && s.online);
-    // A second channel is a new session.
+    // A later session of the same device: the host knows its key.
+    let mut again = socket.connect(2, &host.host_key(), &device).expect("a known device");
+    socket.hello(2, &mut again);
+    let welcome = socket.envelope(2, &mut again);
+    assert!(matches!(welcome.message, Message::Welcome { role: Role::Controller, .. }), "{welcome:?}");
+    let list = host.devices.list();
+    assert_eq!((list.len(), list[0].0.name.as_str(), list[0].1), (1, "Test phone", true), "listed, and connected");
+}
+
+#[test]
+fn a_view_only_device_is_a_viewer_and_may_change_nothing() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |_| {});
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let device = Secret::generate().unwrap();
+    let mut secure = host.paired(&mut socket, 1, &device, Access::View);
+    socket.hello(1, &mut secure);
+    let welcome = socket.envelope(1, &mut secure);
+    let Message::Welcome { role, may, capabilities, .. } = &welcome.message else { panic!("{welcome:?}") };
+    assert_eq!(*role, Role::Viewer);
+    assert!(may.is_empty(), "whatever it negotiated: {capabilities:?} {may:?}");
+    socket.send(service::left(1, close::NORMAL));
+    let mut again = socket.connect(2, &host.host_key(), &device).unwrap();
+    socket.hello(2, &mut again);
+    assert!(matches!(socket.envelope(2, &mut again).message, Message::Welcome { role: Role::Viewer, .. }));
+}
+
+#[test]
+fn an_unknown_device_or_a_forged_channel_is_refused_before_any_json() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |s| s.handshake_timeout = Duration::from_millis(300));
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    until(&host.status, "online", |s| s.online);
+    // A key the host never paired: closed before the host answers.
+    assert_eq!(socket.connect(1, &host.host_key(), &Secret::generate().unwrap()).err(), Some(close::NOT_PAIRED));
+    socket.send(service::left(1, close::NOT_PAIRED));
+    // A handshake meant for another host's key fails to decrypt.
+    let device = Secret::generate().unwrap();
+    assert_eq!(socket.connect(2, &Secret::generate().unwrap().public(), &device).err(), Some(close::REFUSED));
+    socket.send(service::left(2, close::REFUSED));
+    // Plaintext `atomics.v1`, as an H5a browser would send it.
+    socket.send(service::joined(3));
+    let hello = Envelope::new(Message::Hello {
+        client_id: "plain".into(),
+        versions: vec![VERSION],
+        capabilities: vec![],
+        prior_epoch: None,
+        prior_cursor: None,
+    });
+    socket.send(tunnel::data(3, serde_json::to_string(&hello).unwrap().as_bytes()));
+    assert_eq!(socket.closed(3), close::REFUSED);
+    // No pairing is open.
+    let link = format!("https://x.example/p#{}", *Pairing::new(HOST, host.host_key()).unwrap().fragment());
+    assert_eq!(socket.pair(4, &link, &device, "Guess").err(), Some(close::NO_PAIRING));
+    socket.send(service::left(4, close::NO_PAIRING));
+    // Silence after joining.
+    socket.send(service::joined(5));
+    assert_eq!(socket.closed(5), close::IDLE);
+}
+
+#[test]
+fn a_wrong_psk_fails_and_the_link_stays_for_the_right_device() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |_| {});
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let link = host.offer();
+    // The same link with another psk: the browser refuses the host's answer, and whatever it
+    // sends next fails at the host, which gives the link back.
+    let (address, fragment) = link.split_once('#').unwrap();
+    let mut parts: Vec<String> = fragment.split('.').map(str::to_string).collect();
+    parts[3] = Secret::generate().unwrap().public().text();
+    let wrong = Pairing::read(&parts.join(".")).unwrap();
+    socket.send(service::joined(1));
+    let device = Secret::generate().unwrap();
+    let (initiator, first) = Initiator::pair(&wrong, &device).unwrap();
+    socket.send(tunnel::data(1, &first));
+    let answer = socket.body(1).unwrap();
+    assert_eq!(initiator.finish(&answer).err(), Some(noise::NoiseError::Refused));
+    socket.send(tunnel::data(1, &[0x42; 64]));
+    assert_eq!(socket.closed(1), close::REFUSED);
+    assert!(matches!(host.devices.view(), PairingView::Open { .. }), "still open for the real device");
+    // The real device pairs with the same link.
+    let (mut secure, code) = socket.pair(2, &format!("{address}#{fragment}"), &device, "Phone").unwrap();
+    assert_eq!(host.prompt().1, code);
+    host.devices.decide(Some(Access::Control));
+    assert!(socket.pair_answer(2, &mut secure).paired);
+}
+
+#[test]
+fn a_device_racing_the_link_shows_another_code_and_is_refused() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |_| {});
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let link = host.offer();
+    // A script that read the link answers first: the desktop shows its code, not the phone's.
+    let racer = Secret::generate().unwrap();
+    let (mut raced, racer_code) = socket.pair(1, &link, &racer, "Phone").unwrap();
+    let (name, shown) = host.prompt();
+    assert_eq!((name.as_str(), shown.as_str()), ("Phone", racer_code.as_str()));
+    // The phone itself is refused while that pairing waits: one at a time.
+    let phone = Secret::generate().unwrap();
+    assert_eq!(socket.pair(2, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
+    socket.send(service::left(2, close::NO_PAIRING));
+    // The phone shows no code the user could match, so the user refuses.
+    host.devices.decide(None);
+    assert_eq!(socket.pair_answer(1, &mut raced), PairAnswer { paired: false, may: None });
+    assert_eq!(socket.closed(1), close::NOT_PAIRED);
+    assert!(host.devices.list().is_empty(), "never added");
+    assert_eq!(socket.connect(3, &host.host_key(), &racer).err(), Some(close::NOT_PAIRED));
+    socket.send(service::left(3, close::NOT_PAIRED));
+    // And the link is used up.
+    assert_eq!(socket.pair(4, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
+}
+
+#[test]
+fn a_replayed_session_fails_and_the_service_sees_only_ciphertext() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |_| {});
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let device = Secret::generate().unwrap();
+    let _paired = host.paired(&mut socket, 1, &device, Access::Control);
+    socket.send(service::left(1, close::NORMAL));
+    // A recorded session: its first frame and its hello, as the service saw them.
     socket.send(service::joined(2));
-    socket.hello(2);
-    assert!(matches!(socket.envelope(2).message, Message::Welcome { .. }));
+    let (initiator, first) = Initiator::connect(HOST, &host.host_key(), &device).unwrap();
+    socket.send(tunnel::data(2, &first));
+    let answer = socket.body(2).unwrap();
+    let mut session = initiator.finish(&answer).unwrap().channel;
+    let hello = Envelope::new(Message::Hello {
+        client_id: "browser".into(),
+        versions: vec![VERSION],
+        capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+        prior_epoch: None,
+        prior_cursor: None,
+    });
+    let recorded = session.seal(serde_json::to_string(&hello).unwrap().as_bytes()).unwrap();
+    for message in &recorded {
+        socket.send(tunnel::data(2, message));
+    }
+    assert!(matches!(socket.envelope(2, &mut session).message, Message::Welcome { .. }));
+    // Replayed on a new channel: the host answers with a new ephemeral, so the hello fails.
+    socket.send(service::joined(3));
+    socket.send(tunnel::data(3, &first));
+    socket.body(3).expect("an answer with fresh keys");
+    for message in &recorded {
+        socket.send(tunnel::data(3, message));
+    }
+    assert_eq!(socket.closed(3), close::REFUSED, "nothing replayed is served");
+    // Replayed within the live session: the counter nonce refuses it.
+    for message in &recorded {
+        socket.send(tunnel::data(2, message));
+    }
+    assert_eq!(socket.closed(2), close::REFUSED);
+}
+
+#[test]
+fn revoking_a_device_ends_its_session_and_its_next_one() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |_| {});
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let device = Secret::generate().unwrap();
+    let mut secure = host.paired(&mut socket, 1, &device, Access::Control);
+    socket.hello(1, &mut secure);
+    assert!(matches!(socket.envelope(1, &mut secure).message, Message::Welcome { .. }));
+    let key = device.public();
+    host.devices.revoke(&key);
+    assert_eq!(socket.closed(1), close::NOT_PAIRED, "the open session ends at once");
+    assert_eq!(socket.connect(2, &host.host_key(), &device).err(), Some(close::NOT_PAIRED));
+    assert!(host.devices.list().is_empty());
+}
+
+#[test]
+fn a_host_the_service_revoked_stops_and_offers_no_pairing() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |_| {});
+    let link = host.offer();
+    assert!(link.contains(HOST));
+    service.accept().close(close::REVOKED);
+    let stopped = until(&host.status, "stopped", |s| s.phase == Phase::Stopped);
+    assert!(stopped.note.as_deref().unwrap().contains("revoked"), "{stopped:?}");
+    assert!(service.quiet_for(Duration::from_millis(300)), "no new dial");
+    assert!(host.devices.unready().is_some(), "no pairing without a registration");
+    assert!(matches!(host.devices.view(), PairingView::Idle { .. }), "the open link is withdrawn");
 }
 
 #[test]
@@ -552,9 +863,9 @@ fn stopping_closes_the_tunnel_normally_and_ends_every_channel() {
     let mut host = fixture(&service, &ledger, |_| {});
     let mut socket = service.accept();
     socket.expiry_in(300_000);
-    socket.send(service::joined(1));
-    socket.hello(1);
-    socket.envelope(1);
+    let mut secure = host.paired(&mut socket, 1, &Secret::generate().unwrap(), Access::View);
+    socket.hello(1, &mut secure);
+    socket.envelope(1, &mut secure);
     let started = Instant::now();
     host.rendezvous.stop();
     assert!(started.elapsed() < wait(Duration::from_secs(2)), "{:?}", started.elapsed());
@@ -619,12 +930,16 @@ fn the_rendezvous_modules_name_no_product() {
     for (name, source) in [
         ("mod.rs", include_str!("mod.rs")),
         ("channel.rs", include_str!("channel.rs")),
+        ("devices.rs", include_str!("devices.rs")),
         ("issuer.rs", include_str!("issuer.rs")),
         ("keys.rs", include_str!("keys.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("tunnel.rs", include_str!("tunnel.rs")),
         ("tests.rs", include_str!("tests.rs")),
         ("atomics-core tunnel.rs", include_str!("../../../../atomics-core/src/tunnel.rs")),
+        ("atomics-core noise.rs", include_str!("../../../../atomics-core/src/noise.rs")),
+        ("atomics-core noise tests", include_str!("../../../../atomics-core/src/noise/tests.rs")),
+        ("pairing window", include_str!("../../app/pairing.rs")),
     ] {
         assert!(!source.to_lowercase().contains(&product), "{name} names a product");
     }

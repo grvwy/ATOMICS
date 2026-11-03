@@ -47,6 +47,11 @@ pub mod close {
     pub const IDLE: u16 = 4001;
     /// The host could not serve the channel (no thread, or shutting down).
     pub const UNAVAILABLE: u16 = 4002;
+    /// The browser's key is not on the host's allowlist: never paired, or revoked there. Pair again.
+    pub const NOT_PAIRED: u16 = 4003;
+    /// No pairing is open on the host: none was offered, it expired or was used, or another
+    /// device is pairing now.
+    pub const NO_PAIRING: u16 = 4004;
     /// The pass lapsed unrenewed, a renewal was refused, or (on a channel) the browser's session ended.
     pub const UNAUTHORISED: u16 = 4401;
     /// The host was revoked: it needs a new device key.

@@ -168,7 +168,8 @@ close_done_agents = true
 # # result = { steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 #
 # # Phone and browser access through Relay's rendezvous; see docs/daemon.md, "Rendezvous". Uncomment it with
-# # [remote.rendezvous] in the main config: url = "wss://relay.atomisk.ai/api/v1/atomics/tunnel".
+# # [remote.rendezvous] in the main config: url = "wss://relay.atomisk.ai/api/v1/atomics/tunnel" and
+# # pair_url = "https://relay.atomisk.ai/atomics/pair#{pairing}".
 # # [tickets.rendezvous]
 # # label = "Relay"
 # # errors = { code = "code", owner = ["atomics.owner_required"], unknown = ["atomics.host_unknown"], revoked = ["atomics.host_revoked"], challenge = ["atomics.nonce_invalid", "atomics.signature_invalid"], throttled = ["atomics.rate_limited"] }
@@ -440,6 +441,7 @@ github = "primary+g"        # the GitHub controls; primary = Command on macOS, C
 # enabled = false
 # url = ""                  # the service's wss:// address
 # name = ""                 # how the service lists this host; empty = this machine's name
+# pair_url = ""             # the service's pairing page, ending in #{pairing}: "Pair a device" puts the link's secret there
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,6 +498,9 @@ pub struct RendezvousConfig {
     pub url: String,
     /// How the service lists this host; empty: this machine's name.
     pub name: String,
+    /// The service's pairing page, ending in `#{pairing}` (`atomics_core::noise::pair_url_problem`):
+    /// "Pair a device" puts the pairing link's fragment there. Empty: no pairing.
+    pub pair_url: String,
 }
 
 /// Automatic cleanup on plan completion and archival. Dirty worktrees are always kept.
@@ -1435,7 +1440,7 @@ dock = "other""#
         .unwrap();
         assert_eq!(
             rendezvous.remote.rendezvous,
-            RendezvousConfig { enabled: true, url: "wss://r.example/t".into(), name: String::new() }
+            RendezvousConfig { enabled: true, url: "wss://r.example/t".into(), ..RendezvousConfig::default() }
         );
         assert!(!Config::default().remote.rendezvous.enabled, "off by default");
         let on: Config = toml::from_str("[remote]\nenabled = true\nallowed_origins = [\"https://a.example\"]").unwrap();
