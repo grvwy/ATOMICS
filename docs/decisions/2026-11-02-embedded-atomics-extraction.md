@@ -212,13 +212,15 @@ Client)`:
   confirmations). Fields leave the desktop's `Client` as the code that uses them moves; the desktop's `Client`
   keeps the rest and holds the moved part as `ui`, and derefs to it, so desktop code and tests that name a
   moved field read as before.
-- Writes are `atomics_ui::Intent` values the draw code records on the client: a plan by its position in the
-  last list read, as reads address it. `Desktop` is the shim that still holds `&mut State`: `Desktop::draw`
-  gives the client the host's palette, runs the moved code over the in-process `Backend` and then carries
-  out the recorded intents with the posts and view-hint writes the desktop code made (`app/intents.rs`).
-  So an intent runs in the same frame, when the draw function returns, rather than where the click was
-  handled; nothing the moved code reads changes in between. S8 made intents commands (4.7).
+- Writes are `atomics_ui::Command` values recorded by `Client::send` and drained after drawing; host
+  commands go through `Backend::send`, while view commands run on the client. A plan's position comes
+  from the last list read. `Desktop` draws through the in-process backend. The desktop's `Local` backend resolves
+  positions to IDs and posts mutations to the runtime thread (`app/commands.rs`), which looks up those IDs
+  again when executing them. View commands update the client's view state. Mutations therefore run when
+  the runtime drains its actions, rather than synchronously during drawing (see 4.7).
 - Facts the draw code read from the host's disk or native modules come from the host on the view types.
+
+The S7 commits below originally called these writes intents; S8 replaced them with commands (4.7).
 
 Commits, one per file group:
 

@@ -995,7 +995,7 @@ fn the_host_name_defaults_to_the_machine_and_fits_the_service() {
 
 #[test]
 fn the_rendezvous_modules_name_no_product() {
-    let product = ["re", "lay"].concat();
+    let products = [["re", "lay"].concat(), ["atom", "isk"].concat()];
     for (name, source) in [
         ("mod.rs", include_str!("mod.rs")),
         ("channel.rs", include_str!("channel.rs")),
@@ -1009,8 +1009,14 @@ fn the_rendezvous_modules_name_no_product() {
         ("atomics-core noise.rs", include_str!("../../../../atomics-core/src/noise.rs")),
         ("atomics-core noise tests", include_str!("../../../../atomics-core/src/noise/tests.rs")),
         ("pairing window", include_str!("../../app/pairing.rs")),
+        ("journal", include_str!("../journal.rs")),
+        ("ops", include_str!("../ops.rs")),
+        ("advert", include_str!("../../../../atomics-core/src/advert.rs")),
+        ("mutations", include_str!("../../app/mutations.rs")),
     ] {
-        assert!(!source.to_lowercase().contains(&product), "{name} names a product");
+        for product in &products {
+            assert!(!source.to_lowercase().contains(product), "{name} names a product");
+        }
     }
 }
 

@@ -169,3 +169,13 @@ fn refresh_fetches_again_and_other_commands_are_declined() {
     assert!(remote.take_outgoing().is_empty());
     assert!(remote.notice().unwrap().contains("not available"));
 }
+
+#[test]
+fn archive_finished_is_not_sent_as_unconditional_archive() {
+    let remote = connected(Role::Controller);
+    remote.take_outgoing();
+    assert_eq!(Command::ArchiveFinished(0).remote(&remote, &mut || "op".into()), atomics_ui::Remote::Unsupported);
+    remote.send(Command::ArchiveFinished(0));
+    assert!(remote.take_outgoing().is_empty());
+    assert!(remote.notice().unwrap().contains("not available"));
+}
