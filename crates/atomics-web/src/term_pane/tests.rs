@@ -170,6 +170,92 @@ fn losing_the_lease_blurs_the_overlay_and_another_typist_makes_it_read_only() {
     assert_eq!(typed(&world), "ab");
 }
 
+fn acquires(world: &World) -> usize {
+    world.sent().iter().filter(|m| matches!(m, Message::LeaseAcquire { .. })).count()
+}
+
+#[test]
+fn after_a_take_back_nothing_in_flight_types_or_asks_for_the_lease_again() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Text("early".into())]);
+    assert_eq!((typed(&world).as_str(), acquires(&world)), ("", 0), "text without the focus types nothing");
+
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("a".into())]);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!((typed(&world).as_str(), acquires(&world)), ("a", 1), "the tap asks, once");
+
+    // The desktop's Take back ends the lease (typing nothing) while keys are on their way.
+    let back = world.host.desktop_types("s1", "");
+    world.deliver(back);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Text("x".into()), key("Enter")]);
+    assert!(view.term.overlay.blur && !view.term.typing(), "the overlay loses the focus");
+    // Losing it, the keyboard commits the word it was composing, then the field reports the blur.
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            TermInput::Preedit("wor".into()),
+            TermInput::Preedit(String::new()),
+            TermInput::Text("word".into()),
+            TermInput::Focus(false),
+        ],
+    );
+    // The key bar's Paste, whose clipboard read finishes late.
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste("make\n".into())]);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(typed(&world), "a", "nothing typed after the take back");
+    assert_eq!(acquires(&world), 1, "nor was the free lease asked for");
+    assert!(world.host.terminals["s1"].lease.is_none());
+    let lease = world.driver.remote.lease("s1");
+    assert_eq!((lease.yours, lease.lost), (false, Some(Lost::Desktop)));
+    assert_eq!(world.driver.remote.notice(), None, "and it says nothing of another typist");
+
+    // A new tap asks again.
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("b".into())]);
+    assert_eq!((typed(&world).as_str(), acquires(&world)), ("ab", 2));
+}
+
+#[test]
+fn a_paste_over_the_limit_is_not_typed_and_says_so() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("a".into())]);
+    let paste = "p".repeat(MAX_TYPED_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste)]);
+    assert_eq!(typed(&world), "a");
+    let notice = world.driver.remote.notice().expect("a note");
+    assert!(notice.starts_with("Too much to type at once"), "{notice}");
+    assert!(view.term.typing(), "still typing: only the paste was refused");
+}
+
+#[test]
+fn a_touch_whose_lift_was_dropped_leaves_the_next_touch_a_touch() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    let at = view.term.overlay.rect.unwrap().center();
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Down, at, now)]);
+    // The terminal leaves the screen before the lift is carried out: it goes with the overlay's other input.
+    view.tab = Tab::Board;
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Up, at, now)]);
+    view.tab = Tab::Terminal;
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let now = view.now_ms;
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            touch(2, Phase::Down, at + vec2(0.0, 10.0), now),
+            touch(2, Phase::Move, at + vec2(0.0, 130.0), now + 20.0),
+            touch(2, Phase::Up, at + vec2(0.0, 130.0), now + 40.0),
+        ],
+    );
+    assert_eq!(view.term.font, None, "a drag, not a pinch with a finger long gone");
+}
+
 #[test]
 fn offline_the_terminal_shows_disconnected_and_drops_what_is_typed() {
     let (ctx, mut world, mut client, mut view) = terminal(|_| {});

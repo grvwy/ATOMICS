@@ -31,7 +31,7 @@ use atomics_ui::{
     ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
 };
 
-use crate::screens::{Lease, Screens};
+use crate::screens::{Lease, Refused, Screens};
 
 /// What this client asks the host for.
 pub const CAPABILITIES: &[&str] =
@@ -324,15 +324,22 @@ impl RemoteBackend {
         s.screens.acquire(session, takeover, &mut s.outgoing);
     }
 
-    /// Type `data` into `session`, already encoded for its modes ([`Screens::type_text`]). Nothing is sent
-    /// without the `type` grant or a channel; nothing is kept for a later one.
-    pub fn type_text(&self, session: &str, data: &str) -> bool {
+    /// Type `data` into `session`, already encoded for its modes, while this client holds the lease or is
+    /// asking for it ([`Screens::type_text`]). Nothing is sent without the `type` grant or a channel, and
+    /// nothing refused is kept for later: typing never asks for the lease.
+    pub fn type_text(&self, session: &str, data: &str) -> Result<(), Refused> {
         if !self.may(Grant::Type) {
-            return false;
+            return Err(Refused::NoLease);
         }
         let mut s = self.state.borrow_mut();
         let s = &mut *s;
         s.screens.type_text(session, data, &mut s.outgoing)
+    }
+
+    /// A read of the terminals' own state, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_screens<R>(&self, read: impl FnOnce(&Screens) -> R) -> R {
+        read(&self.state.borrow().screens)
     }
 
     pub fn renew(&self, session: &str) {
