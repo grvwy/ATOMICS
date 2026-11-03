@@ -128,7 +128,8 @@ impl FakeTerminal {
     }
 
     /// What the program writes: text, with `\r` (or `\n`) ending a line, DEL erasing one cell and escape
-    /// sequences left out.
+    /// sequences left out. Text past the right edge overwrites the last column, where the cursor stays: a
+    /// published cursor is on the screen.
     pub fn write(&mut self, text: &str) {
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
@@ -165,7 +166,7 @@ impl FakeTerminal {
                     let (row, col) = (usize::from(cursor.row), usize::from(cursor.col));
                     if col < usize::from(self.screen.cols) {
                         self.screen.lines[row].cells[col].c = c;
-                        cursor.col += 1;
+                        cursor.col = (cursor.col + 1).min(self.screen.cols - 1);
                     }
                 }
             }

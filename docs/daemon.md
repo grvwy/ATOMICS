@@ -401,7 +401,8 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   client's size is in force) and **Take back**, which ends the lease as typing in the pane does
   (`TerminalView::holder_pill`). The pill floats over the cells, so the pane keeps its size.
 - **Encoding.** Keys, typed text, a paste and mouse reports are encoded by `atomics_ui::terminal::encode` from the
-  screen's published modes, on the desktop and in the browser alike. A program's clipboard escape (OSC 52) never
+  screen's published modes, on the desktop and in the browser alike; only the browser turns Ctrl with `2`-`8` and
+  some punctuation into control bytes (the module's notes say why). A program's clipboard escape (OSC 52) never
   reaches a browser's clipboard: there is no opt-in yet.
 
 Keystroke echo on loopback (2026-11-02, `protocol::echo_bench`, ignored by default; release build, shared 18-core
@@ -762,6 +763,12 @@ path or trailing slash), is the only one the frame listens to, and only from the
 from any other origin or window is dropped before its data is read. Without the setting, or opened outside a
 frame, the client says to open it from its hosting page and does nothing else.
 
+**The iframe.** The terminal's Copy writes the clipboard and the key bar's Paste reads it through the
+asynchronous clipboard API, which a cross-origin frame may use only where its `<iframe>` allows it:
+`allow="clipboard-write; clipboard-read"`. Without `clipboard-write`, Copy falls back to the browser's copy
+command on a scratch field, which some browsers refuse in a frame; without `clipboard-read`, Paste says the
+clipboard could not be read, and pasting with the keyboard still works.
+
 **Frame to parent.** `postMessage({type, v: 1}, <parent origin>)`, where `type` is one of:
 
 | `type` | When |
@@ -828,41 +835,49 @@ time (Board, Plans, Diffs, Terminal, Chief) from a bottom bar, the approvals beh
 inside `visualViewport` and the safe-area insets. Everything is drawn in the boot's ATOMICS theme (`Palette`);
 the page's own controls take its colours as CSS custom properties.
 
-**Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed. Its
-cells are the desktop's grid, drawn by the shared painter: the font fits the width until the user pinches, a wider
-grid pans, and a grid taller than the pane keeps the cursor in view. Looking never resizes the PTY. **Fit to this
-screen** sends `terminal_resize` for the pane at the current font, shown on the desktop, and lasts as long as the
-lease (**Computer's size** gives it back early).
+**Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and
+the history kept for it freed. Its cells are the desktop's grid, drawn by the shared painter: the font fits the
+width until the user pinches, a wider grid pans, and a grid taller than the pane keeps the cursor in view. Looking
+never resizes the PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
+desktop, and lasts as long as the lease (**Computer's size** gives it back early).
 
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
-  text, composition as preedit (drawn over the cursor), Return and Backspace from `beforeinput`, a hardware
-  keyboard's named keys and Ctrl+character from `keydown` (Ctrl+V and Cmd stay the browser's), and pastes. The
-  field has autocorrect, autocapitalisation, autocomplete and spellcheck off. A touch on it is handled by the client:
-  a tap focuses it from the touch's own handler (which opens the keyboard), and the browser's loupe, callout and page
-  zoom never start.
+  text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
+  from `keydown` (Ctrl+V and Cmd stay the browser's), a soft keyboard's Return and Backspace from `beforeinput`
+  where its `keydown` names no key, and pastes. The field has autocorrect, autocapitalisation, autocomplete and
+  spellcheck off. A touch on it is handled by the client: a tap focuses it from the touch's own handler (which
+  opens the keyboard), and the browser's loupe, callout and page zoom never start.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
   while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, and takes the bottom
   bar's place. Its keys never take the focus; Paste reads the clipboard on the touch's end.
 - **Touch and mouse.** A tap clicks the cell (press and release) where the program asked for mouse reports and this
   client types; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
   output does not move a view scrolled back) and pans; a long press (450 ms) selects, and a **Copy** chip copies
-  on its touch's end; a pinch sets the font size (5-28 points). A mouse clicks and drag-selects, and its wheel
-  scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a scroll sends arrows or wheel
-  reports instead, as the desktop does, only while this client types.
-- **Typing needs the lease.** Focusing the field asks for a free lease; text typed meanwhile waits for the grant
-  (16 KiB at most, this connection only). Another client typing makes the field read-only, with **Take over**. The
-  lease is renewed every 10 s while the field has the focus. Losing it (the desktop types, another client takes
-  over) takes the focus away, so typing again is a new tap. Input refused as `slow_client` is typed again at the
-  screen's next change. A view-only device's field is always read-only.
+  on its touch's end, leaving the focus where it was (see the iframe above); a pinch sets the font size (5-28
+  points). A touch whose lift never reached the client is cancelled when the next touch starts. A mouse clicks
+  and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a
+  scroll sends arrows or wheel reports instead, as the desktop does, only while this client types.
+- **Typing needs the lease.** Only the tap that focuses the field asks for a free lease; text typed meanwhile waits
+  for the grant (16 KiB at most, this connection only), and a lease state sent before the host read the request
+  leaves it standing. Typing never asks for the lease: text, keys and pastes count only while the field has the
+  focus and this client holds the lease or is asking for it, and anything else is dropped, never kept. Another
+  client typing makes the field read-only, with **Take over**. The lease is renewed every 10 s while the field has
+  the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
+  the focus away, and what was in flight then is dropped: keys of that frame, a word the keyboard commits as the
+  field loses the focus, a Paste whose clipboard read finishes late. Typing again is a new tap. A paste over
+  1 MiB, or more than may wait, is not typed, with a note that says so. Input refused as `slow_client` is typed
+  again from the screen's next change on, at most 1 MiB per change. Lease requests, input and resizes carry
+  request IDs, so a refusal names what it refuses; the client keeps at most 1024, forgetting input once a lease
+  state shows it applied. A view-only device's field is always read-only.
 - **Offline.** The screen stays on view, marked "Disconnected"; the field is read-only and nothing typed is kept:
   the lease and anything waiting end with the channel, and the screen is subscribed again after `welcome`.
 
 **Tests.** `cargo test -p atomics-web`: the boot's origin, window and field rules; the channel, pairing, the
 board, commands and grants, reconnecting and every stop against an in-process host built from `atomics_core`
 (`src/fake_host.rs`, whose terminals echo under leases); the terminals' leases, typing, history, no replay and
-`slow_client`; the gestures; the overlay's events; the phone layout at 360, 390 and 430 points; key encoding per
-terminal mode (`atomics_ui::terminal::encode`); the views drawn headless; the manifest; and that the crate names no
-hosting product. `tests/browser.rs` (ignored; needs the bundle and Chrome) also types into a terminal of the real
+`slow_client`; that nothing typed after a take back types or asks for the lease; the gestures; the overlay's
+events; the phone layout at 360, 390 and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
+the views drawn headless; the manifest; and that the crate names no hosting product. `tests/browser.rs` (ignored; needs the bundle and Chrome) also types into a terminal of the real
 bundle through DevTools, sees the echo, and loses and regains the lease.
 `crates/atomics-ui/tests/dependencies.rs` keeps desktop-only crates out of `atomics-ui` and `atomics-web` on both
 targets, and CI checks both for `wasm32-unknown-unknown`.

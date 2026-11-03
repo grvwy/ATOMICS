@@ -4,17 +4,22 @@
 //!
 //! - **Following.** A screen is subscribed while the UI shows it, focused (the faster cadence); a screen
 //!   no frame showed is unsubscribed. A gap asks for that screen's snapshot alone.
-//! - **Typing needs the lease.** Taking it is the user's act (starting to type); taking it from another
-//!   client is a takeover the user asks for. Text typed while the grant is on its way waits for it, on this
-//!   connection only, and is dropped if the lease goes elsewhere. Input refused as `slow_client` is typed
-//!   again, before anything newer, at the screen's next change: the program read something.
+//! - **Typing needs the lease.** Only [`Screens::acquire`] asks for it: the user's tap on the terminal, or
+//!   a takeover the user asks for. Text is typed while this client holds the lease; typed while the grant
+//!   is on its way, it waits for it, on this connection only, and is dropped if the lease goes elsewhere.
+//!   Otherwise it is refused, never kept: text that arrives after the lease was lost cannot take it back.
+//!   Input refused as `slow_client` is typed again, before anything newer, from the screen's next change
+//!   on, [`MAX_TYPED_BYTES`] per change: the program read something.
 //! - **No replay.** A disconnect forgets the lease, the waiting text and whatever was not known to be
 //!   applied (`Typist::disconnected`). The screen stays on view as it was, marked stale, until the next
 //!   snapshot.
 //! - **History.** Lines that scroll off the top are kept as they go; older ones are asked for with
-//!   `history_get` when the view reaches them. A snapshot starts the history over.
+//!   `history_get` when the view reaches them. A snapshot starts the history over; unsubscribing frees it.
+//! - **Requests.** Every frame a refusal can answer carries a request ID. The IDs kept to match refusals
+//!   are bounded: applied input and answered requests are forgotten, and past [`MAX_REQUESTS`] the
+//!   oldest go.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use atomics_core::lease::{GridSize, LeaseReason, LeaseState, Typist};
 use atomics_core::screen::{
@@ -22,8 +27,15 @@ use atomics_core::screen::{
 };
 use atomics_core::wire::{Envelope, ErrorCode, Message, Seq, Topic};
 
-/// Text typed before a grant arrived that waits for it; more is dropped.
+/// Text typed before a grant arrived that waits for it; more is refused.
 pub const MAX_WAITING_BYTES: usize = 16 * 1024;
+/// The most typed at once (a paste, say), the most that waits behind input refused as `slow_client`,
+/// and the most of that typed again at each change of the screen.
+pub const MAX_TYPED_BYTES: usize = 1 << 20;
+/// Requests kept to match refusals to; the oldest go first.
+pub const MAX_REQUESTS: usize = 1024;
+/// Starts every request ID the terminals use; an error naming one is theirs.
+const REQUEST_PREFIX: &str = "t-";
 /// History lines kept per terminal; the oldest go first.
 const MAX_HISTORY_KEPT: usize = 5000;
 /// Lines one `history_get` asks for.
@@ -58,9 +70,26 @@ pub enum Lost {
     Gone,
 }
 
+/// Why text was not typed. Nothing of it was sent or kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// This client neither holds the lease nor is asking for it (or is offline, or view only).
+    NoLease,
+    /// Over [`MAX_TYPED_BYTES`] at once, or more than may wait: [`MAX_WAITING_BYTES`] for the grant, or
+    /// [`MAX_TYPED_BYTES`] behind input the program has not read yet.
+    TooMuch,
+}
+
 enum Request {
-    Input { session: String, seq: u64 },
-    Lease(String),
+    Input {
+        session: String,
+        seq: u64,
+    },
+    /// Asking for the lease.
+    Acquire(String),
+    /// A renew, a release or a resize. Refused, it changes nothing here: the lease or its terminal had
+    /// ended, and the lease state the host sends says so.
+    Lease,
     History(String),
 }
 
@@ -118,17 +147,26 @@ impl Term {
 #[derive(Default)]
 pub struct Screens {
     terms: BTreeMap<String, Term>,
-    /// Requests a refusal can name: input by its number, a lease request, a history page.
-    requests: HashMap<String, Request>,
+    /// Requests a refusal can name, by the number in their ID: input by its number, a lease request, a
+    /// history page. At most [`MAX_REQUESTS`].
+    requests: BTreeMap<u64, Request>,
     next_request: u64,
 }
 
 impl Screens {
     fn request(&mut self, request: Request) -> String {
         self.next_request += 1;
-        let id = format!("t-{}", self.next_request);
-        self.requests.insert(id.clone(), request);
-        id
+        self.requests.insert(self.next_request, request);
+        while self.requests.len() > MAX_REQUESTS {
+            self.requests.pop_first();
+        }
+        format!("{REQUEST_PREFIX}{}", self.next_request)
+    }
+
+    /// The request `id` names, forgotten here: answered.
+    fn answered(&mut self, id: Option<&str>) -> Option<Request> {
+        let number = id?.strip_prefix(REQUEST_PREFIX)?.parse().ok()?;
+        self.requests.remove(&number)
     }
 
     fn term(&mut self, session: &str) -> &mut Term {
@@ -147,19 +185,27 @@ impl Screens {
         }
     }
 
-    /// After a frame: stop following the screens it did not show, letting go of their leases.
+    /// After a frame: stop following the screens it did not show, letting go of their leases and their
+    /// history. The last screen stays, to show until the next snapshot if the terminal comes back.
     pub fn end_frame(&mut self, out: &mut Vec<Envelope>) {
+        let mut frames = Vec::new();
         for (session, term) in &mut self.terms {
             if !std::mem::take(&mut term.shown) && term.subscribed.take().is_some() {
                 if let Some(release) = term.typist.release() {
-                    out.push(Envelope::new(release));
+                    frames.push(release);
                 }
                 term.acquiring = false;
-                term.waiting.clear();
+                term.waiting = String::new();
                 term.retype = false;
+                term.history = BTreeMap::new();
+                term.history_asked = false;
                 let topics = vec![Topic::Screen { session: session.clone(), focused: false }];
-                out.push(Envelope::new(Message::Unsubscribe { topics }));
+                frames.push(Message::Unsubscribe { topics });
             }
+        }
+        for message in frames {
+            let id = matches!(message, Message::LeaseRelease { .. }).then(|| self.request(Request::Lease));
+            out.push(Envelope::new(message).reply_to(id));
         }
     }
 
@@ -181,7 +227,8 @@ impl Screens {
         }
     }
 
-    /// Ask for the lease. `takeover` displaces another client: only for the user's explicit act.
+    /// Ask for the lease: the only way this client does. `takeover` displaces another client: only for
+    /// the user's explicit act.
     pub fn acquire(&mut self, session: &str, takeover: bool, out: &mut Vec<Envelope>) {
         let term = self.term(session);
         if term.typist.may_type() || term.acquiring || term.subscribed.is_none() {
@@ -190,63 +237,79 @@ impl Screens {
         term.acquiring = true;
         term.lost = None;
         let message = term.typist.acquire(takeover);
-        let id = self.request(Request::Lease(session.to_string()));
+        let id = self.request(Request::Acquire(session.to_string()));
         out.push(Envelope::new(message).reply_to(Some(id)));
     }
 
-    /// Type `data` (already encoded for the terminal's modes). Without the lease, a free one is asked for
-    /// and the text waits for the grant; with another client typing it is dropped (`false`).
-    pub fn type_text(&mut self, session: &str, data: &str, out: &mut Vec<Envelope>) -> bool {
-        if data.is_empty() {
-            return true;
+    /// Type `data` (already encoded for the terminal's modes) while this client holds the lease or is
+    /// asking for it; until the grant it waits. Anything else is refused and nothing of it sent or kept:
+    /// typing never asks for the lease.
+    pub fn type_text(&mut self, session: &str, data: &str, out: &mut Vec<Envelope>) -> Result<(), Refused> {
+        let Some(term) = self.terms.get_mut(session).filter(|t| t.subscribed.is_some()) else {
+            return Err(Refused::NoLease);
+        };
+        if !term.typist.may_type() && !term.acquiring {
+            return Err(Refused::NoLease);
         }
-        let term = self.term(session);
-        if term.subscribed.is_none() {
-            return false;
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > MAX_TYPED_BYTES {
+            return Err(Refused::TooMuch);
         }
         if term.typist.may_type() && term.waiting.is_empty() {
             self.send(session, data, out);
-            return true;
+            return Ok(());
         }
-        let free = term.typist.state.as_ref().is_none_or(|s| s.holder.is_none());
-        if !term.typist.may_type() && !term.acquiring && !free {
-            return false;
-        }
-        if term.waiting.len() + data.len() > MAX_WAITING_BYTES {
-            return false;
+        let limit = if term.retype { MAX_TYPED_BYTES } else { MAX_WAITING_BYTES };
+        if term.waiting.len() + data.len() > limit {
+            return Err(Refused::TooMuch);
         }
         term.waiting.push_str(data);
-        if !term.typist.may_type() {
-            self.acquire(session, false, out);
-        }
-        true
+        Ok(())
     }
 
     fn send(&mut self, session: &str, data: &str, out: &mut Vec<Envelope>) {
         let messages = self.term(session).typist.input(data);
         for message in messages {
-            let id = match &message {
-                Message::TerminalInput { seq, .. } => {
-                    Some(self.request(Request::Input { session: session.to_string(), seq: seq.0 }))
-                }
-                _ => None,
+            let request = match &message {
+                Message::TerminalInput { seq, .. } => Request::Input { session: session.to_string(), seq: seq.0 },
+                _ => Request::Lease,
             };
-            out.push(Envelope::new(message).reply_to(id));
+            let id = self.request(request);
+            out.push(Envelope::new(message).reply_to(Some(id)));
         }
     }
 
     /// Keep the lease while the user is at the terminal.
     pub fn renew(&mut self, session: &str, out: &mut Vec<Envelope>) {
         if let Some(renew) = self.terms.get(session).and_then(|t| t.typist.renew()) {
-            out.push(Envelope::new(renew));
+            let id = self.request(Request::Lease);
+            out.push(Envelope::new(renew).reply_to(Some(id)));
         }
     }
 
     /// "Fit to this screen" with a size; back to the computer's size with `None`. Needs the lease.
     pub fn resize(&mut self, session: &str, size: Option<GridSize>, out: &mut Vec<Envelope>) {
         if let Some(resize) = self.terms.get(session).and_then(|t| t.typist.resize(size)) {
-            out.push(Envelope::new(resize));
+            let id = self.request(Request::Lease);
+            out.push(Envelope::new(resize).reply_to(Some(id)));
         }
+    }
+
+    /// Type up to [`MAX_TYPED_BYTES`] of what waits behind input refused as `slow_client`: the screen
+    /// changed (a delta, or a snapshot after a gap), so the program may have read something. The rest
+    /// waits for the next change.
+    fn retype(&mut self, session: &str, out: &mut Vec<Envelope>) {
+        let Some(term) = self.terms.get_mut(session).filter(|t| t.retype && t.typist.may_type()) else { return };
+        let mut cut = term.waiting.len().min(MAX_TYPED_BYTES);
+        while !term.waiting.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let rest = term.waiting.split_off(cut);
+        let now = std::mem::replace(&mut term.waiting, rest);
+        term.retype = !term.waiting.is_empty();
+        self.send(session, &now, out);
     }
 
     /// Fill `view` with `rows` lines from line ID `top` on: history, then the live screen. Lines not held
@@ -331,13 +394,23 @@ impl Screens {
         match &envelope.message {
             Message::ScreenSnapshot(snapshot) => self.snapshot(snapshot, out),
             Message::ScreenDelta(delta) => self.delta(delta, out),
-            Message::HistoryChunk(chunk) => self.chunk(chunk, envelope.request_id.as_deref()),
-            Message::LeaseState(state) => self.lease_state(state, out),
+            Message::HistoryChunk(chunk) => {
+                self.answered(envelope.request_id.as_deref());
+                self.chunk(chunk);
+            }
+            Message::LeaseState(state) => {
+                let answer = self.answered(envelope.request_id.as_deref());
+                let acquired = matches!(&answer, Some(Request::Acquire(session)) if *session == state.session);
+                self.lease_state(state, acquired, out);
+            }
             Message::Error { code, .. } => {
-                let Some(request) = envelope.request_id.as_deref().and_then(|id| self.requests.remove(id)) else {
+                // A refusal of a request the terminals made is theirs, even one forgotten since.
+                if !envelope.request_id.as_deref().is_some_and(|id| id.starts_with(REQUEST_PREFIX)) {
                     return false;
-                };
-                self.refused(request, *code);
+                }
+                if let Some(request) = self.answered(envelope.request_id.as_deref()) {
+                    self.refused(request, *code);
+                }
             }
             _ => return false,
         }
@@ -361,6 +434,7 @@ impl Screens {
                 term.stale = false;
                 term.history.clear();
                 term.history_asked = false;
+                self.retype(&snapshot.session.clone(), out);
             }
             Ok(_) => {}
             Err(_) => self.gap(&snapshot.session.clone(), out),
@@ -384,12 +458,7 @@ impl Screens {
                     None if delta.scroll > 0 => term.history.clear(),
                     None => term.trim_history(),
                 }
-                if term.retype && term.typist.may_type() {
-                    term.retype = false;
-                    let waiting = std::mem::take(&mut term.waiting);
-                    let session = delta.session.clone();
-                    self.send(&session, &waiting, out);
-                }
+                self.retype(&delta.session.clone(), out);
             }
             Ok(_) => {}
             Err(ScreenGap::NoSnapshot | ScreenGap::Missing { .. } | ScreenGap::Malformed(_)) => {
@@ -398,10 +467,7 @@ impl Screens {
         }
     }
 
-    fn chunk(&mut self, chunk: &HistoryChunk, request: Option<&str>) {
-        if let Some(id) = request {
-            self.requests.remove(id);
-        }
+    fn chunk(&mut self, chunk: &HistoryChunk) {
         let Some(term) = self.terms.get_mut(&chunk.session) else { return };
         term.history_asked = false;
         let Some(screen) = term.mirror.screen.as_ref() else { return };
@@ -420,10 +486,17 @@ impl Screens {
         term.trim_history();
     }
 
-    fn lease_state(&mut self, state: &LeaseState, out: &mut Vec<Envelope>) {
+    /// What the host says of a lease; `acquired` when it answers this client's request for it.
+    fn lease_state(&mut self, state: &LeaseState, acquired: bool, out: &mut Vec<Envelope>) {
         let Some(term) = self.terms.get_mut(&state.session) else { return };
-        let had = term.typist.may_type() || term.acquiring;
+        let held = term.typist.may_type();
         term.typist.apply(state);
+        // Input the host applied, or sent under a lease that ended, can no longer be refused as
+        // `slow_client`: forget its requests.
+        let next = if state.yours { state.next.map_or(0, |n| n.0) } else { u64::MAX };
+        self.requests
+            .retain(|_, r| !matches!(r, Request::Input { session, seq } if *session == state.session && *seq < next));
+        let Some(term) = self.terms.get_mut(&state.session) else { return };
         if term.typist.may_type() {
             term.acquiring = false;
             term.lost = None;
@@ -434,7 +507,12 @@ impl Screens {
             }
             return;
         }
-        if had {
+        if term.acquiring && !held && !acquired && state.holder.is_none() {
+            // Sent before the host read the request (the state a subscription starts with, say): the
+            // request stands, and its answer or refusal says how it went.
+            return;
+        }
+        if held || term.acquiring {
             term.lost = match state.reason {
                 Some(LeaseReason::Desktop) => Some(Lost::Desktop),
                 Some(LeaseReason::TakenOver) => Some(Lost::TakenOver),
@@ -454,17 +532,18 @@ impl Screens {
             Request::Input { session, seq } => {
                 let Some(term) = self.terms.get_mut(&session) else { return };
                 if let Some(again) = term.typist.refused(Seq(seq), code) {
-                    // Before anything typed since; sent at the screen's next change.
+                    // Before anything typed since; sent from the screen's next change on.
                     term.waiting.insert_str(0, &again);
                     term.retype = true;
                 }
             }
-            Request::Lease(session) => {
+            Request::Acquire(session) => {
                 let Some(term) = self.terms.get_mut(&session) else { return };
                 term.acquiring = false;
                 term.waiting.clear();
                 term.lost = Some(if code == ErrorCode::LeaseHeld { Lost::Held } else { Lost::Gone });
             }
+            Request::Lease => {}
             Request::History(session) => {
                 if let Some(term) = self.terms.get_mut(&session) {
                     term.history_asked = false;
