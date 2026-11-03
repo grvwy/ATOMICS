@@ -145,6 +145,16 @@ impl Lease {
     pub fn input_at(&self) -> u64 {
         self.input_at.load(Ordering::Acquire)
     }
+
+    /// Who holds the lease (its label) and whether its own size is in force, for the desktop to show.
+    /// Takes the lock only while someone holds it.
+    pub fn holder(&self) -> Option<(Arc<str>, bool)> {
+        if !self.held() {
+            return None;
+        }
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.holder.as_ref().map(|h| (h.client.label.clone(), h.sized))
+    }
 }
 
 fn fenced(message: String) -> WireError {

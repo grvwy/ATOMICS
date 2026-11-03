@@ -7,6 +7,10 @@
 //! text is laid out in runs; any other character, with its combining characters, is centred over
 //! its one or two columns. Combining characters over an ASCII letter are not drawn, as the desktop
 //! never drew them.
+//!
+//! [`encode`] turns keys, text, a paste and mouse reports into what the terminal is sent.
+
+pub mod encode;
 
 use atomics_core::screen::{
     BACKGROUND, Color, CursorShape, FOREGROUND, LAST_SLOT, PALETTE_LEN, Rgb, Screen, Style, attr,

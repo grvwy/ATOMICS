@@ -134,7 +134,8 @@ fn line(grid: &Grid<TermCell>, at: i32) -> Line {
     Line { cells, wrapped }
 }
 
-fn modes(mode: TermMode) -> Modes {
+/// The modes a client sees, from the emulator's: what keys, paste and mouse reports are encoded with.
+pub(crate) fn modes(mode: TermMode) -> Modes {
     let on = |m: TermMode| mode.contains(m);
     Modes {
         alt_screen: on(TermMode::ALT_SCREEN),

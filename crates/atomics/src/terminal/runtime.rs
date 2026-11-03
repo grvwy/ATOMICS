@@ -310,6 +310,12 @@ impl Terminal {
         ScreenHandle { term: self.term.clone(), shared: self.shared.clone(), input: Input::Pty(self.sender.clone()) }
     }
 
+    /// The remote client typing here, as its lease names it, and whether its size is in force; `None`
+    /// when nobody holds the lease (always with remote access off). Lock-free then.
+    pub fn remote_holder(&self) -> Option<(std::sync::Arc<str>, bool)> {
+        self.shared.lease.holder()
+    }
+
     /// Someone typed on the desktop: a remote client's lease on this terminal ends, and its size
     /// with it. Nothing happens (and no lock is taken) when nobody holds one, which is always so
     /// with remote access off.

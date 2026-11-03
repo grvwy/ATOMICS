@@ -24,6 +24,7 @@ use atomics_core::screen::{CursorShape, Screen};
 use atomics_core::theme::{parse_color, xterm_color};
 use atomics_ui::terminal as painter;
 pub use atomics_ui::terminal::Metrics;
+use atomics_ui::terminal::encode;
 use egui::{Key, Modifiers, Pos2, Rect, Sense, vec2};
 
 pub struct TerminalView {
@@ -40,6 +41,8 @@ pub struct TerminalView {
     /// holder's, a take-back) move the terminal's revision, so while it, the scroll position, the
     /// history, the emulator's size and the view's rows stay put the cells are still current.
     copied: Option<Copied>,
+    /// Where the last frame drew "Take back", while a remote client held the lease.
+    take_back: Option<Rect>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,6 +66,7 @@ impl Default for TerminalView {
             line: String::new(),
             screen: Screen::blank(0, 0),
             copied: None,
+            take_back: None,
         }
     }
 }
@@ -109,7 +113,55 @@ impl TerminalView {
             self.handle_keys(terminal, ui);
         }
         self.paint(terminal, ui, (rect, inner), metrics, palette, focused);
+        self.take_back = None;
+        if let Some((holder, sized)) = terminal.remote_holder() {
+            self.holder_pill(terminal, ui, rect, id, (&holder, sized), palette);
+        }
         response
+    }
+
+    /// "Typing from <device>" over the pane's top-right corner while a remote client holds the
+    /// lease, with "Take back", which ends its lease and with it any size it set, as typing here
+    /// does. It floats over the cells, so the pane and the grid it asks for keep their size.
+    fn holder_pill(
+        &mut self,
+        terminal: &Terminal,
+        ui: &egui::Ui,
+        rect: Rect,
+        id: egui::Id,
+        (holder, sized): (&str, bool),
+        palette: &Palette,
+    ) {
+        let text =
+            if sized { format!("Typing from {holder} · sized for it") } else { format!("Typing from {holder}") };
+        let font = palette.ui(12.0);
+        let painter = ui.painter().with_clip_rect(rect);
+        let label = painter.layout_no_wrap(text, font.clone(), palette.foreground);
+        let action = painter.layout_no_wrap("Take back".into(), font, palette.on_accent);
+        let pad = vec2(8.0, 4.0);
+        let height = label.size().y.max(action.size().y) + 2.0 * pad.y;
+        let button = vec2(action.size().x + 2.0 * pad.x, height - 4.0);
+        let width = pad.x + label.size().x + pad.x + button.x + 2.0;
+        let pill = Rect::from_min_size(egui::pos2(rect.right() - width - 6.0, rect.top() + 6.0), vec2(width, height));
+        painter.rect_filled(pill, 6.0, palette.raised);
+        painter.rect_stroke(pill, 6.0, egui::Stroke::new(1.0, palette.accent), egui::StrokeKind::Inside);
+        painter.galley(
+            egui::pos2(pill.left() + pad.x, pill.center().y - label.size().y / 2.0),
+            label,
+            palette.foreground,
+        );
+        let at = Rect::from_min_size(egui::pos2(pill.right() - button.x - 2.0, pill.top() + 2.0), button);
+        let response = ui
+            .interact(at, id.with("take back"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("End the remote device's typing here; the terminal returns to this pane's size");
+        let fill = if response.hovered() { palette.accent.gamma_multiply(0.85) } else { palette.accent };
+        painter.rect_filled(at, 4.0, fill);
+        painter.galley(at.center() - action.size() / 2.0, action, palette.on_accent);
+        self.take_back = Some(at);
+        if response.clicked() {
+            terminal.take_back();
+        }
     }
 
     fn resize(&mut self, terminal: &Terminal, rect: Rect, metrics: &Metrics) {
@@ -190,11 +242,13 @@ impl TerminalView {
         if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
             let pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(rect.min);
             let (point, _) = self.point_at(pos, rect, metrics, offset);
-            let button = if lines > 0 { 64 } else { 65 };
-            let row = point.line.0 + offset as i32 + 1;
-            let seq = format!("\x1b[<{button};{};{row}M", point.column.0 + 1).repeat(lines.unsigned_abs() as usize);
+            let button = if lines > 0 { encode::Button::WheelUp } else { encode::Button::WheelDown };
+            let row = (point.line.0 + offset as i32).max(0) as u16;
+            let report = encode::mouse(button, true, point.column.0 as u16, row, Modifiers::NONE, &screen::modes(mode));
             drop(term);
-            terminal.write(seq.into_bytes());
+            if let Some(report) = report {
+                terminal.write(report.repeat(lines.unsigned_abs() as usize).into_bytes());
+            }
         } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
             let key = if lines > 0 { "\x1bOA" } else { "\x1bOB" };
             drop(term);
@@ -206,8 +260,7 @@ impl TerminalView {
 
     fn handle_keys(&mut self, terminal: &Terminal, ui: &egui::Ui) {
         let events = ui.input(|i| i.events.clone());
-        let app_cursor = terminal.term.lock().mode().contains(TermMode::APP_CURSOR);
-        let bracketed = terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let modes = screen::modes(*terminal.term.lock().mode());
         let mut out: Vec<u8> = Vec::new();
         for event in events {
             match event {
@@ -222,7 +275,7 @@ impl TerminalView {
                     }
                 }
                 egui::Event::Paste(text) => {
-                    out.extend(atomics_core::steer::paste_bytes(&text, bracketed));
+                    out.extend(encode::paste(&text, &modes).into_bytes());
                     self.line.push_str(&text);
                     if !text.is_empty() {
                         terminal.record_input(std::time::Instant::now(), false);
@@ -241,7 +294,7 @@ impl TerminalView {
                     }
                 }
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
-                    if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
+                    if let Some(bytes) = encode::key(key, modifiers, &modes) {
                         out.extend(bytes);
                         terminal.record_input(
                             std::time::Instant::now(),
@@ -333,56 +386,6 @@ fn view_selection(range: SelectionRange, offset: i32) -> painter::Selection {
 }
 
 /// Terminal input for keys that don't arrive as text.
-fn key_bytes(key: Key, m: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
-    let code = 1 + m.shift as u8 + 2 * m.alt as u8 + 4 * m.ctrl as u8;
-    let cursor = |c: char| {
-        if code > 1 {
-            format!("\x1b[1;{code}{c}")
-        } else if app_cursor {
-            format!("\x1bO{c}")
-        } else {
-            format!("\x1b[{c}")
-        }
-    };
-    let tilde = |n: u8| if code > 1 { format!("\x1b[{n};{code}~") } else { format!("\x1b[{n}~") };
-    let text = match key {
-        // Shift/Option+Enter insert a newline in Claude Code and most line editors.
-        Key::Enter if m.shift || m.alt => "\x1b\r".to_string(),
-        Key::Enter => "\r".to_string(),
-        Key::Tab if m.shift => "\x1b[Z".to_string(),
-        Key::Tab => "\t".to_string(),
-        Key::Backspace if m.alt => "\x1b\x7f".to_string(),
-        Key::Backspace if m.ctrl => "\x08".to_string(),
-        Key::Backspace => "\x7f".to_string(),
-        Key::Escape => "\x1b".to_string(),
-        Key::ArrowUp => cursor('A'),
-        Key::ArrowDown => cursor('B'),
-        Key::ArrowRight => cursor('C'),
-        Key::ArrowLeft => cursor('D'),
-        Key::Home => cursor('H'),
-        Key::End => cursor('F'),
-        Key::Insert => tilde(2),
-        Key::Delete => tilde(3),
-        Key::PageUp => tilde(5),
-        Key::PageDown => tilde(6),
-        Key::F1 => "\x1bOP".to_string(),
-        Key::F2 => "\x1bOQ".to_string(),
-        Key::F3 => "\x1bOR".to_string(),
-        Key::F4 => "\x1bOS".to_string(),
-        Key::F5 => tilde(15),
-        Key::F6 => tilde(17),
-        Key::F7 => tilde(18),
-        Key::F8 => tilde(19),
-        Key::F9 => tilde(20),
-        Key::F10 => tilde(21),
-        Key::F11 => tilde(23),
-        Key::F12 => tilde(24),
-        _ if m.ctrl => return ctrl_byte(key).map(|b| vec![b]),
-        _ => return None,
-    };
-    Some(text.into_bytes())
-}
-
 /// Follows the line being typed: Enter hands it back, unless it is empty.
 fn typed_key(line: &mut String, key: Key, m: Modifiers) -> Option<String> {
     match key {
@@ -398,23 +401,6 @@ fn typed_key(line: &mut String, key: Key, m: Modifiers) -> Option<String> {
         _ => {}
     }
     None
-}
-
-fn ctrl_byte(key: Key) -> Option<u8> {
-    let name = key.name();
-    if name.len() == 1 {
-        let c = name.chars().next()?.to_ascii_lowercase();
-        if c.is_ascii_lowercase() {
-            return Some(c as u8 & 0x1f);
-        }
-    }
-    match key {
-        Key::Space => Some(0),
-        Key::OpenBracket => Some(0x1b),
-        Key::Backslash => Some(0x1c),
-        Key::CloseBracket => Some(0x1d),
-        _ => None,
-    }
 }
 
 /// The palette's colours for the cell slots the desktop copy fills: the 256 indexed colours,
@@ -643,6 +629,80 @@ mod tests {
         terminal.shutdown();
     }
 
+    #[test]
+    fn the_desktop_shows_who_types_and_takes_the_terminal_back_in_one_click() {
+        use crate::protocol::TerminalControl;
+        use crate::protocol::lease::{Client, Policy};
+        use alacritty_terminal::grid::Dimensions;
+        use atomics_core::lease::{GridSize, LeaseReason};
+
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/cat".into(),
+            vec![],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let palette = Theme::from_config(&atomics_core::config::ThemeConfig::default()).palette();
+        let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(812.0, 392.0));
+        let ctx = egui::Context::default();
+        let mut view = TerminalView::default();
+        let frame = |view: &mut TerminalView, events: Vec<egui::Event>| -> Vec<String> {
+            let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| {
+                let id = ui.scope_id().with("pane");
+                view.show(&terminal, ui, rect, id, &metrics, &palette);
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let pill = |texts: &[String]| texts.iter().any(|t| t.starts_with("Typing from"));
+        assert!(!pill(&frame(&mut view, Vec::new())), "nobody types remotely: no pill");
+        assert!(view.take_back.is_none());
+
+        let handle = terminal.screen_handle();
+        let control: &dyn TerminalControl = &handle;
+        let (phone, policy, now) =
+            (Client { id: 7, label: "Safari on iPhone".into() }, Policy::default(), std::time::Instant::now());
+        control.acquire(&phone, false, now, &policy).unwrap();
+        let texts = frame(&mut view, Vec::new());
+        assert!(texts.iter().any(|t| t == "Typing from Safari on iPhone"), "{texts:?}");
+        let token = control.view("s", &phone, &policy).1.lease.unwrap().0;
+        control.resize_for(&phone, token, Some(GridSize::new(40, 12)), now, &policy).unwrap();
+        let texts = frame(&mut view, Vec::new());
+        assert!(texts.iter().any(|t| t == "Typing from Safari on iPhone · sized for it"), "{texts:?}");
+        assert_eq!(terminal.term.lock().grid().columns(), 40, "the pane shows the phone's size meanwhile");
+
+        // One click on Take back ends the lease and the phone's size with it.
+        let at = view.take_back.expect("the pill's button").center();
+        frame(&mut view, vec![egui::Event::PointerMoved(at)]);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut view, vec![button(true)]);
+        frame(&mut view, vec![button(false)]);
+        let (_, state) = control.view("s", &phone, &policy);
+        assert_eq!((state.holder, state.reason), (None, Some(LeaseReason::Desktop)));
+        assert_eq!(terminal.term.lock().grid().columns(), 100, "back to the pane's size");
+        assert!(!pill(&frame(&mut view, Vec::new())), "the pill goes with the lease");
+        terminal.shutdown();
+    }
+
     fn selected_terminal() -> (Terminal, TerminalView, Metrics, crate::test_support::TempDir) {
         let dir = crate::test_support::tempdir().unwrap();
         let theme = Theme::from_config(&atomics_core::config::ThemeConfig::default());
@@ -771,20 +831,6 @@ mod tests {
                 assert_eq!([rgb.r, rgb.g, rgb.b], [color.r(), color.g(), color.b()], "{} color {index}", config.name);
             }
         }
-    }
-
-    #[test]
-    fn keys_map_to_terminal_sequences() {
-        let none = Modifiers::NONE;
-        assert_eq!(key_bytes(Key::Enter, none, false).unwrap(), b"\r");
-        assert_eq!(key_bytes(Key::Enter, Modifiers::SHIFT, false).unwrap(), b"\x1b\r");
-        assert_eq!(key_bytes(Key::Tab, Modifiers::SHIFT, false).unwrap(), b"\x1b[Z");
-        assert_eq!(key_bytes(Key::ArrowUp, none, false).unwrap(), b"\x1b[A");
-        assert_eq!(key_bytes(Key::ArrowUp, none, true).unwrap(), b"\x1bOA");
-        assert_eq!(key_bytes(Key::ArrowLeft, Modifiers::ALT, false).unwrap(), b"\x1b[1;3D");
-        assert_eq!(key_bytes(Key::C, Modifiers::CTRL, false).unwrap(), [3]);
-        assert_eq!(key_bytes(Key::C, none, false), None);
-        assert_eq!(key_bytes(Key::Delete, none, false).unwrap(), b"\x1b[3~");
     }
 
     #[test]
