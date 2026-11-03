@@ -7,7 +7,8 @@
 //! views that draw from a [`Backend`] into a [`Client`]: the plan board, the approval banner, a worktree's
 //! diff panel, the sidebar's sessions and explorer, and the top bar's navigation, brand, notices, buttons
 //! and Project menu. They record what the user asks for as [`Command`]s, which the platform carries out
-//! after the draw: a host's through [`Backend::send`], a view command on the UI itself.
+//! after the draw: a host's through [`Backend::send`], a view command on the UI itself. A platform drawing
+//! for a finger on a small screen sets [`Client::touch`], and the views fit a phone ([`touch`]).
 //!
 //! This crate must stay free of desktop-only dependencies; `tests/dependencies.rs` enforces it.
 
@@ -28,6 +29,7 @@ pub mod terminal;
 pub mod text;
 pub mod theme;
 pub mod topbar;
+pub mod touch;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, Notices, PanelMode, PlanRow, PlanState, ProjectMenu,

@@ -5,8 +5,10 @@
 //! under the lease.
 //!
 //! - **The grid is the desktop's.** The pane pans and zooms it: the font fits the width until the user
-//!   pinches, a wider grid pans sideways, and a grid taller than the pane keeps the cursor in view. "Fit
-//!   to this screen" is an explicit resize, shown on the desktop, that lasts as long as the lease.
+//!   pinches, but on a phone never below a readable size, so a wider grid pans sideways; a grid taller than
+//!   the pane keeps the cursor in view, and the terminal's background fills the rest of the pane. "Fit to
+//!   this screen" is an explicit resize to the pane at that font, shown on the desktop, that lasts as long as
+//!   the lease.
 //! - **Touch.** A tap focuses the overlay (the browser opens the keyboard) and, where the program takes
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
 //!   only) and pans; a long press selects, with Copy; a pinch sets the font size. A mouse clicks and
@@ -21,8 +23,9 @@
 
 use atomics_core::lease::{GridSize, MAX_CELL_PIXELS};
 use atomics_core::ops::Grant;
-use atomics_core::screen::{Modes, Screen};
+use atomics_core::screen::{self as grid, Modes, Screen};
 use atomics_ui::terminal::{self as painter, Metrics, Point, Selection, encode};
+use atomics_ui::touch::{self, Touch};
 use atomics_ui::{Backend, Client, approvals};
 use egui::{Align2, Key, Modifiers, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2};
 
@@ -35,7 +38,9 @@ pub const MIN_FONT: f32 = 5.0;
 pub const MAX_FONT: f32 = 28.0;
 const FIT_MIN: f32 = 7.0;
 const FIT_MAX: f32 = 14.0;
-/// Space between the pane's edge and the cells.
+/// On a phone the fitted font stays readable: a wider grid pans instead.
+const PHONE_FIT_MIN: f32 = 13.0;
+/// Space between the pane's edge and the cells; on a phone the cells keep to the screen's gutter.
 const PAD: f32 = 4.0;
 /// How often the lease is renewed while the user stays at the terminal without typing.
 const RENEW_MS: f64 = 10_000.0;
@@ -114,6 +119,8 @@ pub struct TermPane {
     pub overlay: Overlay,
     /// This frame drew a terminal.
     drawn: bool,
+    /// The phone layout's measures while it draws, set by the views each frame.
+    pub touch: Option<Touch>,
 }
 
 impl Default for TermPane {
@@ -136,6 +143,7 @@ impl Default for TermPane {
             inputs: Vec::new(),
             overlay: Overlay::default(),
             drawn: false,
+            touch: None,
         }
     }
 }
@@ -144,6 +152,8 @@ impl Default for TermPane {
 #[derive(Debug, Clone, Copy)]
 struct Frame {
     rect: Rect,
+    /// Between the pane's edges and the cells.
+    pad: Vec2,
     origin: Pos2,
     /// The font size in use, and its cell.
     size: f32,
@@ -283,11 +293,14 @@ impl TermPane {
         let live = remote.live();
 
         // Header: who types, and what this client may do about it.
-        let header = Rect::from_min_size(rect.min, vec2(rect.width(), 30.0));
+        let (height, margin) = match self.touch {
+            Some(touch) => (touch.target + 8.0, vec2(touch.gutter, 4.0)),
+            None => (30.0, vec2(8.0, 3.0)),
+        };
+        let header = Rect::from_min_size(rect.min, vec2(rect.width(), height));
         let mut actions = Actions::default();
-        let mut child = ui.new_child(
-            egui::UiBuilder::new().id_salt(("term-header", session)).max_rect(header.shrink2(vec2(8.0, 3.0))),
-        );
+        let mut child =
+            ui.new_child(egui::UiBuilder::new().id_salt(("term-header", session)).max_rect(header.shrink2(margin)));
         child.horizontal(|ui| self.header(ui, &lease, may_type, live, &p, &mut actions));
         let mut body = rect.with_min_y(header.bottom());
 
@@ -409,8 +422,10 @@ impl TermPane {
             }
         };
         ui.label(RichText::new(text).color(color).size(12.5));
+        let touch = self.touch;
+        let button = |ui: &mut egui::Ui, text: &str| touch::small_button(ui, touch, text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if self.top.is_some() && ui.small_button("↓ Live").on_hover_text("Back to the live screen").clicked() {
+            if self.top.is_some() && button(ui, "↓ Live").on_hover_text("Back to the live screen").clicked() {
                 actions.live = true;
             }
             if !live || !may_type {
@@ -418,17 +433,16 @@ impl TermPane {
             }
             if lease.yours {
                 if lease.resized {
-                    if ui.small_button("Computer's size").clicked() {
+                    if button(ui, "Computer's size").clicked() {
                         actions.fit = Some(false);
                     }
-                } else if ui
-                    .small_button("Fit to this screen")
+                } else if button(ui, "Fit to this screen")
                     .on_hover_text("Resize the terminal to this screen; the computer shows it, and gets its size back when it types")
                     .clicked()
                 {
                     actions.fit = Some(true);
                 }
-            } else if lease.holder.is_some() && ui.small_button("Take over").clicked() {
+            } else if lease.holder.is_some() && button(ui, "Take over").clicked() {
                 actions.take_over = true;
             }
         });
@@ -445,12 +459,16 @@ impl TermPane {
     ) -> Option<Frame> {
         let (cols, rows, first, cursor_row, oldest) = remote
             .with_screen(session, |s| s.map(|(s, _)| (s.cols, s.rows, s.first_line, s.cursor.row, s.oldest_line())))?;
+        let (pad, fit_min) = match self.touch {
+            Some(touch) => (vec2(touch.gutter, 8.0), PHONE_FIT_MIN),
+            None => (vec2(PAD, PAD), FIT_MIN),
+        };
         let ratio = ui.fonts_mut(|f| f.glyph_width(&p.mono(100.0), 'M')) / 100.0;
-        let fit = (body.width() - 2.0 * PAD) / (f32::from(cols) * ratio.max(0.01));
-        let size = self.font.unwrap_or(fit.clamp(FIT_MIN, FIT_MAX)).clamp(MIN_FONT, MAX_FONT);
+        let fit = (body.width() - 2.0 * pad.x) / (f32::from(cols) * ratio.max(0.01));
+        let size = self.font.unwrap_or(fit.clamp(fit_min, FIT_MAX)).clamp(MIN_FONT, MAX_FONT);
         let font = p.mono(size);
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font).ceil()));
-        let fit_rows = (((body.height() - 2.0 * PAD) / cell.y).floor().max(1.0)) as u16;
+        let fit_rows = (((body.height() - 2.0 * pad.y) / cell.y).floor().max(1.0)) as u16;
         let shown = fit_rows.min(rows);
         // The lowest window that still shows the cursor, with a line under it where there is one.
         let below = (u64::from(cursor_row) + 2).saturating_sub(u64::from(shown));
@@ -460,9 +478,9 @@ impl TermPane {
             self.top = None;
         }
         let width = f32::from(cols) * cell.x;
-        self.pan_x = self.pan_x.clamp(0.0, (width - (body.width() - 2.0 * PAD)).max(0.0));
-        let origin = body.min + vec2(PAD - self.pan_x, PAD);
-        Some(Frame { rect: body, origin, size, cell, first, top, rows: shown, cols, live_top, oldest })
+        self.pan_x = self.pan_x.clamp(0.0, (width - (body.width() - 2.0 * pad.x)).max(0.0));
+        let origin = body.min + vec2(pad.x - self.pan_x, pad.y);
+        Some(Frame { rect: body, pad, origin, size, cell, first, top, rows: shown, cols, live_top, oldest })
     }
 
     /// Carry out one input. `lost`: the lease was lost since the last frame, so nothing typed in this one
@@ -563,8 +581,8 @@ impl TermPane {
         let current = frame.size;
         let next = (current * factor).clamp(MIN_FONT, MAX_FONT);
         let scale = next / current;
-        let x = at.x - frame.rect.left() - PAD + self.pan_x;
-        self.pan_x = x * scale - (at.x - frame.rect.left() - PAD);
+        let x = at.x - frame.rect.left() - frame.pad.x + self.pan_x;
+        self.pan_x = x * scale - (at.x - frame.rect.left() - frame.pad.x);
         self.font = Some(next);
     }
 
@@ -621,7 +639,13 @@ impl TermPane {
                 block: false,
             }
         });
-        let theme = p.terminal_theme();
+        // The screen's own background, the desktop's, fills the pane below a grid shorter than it.
+        let background = self
+            .view
+            .palette
+            .get(usize::from(grid::BACKGROUND))
+            .map(|grid::Rgb([r, g, b])| egui::Color32::from_rgb(*r, *g, *b));
+        let theme = painter::Theme { background: background.unwrap_or(p.terminal), ..p.terminal_theme() };
         painter::paint(
             ui.painter(),
             (frame.rect, inner),
@@ -687,8 +711,8 @@ impl TermPane {
 
 /// The grid that fits the pane at the font in use.
 fn fit_size(frame: &Frame) -> GridSize {
-    let cols = ((frame.rect.width() - 2.0 * PAD) / frame.cell.x).floor().max(2.0) as u16;
-    let rows = ((frame.rect.height() - 2.0 * PAD) / frame.cell.y).floor().max(1.0) as u16;
+    let cols = ((frame.rect.width() - 2.0 * frame.pad.x) / frame.cell.x).floor().max(2.0) as u16;
+    let rows = ((frame.rect.height() - 2.0 * frame.pad.y) / frame.cell.y).floor().max(1.0) as u16;
     let pixels = |v: f32| Some((v.round() as u16).clamp(1, MAX_CELL_PIXELS));
     GridSize { cols, rows, cell_width: pixels(frame.cell.x), cell_height: pixels(frame.cell.y) }
 }

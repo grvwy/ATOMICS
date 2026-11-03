@@ -55,7 +55,7 @@ const fn rgb(hex: u32) -> Color32 {
 }
 
 /// The UI text size the built-in themes are drawn at; `ui_size` scales the UI from it.
-const UI_SIZE: f32 = 13.0;
+pub const UI_SIZE: f32 = 13.0;
 
 impl Palette {
     /// A resolved theme's tokens in egui colors, with the fonts the host found it naming.

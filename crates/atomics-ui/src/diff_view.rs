@@ -15,6 +15,7 @@ use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2
 
 use crate::keys::shortcut_label;
 use crate::theme::{Palette, lerp};
+use crate::touch::{self, Touch};
 
 pub use atomics_core::diff_data::{FileView, Prepared};
 
@@ -37,6 +38,8 @@ pub struct DiffState {
     pub file_error: Option<String>,
     /// The file last opened or reached by scrolling the diff.
     pub focused: Option<String>,
+    /// Long lines run on to the right, to scroll to, where a phone would wrap them.
+    pub unwrapped: bool,
 }
 
 /// The explorer of one project: the main checkout's files, with the changes of the
@@ -213,6 +216,8 @@ enum Row {
     Binary,
     Hunk(usize, usize),
     Line(usize, usize, usize),
+    /// On a phone, a long line's continuation (the first is 1), wrapped under the line ([`wrapping`]).
+    Wrap(usize, usize, usize, usize),
     /// Side by side: the old and the new line of one hunk row.
     Pair(usize, usize, SplitRow),
     Comment(usize),
@@ -224,7 +229,7 @@ impl Row {
     /// The line a diff row shows: the new side of a pair, unless that is blank.
     fn line(&self) -> Option<(usize, usize, usize)> {
         match *self {
-            Row::Line(fi, hi, li) => Some((fi, hi, li)),
+            Row::Line(fi, hi, li) | Row::Wrap(fi, hi, li, _) => Some((fi, hi, li)),
             Row::Pair(fi, hi, pair) => pair.new.or(pair.old).map(|li| (fi, hi, li)),
             _ => None,
         }
@@ -245,6 +250,8 @@ pub struct Header<'a> {
     pub can_send: bool,
     pub split: DiffSplit,
     pub editor_shortcut: &'a str,
+    /// A phone: the header stacks, a side shows at a time and long lines wrap ([`crate::touch`]).
+    pub touch: Option<Touch>,
 }
 
 pub use crate::panel_nav::focus_id;
@@ -264,58 +271,43 @@ pub fn show(
 ) -> DiffAction {
     crate::panel_nav::focusable(ui, rect);
     let mut action = DiffAction::None;
-    let mut split = header.split.split(rect.width());
+    let touch = header.touch;
+    let mut split = header.split.split(rect.width()) && touch.is_none();
     ui.painter().rect_filled(rect, 0.0, palette.background);
-    let mut panel = ui.new_child(egui::UiBuilder::new().id_salt("diff-panel").max_rect(rect.shrink2(vec2(10.0, 6.0))));
+    let margin = touch.map_or(vec2(10.0, 6.0), |touch| vec2(touch.gutter, 6.0));
+    let mut panel = ui.new_child(egui::UiBuilder::new().id_salt("diff-panel").max_rect(rect.shrink2(margin)));
     let ui = &mut panel;
 
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(header.title).strong().size(14.0).color(palette.foreground));
-        if let Some(branch) = header.branch {
-            ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("×").on_hover_text("Close diff").clicked() {
-                action = DiffAction::Close;
+    if touch.is_none() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(header.title).strong().size(14.0).color(palette.foreground));
+            if let Some(branch) = header.branch {
+                ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
             }
-            if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                action = DiffAction::Refresh;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                header_buttons(ui, state, &header, palette, &mut action);
+            });
+        });
+    } else {
+        // A phone stacks the header: the title, the branch and counts, then every button in a row that wraps.
+        let title = egui::RichText::new(header.title).strong().size(15.0).color(palette.foreground);
+        ui.add(egui::Label::new(title).wrap());
+        let prepared = state.prepared.clone().filter(|_| state.viewing.is_none());
+        ui.horizontal_wrapped(|ui| {
+            if let Some(branch) = header.branch {
+                ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
             }
-            if state.viewing.is_some() && ui.small_button("← diff").on_hover_text("Back to the diff").clicked() {
-                state.viewing = None;
-            }
-            if ui
-                .small_button("editor")
-                .on_hover_text(format!(
-                    "Edit in the editor ({}) · double-click a line to edit there",
-                    shortcut_label(ui.ctx(), header.editor_shortcut)
-                ))
-                .clicked()
-            {
-                let first = state.prepared.as_ref().and_then(|p| p.diff.files.first().map(|f| f.path().to_string()));
-                action = DiffAction::Edit { path: state.viewing.clone().or(first), line: None };
-            }
-            let n = state.comments.len();
-            let (text, fill) =
-                if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
-            let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(text)).fill(fill);
-            if ui
-                .add_enabled(n > 0 && header.can_send, send)
-                .on_hover_text("Send every comment to the agent as one message")
-                .on_disabled_hover_text(if header.can_send {
-                    "Click a line to comment"
-                } else {
-                    "No agent in this worktree"
-                })
-                .clicked()
-            {
-                action = DiffAction::SendReview;
-            }
-            if !state.comments.is_empty() && ui.small_button("discard").clicked() {
-                state.comments.clear();
+            if let Some(prepared) = &prepared {
+                counts(ui, prepared, state.error.as_deref(), palette);
             }
         });
-    });
+        ui.horizontal_wrapped(|ui| {
+            header_buttons(ui, state, &header, palette, &mut action);
+            if let Some(prepared) = &prepared {
+                diff_buttons(ui, state, &prepared.diff, &mut split, touch, &mut action);
+            }
+        });
+    }
 
     if let Some(path) = state.viewing.clone() {
         if let Some(line) = show_file(ui, state, &path, palette, font) {
@@ -336,45 +328,12 @@ pub fn show(
     };
     let diff = &prepared.diff;
 
-    ui.horizontal(|ui| {
-        let short = &diff.base[..diff.base.len().min(8)];
-        ui.label(egui::RichText::new(format!("{} files", diff.files.len())).color(palette.foreground));
-        ui.label(egui::RichText::new(format!("+{}", prepared.additions)).color(palette.success));
-        ui.label(egui::RichText::new(format!("−{}", prepared.deletions)).color(palette.error));
-        ui.label(egui::RichText::new(format!("vs {} @ {short}", diff.base_ref)).color(palette.muted).monospace());
-        if let Some(err) = &state.error {
-            ui.label(egui::RichText::new("refresh failed").color(palette.error)).on_hover_text(err);
-        }
-        ui.menu_button("files ▾", |ui| {
-            egui::ScrollArea::vertical().id_salt("diff-files").max_height(420.0).show(ui, |ui| {
-                for (i, file) in diff.files.iter().enumerate() {
-                    let label = format!("{}  +{} −{}", file.path(), file.additions(), file.deletions());
-                    if ui.button(label).clicked() {
-                        state.collapsed.remove(file.path());
-                        state.scroll_to = Some(ScrollTarget::File(i));
-                        ui.close();
-                    }
-                }
-            });
+    if touch.is_none() {
+        ui.horizontal(|ui| {
+            counts(ui, &prepared, state.error.as_deref(), palette);
+            diff_buttons(ui, state, diff, &mut split, None, &mut action);
         });
-        if !diff.files.is_empty() {
-            let all = state.collapsed.len() == diff.files.len();
-            if ui.small_button(if all { "expand all" } else { "collapse all" }).clicked() {
-                if all {
-                    state.collapsed.clear();
-                } else {
-                    state.collapsed = diff.files.iter().map(|f| f.path().to_string()).collect();
-                }
-            }
-        }
-        if ui
-            .toggle_value(&mut split, "split")
-            .on_hover_text("Old and new side by side until ATOMICS quits (diff_split in the config sets the default)")
-            .changed()
-        {
-            action = DiffAction::Split(split);
-        }
-    });
+    }
     ui.add_space(4.0);
 
     if diff.files.is_empty() {
@@ -382,6 +341,20 @@ pub fn show(
         ui.label(egui::RichText::new("No changes against the merge-base yet.").color(palette.muted));
         return action;
     }
+
+    let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
+    let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
+    let view = ui.available_rect_before_wrap();
+    // A phone numbers each line once, as wide as the diff's highest number, and wraps long lines to the screen
+    // unless the user turned that off.
+    let digits = touch.map(|_| {
+        let lines = diff.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines);
+        let highest = lines.filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
+        highest.to_string().len().max(2)
+    });
+    let gutter = digits.map_or(char_w * 13.0, |digits| char_w * (digits as f32 + 3.0));
+    let wrap = (touch.is_some() && !state.unwrapped && !split)
+        .then(|| (((view.width() - gutter) / char_w).floor() as usize).max(8));
 
     // Comment anchors: (path, line, removed) → comment indices.
     let mut anchored: HashMap<(&str, u32, bool), Vec<usize>> = HashMap::new();
@@ -428,22 +401,24 @@ pub fn show(
             } else {
                 for li in 0..hunk.lines.len() {
                     rows.push(Row::Line(fi, hi, li));
+                    if let Some(chars) = wrap {
+                        let (_, more) = wrapping(&hunk.lines[li].text, chars);
+                        rows.extend((1..=more).map(|piece| Row::Wrap(fi, hi, li, piece)));
+                    }
                     annotate(&mut rows, li);
                 }
             }
         }
     }
 
-    let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
-    let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
-    let gutter = char_w * 13.0;
     let code_w = char_w * (prepared.longest_line as f32 + 2.0);
     // Side by side, the line numbers stay put and the code of both halves scrolls together.
-    let view = ui.available_rect_before_wrap();
     let mid = view.left() + (view.width() / 2.0).floor();
     let side_gutter = char_w * 8.0;
     let content_w = if split {
         view.width() + (side_gutter + code_w - (mid - view.left())).max(0.0)
+    } else if wrap.is_some() {
+        view.width()
     } else {
         (gutter + code_w).max(view.width())
     };
@@ -546,25 +521,34 @@ pub fn show(
                         lerp(palette.muted, palette.accent, 0.5),
                     );
                 }
-                Row::Line(fi, hi, li) => {
+                Row::Line(fi, hi, li) | Row::Wrap(fi, hi, li, _) => {
                     let line = &diff.files[fi].hunks[hi].lines[li];
                     let code_x = rect.left() + gutter;
                     let hovered = response.hovered();
-                    paint_line(painter, rect, code_x, 0.0, char_w, line, spans(fi, hi, li), hovered, font, palette);
-                    painter.text(
-                        text_pos(0.0),
-                        egui::Align2::LEFT_TOP,
-                        number(line.old_no),
-                        font.clone(),
-                        palette.quiet,
-                    );
-                    painter.text(
-                        text_pos(char_w * 5.5),
-                        egui::Align2::LEFT_TOP,
-                        number(line.new_no),
-                        font.clone(),
-                        palette.quiet,
-                    );
+                    let piece = if let Row::Wrap(.., piece) = *row { piece } else { 0 };
+                    let segment = wrap.map(|chars| Piece::of(&line.text, chars, piece, char_w));
+                    let spans = spans(fi, hi, li);
+                    paint_line(painter, rect, code_x, 0.0, char_w, line, spans, hovered, font, palette, segment);
+                    if let Some(digits) = digits.filter(|_| piece == 0) {
+                        let n = if line.kind == LineKind::Removed { line.old_no } else { line.new_no };
+                        let n = n.map(|n| format!("{n:>digits$}")).unwrap_or_default();
+                        painter.text(text_pos(0.0), egui::Align2::LEFT_TOP, n, font.clone(), palette.quiet);
+                    } else if digits.is_none() {
+                        painter.text(
+                            text_pos(0.0),
+                            egui::Align2::LEFT_TOP,
+                            number(line.old_no),
+                            font.clone(),
+                            palette.quiet,
+                        );
+                        painter.text(
+                            text_pos(char_w * 5.5),
+                            egui::Align2::LEFT_TOP,
+                            number(line.new_no),
+                            font.clone(),
+                            palette.quiet,
+                        );
+                    }
                     if line.kind != LineKind::Note {
                         if response.double_clicked() {
                             edit_line = Some((diff.files[fi].path().to_string(), edit_target(line)));
@@ -586,7 +570,8 @@ pub fn show(
                         let line = &lines[li];
                         let code_x = cell.left() + side_gutter;
                         let over = hovered == Some(right);
-                        paint_line(painter, cell, code_x, shift, char_w, line, spans(fi, hi, li), over, font, palette);
+                        let spans = spans(fi, hi, li);
+                        paint_line(painter, cell, code_x, shift, char_w, line, spans, over, font, palette, None);
                         let n = if right { line.new_no } else { line.old_no };
                         let at = pos2(cell.left() + char_w * 0.5, rect.top() + 1.5);
                         painter.text(at, egui::Align2::LEFT_TOP, number(n), font.clone(), palette.quiet);
@@ -684,6 +669,111 @@ pub fn show(
         state.editor = Some(Editor { anchor: Anchor::Diff(fi, hi, li), text: String::new(), focus: true });
     }
     action
+}
+
+/// The header's buttons, in the order a right-to-left row shows them from its end: Close, Refresh, Back to
+/// the diff, Edit, Send review and Discard.
+fn header_buttons(
+    ui: &mut egui::Ui,
+    state: &mut DiffState,
+    header: &Header<'_>,
+    palette: &Palette,
+    action: &mut DiffAction,
+) {
+    let touch = header.touch;
+    if touch::small_button(ui, touch, "×").on_hover_text("Close diff").clicked() {
+        *action = DiffAction::Close;
+    }
+    if touch::small_button(ui, touch, "⟳").on_hover_text("Refresh").clicked() {
+        *action = DiffAction::Refresh;
+    }
+    if state.viewing.is_some() && touch::small_button(ui, touch, "← diff").on_hover_text("Back to the diff").clicked()
+    {
+        state.viewing = None;
+    }
+    if touch::small_button(ui, touch, "editor")
+        .on_hover_text(format!(
+            "Edit in the editor ({}) · double-click a line to edit there",
+            shortcut_label(ui.ctx(), header.editor_shortcut)
+        ))
+        .clicked()
+    {
+        let first = state.prepared.as_ref().and_then(|p| p.diff.files.first().map(|f| f.path().to_string()));
+        *action = DiffAction::Edit { path: state.viewing.clone().or(first), line: None };
+    }
+    let n = state.comments.len();
+    let (text, fill) = if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
+    let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(text)).fill(fill);
+    if ui
+        .add_enabled(n > 0 && header.can_send, touch::sized(send, touch))
+        .on_hover_text("Send every comment to the agent as one message")
+        .on_disabled_hover_text(if header.can_send { "Click a line to comment" } else { "No agent in this worktree" })
+        .clicked()
+    {
+        *action = DiffAction::SendReview;
+    }
+    if !state.comments.is_empty() && touch::small_button(ui, touch, "discard").clicked() {
+        state.comments.clear();
+    }
+}
+
+/// What the diff holds: its files, the lines it adds and removes, and what it is against.
+fn counts(ui: &mut egui::Ui, prepared: &Prepared, error: Option<&str>, palette: &Palette) {
+    let diff = &prepared.diff;
+    let short = &diff.base[..diff.base.len().min(8)];
+    ui.label(egui::RichText::new(format!("{} files", diff.files.len())).color(palette.foreground));
+    ui.label(egui::RichText::new(format!("+{}", prepared.additions)).color(palette.success));
+    ui.label(egui::RichText::new(format!("−{}", prepared.deletions)).color(palette.error));
+    ui.label(egui::RichText::new(format!("vs {} @ {short}", diff.base_ref)).color(palette.muted).monospace());
+    if let Some(err) = error {
+        ui.label(egui::RichText::new("refresh failed").color(palette.error)).on_hover_text(err);
+    }
+}
+
+/// The diff's own buttons: its files, to jump to one, folding them all, and side by side; on a phone,
+/// wrapping long lines instead.
+fn diff_buttons(
+    ui: &mut egui::Ui,
+    state: &mut DiffState,
+    diff: &atomics_core::diff::WorktreeDiff,
+    split: &mut bool,
+    touch: Option<Touch>,
+    action: &mut DiffAction,
+) {
+    ui.menu_button("files ▾", |ui| {
+        egui::ScrollArea::vertical().id_salt("diff-files").max_height(420.0).show(ui, |ui| {
+            for (i, file) in diff.files.iter().enumerate() {
+                let label = format!("{}  +{} −{}", file.path(), file.additions(), file.deletions());
+                if ui.button(label).clicked() {
+                    state.collapsed.remove(file.path());
+                    state.scroll_to = Some(ScrollTarget::File(i));
+                    ui.close();
+                }
+            }
+        });
+    });
+    if !diff.files.is_empty() {
+        let all = state.collapsed.len() == diff.files.len();
+        if touch::small_button(ui, touch, if all { "expand all" } else { "collapse all" }).clicked() {
+            if all {
+                state.collapsed.clear();
+            } else {
+                state.collapsed = diff.files.iter().map(|f| f.path().to_string()).collect();
+            }
+        }
+    }
+    if touch.is_some() {
+        let wrap = egui::Button::selectable(!state.unwrapped, "wrap");
+        if ui.add(touch::sized(wrap, touch)).on_hover_text("Wrap long lines to the screen").clicked() {
+            state.unwrapped = !state.unwrapped;
+        }
+    } else if ui
+        .toggle_value(split, "split")
+        .on_hover_text("Old and new side by side until ATOMICS quits (diff_split in the config sets the default)")
+        .changed()
+    {
+        *action = DiffAction::Split(*split);
+    }
 }
 
 /// A whole file, read-only, where clicking a line starts a comment just like in the
@@ -1040,9 +1130,42 @@ fn status_badge(status: FileStatus, palette: &Palette) -> (&'static str, Color32
     }
 }
 
+/// How a line of `text` wraps at `chars` a row: the columns its continuations hang in by, the line's own
+/// indent up to half a row, and how many continuations there are.
+fn wrapping(text: &str, chars: usize) -> (usize, usize) {
+    let width = |c: char| if c == '\t' { 4 } else { 1 };
+    let total: usize = text.chars().map(width).sum();
+    let indent = text.chars().take_while(|c| c.is_whitespace()).map(width).sum::<usize>().min(chars / 2);
+    (indent, total.saturating_sub(chars).div_ceil(chars - indent))
+}
+
+/// The part of a wrapped line one row shows, in points: the code from `start` on, drawn `indent` right of
+/// the code column and `width` wide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Piece {
+    start: f32,
+    indent: f32,
+    width: f32,
+}
+
+impl Piece {
+    /// The `piece`th part of a line of `text` wrapped at `chars` a row: the first a whole row, each
+    /// continuation under the line's indent ([`wrapping`]).
+    fn of(text: &str, chars: usize, piece: usize, char_w: f32) -> Piece {
+        let (indent, _) = wrapping(text, chars);
+        let rest = chars - indent;
+        let (start, indent, width) = match piece {
+            0 => (0, 0, chars),
+            _ => (chars + (piece - 1) * rest, indent, rest),
+        };
+        Piece { start: start as f32 * char_w, indent: indent as f32 * char_w, width: width as f32 * char_w }
+    }
+}
+
 /// Paints a diff line over `cell`: the background of its kind, the sign (💬 when hovered)
 /// left of `code_x`, and the highlighted code from `code_x`, scrolled left by `shift`
-/// and clipped to the code column.
+/// and clipped to the code column. A wrapped line's `piece` shows that part alone, the sign
+/// with the first.
 #[allow(clippy::too_many_arguments)]
 fn paint_line(
     painter: &egui::Painter,
@@ -1055,6 +1178,7 @@ fn paint_line(
     hovered: bool,
     font: &FontId,
     palette: &Palette,
+    piece: Option<Piece>,
 ) {
     let (bg, emphasis, sign) = match line.kind {
         LineKind::Added => (palette.added, palette.added_emphasis, "+"),
@@ -1065,14 +1189,21 @@ fn paint_line(
         painter.rect_filled(cell, 0.0, bg);
     }
     let y = cell.top() + 1.5;
+    let piece = piece.unwrap_or(Piece { start: 0.0, indent: 0.0, width: f32::INFINITY });
+    let first = piece.start == 0.0;
     if hovered {
         painter.rect_filled(cell, 0.0, palette.hover());
+    }
+    if hovered && first {
         painter.text(pos2(code_x - char_w * 2.0, y), egui::Align2::LEFT_TOP, "💬", font.clone(), palette.accent);
-    } else {
+    } else if first {
         painter.text(pos2(code_x - char_w * 1.5, y), egui::Align2::LEFT_TOP, sign, font.clone(), palette.muted);
     }
     let galley = painter.layout_job(line_job(&line.text, spans, &line.emphasis, emphasis, font, palette));
-    painter.with_clip_rect(cell.with_min_x(code_x - 1.0)).galley(pos2(code_x - shift, y), galley, palette.foreground);
+    // A continuation is cut exactly where it starts, so nothing of the part before shows.
+    let x = code_x + piece.indent;
+    let clip = cell.with_min_x(if first { code_x - 1.0 } else { x }).with_max_x(cell.right().min(x + piece.width));
+    painter.with_clip_rect(clip).galley(pos2(x - shift - piece.start, y), galley, palette.foreground);
 }
 
 /// Where double-clicking a line opens the editor: the line in the new version, or
@@ -1234,6 +1365,23 @@ mod tests {
             all_files: Arc::default(),
         };
         DiffState { prepared: Some(Arc::new(prepared)), ..DiffState::default() }
+    }
+
+    #[test]
+    fn a_phone_wraps_a_long_line_under_its_indent() {
+        assert_eq!(wrapping("short", 10), (0, 0));
+        assert_eq!(wrapping("0123456789", 10), (0, 0), "a line that just fits");
+        assert_eq!(wrapping("0123456789abcdefghij", 10), (0, 1));
+        // Four spaces in: the continuations hang under the code, six columns a row.
+        let line = "    step(1); // xxxxxxxx";
+        assert_eq!(wrapping(line, 10), (4, 3));
+        let piece = |n| Piece::of(line, 10, n, 2.0);
+        assert_eq!(piece(0), Piece { start: 0.0, indent: 0.0, width: 20.0 });
+        assert_eq!(piece(1), Piece { start: 20.0, indent: 8.0, width: 12.0 });
+        assert_eq!(piece(3), Piece { start: 44.0, indent: 8.0, width: 12.0 });
+        // A tab is four columns; an indent past half a row hangs at half.
+        assert_eq!(wrapping("\tx", 10).0, 4);
+        assert_eq!(wrapping(&format!("{}x{}", " ".repeat(9), "y".repeat(10)), 10), (5, 2));
     }
 
     #[test]

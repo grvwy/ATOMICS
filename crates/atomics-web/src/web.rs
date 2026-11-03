@@ -416,8 +416,8 @@ impl eframe::App for App {
         if !self.themed
             && let Some(boot) = self.driver.boot()
         {
-            views::apply_theme(ctx, &mut self.client, boot);
-            set_theme(&theme_colors(&self.client.palette));
+            views::apply_theme(&mut self.view, boot);
+            set_theme(&theme_colors(&self.view.looks.desktop));
             self.view.tab = boot.view.as_deref().map_or(Tab::Board, Tab::named);
             self.view.ticket_key.clone_from(&boot.ticket_key);
             self.themed = true;

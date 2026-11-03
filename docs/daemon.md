@@ -855,16 +855,26 @@ is fetched file by file with `diff_get`, four files at a time, up to 16 pages ea
 syntax colours.
 
 **Layouts (C4).** On a desktop, a top bar with the connection's state and a tab per view: Board, Plans,
-Approvals, Diffs, Terminal (an agent's, picked from a list) and Chief. On a phone (narrower than 600 points, or 900
-with a coarse pointer; the ⋯ menu overrides it, remembered in the client origin's `localStorage`), one pane at a
+Approvals, Diffs, Terminal (an agent's, picked from a list) and Chief. On a phone (narrower than 600 CSS pixels, or
+900 with a coarse pointer; the ⋯ menu overrides it, remembered in the client origin's `localStorage`), one pane at a
 time (Board, Plans, Diffs, Terminal, Chief) from a bottom bar, the approvals behind the top bar's ◆ badge, all
-inside `visualViewport` and the safe-area insets. Everything is drawn in the boot's ATOMICS theme (`Palette`);
-the page's own controls take its colours as CSS custom properties.
+inside `visualViewport` and the safe-area insets (the sides too, for a phone held sideways). Everything is drawn in
+the boot's ATOMICS theme (`Palette`); the page's own controls take its colours as CSS custom properties.
+
+The phone draws the theme's colours zoomed by 1.25 (through the theme's UI size, so code and terminals keep their
+CSS size), with proportional UI text and monospace only for code, terminals and IDs; every control is at least
+44 CSS pixels square and the content keeps a 16 px gutter from the sides. The shared views fit it through
+`Client::touch` (`atomics_ui::touch`), which the desktop never sets: the board stacks the statuses that have tasks
+with full-width cards under its header and buttons; the diff header stacks the title, then the branch and counts,
+then its buttons in a row that wraps, and the diff shows one side, numbers each line once and wraps long lines
+under their indent (**wrap** turns that off); approval banners span the screen. Plans and Diffs are lists of
+full-width rows.
 
 **Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and
 the history kept for it freed. Its cells are the desktop's grid, drawn by the shared painter: the font fits the
-width until the user pinches, a wider grid pans, and a grid taller than the pane keeps the cursor in view. Looking
-never resizes the PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
+width until the user pinches, on a phone never below 13 px, a wider grid pans, a grid taller than the pane keeps
+the cursor in view, and the screen's own background fills the pane below a shorter one. Looking never resizes the
+PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
 desktop, and lasts as long as the lease (**Computer's size** gives it back early).
 
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
