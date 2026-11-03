@@ -32,7 +32,8 @@ static TOKENS: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct Client {
     pub id: u64,
-    /// The `client_id` it said hello with, shown to other clients.
+    /// Shown to other clients as the holder: a paired device's name, else the `client_id` it
+    /// said hello with.
     pub label: Arc<str>,
 }
 

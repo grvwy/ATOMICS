@@ -395,8 +395,9 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   held. `terminal::tests` drives `TerminalView` to show that desktop typing still reaches the PTY and takes the lease
   back. The headless gate (`tests/headless_host.rs`) types into a shell that ctl started. `protocol/link.rs` races
   wakes against the wake pipe's drain and checks that a later wake still ends a wait at once.
-- **Not yet.** `holder` is the `client_id` the client chose, not yet the paired device's name. Encoding mouse
-  reports and the clipboard opt-in is client work (C3, C4).
+- **Who holds it.** `holder` is a paired device's name, the one it was paired under (so a client can say
+  "typing from iPhone"); a loopback client's is the `client_id` it chose.
+- **Not yet.** Encoding mouse reports and the clipboard opt-in is client work (C3, C4).
 
 Keystroke echo on loopback (2026-11-02, `protocol::echo_bench`, ignored by default; release build, shared 18-core
 machine). A real PTY runs `cat` in cooked mode, so the kernel echoes each key. A client on a loopback socket with
@@ -474,8 +475,10 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   and both see how it ended; the desktop racing a client likewise; a decision for an answered request does not answer
   the next; a retried steer is delivered once; an operation an earlier host died during is `uncertain`; and a plan
   approval with an outdated digest is refused.
-- **Not yet.** Opening an editor (its terminal is not streamed yet), and attributing a decision to a device name
-  (the journal names the `client_id`).
+- **Who sent it.** The journal keys a paired device's operations by a digest of its key and its client's ID
+  (`device:<digest>:<client_id>`), so two devices never share one, and records the device's name (`by`). A loopback
+  client's are `client:<client_id>`, the desktop's `desktop`.
+- **Not yet.** Opening an editor (its terminal is not streamed yet).
 
 ### Terminal painter
 
@@ -653,7 +656,8 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   `not_paired`.
 - **Sessions.** A paired device dials `Noise_IK_25519_ChaChaPoly_SHA256` with its stored static key. The host looks
   the key up in the allowlist and closes the channel with `not_paired` (4003) before answering if it is not there.
-  Its access is its role: view only is a viewer (`may` empty), may type and approve a controller.
+  Its access is its role: view only is a viewer (`may` empty), may type and approve a controller. Its name is
+  its lease holder label and its name in the operation journal.
 - **Frames.** The first data body is `[kind u8: 1 pair, 2 session][Noise message 1]`, exactly 97 bytes; the
   host's answer is message 2 (48 bytes); before it, the host reads that one bounded frame and parses nothing. Then
   each body is one Noise transport message (at most 65535 bytes) whose plaintext is `[flags u8][part of a frame]`:

@@ -117,6 +117,30 @@ pub struct Shared {
     pub frame_budget: usize,
 }
 
+/// Who a session serves: what it may do and, for a paired device, who it is. A loopback client
+/// is known only by its `hello`.
+#[derive(Debug, Clone)]
+pub struct Peer {
+    pub role: Role,
+    pub device: Option<PeerDevice>,
+}
+
+/// A paired device, as the host's allowlist knows it rather than as its `hello` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDevice {
+    /// The name it was paired under: the lease holder other clients see, and who the journal
+    /// says sent an operation.
+    pub name: String,
+    /// A digest of its key, which keeps its operations apart from another device's.
+    pub id: String,
+}
+
+impl Peer {
+    pub fn local(role: Role) -> Self {
+        Self { role, device: None }
+    }
+}
+
 /// Connection numbers: a lease belongs to one connection and dies with it.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -168,10 +192,10 @@ fn link_ended(error: LinkError) -> Ended {
     }
 }
 
-pub fn serve(link: &mut dyn Link, role: Role, shared: &Shared) -> Ended {
+pub fn serve(link: &mut dyn Link, peer: &Peer, shared: &Shared) -> Ended {
     let epoch = lock(&shared.hub).epoch().to_string();
     let mut out = Out { link, epoch, last_sent: Instant::now() };
-    let ended = run(&mut out, role, shared);
+    let ended = run(&mut out, peer, shared);
     use atomics_core::tunnel::close;
     let (code, reason) = match &ended {
         Ended::Stopped => (close::NORMAL, "host is shutting down"),
@@ -184,7 +208,8 @@ pub fn serve(link: &mut dyn Link, role: Role, shared: &Shared) -> Ended {
     ended
 }
 
-fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
+fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
+    let role = peer.role;
     let config = &shared.config;
     // The handshake: the first frame is a hello.
     let started = Instant::now();
@@ -250,7 +275,12 @@ fn run(out: &mut Out<'_>, role: Role, shared: &Shared) -> Ended {
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
         may: may.clone(),
         client_id: client_id.clone(),
-        me: Client { id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1, label: client_id.as_str().into() },
+        device: peer.device.clone(),
+        // Others see a paired device by the name it was paired under, not one it chose itself.
+        me: Client {
+            id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1,
+            label: peer.device.as_ref().map_or(client_id.as_str(), |device| device.name.as_str()).into(),
+        },
         told: HashMap::new(),
         slowed: HashMap::new(),
         ops: HashMap::new(),
@@ -347,6 +377,8 @@ struct Follows {
     may: Vec<Grant>,
     /// The ID it said hello with, which names its operations in the journal.
     client_id: String,
+    /// The paired device this session serves, if any.
+    device: Option<PeerDevice>,
     me: Client,
     /// The lease last told for each followed screen: the terminal's identity and lease version.
     told: HashMap<String, (usize, u64)>,
@@ -617,7 +649,12 @@ fn mutate(
     if follows.ops.len() >= MAX_PENDING_OPS {
         return Err(refuse(ErrorCode::TooMany, "too many operations under way; wait for their results"));
     }
-    let request = OpRequest { client: follows.client_id.clone(), command, reply: follows.reply.clone() };
+    let request = OpRequest {
+        client: follows.client_id.clone(),
+        device: follows.device.clone(),
+        command,
+        reply: follows.reply.clone(),
+    };
     if !shared.commands.submit(request) {
         return Err(refuse(ErrorCode::Internal, "the host is stopping"));
     }

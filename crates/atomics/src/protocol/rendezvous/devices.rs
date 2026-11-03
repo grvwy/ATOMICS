@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::super::link::Waker;
+use super::super::{Peer, PeerDevice};
 
 /// How long a device that answered the link has to finish the handshake and prove the psk.
 pub const HANDSHAKE_WINDOW: Duration = Duration::from_secs(30);
@@ -45,6 +46,19 @@ pub struct Device {
     /// Unix milliseconds.
     pub paired_ms: u64,
     pub seen_ms: u64,
+}
+
+impl Device {
+    /// Its sessions' peer: the role its access gives, its name and its key's digest.
+    pub fn peer(&self) -> Peer {
+        Peer { role: self.access.role(), device: Some(PeerDevice { name: self.name.clone(), id: digest(&self.key) }) }
+    }
+}
+
+/// Sixteen hex digits of the key's SHA-256: names a device in the operation journal.
+pub fn digest(key: &PublicKey) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+    digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -459,17 +473,18 @@ impl Devices {
         if pending && !expired { Answer::Pending } else { Answer::Gone }
     }
 
-    /// A session for `key`: what it may do and its revocation handle, if the key is paired.
-    pub(super) fn attach(&self, key: &PublicKey, waker: Arc<Waker>) -> Option<(Access, Arc<Live>)> {
+    /// A session for `key`: its device (what it may do, its name) and its revocation handle, if
+    /// the key is paired.
+    pub(super) fn attach(&self, key: &PublicKey, waker: Arc<Waker>) -> Option<(Device, Arc<Live>)> {
         self.edit(|inner| {
             let device = inner.devices.iter_mut().find(|d| d.key == *key)?;
             device.seen_ms = now_ms();
-            let access = device.access;
+            let device = device.clone();
             inner.generation += 1;
             let live = Arc::new(Live { revoked: AtomicBool::new(false), waker });
             inner.live.retain(|(_, live)| live.strong_count() > 0);
             inner.live.push((*key, Arc::downgrade(&live)));
-            Some((access, live))
+            Some((device, live))
         })
     }
 
@@ -612,8 +627,13 @@ mod tests {
         let reread = Devices::open(path.clone(), || {});
         assert_eq!(reread.list()[0].0.access, Access::Control);
         let wait = crate::protocol::link::Wait::new().unwrap();
-        let (access, live) = reread.attach(&key, wait.waker()).unwrap();
-        assert_eq!(access, Access::Control);
+        let (device, live) = reread.attach(&key, wait.waker()).unwrap();
+        assert_eq!(device.access, Access::Control);
+        let peer = device.peer();
+        assert_eq!(peer.role, atomics_core::wire::Role::Controller);
+        let named = peer.device.unwrap();
+        assert_eq!((named.name.as_str(), named.id.len()), ("Tablet", 16));
+        assert!(!named.id.contains(&key.text()[..8]), "a digest, not the key");
         assert!(reread.list()[0].1, "connected");
         reread.revoke(&key);
         assert!(live.revoked(), "the open session is told");

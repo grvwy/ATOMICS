@@ -79,6 +79,7 @@ impl Desktop<'_> {
                     }
                     ui.colored_label(palette.muted, format!("Expires in {}", minutes(left)));
                 });
+                ui.colored_label(palette.muted, "Share it only with your own device; it expires in 5 minutes.");
                 if busy {
                     ui.colored_label(palette.muted, "A device is answering the link…");
                 }

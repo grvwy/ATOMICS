@@ -1177,6 +1177,7 @@ fn an_operation_the_host_stopped_during_is_uncertain_and_not_run_again() {
                 let mut earlier = Journal::open(&path, atomics_core::store::now()).unwrap();
                 let began = earlier.begin(
                     &Key::client("test", "s-1"),
+                    None,
                     &journal::fingerprint(&command),
                     atomics_core::store::now(),
                 );

@@ -54,7 +54,7 @@ pub use lease::{Lease, TerminalControl};
 pub use ops::NoCommands;
 pub use ops::{Commands, OpReply, OpRequest};
 pub use screens::{ScreenConfig, ScreenSource, TerminalEntry, Terminals};
-pub use session::{Departed, DiffSource, SessionConfig};
+pub use session::{Departed, DiffSource, Peer, PeerDevice, SessionConfig};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -276,8 +276,8 @@ pub struct Sessions {
 
 impl Sessions {
     /// Serve one client on the calling thread, until its session ends.
-    pub(crate) fn run(&self, link: &mut dyn link::Link, role: Role) {
-        session::serve(link, role, &self.shared);
+    pub(crate) fn run(&self, link: &mut dyn link::Link, peer: &Peer) {
+        session::serve(link, peer, &self.shared);
     }
 }
 
@@ -391,7 +391,7 @@ fn serve_stream(stream: TcpStream, shared: &session::Shared, up: &Upgrade, pre_a
     drop(pre_auth);
     let _client = claimed.take();
     let mut link = link::WsLink::new(socket, up.write_timeout)?;
-    session::serve(&mut link, up.role, shared);
+    session::serve(&mut link, &Peer::local(up.role), shared);
     Ok(())
 }
 

@@ -1,8 +1,9 @@
 //! The operation journal. A mutation is recorded before it takes effect and its outcome once it
 //! has one, so sending the same operation ID again returns what happened instead of doing it twice.
 //!
-//! An operation is known by who sent it (`desktop`, or `client:` and the client's ID) and its
-//! `op`. Its command's fingerprint is kept with it: the same ID with a different command is a
+//! An operation is known by who sent it (`desktop`; `client:` and a loopback client's ID; or
+//! `device:`, a paired device's key digest and its client's ID) and its `op`; a paired device's
+//! beginning also records its name (`by`). Its command's fingerprint is kept with it: the same ID with a different command is a
 //! `conflict`, never the old outcome. With a file (while the protocol server runs), each record is
 //! one JSON line, appended before the work starts and after it ends. If the host process dies in
 //! between, the next start finds a beginning without an end and answers `uncertain` for it: the
@@ -44,6 +45,12 @@ impl Key {
     pub fn client(client_id: &str, op: &str) -> Self {
         Self { origin: format!("client:{client_id}"), op: op.into() }
     }
+
+    /// From a paired device: `device_id` (`PeerDevice::id`) keeps it apart from other devices'
+    /// clients with the same ID.
+    pub fn device(device_id: &str, client_id: &str, op: &str) -> Self {
+        Self { origin: format!("device:{device_id}:{client_id}"), op: op.into() }
+    }
 }
 
 /// What `begin` found.
@@ -67,6 +74,8 @@ struct Entry {
     fingerprint: String,
     began: u64,
     outcome: Option<Outcome>,
+    /// The paired device's name, when one sent it.
+    by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,6 +86,8 @@ enum Record {
         key: Key,
         fingerprint: String,
         at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
     End {
         #[serde(flatten)]
@@ -142,8 +153,8 @@ impl Journal {
                     // other unreadable one.
                     let Ok(record) = serde_json::from_slice::<Record>(&line?) else { continue };
                     match record {
-                        Record::Begin { key, fingerprint, at } => {
-                            entries.insert(key, Entry { fingerprint, began: at, outcome: None });
+                        Record::Begin { key, fingerprint, at, by } => {
+                            entries.insert(key, Entry { fingerprint, began: at, outcome: None, by });
                         }
                         Record::End { key, outcome } => {
                             if let Some(entry) = entries.get_mut(&key) {
@@ -178,8 +189,9 @@ impl Journal {
         self.entries.len()
     }
 
-    /// Look the operation up, or record its beginning. Only `Fresh` means "carry it out".
-    pub fn begin(&mut self, key: &Key, fingerprint: &str, now: u64) -> Begun {
+    /// Look the operation up, or record its beginning (with `by`, the name of the paired device
+    /// that sent it). Only `Fresh` means "carry it out".
+    pub fn begin(&mut self, key: &Key, by: Option<&str>, fingerprint: &str, now: u64) -> Begun {
         self.expire(now);
         if let Some(entry) = self.entries.get(key) {
             if entry.fingerprint != fingerprint {
@@ -190,11 +202,12 @@ impl Journal {
         if self.entries.len() >= CAPACITY {
             return Begun::Full;
         }
-        let record = Record::Begin { key: key.clone(), fingerprint: fingerprint.into(), at: now };
+        let by = by.map(str::to_string);
+        let record = Record::Begin { key: key.clone(), fingerprint: fingerprint.into(), at: now, by: by.clone() };
         if let Err(e) = self.append(&record) {
             return Begun::Unwritable(e.to_string());
         }
-        self.entries.insert(key.clone(), Entry { fingerprint: fingerprint.into(), began: now, outcome: None });
+        self.entries.insert(key.clone(), Entry { fingerprint: fingerprint.into(), began: now, outcome: None, by });
         Begun::Fresh
     }
 
@@ -238,7 +251,12 @@ impl Journal {
         let mut out = Vec::new();
         let mut lines = 0;
         for (key, entry) in &self.entries {
-            let begin = Record::Begin { key: key.clone(), fingerprint: entry.fingerprint.clone(), at: entry.began };
+            let begin = Record::Begin {
+                key: key.clone(),
+                fingerprint: entry.fingerprint.clone(),
+                at: entry.began,
+                by: entry.by.clone(),
+            };
             serde_json::to_writer(&mut out, &begin).map_err(io::Error::other)?;
             out.push(b'\n');
             lines += 1;
@@ -277,7 +295,7 @@ mod tests {
     }
 
     fn begin(journal: &mut Journal, command: &Command, now: u64) -> Begun {
-        journal.begin(&Key::client("phone", command.op()), &fingerprint(command), now)
+        journal.begin(&Key::client("phone", command.op()), None, &fingerprint(command), now)
     }
 
     #[test]
@@ -291,8 +309,39 @@ mod tests {
         assert_eq!(begin(&mut journal, &command, 12), Begun::Known(done));
         assert_eq!(begin(&mut journal, &steer("o1", "something else"), 12), Begun::Conflict);
         // Another client's operation with the same ID is its own.
-        let other = journal.begin(&Key::client("laptop", "o1"), &fingerprint(&command), 12);
+        let other = journal.begin(&Key::client("laptop", "o1"), None, &fingerprint(&command), 12);
         assert_eq!(other, Begun::Fresh);
+    }
+
+    #[test]
+    fn a_paired_device_is_named_in_the_file_and_kept_apart_from_other_devices() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        let command = steer("o1", "go on");
+        let phone = Key::device("0123456789abcdef", "browser", "o1");
+        assert_eq!(phone.origin, "device:0123456789abcdef:browser");
+        {
+            let mut journal = Journal::open(&path, 10).unwrap();
+            assert_eq!(journal.begin(&phone, Some("Test phone"), &fingerprint(&command), 10), Begun::Fresh);
+            // Another device whose client chose the same ID: its own operation, not a retry.
+            let tablet = Key::device("fedcba9876543210", "browser", "o1");
+            assert_eq!(journal.begin(&tablet, Some("Tablet"), &fingerprint(&command), 10), Begun::Fresh);
+            assert_eq!(journal.begin(&Key::client("browser", "o1"), None, &fingerprint(&command), 10), Begun::Fresh);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""by":"Test phone""#) && text.contains(r#""by":"Tablet""#), "{text}");
+        assert_eq!(text.matches(r#""by""#).count(), 2, "only devices are named: {text}");
+        // Kept through a restart, which compacts the file.
+        drop(Journal::open(&path, 11).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#""by":"Test phone""#) && text.contains(r#""origin":"device:0123456789abcdef:browser""#),
+            "{text}"
+        );
+        // A line written before devices were named still reads.
+        std::fs::write(&path, r#"{"record":"begin","origin":"client:old","op":"o9","fingerprint":"x","at":11}"#)
+            .unwrap();
+        assert_eq!(Journal::open(&path, 12).unwrap().len(), 1);
     }
 
     #[test]

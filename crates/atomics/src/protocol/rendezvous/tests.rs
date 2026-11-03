@@ -17,7 +17,7 @@ use atomics_core::projection::Projections;
 use atomics_core::session::AgentStatus;
 use atomics_core::tunnel::service::{self, FromHost};
 use atomics_core::tunnel::{self, SUBPROTOCOL, close};
-use atomics_core::wire::{self, CAPABILITIES, Envelope, Message, Role, VERSION};
+use atomics_core::wire::{self, CAPABILITIES, Envelope, Message, Role, Topic, VERSION};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -194,6 +194,11 @@ impl Admitted {
             prior_cursor: None,
         });
         self.seal(channel, noise, serde_json::to_string(&hello).unwrap().as_bytes());
+    }
+
+    fn message(&mut self, channel: u32, noise: &mut noise::Channel, message: Message) {
+        let envelope = Envelope::new(message).reply_to(Some("r1".into()));
+        self.seal(channel, noise, serde_json::to_string(&envelope).unwrap().as_bytes());
     }
 
     /// A paired device's session on a new channel: the established channel, or the close code.
@@ -385,6 +390,17 @@ fn quick(url: &str) -> Settings {
 }
 
 fn fixture(service: &FakeService, ledger: &Shared, tune: impl FnOnce(&mut Settings)) -> Fixture {
+    fixture_serving(service, ledger, tune, Arc::new(Terminals::default()), Arc::new(crate::protocol::NoCommands))
+}
+
+/// A fixture whose server streams `terminals` and hands its mutations to `commands`.
+fn fixture_serving(
+    service: &FakeService,
+    ledger: &Shared,
+    tune: impl FnOnce(&mut Settings),
+    terminals: Arc<Terminals>,
+    commands: Arc<dyn crate::protocol::Commands>,
+) -> Fixture {
     let projections = Arc::new(Projections::default());
     projections.publish_sessions(vec![crate::protocol::tests::session("a", "fix the parser", AgentStatus::Working)]);
     let config = ServerConfig {
@@ -392,14 +408,7 @@ fn fixture(service: &FakeService, ledger: &Shared, tune: impl FnOnce(&mut Settin
         session: SessionConfig { tick: Duration::from_millis(5), ..SessionConfig::default() },
         ..ServerConfig::default()
     };
-    let server = Server::start(
-        config,
-        projections,
-        Arc::new(NoDiffs),
-        Arc::new(Terminals::default()),
-        Arc::new(crate::protocol::NoCommands),
-    )
-    .unwrap();
+    let server = Server::start(config, projections, Arc::new(NoDiffs), terminals, commands).unwrap();
     let (dir, _, store) = crate::credentials::tests::machine(false);
     let home = dir.path().join("home");
     let mut settings = quick(&service.url());
@@ -472,6 +481,66 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     assert!(matches!(welcome.message, Message::Welcome { role: Role::Controller, .. }), "{welcome:?}");
     let list = host.devices.list();
     assert_eq!((list.len(), list[0].0.name.as_str(), list[0].1), (1, "Test phone", true), "listed, and connected");
+}
+
+/// Keeps the mutations the server hands over.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<crate::protocol::OpRequest>>);
+
+impl crate::protocol::Commands for Recorder {
+    fn submit(&self, request: crate::protocol::OpRequest) -> bool {
+        self.0.lock().unwrap().push(request);
+        true
+    }
+}
+
+#[test]
+fn a_paired_device_types_and_commands_under_its_paired_name() {
+    let terminal = crate::terminal::Detached::new(40, 6, 100);
+    let terminals = Arc::new(Terminals::default());
+    terminals.publish(vec![crate::protocol::screen_tests::entry("s1", &terminal)]);
+    let recorder = Arc::new(Recorder::default());
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture_serving(&service, &ledger, |_| {}, terminals, recorder.clone());
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let device = Secret::generate().unwrap();
+    let mut secure = host.paired(&mut socket, 1, &device, Access::Control);
+    socket.hello(1, &mut secure); // its client_id is "browser"
+    socket.message(
+        1,
+        &mut secure,
+        Message::Subscribe { topics: vec![Topic::Screen { session: "s1".into(), focused: true }] },
+    );
+    socket.message(1, &mut secure, atomics_core::lease::Typist::new("s1").acquire(false));
+    let held = loop {
+        if let Message::LeaseState(state) = socket.envelope(1, &mut secure).message
+            && state.yours
+        {
+            break state;
+        }
+    };
+    assert_eq!(held.holder.as_deref(), Some("Test phone"), "others see who types: the device, not its client_id");
+    socket.message(
+        1,
+        &mut secure,
+        Message::ApprovalDecide(atomics_core::ops::ApprovalDecide {
+            op: "op-1".into(),
+            approval: "a-1".into(),
+            decision: atomics_core::approvals::Decision::Allow,
+            message: None,
+        }),
+    );
+    let deadline = Instant::now() + wait(Duration::from_secs(5));
+    while recorder.0.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the mutation never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let requests = recorder.0.lock().unwrap();
+    let sent = requests[0].device.clone().expect("from a paired device");
+    assert_eq!((requests[0].client.as_str(), sent.name.as_str()), ("browser", "Test phone"));
+    assert_eq!(sent.id, super::devices::digest(&device.public()), "known by its key, for the journal");
 }
 
 #[test]

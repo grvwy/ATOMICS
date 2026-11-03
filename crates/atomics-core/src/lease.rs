@@ -82,7 +82,8 @@ pub enum LeaseReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseState {
     pub session: String,
-    /// The holder's `client_id`, or absent when nobody holds the lease.
+    /// Who holds the lease: a paired device's name (what it was paired under), else the
+    /// holder's `client_id`; absent when nobody holds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
     /// Whether the holder is the client this is sent to.

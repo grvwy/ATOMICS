@@ -4,7 +4,9 @@
 //!
 //! - **Sessions** (`Noise_IK`): the device's key must be on the allowlist, or the channel is closed
 //!   with `not_paired` (4003) before the host answers. A view-only device is a viewer, any other a
-//!   controller, so H4's grants (`welcome.may`) follow from what the user chose when pairing.
+//!   controller, so H4's grants (`welcome.may`) follow from what the user chose when pairing. Its
+//!   paired name, not the `client_id` its `hello` chose, is the lease holder others see and the
+//!   sender the operation journal records (`protocol::Peer`).
 //! - **Pairing** (`Noise_IKpsk2`): only while the desktop offers a link, and one device at a time
 //!   (otherwise `no_pairing`, 4004). The device's first message proves the psk and names it; the
 //!   desktop shows its name and the code and asks; the answer goes back encrypted
@@ -187,14 +189,14 @@ fn session(mut raw: Raw, gate: &Gate, first: &[u8]) {
         return raw.close(close::REFUSED);
     };
     let key = responder.device();
-    let Some((access, live)) = gate.devices.attach(&key, raw.waker()) else {
+    let Some((device, live)) = gate.devices.attach(&key, raw.waker()) else {
         return raw.close(close::NOT_PAIRED);
     };
     match responder.answer() {
         Ok((answer, Established { channel, .. })) if raw.send(&answer).is_ok() => {
             let mut link = SecureLink::new(raw, channel, gate.rekey_every);
             link.live = Some(live);
-            gate.sessions.run(&mut link, access.role());
+            gate.sessions.run(&mut link, &device.peer());
         }
         _ => raw.close(close::REFUSED),
     }
@@ -254,9 +256,9 @@ fn pair(mut raw: Raw, gate: &Gate, first: &[u8]) {
     }
     // Paired: the channel goes on as the device's session (unless it was revoked already).
     match gate.devices.attach(&key, link.raw.waker()) {
-        Some((access, live)) => {
+        Some((device, live)) => {
             link.live = Some(live);
-            gate.sessions.run(&mut link, access.role());
+            gate.sessions.run(&mut link, &device.peer());
             gate.devices.detach(&key);
         }
         None => link.raw.close(close::NOT_PAIRED),
