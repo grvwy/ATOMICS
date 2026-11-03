@@ -41,8 +41,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
-      - name: Check browser core
-        run: cargo check -p atomics-core --target wasm32-unknown-unknown --no-default-features
+      - name: Check the browser crates
+        run: |
+          cargo check -p atomics-core --target wasm32-unknown-unknown --no-default-features
+          cargo check -p atomics-ui -p atomics-web --target wasm32-unknown-unknown
+          cargo clippy -p atomics-web --target wasm32-unknown-unknown -- -D warnings
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |

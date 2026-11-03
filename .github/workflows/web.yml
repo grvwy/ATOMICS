@@ -1,0 +1,48 @@
+name: Web bundle
+
+# The ATOMICS web client as a release artifact (docs/daemon.md, "The browser client and its embedding"):
+# atomics-web-<version>.tar.gz and its .sha256, on every tag, and on demand from any branch.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install trunk and wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          # wasm-bindgen must equal the crate version in Cargo.lock.
+          tool: trunk@0.21.14,wasm-bindgen@0.2.129
+      - name: Build
+        env:
+          BUILT_FROM: ${{ github.sha }}
+          JOBS: '2'
+        run: scripts/build-web.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atomics-web
+          path: |
+            target/web/atomics-web-*.tar.gz
+            target/web/atomics-web-*.tar.gz.sha256
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=(target/web/atomics-web-*.tar.gz target/web/atomics-web-*.tar.gz.sha256)
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes ''
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
