@@ -1,25 +1,37 @@
-//! The real bundle in headless Chrome. A page on another origin frames it and boots it over `postMessage`,
-//! a third origin's frame keeps posting a boot of its own, and a fake broker passes the channel to the fake
-//! host of the unit tests. The browser pairs (keeping its key in IndexedDB), says `hello`, reconnects with
-//! a fresh ticket and resumes, and after a reload dials again with the key read back from IndexedDB, opening
-//! on an agent's terminal. There, through DevTools: a click focuses the input overlay, which takes the
-//! lease; typed text and Return reach the host and echo; a drag selects the echoed line from the client's
-//! own cells; the desktop takes the lease back, which blurs the overlay; and a new click takes it again.
-//! The client's page is served under the strict CSP the bundle is built for.
-//!
-//! It needs the built bundle and Chrome, so it is ignored by default:
+//! The real bundle in headless Chrome, against the fake host of the unit tests behind a fake broker. Both
+//! tests need the built bundle and Chrome, so they are ignored by default:
 //!
 //!     scripts/build-web.sh
 //!     cargo test -p atomics-web --test browser -- --ignored
 //!
-//! `ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser binary.
-//! `ATOMICS_WEB_SCREENSHOT=out.png` also saves what the page shows once the board is in, and
-//! `ATOMICS_WEB_TERMINAL_SCREENSHOT=out.png` the terminal with its echo selected.
+//! `ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser binary. The client's page is
+//! served under the strict CSP the bundle is built for.
+//!
+//! `the_bundle_pairs_reconnects_and_reloads_in_a_browser`: a page on another origin frames the bundle and
+//! boots it over `postMessage`, a third origin's frame keeps posting a boot of its own, and the browser pairs
+//! (keeping its key in IndexedDB), says `hello`, reconnects with a fresh ticket and resumes, and after a
+//! reload dials again with the key read back from IndexedDB, opening on an agent's terminal. There, through
+//! DevTools: a click focuses the input overlay, which takes the lease; typed text and Return reach the host
+//! and echo; a drag selects the echoed line from the client's own cells; the desktop takes the lease back,
+//! which blurs the overlay; and a new click takes it again. `ATOMICS_WEB_SCREENSHOT=out.png` also saves what
+//! the page shows once the board is in, and `ATOMICS_WEB_TERMINAL_SCREENSHOT=out.png` the terminal with its
+//! echo selected.
+//!
+//! `the_bundle_works_on_a_phone_by_touch`: the same bundle on an iPhone (390 × 844 points at 3 pixels a
+//! point, a touch screen, Safari's user agent), framed full screen by a hosting page, and used by touch alone
+//! (`Input.dispatchTouchEvent`). It pairs, shows the board, the plans and a two-file diff, approves the plan
+//! and a tool request with a tap on their buttons, and opens an agent's terminal, where a tap focuses the input
+//! overlay; `ls`, Return, Backspace on an empty line and the key bar's ↑ reach the host as their bytes, and once
+//! the desktop takes the terminal back the field has lost the focus and typing sends nothing. Every screen
+//! is saved as a PNG in `target/phone-shots/` (emptied first) for a person to look at. The client draws on a
+//! canvas, so the test finds what to tap by colour in the screenshots, using the palette the client draws
+//! with, and the pane bar from the client's own layout code, whose points are `layout::ZOOM` CSS pixels.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
 mod fake_host;
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,7 +42,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use atomics_core::approvals::Decision;
+use atomics_core::ops::PlanAction;
 use atomics_core::wire::{Message, Topic};
+use atomics_ui::theme::{Fonts, Palette};
+use atomics_web::boot::{self, FromParent, ParentOrigin};
+use atomics_web::layout::{self, Viewport};
+use atomics_web::views::{self, Tab};
+use egui::{Color32, Pos2, Rect, pos2, vec2};
 use serde_json::json;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::http::HeaderValue;
@@ -45,6 +64,13 @@ const WAIT: Duration = Duration::from_secs(30);
 const READ: Duration = Duration::from_secs(5);
 /// The longest the whole test may take: then it says what it saw, stops the browser and exits.
 const OVERALL: Duration = Duration::from_secs(150);
+const PHONE_OVERALL: Duration = Duration::from_secs(240);
+
+/// The phone: an iPhone's screen in CSS pixels (egui's points), its pixels a point, and Safari's user agent.
+const PHONE: (f32, f32) = (390.0, 844.0);
+const PHONE_SCALE: f32 = 3.0;
+const IOS_SAFARI: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 \
+                          (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
 
 /// What the servers saw, in order, with a way to wait for a line.
 #[derive(Default)]
@@ -83,10 +109,18 @@ fn console(log: &Path) {
     }
 }
 
-/// Kills the browser however the test ends, and shows the console of a failed run.
+/// Kills the browser however the test ends, and shows the console of a failed run. Its profile goes after it.
 struct Browser {
     child: Arc<Mutex<Child>>,
     log: PathBuf,
+    profile: tempfile::TempDir,
+}
+
+impl Browser {
+    /// Where Chrome writes `DevToolsActivePort`.
+    fn devtools(&self) -> PathBuf {
+        self.profile.path().join("profile")
+    }
 }
 
 impl Drop for Browser {
@@ -101,11 +135,11 @@ impl Drop for Browser {
     }
 }
 
-/// Past [`OVERALL`], say what the servers saw and the browser logged, stop the browser and exit.
-fn watchdog(child: Arc<Mutex<Child>>, seen: Arc<Log>, log: PathBuf) {
+/// Past `overall`, say what the servers saw and the browser logged, stop the browser and exit.
+fn watchdog(child: Arc<Mutex<Child>>, seen: Arc<Log>, log: PathBuf, overall: Duration) {
     thread::spawn(move || {
-        thread::sleep(OVERALL);
-        eprintln!("browser test: still running after {OVERALL:?}; the servers saw {:#?}", seen.lines.lock().unwrap());
+        thread::sleep(overall);
+        eprintln!("browser test: still running after {overall:?}; the servers saw {:#?}", seen.lines.lock().unwrap());
         console(&log);
         if let Ok(mut child) = child.lock() {
             let _ = child.kill();
@@ -334,6 +368,8 @@ fn base64(text: &str) -> Vec<u8> {
 struct DevTools {
     socket: tungstenite::WebSocket<TcpStream>,
     next: u64,
+    /// Events read while waiting for something else, oldest first.
+    events: VecDeque<serde_json::Value>,
 }
 
 impl DevTools {
@@ -386,20 +422,15 @@ impl DevTools {
         };
         let (socket, _) = tungstenite::client(url.as_str(), connect("the DevTools socket"))
             .unwrap_or_else(|e| panic!("devtools ({what}): the handshake: {e}"));
-        DevTools { socket, next: 0 }
+        DevTools { socket, next: 0, events: VecDeque::new() }
     }
 
-    /// Call `method` and return its result.
-    fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
-        self.next += 1;
-        let id = self.next;
-        let ask = json!({ "id": id, "method": method, "params": params });
-        self.socket.send(tungstenite::Message::text(ask.to_string())).unwrap();
-        let deadline = Instant::now() + WAIT;
+    /// The next message, whatever it is.
+    fn read(&mut self, what: &str, deadline: Instant) -> serde_json::Value {
         loop {
-            assert!(Instant::now() < deadline, "devtools: timed out waiting for {method}");
-            let reply = match self.socket.read() {
-                Ok(tungstenite::Message::Text(reply)) => reply,
+            assert!(Instant::now() < deadline, "devtools: timed out waiting for {what}");
+            match self.socket.read() {
+                Ok(tungstenite::Message::Text(text)) => return serde_json::from_str(text.as_str()).unwrap(),
                 Ok(_) => continue,
                 Err(tungstenite::Error::Io(e))
                     if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
@@ -407,18 +438,59 @@ impl DevTools {
                     continue;
                 }
                 Err(e) => panic!("devtools: the socket: {e}"),
-            };
-            let reply: serde_json::Value = serde_json::from_str(reply.as_str()).unwrap();
+            }
+        }
+    }
+
+    /// Call `method` and return its result.
+    fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.call_in(None, method, params)
+    }
+
+    /// Call `method` in a target this connection attached to (`session`), or in its own (`None`).
+    fn call_in(&mut self, session: Option<&str>, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.next += 1;
+        let id = self.next;
+        let mut ask = json!({ "id": id, "method": method, "params": params });
+        if let Some(session) = session {
+            ask["sessionId"] = json!(session);
+        }
+        self.socket.send(tungstenite::Message::text(ask.to_string())).unwrap();
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let reply = self.read(method, deadline);
             if reply["id"] == id {
                 assert!(reply.get("error").is_none(), "devtools: {method} failed: {reply}");
                 return reply["result"].clone();
+            }
+            if reply.get("method").is_some() {
+                self.events.push_back(reply);
+            }
+        }
+    }
+
+    /// Wait for an event `method` that `pick` takes.
+    fn event(&mut self, method: &str, pick: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let wanted = |e: &serde_json::Value| e["method"] == method && pick(e);
+        if let Some(at) = self.events.iter().position(wanted) {
+            return self.events.remove(at).expect("found");
+        }
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let event = self.read(method, deadline);
+            if wanted(&event) {
+                return event;
+            }
+            if event.get("method").is_some() {
+                self.events.push_back(event);
             }
         }
     }
 
     /// The value of a JavaScript expression in the target.
     fn eval(&mut self, expression: &str) -> serde_json::Value {
-        let result = self.call("Runtime.evaluate", json!({ "expression": expression, "returnByValue": true }));
+        let params = json!({ "expression": expression, "returnByValue": true, "awaitPromise": true });
+        let result = self.call("Runtime.evaluate", params);
         result["result"]["value"].clone()
     }
 
@@ -443,6 +515,35 @@ impl DevTools {
     fn click(&mut self, at: (f64, f64)) {
         self.mouse("mousePressed", at);
         self.mouse("mouseReleased", at);
+    }
+
+    /// A finger touches, moves or lifts: `points` are the fingers still on the screen.
+    fn touch(&mut self, kind: &str, points: &[Pos2]) {
+        let points: Vec<serde_json::Value> = points
+            .iter()
+            .map(|p| json!({ "x": p.x, "y": p.y, "radiusX": 4, "radiusY": 4, "force": 1, "id": 1 }))
+            .collect();
+        self.call("Input.dispatchTouchEvent", json!({ "type": kind, "touchPoints": points }));
+    }
+
+    /// A finger taps `at`, as briefly as a person's does.
+    fn tap(&mut self, at: Pos2) {
+        self.touch("touchStart", &[at]);
+        thread::sleep(Duration::from_millis(80));
+        self.touch("touchEnd", &[]);
+    }
+
+    /// A key pressed and let go on the focused field, as a soft keyboard sends Return or Backspace.
+    fn key(&mut self, key: &str, code: u32, text: Option<&str>) {
+        let mut down = json!({ "type": "keyDown", "key": key, "code": key, "windowsVirtualKeyCode": code });
+        if let Some(text) = text {
+            down["text"] = json!(text);
+        }
+        self.call("Input.dispatchKeyEvent", down);
+        self.call(
+            "Input.dispatchKeyEvent",
+            json!({ "type": "keyUp", "key": key, "code": key, "windowsVirtualKeyCode": code }),
+        );
     }
 }
 
@@ -474,14 +575,90 @@ fn chrome() -> String {
         .to_string()
 }
 
-#[test]
-#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
-fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
+/// The bundle to serve: `ATOMICS_WEB_DIST`, else the crate's `dist`.
+fn dist() -> PathBuf {
     let dist = std::env::var_os("ATOMICS_WEB_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("dist"));
     assert!(dist.join("index.html").is_file(), "no bundle in {}: run scripts/build-web.sh", dist.display());
+    dist
+}
 
+/// The client's origin: the bundle under the strict CSP it is built for, beside the hosting page's config,
+/// which names `parent_origin`; the broker listens on `tunnel_port`.
+fn serve_client(listener: TcpListener, dist: PathBuf, parent_origin: &str, tunnel_port: u16) {
+    let csp = format!(
+        "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' ws://127.0.0.1:{tunnel_port}; frame-ancestors {parent_origin}"
+    );
+    let config = format!("window.ATOMICS_PARENT_ORIGIN = '{parent_origin}';\n");
+    serve(
+        listener,
+        Arc::new(move |_, path, _| {
+            let path = if path == "/" { "/index.html" } else { path };
+            if path == "/config.js" {
+                return Some(Reply::new("text/javascript", config.clone()));
+            }
+            let file = path.trim_start_matches('/');
+            if file.split('/').any(|part| part == ".." || part.is_empty()) {
+                return None;
+            }
+            let mut reply = Reply::new(content_type(file), std::fs::read(dist.join(file)).ok()?);
+            if file == "index.html" {
+                reply.headers.push(("Content-Security-Policy", csp.clone()));
+            }
+            Some(reply)
+        }),
+    );
+}
+
+/// The hosting page's origin: `pages` by path, `/phase` (what the page is to do next) and `/report` (what its
+/// frame said, logged as `parent …`).
+fn serve_parent(listener: TcpListener, pages: HashMap<&'static str, String>, log: Arc<Log>, phase: Arc<Mutex<String>>) {
+    serve(
+        listener,
+        Arc::new(move |method, path, body| match (method, path) {
+            ("GET", "/phase") => Some(Reply::new("text/plain", phase.lock().unwrap().clone())),
+            ("GET", page) => pages.get(page).map(|html| Reply::new("text/html; charset=utf-8", html.clone())),
+            ("POST", "/report") => {
+                log.push(format!("parent {}", String::from_utf8_lossy(body)));
+                Some(Reply::new("text/plain", ""))
+            }
+            _ => None,
+        }),
+    );
+}
+
+/// Headless Chrome on `url` in a fresh profile, with `flags`; the watchdog stops it after `overall`.
+fn launch(flags: &[String], url: &str, log: &Arc<Log>, overall: Duration) -> Browser {
+    let profile = tempfile::tempdir().unwrap();
+    let chrome_log = profile.path().join("chrome.log");
+    let child = Command::new(chrome())
+        .args([
+            "--headless=new".to_string(),
+            format!("--user-data-dir={}", profile.path().join("profile").display()),
+            "--no-first-run".into(),
+            "--no-default-browser-check".into(),
+            "--disable-extensions".into(),
+            "--use-angle=swiftshader".into(),
+            "--enable-unsafe-swiftshader".into(),
+            "--enable-logging=stderr".into(),
+            "--remote-debugging-port=0".into(),
+        ])
+        .args(flags)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(File::create(&chrome_log).unwrap())
+        .spawn()
+        .expect("Chrome starts");
+    let child = Arc::new(Mutex::new(child));
+    watchdog(child.clone(), log.clone(), chrome_log.clone(), overall);
+    Browser { child, log: chrome_log, profile }
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
+    let dist = dist();
     let mut host = fake_host::host();
     let pairing = host.open_pairing();
     let host = Arc::new(Mutex::new(host));
@@ -511,30 +688,7 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     session["view"] = json!("terminal");
     let evil = boot("evil");
 
-    let csp = format!(
-        "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' ws://127.0.0.1:{}; frame-ancestors {parent_origin}",
-        port(&tunnel)
-    );
-    let config = format!("window.ATOMICS_PARENT_ORIGIN = '{parent_origin}';\n");
-    serve(
-        client,
-        Arc::new(move |_, path, _| {
-            let path = if path == "/" { "/index.html" } else { path };
-            if path == "/config.js" {
-                return Some(Reply::new("text/javascript", config.clone()));
-            }
-            let file = path.trim_start_matches('/');
-            if file.split('/').any(|part| part == ".." || part.is_empty()) {
-                return None;
-            }
-            let mut reply = Reply::new(content_type(file), std::fs::read(dist.join(file)).ok()?);
-            if file == "index.html" {
-                reply.headers.push(("Content-Security-Policy", csp.clone()));
-            }
-            Some(reply)
-        }),
-    );
-
+    serve_client(client, dist, &parent_origin, port(&tunnel));
     let phase = Arc::new(Mutex::new("pair".to_string()));
     let page = include_str!("browser/parent.html")
         .replace("CLIENT_ORIGIN", &client_origin)
@@ -542,49 +696,13 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
         .replace("PAIR_BOOT", &pair.to_string())
         .replace("SESSION_BOOT", &session.to_string());
     let attacker = include_str!("browser/other.html").replace("EVIL_BOOT", &evil.to_string());
-    {
-        let (log, phase) = (log.clone(), phase.clone());
-        serve(
-            parent,
-            Arc::new(move |method, path, body| match (method, path) {
-                ("GET", "/") => Some(Reply::new("text/html; charset=utf-8", page.clone())),
-                ("GET", "/other") => Some(Reply::new("text/html; charset=utf-8", attacker.clone())),
-                ("GET", "/phase") => Some(Reply::new("text/plain", phase.lock().unwrap().clone())),
-                ("POST", "/report") => {
-                    log.push(format!("parent {}", String::from_utf8_lossy(body)));
-                    Some(Reply::new("text/plain", ""))
-                }
-                _ => None,
-            }),
-        );
-    }
+    serve_parent(parent, HashMap::from([("/", page), ("/other", attacker)]), log.clone(), phase.clone());
     let cut = Arc::new(AtomicBool::new(false));
     let pending: Pending = Arc::default();
     broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), pending.clone());
 
-    let profile = tempfile::tempdir().unwrap();
-    let chrome_log = profile.path().join("chrome.log");
-    let child = Command::new(chrome())
-        .args([
-            "--headless=new".to_string(),
-            format!("--user-data-dir={}", profile.path().join("profile").display()),
-            "--no-first-run".into(),
-            "--no-default-browser-check".into(),
-            "--disable-extensions".into(),
-            "--use-angle=swiftshader".into(),
-            "--enable-unsafe-swiftshader".into(),
-            "--window-size=420,900".into(),
-            "--enable-logging=stderr".into(),
-            "--remote-debugging-port=0".into(),
-            format!("{parent_origin}/"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(File::create(&chrome_log).unwrap())
-        .spawn()
-        .expect("Chrome starts");
-    let child = Arc::new(Mutex::new(child));
-    watchdog(child.clone(), log.clone(), chrome_log.clone());
-    let _browser = Browser { child, log: chrome_log };
+    let browser = launch(&["--window-size=420,900".into()], &format!("{parent_origin}/"), &log, OVERALL);
+    let devtools = browser.devtools();
 
     // Pairing: the boot, the IKpsk2 channel, the host's answer, then hello on a board this page never had.
     log.wait("parent atomics.ready", 1);
@@ -604,7 +722,7 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     log.wait("hello epoch-1", 1);
     if let Some(out) = std::env::var_os("ATOMICS_WEB_SCREENSHOT") {
         thread::sleep(Duration::from_secs(2));
-        screenshot(&profile.path().join("profile"), Path::new(&out));
+        screenshot(&devtools, Path::new(&out));
     }
 
     // A new page: the key comes back out of IndexedDB, and the host still knows it.
@@ -618,7 +736,6 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     // The terminal: following it takes no lease, and nothing ever resizes it.
     log.wait("subscribe s1", 1);
     assert!(!log.has("acquire s1"), "following a terminal never takes its lease");
-    let devtools = profile.path().join("profile");
     let frame_url = format!("{client_origin}/");
     let mut frame = DevTools::open(&devtools, "the client's frame", |t| {
         t["type"] == "iframe" && t["url"].as_str().is_some_and(|u| u.starts_with(&frame_url))
@@ -676,4 +793,321 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     assert!(!log.has("dial evil"), "a boot from another origin was never taken");
     assert!(!log.has("upgrade refused"), "every upgrade carried the client's exact origin and the subprotocol");
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
+}
+
+/// Screenshot the page and keep it in the page for [`boxes`]: until `find` finds something on one, which is
+/// returned with that screenshot (a base64 PNG).
+fn until<T>(page: &mut DevTools, what: &str, find: impl Fn(&mut DevTools) -> Option<T>) -> (T, String) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let shot = page.call("Page.captureScreenshot", json!({ "format": "png" }));
+        let png = shot["data"].as_str().unwrap_or_else(|| panic!("screenshot: DevTools said {shot}")).to_string();
+        let size = page.eval(&format!("look('{png}')"));
+        let pixels = (size[0].as_f64(), size[1].as_f64());
+        let phone = (f64::from(PHONE.0 * PHONE_SCALE), f64::from(PHONE.1 * PHONE_SCALE));
+        assert_eq!(pixels, (Some(phone.0), Some(phone.1)), "a screenshot of the phone's pixels");
+        if let Some(found) = find(page) {
+            return (found, png);
+        }
+        if Instant::now() >= deadline {
+            let out = shots().join("timed-out.png");
+            std::fs::write(&out, base64(&png)).unwrap();
+            panic!("timed out waiting for {what} on the phone's screen; it showed {}", out.display());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// The areas of `color` (±`tol` a channel) inside `region` on the last screenshot, in points, largest first.
+fn boxes(page: &mut DevTools, color: Color32, tol: u8, region: Rect, min_area: f32) -> Vec<Rect> {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    let (min, max) = (region.min, region.max);
+    let found =
+        page.eval(&format!("boxes([{r}, {g}, {b}], {tol}, [{}, {}, {}, {}], {min_area})", min.x, min.y, max.x, max.y));
+    let found = found.as_array().unwrap_or_else(|| panic!("boxes: the page said {found}"));
+    found
+        .iter()
+        .map(|b| {
+            let n = |i: usize| b[i].as_f64().expect("a number") as f32;
+            Rect::from_min_size(pos2(n(0), n(1)), vec2(n(2), n(3)))
+        })
+        .collect()
+}
+
+/// How much of `region` shows `color` on the last screenshot, in square points: text in that colour, say.
+fn amount(page: &mut DevTools, color: Color32, tol: u8, region: Rect) -> f64 {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    let (min, max) = (region.min, region.max);
+    let found = page.eval(&format!("boxes([{r}, {g}, {b}], {tol}, [{}, {}, {}, {}], 1)", min.x, min.y, max.x, max.y));
+    found
+        .as_array()
+        .unwrap_or_else(|| panic!("boxes: the page said {found}"))
+        .iter()
+        .filter_map(|b| b[4].as_f64())
+        .sum()
+}
+
+/// The phone's screens, each saved as `NN-name.png` in `target/phone-shots` for a person to look at.
+struct Screens {
+    dir: PathBuf,
+    saved: Vec<PathBuf>,
+}
+
+/// `target/phone-shots`.
+fn shots() -> PathBuf {
+    // The test runs as `target/<profile>/deps/browser-<hash>`.
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors().nth(3).expect("the target folder").join("phone-shots")
+}
+
+impl Screens {
+    fn new() -> Self {
+        let dir = shots();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self { dir, saved: Vec::new() }
+    }
+
+    /// Wait for the screen `ready` sees, and save it.
+    fn save(&mut self, page: &mut DevTools, name: &str, ready: impl Fn(&mut DevTools) -> bool) {
+        let ((), png) = until(page, &format!("the {name} screen"), |page| ready(page).then_some(()));
+        let path = self.dir.join(format!("{:02}-{name}.png", self.saved.len() + 1));
+        std::fs::write(&path, base64(&png)).unwrap();
+        self.saved.push(path);
+    }
+}
+
+/// What the browser typed into `session`'s terminal: the bytes of every `terminal_input` the host took.
+fn typed(host: &Mutex<FakeHost>, session: &str) -> String {
+    host.lock().unwrap().terminals[session].typed.clone()
+}
+
+/// How many `terminal_input` messages the host received.
+fn inputs(host: &Mutex<FakeHost>) -> usize {
+    host.lock().unwrap().received.iter().filter(|m| matches!(m, Message::TerminalInput { .. })).count()
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn the_bundle_works_on_a_phone_by_touch() {
+    let dist = dist();
+    let mut host = fake_host::host();
+    // The pairing code stays on screen until the test has looked at it.
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let host = Arc::new(Mutex::new(host));
+    let log = Arc::new(Log::default());
+    let bind = || TcpListener::bind("127.0.0.1:0").unwrap();
+    let (client, parent, tunnel) = (bind(), bind(), bind());
+    let port = |l: &TcpListener| l.local_addr().unwrap().port();
+    let client_origin = format!("http://127.0.0.1:{}", port(&client));
+    let parent_origin = format!("http://localhost:{}", port(&parent));
+    let broker_url = format!("ws://127.0.0.1:{}/atomics/tunnel", port(&tunnel));
+    let fragment = pairing.fragment();
+    let keys: Vec<&str> = fragment.split('.').collect();
+    let pair = json!({
+        "type": "atomics.embed.boot", "v": 1, "host_id": HOST_ID, "ticket": "ticket-0", "broker": broker_url,
+        "display_name": "A Person", "theme": "dark", "scheme": "dark", "locale": "en", "view": "board",
+        "mode": "pair", "pair": { "v": 1, "host_noise_pubkey": keys[2], "psk": keys[3] },
+    });
+
+    serve_client(client, dist, &parent_origin, port(&tunnel));
+    let phase = Arc::new(Mutex::new("wait".to_string()));
+    let page_html = include_str!("browser/phone.html")
+        .replace("CLIENT_ORIGIN", &client_origin)
+        .replace("PHONE_BOOT", &pair.to_string());
+    serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
+    let pending: Pending = Arc::default();
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), pending.clone());
+
+    // The phone. The client's frame is cross-origin, so it draws in a renderer of its own, which the page's
+    // emulation does not reach: its pixel ratio comes from the browser's flag, its user agent too, and its touch
+    // screen from its own target, attached and set up before its first script runs.
+    let flags = [
+        format!("--window-size={},{}", PHONE.0, PHONE.1),
+        format!("--force-device-scale-factor={PHONE_SCALE}"),
+        format!("--user-agent={IOS_SAFARI}"),
+        "--hide-scrollbars".into(),
+    ];
+    let browser = launch(&flags, &format!("{parent_origin}/"), &log, PHONE_OVERALL);
+    let devtools = browser.devtools();
+    let mut page = DevTools::open(&devtools, "the phone's page", |t| t["type"] == "page");
+    let (width, height) = (PHONE.0 as u32, PHONE.1 as u32);
+    let metrics = json!({ "width": width, "height": height, "deviceScaleFactor": PHONE_SCALE, "mobile": true });
+    page.call("Emulation.setDeviceMetricsOverride", metrics);
+    let touch = json!({ "enabled": true, "maxTouchPoints": 5 });
+    page.call("Emulation.setTouchEmulationEnabled", touch.clone());
+    page.call("Target.setAutoAttach", json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }));
+    *phase.lock().unwrap() = "go".into();
+    let attached = page.event("Target.attachedToTarget", |e| e["params"]["targetInfo"]["type"] == "iframe");
+    let session = attached["params"]["sessionId"].as_str().expect("the frame's session").to_string();
+    page.call_in(Some(&session), "Emulation.setTouchEmulationEnabled", touch);
+    page.call_in(Some(&session), "Runtime.runIfWaitingForDebugger", json!({}));
+    let frame_url = format!("{client_origin}/");
+    let mut frame = DevTools::open(&devtools, "the client's frame", |t| {
+        t["type"] == "iframe" && t["url"].as_str().is_some_and(|u| u.starts_with(&frame_url))
+    });
+    let device = "devicePixelRatio === 3 && matchMedia('(pointer: coarse)').matches && navigator.maxTouchPoints > 0";
+    frame.wait("an iPhone's screen in the frame", device);
+    let offset = page.eval("(() => { const r = document.querySelector('iframe').getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; })()");
+    let frame_rect: Vec<f64> = (0..4).filter_map(|i| offset[i].as_f64()).collect();
+    assert_eq!(frame_rect, [0.0, 0.0, f64::from(width), f64::from(height)], "the frame fills the screen");
+
+    // What the client draws with: the boot's theme, and the phone layout of its own code, in its zoomed points
+    // and then in CSS pixels, which the screenshots and taps are in.
+    let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
+    let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
+    let p = Palette::new(&booted.theme_tokens(), Fonts::default());
+    assert_ne!(p.panel, p.background, "the approval banner stands out from the page");
+    let css = |r: Rect| {
+        Rect::from_min_max((r.min.to_vec2() * layout::ZOOM).to_pos2(), (r.max.to_vec2() * layout::ZOOM).to_pos2())
+    };
+    let points = Rect::from_min_size(Pos2::ZERO, vec2(PHONE.0, PHONE.1) / layout::ZOOM);
+    let regions =
+        layout::regions(points, &Viewport { visible: Some(points), coarse: true, ..Viewport::default() }, false);
+    let bar = regions.bar.expect("the pane bar");
+    let items: Vec<Rect> = layout::bar_items(bar, views::BAR.len()).into_iter().map(css).collect();
+    let (screen, top, body, bar) = (css(points), css(regions.top), css(regions.body), css(bar));
+    let pane = |tab: Tab| items[views::BAR.iter().position(|(t, _)| *t == tab).expect("a pane")].center();
+    // The pane the bar marks, by its accent line on the bar's top edge; none while the key bar replaces it.
+    let active = |page: &mut DevTools| {
+        let edge = Rect::from_min_max(bar.left_top(), pos2(bar.right(), bar.top() + 2.0));
+        let line = boxes(page, p.accent, 8, edge, 10.0).first().map(|b| b.center().x);
+        line.and_then(|x| items.iter().position(|i| i.x_range().contains(x))).map(|i| views::BAR[i].0)
+    };
+    // The plan's Approve button: the accent-filled box, a finger's size, in the board's header rows.
+    let header = Rect::from_min_max(body.left_top(), pos2(screen.right(), body.top() + 220.0));
+    let approve = |page: &mut DevTools| {
+        boxes(page, p.accent, 6, header, 150.0).into_iter().find(|b| b.width() >= 40.0 && b.height() >= 40.0)
+    };
+    // A tool request's banner, and its first button (Allow).
+    let banner = |page: &mut DevTools| {
+        boxes(page, p.panel, 2, body, 5000.0).into_iter().find(|b| b.width() >= 300.0 && b.height() >= 100.0)
+    };
+    let mut screens = Screens::new();
+
+    // 1. Pairing: the six-digit code, large in the accent colour, until the host's user accepts it.
+    log.wait("parent atomics.ready", 1);
+    log.wait("parent atomics.booted", 1);
+    log.wait("dial ticket-0", 1);
+    log.wait("first 97 bytes, kind 1", 1);
+    wait_host(&host, "the pairing request", |h| h.named.is_some());
+    assert_eq!(host.lock().unwrap().named.as_deref(), Some("Safari on iPhone"), "the frame has Safari's user agent");
+    screens.save(&mut page, "pairing", |page| amount(page, p.accent, 24, body) >= 300.0);
+    let answer = host.lock().unwrap().confirm();
+    pending.lock().unwrap().extend(answer);
+    log.wait("parent atomics.paired", 1);
+    log.wait("hello new", 1);
+
+    // 2. The board with its plan, the plans, and the task's diff of two files, each pane tapped in the bar.
+    screens.save(&mut page, "board", |page| active(page) == Some(Tab::Board) && approve(page).is_some());
+    page.tap(pane(Tab::Plans));
+    screens.save(&mut page, "plans", |page| active(page) == Some(Tab::Plans));
+    page.tap(pane(Tab::Diffs));
+    screens.save(&mut page, "diffs", |page| active(page) == Some(Tab::Diffs));
+    // The worktree's row, first in the list, opens its diff.
+    let first =
+        css(Rect::from_min_size(regions.body.left_top() + vec2(layout::GUTTER, 8.0), vec2(80.0, layout::TOUCH)));
+    page.tap(first.center());
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    screens.save(&mut page, "diff", |page| !boxes(page, p.added, 2, body, 2000.0).is_empty());
+
+    // 3. Approving: a tap on the plan's Approve button sends the plan's approval with its digest, and the board
+    // shows it approved. Then the top bar's ◆ badge opens the tool request, and a tap on Allow answers it.
+    page.tap(pane(Tab::Board));
+    let (button, _) = until(&mut page, "the plan's Approve button", |page| approve(page));
+    page.tap(button.center());
+    wait_host(&host, "plan_command approve for p1 at its digest", |h| {
+        h.received.iter().any(|m| {
+            matches!(m, Message::PlanCommand(c) if c.action == PlanAction::Approve
+                && c.plan.as_deref() == Some("p1") && c.digest.as_deref() == Some("digest-1"))
+        })
+    });
+    wait_host(&host, "the plan approved", |h| h.board.plans[0].approved);
+    screens.save(&mut page, "plan-approved", |page| {
+        // "approved ✓", wherever the header's rows put it.
+        approve(page).is_none() && amount(page, p.success, 24, header) >= 10.0
+    });
+    let corner = Rect::from_min_max(pos2(screen.center().x, top.top()), top.max);
+    let (badge, _) = until(&mut page, "the approvals badge", |page| {
+        boxes(page, p.warning, 16, corner, 1.0).into_iter().reduce(|a, b| a.union(b))
+    });
+    page.tap(badge.center());
+    screens.save(&mut page, "approvals", |page| banner(page).is_some());
+    let (allow, _) = until(&mut page, "the Allow button", |page| {
+        let banner = banner(page)?;
+        let buttons = boxes(page, p.raised, 2, banner, 100.0).into_iter();
+        // A finger's target: 44 CSS pixels each way, less the outline.
+        buttons
+            .filter(|b| b.width() >= 40.0 && (40.0..=50.0).contains(&b.height()))
+            .min_by(|a, b| (a.top() as i32, a.left() as i32).cmp(&(b.top() as i32, b.left() as i32)))
+    });
+    page.tap(allow.center());
+    wait_host(&host, "approval_decide allow for a1", |h| {
+        h.received
+            .iter()
+            .any(|m| matches!(m, Message::ApprovalDecide(d) if d.approval == "a1" && d.decision == Decision::Allow))
+    });
+    screens.save(&mut page, "approval-allowed", |page| banner(page).is_none());
+
+    // 4. The agent's terminal: following it takes no lease; a tap on it focuses the input overlay, which asks
+    // for the lease, and the key bar takes the pane bar's place.
+    page.tap(pane(Tab::Terminal));
+    log.wait("subscribe s1", 1);
+    frame.wait("the input overlay over the terminal", "!document.getElementById('atomics-input').hidden");
+    frame.wait("a writable overlay", "!document.getElementById('atomics-input').readOnly");
+    assert!(!log.has("acquire s1"), "following a terminal never takes its lease");
+    screens.save(&mut page, "terminal", |page| active(page) == Some(Tab::Terminal));
+    let overlay = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; })()");
+    let number = |v: &serde_json::Value, i: usize| v[i].as_f64().expect("a number") as f32;
+    assert!(number(&overlay, 2) >= PHONE.0 - 1.0, "the terminal fills the phone's width: {overlay}");
+    page.tap(pos2(number(&overlay, 0) + 40.0, number(&overlay, 1) + 40.0));
+    let focused = "document.activeElement === document.getElementById('atomics-input')";
+    frame.wait("the focus on the overlay after a tap", focused);
+    log.wait("acquire s1", 1);
+    frame.wait("the key bar", "!document.getElementById('atomics-keybar').hidden");
+    screens.save(&mut page, "terminal-focused", |page| active(page).is_none());
+
+    // 5. What the phone types reaches the host as its bytes: text, Return, Backspace on the empty line the
+    // echo left (the field is empty too), and the key bar's ↑, which leaves the focus where it was.
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed", |h| h.terminals["s1"].typed == "ls");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "Return as CR", |h| h.terminals["s1"].typed == "ls\r");
+    page.key("Backspace", 8, None);
+    wait_host(&host, "Backspace as DEL", |h| h.terminals["s1"].typed == "ls\r\x7f");
+    let up = frame.eval("(() => { const r = document.querySelector('#atomics-keybar button[data-value=\"ArrowUp\"]').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()");
+    page.tap(pos2(number(&up, 0), number(&up, 1)));
+    wait_host(&host, "↑ as CSI A", |h| h.terminals["s1"].typed == "ls\r\x7f\x1b[A");
+    assert_eq!(frame.eval(focused), json!(true), "a key bar key leaves the focus on the field");
+    assert_eq!(inputs(&host), 4, "one terminal_input each");
+    screens.save(&mut page, "typed", |page| active(page).is_none());
+
+    // 6. The desktop takes the terminal back: the field loses the focus, the key bar goes, and nothing the
+    // phone types reaches the host. Text a keyboard commits (`insertText`) does not put the focus back, since
+    // the caret went with it, nor do Return and Backspace.
+    let back = host.lock().unwrap().desktop_types("s1", "!");
+    pending.lock().unwrap().extend(back);
+    frame.wait("the field blurred", &format!("!({focused})"));
+    frame.wait("the key bar gone", "document.getElementById('atomics-keybar').hidden");
+    page.call("Input.insertText", json!({ "text": "x" }));
+    page.key("Enter", 13, Some("\r"));
+    page.key("Backspace", 8, None);
+    screens.save(&mut page, "taken-back", |page| active(page) == Some(Tab::Terminal));
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(frame.eval(focused), json!(false), "typing did not focus the field again");
+    assert_eq!(typed(&host, "s1"), "ls\r\x7f\x1b[A!", "after the take back nothing typed reaches the host");
+    assert_eq!(inputs(&host), 4, "no terminal_input after the take back");
+    assert!(host.lock().unwrap().terminals["s1"].lease.is_none(), "the desktop holds the terminal");
+    assert_eq!(log.lines.lock().unwrap().iter().filter(|l| l.starts_with("acquire s1")).count(), 1);
+    assert!(!log.has("resize s1"), "the phone never resized the terminal");
+    assert!(!log.has("upgrade refused"), "every upgrade carried the client's exact origin and the subprotocol");
+    assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
+    eprintln!("phone screens:");
+    for path in &screens.saved {
+        eprintln!("  {}", path.display());
+    }
 }

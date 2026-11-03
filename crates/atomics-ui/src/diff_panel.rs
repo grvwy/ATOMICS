@@ -25,6 +25,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, c
         can_send: heading.can_send,
         split,
         editor_shortcut: &config.keys.toggle_editor,
+        touch: client.touch,
     };
     let before = state.comments.clone();
     let action = diff_view::show(ui, rect, state, header, &palette, &font);

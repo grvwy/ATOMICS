@@ -49,9 +49,14 @@ pub mod close {
     pub const UNAVAILABLE: u16 = 4002;
     /// The browser's key is not on the host's allowlist: never paired, or revoked there. Pair again.
     pub const NOT_PAIRED: u16 = 4003;
-    /// No pairing is open on the host: none was offered, it expired or was used, or another
-    /// device is pairing now.
+    /// No pairing is open on the host: none was offered, or it expired or was used. Asking again
+    /// cannot help; the host must show a new link.
     pub const NO_PAIRING: u16 = 4004;
+    /// The host's pairing link is open, but another device is pairing with it now. It may come
+    /// free, so a browser asks again while its link may be valid. Older hosts send `NO_PAIRING`
+    /// for this too; an older browser reads this code as any dropped channel and dials again,
+    /// until the link is used or expires and the host says `NO_PAIRING`.
+    pub const PAIRING_BUSY: u16 = 4005;
     /// The pass lapsed unrenewed, a renewal was refused, or (on a channel) the browser's session ended.
     pub const UNAUTHORISED: u16 = 4401;
     /// The host was revoked: it needs a new device key.

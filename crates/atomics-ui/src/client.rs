@@ -11,6 +11,7 @@ use atomics_core::plan::PlanStatus;
 use crate::Command;
 use crate::diff_view::{DiffState, ExplorerState};
 use crate::theme::{Fonts, Palette};
+use crate::touch::Touch;
 
 /// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
 /// the desktop's client as the draw code that uses them moves into this crate.
@@ -40,6 +41,8 @@ pub struct Client {
     pub icon: Option<egui::TextureHandle>,
     /// The name typed for saving the open projects as a workspace.
     pub workspace_input: String,
+    /// Set while the platform draws for a finger on a small screen; the desktop leaves it `None`.
+    pub touch: Option<Touch>,
 }
 
 impl Default for Client {
@@ -59,6 +62,7 @@ impl Default for Client {
             confirm_close: None,
             icon: None,
             workspace_input: String::new(),
+            touch: None,
         }
     }
 }

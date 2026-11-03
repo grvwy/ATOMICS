@@ -9,6 +9,7 @@ use egui::{Rect, RichText, Sense, Stroke, vec2};
 use crate::status::{status_color, task_color};
 use crate::text::truncate;
 use crate::theme::{Palette, lerp};
+use crate::touch::{self, Touch};
 use crate::{Backend, Client, Command};
 
 /// A ticket's key and state. A click opens it in the browser; hovering shows the rest.
@@ -129,7 +130,24 @@ pub fn task_result(
     now: u64,
     p: &Palette,
 ) -> Option<&'static str> {
-    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+    task_result_for(ui, task, status, expanded, read_only, available, codex, now, p, None)
+}
+
+/// [`task_result`] with its buttons sized for `touch`.
+#[allow(clippy::too_many_arguments)]
+fn task_result_for(
+    ui: &mut egui::Ui,
+    task: &Task,
+    status: Option<AgentStatus>,
+    expanded: bool,
+    read_only: bool,
+    available: bool,
+    codex: bool,
+    now: u64,
+    p: &Palette,
+    touch: Option<Touch>,
+) -> Option<&'static str> {
+    let result = |ui: &mut egui::Ui| {
         let mut action = None;
         if task.finished_at.is_some() {
             ui.label(
@@ -163,14 +181,14 @@ pub fn task_result(
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
             ui.horizontal(|ui| {
-                if ui.add_enabled(available, egui::Button::new("diff").small()).clicked() {
+                if ui.add_enabled(available, touch::sized(egui::Button::new("diff").small(), touch)).clicked() {
                     action = Some("diff");
                 }
                 if !read_only
                     && ui
                         .add_enabled(
                             status.is_none() && available && (task.resume_id.is_some() || codex),
-                            egui::Button::new("resume").small(),
+                            touch::sized(egui::Button::new("resume").small(), touch),
                         )
                         .clicked()
                 {
@@ -179,20 +197,41 @@ pub fn task_result(
             });
         }
         action
-    })
-    .inner
+    };
+    match touch {
+        Some(_) => when_drawn(ui, egui::Layout::top_down(egui::Align::Min), None, result),
+        None => ui.with_layout(egui::Layout::top_down(egui::Align::Min), result).inner,
+    }
+}
+
+/// `add` in a child of `layout`, its rows `row` high if given, that takes room only once something is drawn
+/// in it, so that a phone's card keeps no gap for a part it has nothing of.
+fn when_drawn<R>(ui: &mut egui::Ui, layout: egui::Layout, row: Option<f32>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let mut rect = ui.available_rect_before_wrap();
+    if let Some(row) = row {
+        rect.max.y = rect.min.y + row;
+    }
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    let inner = add(&mut child);
+    let used = child.min_rect();
+    if used.width() > 0.0 && used.height() > 0.0 {
+        ui.advance_cursor_after_rect(used);
+    }
+    inner
 }
 
 /// The board of the plan at `index` of [`Backend::plan_list`]: its header, then the kanban columns, drawn
 /// from the plan's [`BoardView`](crate::BoardView), read once per frame.
 pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
+    let touch = client.touch;
     ui.painter().rect_filled(rect, 0.0, p.background);
     let Some(mut board) = backend.board(index) else { return };
     let now = board.now;
     let plan = &board.plan;
+    let margin = touch.map_or(vec2(12.0, 8.0), |touch| vec2(touch.gutter, 8.0));
     let mut child =
-        ui.new_child(egui::UiBuilder::new().id_salt(("plan-panel", &plan.id)).max_rect(rect.shrink2(vec2(12.0, 8.0))));
+        ui.new_child(egui::UiBuilder::new().id_salt(("plan-panel", &plan.id)).max_rect(rect.shrink2(margin)));
     let ui = &mut child;
     let read_only = plan.status != PlanStatus::Open;
     let mut reopen = false;
@@ -203,12 +242,43 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let mut close_status = None;
     let mut clean_plan = false;
     let ready = board.ready.len();
+    let total = plan.tasks.len();
     if board.checking {
         ui.label(RichText::new("Checking integration freshness…").color(p.muted));
     }
+    // The plan's buttons: those that end or reopen it, and approving or dispatching it. The desktop puts them
+    // right to left at the end of the header's row; a phone puts them in a row of their own, the main one first.
+    let mut end_buttons = |ui: &mut egui::Ui| {
+        if read_only {
+            if plan.status == PlanStatus::Completed {
+                archive = touch::small_button(ui, touch, "Archive").clicked();
+                clean_plan = touch::small_button(ui, touch, "Clean up plan…").clicked();
+            }
+            reopen = touch::small_button(ui, touch, "Reopen plan").clicked();
+        } else if touch::small_button(ui, touch, "Close plan…").clicked() {
+            close_status = Some(PlanStatus::Completed);
+        }
+    };
+    let mut main_buttons = |ui: &mut egui::Ui| {
+        if read_only || total == 0 {
+            return;
+        }
+        if !plan.approved {
+            let button = egui::Button::new(RichText::new("Approve plan").color(p.on_accent)).fill(p.accent);
+            approve = ui
+                .add(touch::sized(button, touch))
+                .on_hover_text("Let the orchestrator dispatch these tasks")
+                .clicked();
+        } else {
+            dispatch_all = ui
+                .add_enabled(ready > 0, touch::sized(egui::Button::new(format!("Dispatch ready ({ready})")), touch))
+                .on_hover_text("Start every task whose dependencies are done")
+                .clicked();
+            ui.label(RichText::new("approved ✓").color(p.success).size(12.0));
+        }
+    };
     ui.horizontal(|ui| {
         ui.label(RichText::new("PLAN").color(p.accent).strong().size(13.0));
-        let total = plan.tasks.len();
         if total > 0 {
             let done = plan.count(TaskStatus::Done);
             ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
@@ -221,32 +291,12 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             };
             ui.label(RichText::new(status).color(p.muted).size(12.0));
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if read_only {
-                if plan.status == PlanStatus::Completed {
-                    archive = ui.small_button("Archive").clicked();
-                    clean_plan = ui.small_button("Clean up plan…").clicked();
-                }
-                reopen = ui.small_button("Reopen plan").clicked();
-            } else {
-                if ui.small_button("Close plan…").clicked() {
-                    close_status = Some(PlanStatus::Completed);
-                }
-                if total == 0 {
-                    return;
-                }
-                if !plan.approved {
-                    let button = egui::Button::new(RichText::new("Approve plan").color(p.on_accent)).fill(p.accent);
-                    approve = ui.add(button).on_hover_text("Let the orchestrator dispatch these tasks").clicked();
-                } else {
-                    dispatch_all = ui
-                        .add_enabled(ready > 0, egui::Button::new(format!("Dispatch ready ({ready})")))
-                        .on_hover_text("Start every task whose dependencies are done")
-                        .clicked();
-                    ui.label(RichText::new("approved ✓").color(p.success).size(12.0));
-                }
-            }
-        });
+        if touch.is_none() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                end_buttons(ui);
+                main_buttons(ui);
+            });
+        }
     });
     if !plan.goal.is_empty() {
         ui.label(RichText::new(&plan.goal).color(board.state.color(&p)).size(13.0));
@@ -256,11 +306,17 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
         ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
             .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
     }
+    if touch.is_some() {
+        ui.horizontal_wrapped(|ui| {
+            main_buttons(ui);
+            end_buttons(ui);
+        });
+    }
     let pending = plan.pending_integrations().len();
     if !read_only && pending > 0 {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{pending} accepted tasks not integrated yet")).color(p.warning));
-            integrate_accepted = ui.button("Integrate").clicked();
+            integrate_accepted = ui.add(touch::sized(egui::Button::new("Integrate"), touch)).clicked();
         });
     }
     let ticket_config = &board.ticket_config;
@@ -294,7 +350,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 );
             }
             if ticket_config.is_some() {
-                sync_tickets = ui.small_button("sync").on_hover_text("Read the tickets again now").clicked();
+                sync_tickets =
+                    touch::small_button(ui, touch, "sync").on_hover_text("Read the tickets again now").clicked();
             }
         });
     }
@@ -347,7 +404,191 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     // The cards edit briefs in place; an edit is recorded below.
     let mut edited_tasks = std::mem::take(&mut board.plan.tasks);
     let tasks = &mut edited_tasks;
-    if !tasks.is_empty() {
+    // One task's card.
+    let mut card = |ui: &mut egui::Ui, task: &mut Task| {
+        let color = task_color(task.status, &p);
+        let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
+        egui::Frame::new()
+            .fill(p.raised)
+            .stroke(Stroke::new(1.0, if open { color.gamma_multiply(0.6) } else { p.border }))
+            .corner_radius(3)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                // Columns justify their children; card text needs ordinary word spacing.
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.set_width(ui.available_width());
+                    let title = ui.add(
+                        egui::Label::new(RichText::new(&task.title).color(p.foreground).strong()).sense(Sense::click()),
+                    );
+                    if title.clicked() {
+                        actions.push((task.id.clone(), "toggle"));
+                    }
+                    let mut meta =
+                        format!("{} · {}", task.id, if task.agent.is_empty() { "claude" } else { &task.agent });
+                    if let Some(model) =
+                        task.args.windows(2).find(|w| w[0] == "-m" || w[0] == "--model").map(|w| w[1].clone())
+                    {
+                        meta.push_str(&format!(" {model}"));
+                    }
+                    if let Some(isolation) = task.isolation {
+                        meta.push_str(&format!(" · {}", isolation.name()));
+                    }
+                    ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                    stage_chip(ui, latest_stages.get(&task.id));
+                    if let Some(link) = &task.ticket {
+                        let means = ticket_states
+                            .as_ref()
+                            .filter(|_| !expected_tasks.contains(&task.id))
+                            .and_then(|s| s.status_of(link.state.as_deref()?))
+                            .map(|ticket| (ticket, task.status));
+                        ticket_chip(ui, link, means, ticket_config.as_deref(), now, &p);
+                    }
+                    if let Some(branch) = &task.branch {
+                        let branch = RichText::new(branch).color(p.muted).size(11.0);
+                        // A phone shows names like this one in monospace, its other text in the UI's font.
+                        let branch = if touch.is_some() { branch.monospace() } else { branch };
+                        ui.add(egui::Label::new(branch).truncate());
+                    }
+                    if let Some((note, checking)) = integration_notes.get(&task.id) {
+                        let color = if *checking { p.muted } else { p.warning };
+                        ui.label(RichText::new(note).color(color).size(11.0));
+                    }
+                    if !task.depends_on.is_empty() {
+                        ui.label(
+                            RichText::new(format!("after {}", task.depends_on.join(", "))).color(p.muted).size(11.0),
+                        );
+                    }
+                    if let Some((title, agent_status)) = task.session.as_ref().and_then(|s| sessions.get(s)) {
+                        ui.label(
+                            RichText::new(format!("● {title} · {}", agent_status.label()))
+                                .color(status_color(*agent_status, &p))
+                                .size(11.0),
+                        );
+                    }
+                    let status = task.session.as_ref().and_then(|s| sessions.get(s)).map(|(_, s)| *s);
+                    if let Some(action) = task_result_for(
+                        ui,
+                        task,
+                        status,
+                        open,
+                        read_only,
+                        worktrees.contains(&task.id),
+                        codex.contains(&task.id),
+                        now,
+                        &p,
+                        touch,
+                    ) {
+                        actions.push((task.id.clone(), action));
+                    }
+                    if let Some(alert) = &task.ref_alert {
+                        egui::Frame::new()
+                            .fill(lerp(p.panel, p.error, 0.15))
+                            .stroke(Stroke::new(1.0, p.error))
+                            .inner_margin(6)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(alert).color(p.error).strong().size(12.0));
+                                if touch::small_button(ui, touch, "Acknowledge ref alert").clicked() {
+                                    actions.push((task.id.clone(), "acknowledge_refs"));
+                                }
+                            });
+                    } else if let Some(note) = task.notes.last() {
+                        ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
+                    }
+                    if open {
+                        ui.add_space(4.0);
+                        if editable && task.status == TaskStatus::Planned {
+                            let edit =
+                                egui::TextEdit::multiline(&mut task.brief).desired_rows(4).desired_width(f32::INFINITY);
+                            let response = ui.add(edit);
+                            editing |= response.has_focus();
+                            if response.changed() {
+                                actions.push((task.id.clone(), "edited"));
+                            }
+                        } else {
+                            ui.label(RichText::new(&task.brief).color(p.foreground).size(12.0));
+                        }
+                        for check in &task.acceptance {
+                            ui.label(RichText::new(format!("✓ {check}")).color(p.muted).size(11.5));
+                        }
+                    }
+                    let buttons = |ui: &mut egui::Ui| {
+                        if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
+                            && touch::small_button(ui, touch, "open").clicked()
+                        {
+                            open_session = task.session.clone();
+                        }
+                        if read_only {
+                            return;
+                        }
+                        match task.status {
+                            TaskStatus::Planned if approved && ready_ids.contains(&task.id) => {
+                                if touch::small_button(ui, touch, "start").clicked() {
+                                    actions.push((task.id.clone(), "start"));
+                                }
+                            }
+                            TaskStatus::Review => {
+                                if touch::small_button(ui, touch, "accept").clicked() {
+                                    actions.push((task.id.clone(), "done"));
+                                }
+                                if touch::small_button(ui, touch, "send back")
+                                    .on_hover_text("Back to running; steer it in the steer bar")
+                                    .clicked()
+                                {
+                                    actions.push((task.id.clone(), "running"));
+                                }
+                            }
+                            TaskStatus::Blocked => {
+                                if touch::small_button(ui, touch, "unblock").clicked() {
+                                    actions.push((task.id.clone(), "running"));
+                                }
+                            }
+                            TaskStatus::Done
+                                if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
+                                    && touch::small_button(ui, touch, "reopen").clicked() =>
+                            {
+                                actions.push((task.id.clone(), "review"));
+                            }
+                            _ => {}
+                        }
+                        if task.id != plan::REVIEW_TASK
+                            && task.branch.is_some()
+                            && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+                        {
+                            let busy = integrating.contains(&task.id);
+                            let label = if busy { "integrating…" } else { "integrate" };
+                            if ui
+                                .add_enabled(!busy, touch::sized(egui::Button::new(label).small(), touch))
+                                .on_hover_text(format!("Commit its changes and merge it into {integration}"))
+                                .clicked()
+                            {
+                                actions.push((task.id.clone(), "integrate"));
+                            }
+                        }
+                    };
+                    match touch {
+                        // A phone's row is as tall as its buttons, and takes no room without any.
+                        Some(touch) => {
+                            let row = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+                            when_drawn(ui, row, Some(touch.target), buttons);
+                        }
+                        None => {
+                            ui.horizontal_wrapped(buttons);
+                        }
+                    }
+                });
+            });
+    };
+    // A status's heading, over its tasks.
+    let heading = |ui: &mut egui::Ui, status: TaskStatus, count: usize| {
+        ui.label(
+            RichText::new(format!("{} · {count}", status.label().to_uppercase()))
+                .color(task_color(status, &p))
+                .strong()
+                .size(11.0),
+        );
+    };
+    if !tasks.is_empty() && touch.is_none() {
         egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             let columns = TaskStatus::ALL.len();
             let spacing = ui.spacing().item_spacing.x * (columns - 1) as f32;
@@ -355,209 +596,36 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             ui.columns(TaskStatus::ALL.len(), |columns| {
                 for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
                     let count = tasks.iter().filter(|t| t.status == status).count();
-                    let color = task_color(status, &p);
-                    column.label(
-                        RichText::new(format!("{} · {count}", status.label().to_uppercase()))
-                            .color(color)
-                            .strong()
-                            .size(11.0),
-                    );
+                    heading(column, status, count);
                     column.add_space(4.0);
                     egui::ScrollArea::vertical()
                         .id_salt(("plan-column", &plan_id, status.label()))
                         .auto_shrink([false, false])
                         .show(column, |ui| {
                             for task in tasks.iter_mut().filter(|t| t.status == status) {
-                                let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
-                                egui::Frame::new()
-                                    .fill(p.raised)
-                                    .stroke(Stroke::new(1.0, if open { color.gamma_multiply(0.6) } else { p.border }))
-                                    .corner_radius(3)
-                                    .inner_margin(egui::Margin::same(8))
-                                    .show(ui, |ui| {
-                                        // Columns justify their children; card text needs ordinary word spacing.
-                                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                                            ui.set_width(ui.available_width());
-                                            let title = ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&task.title).color(p.foreground).strong(),
-                                                )
-                                                .sense(Sense::click()),
-                                            );
-                                            if title.clicked() {
-                                                actions.push((task.id.clone(), "toggle"));
-                                            }
-                                            let mut meta = format!(
-                                                "{} · {}",
-                                                task.id,
-                                                if task.agent.is_empty() { "claude" } else { &task.agent }
-                                            );
-                                            if let Some(model) = task
-                                                .args
-                                                .windows(2)
-                                                .find(|w| w[0] == "-m" || w[0] == "--model")
-                                                .map(|w| w[1].clone())
-                                            {
-                                                meta.push_str(&format!(" {model}"));
-                                            }
-                                            if let Some(isolation) = task.isolation {
-                                                meta.push_str(&format!(" · {}", isolation.name()));
-                                            }
-                                            ui.label(RichText::new(meta).color(p.muted).size(11.0));
-                                            stage_chip(ui, latest_stages.get(&task.id));
-                                            if let Some(link) = &task.ticket {
-                                                let means = ticket_states
-                                                    .as_ref()
-                                                    .filter(|_| !expected_tasks.contains(&task.id))
-                                                    .and_then(|s| s.status_of(link.state.as_deref()?))
-                                                    .map(|ticket| (ticket, task.status));
-                                                ticket_chip(ui, link, means, ticket_config.as_deref(), now, &p);
-                                            }
-                                            if let Some(branch) = &task.branch {
-                                                ui.add(
-                                                    egui::Label::new(RichText::new(branch).color(p.muted).size(11.0))
-                                                        .truncate(),
-                                                );
-                                            }
-                                            if let Some((note, checking)) = integration_notes.get(&task.id) {
-                                                let color = if *checking { p.muted } else { p.warning };
-                                                ui.label(RichText::new(note).color(color).size(11.0));
-                                            }
-                                            if !task.depends_on.is_empty() {
-                                                ui.label(
-                                                    RichText::new(format!("after {}", task.depends_on.join(", ")))
-                                                        .color(p.muted)
-                                                        .size(11.0),
-                                                );
-                                            }
-                                            if let Some((title, agent_status)) =
-                                                task.session.as_ref().and_then(|s| sessions.get(s))
-                                            {
-                                                ui.label(
-                                                    RichText::new(format!("● {title} · {}", agent_status.label()))
-                                                        .color(status_color(*agent_status, &p))
-                                                        .size(11.0),
-                                                );
-                                            }
-                                            let status =
-                                                task.session.as_ref().and_then(|s| sessions.get(s)).map(|(_, s)| *s);
-                                            if let Some(action) = task_result(
-                                                ui,
-                                                task,
-                                                status,
-                                                open,
-                                                read_only,
-                                                worktrees.contains(&task.id),
-                                                codex.contains(&task.id),
-                                                now,
-                                                &p,
-                                            ) {
-                                                actions.push((task.id.clone(), action));
-                                            }
-                                            if let Some(alert) = &task.ref_alert {
-                                                egui::Frame::new()
-                                                    .fill(lerp(p.panel, p.error, 0.15))
-                                                    .stroke(Stroke::new(1.0, p.error))
-                                                    .inner_margin(6)
-                                                    .show(ui, |ui| {
-                                                        ui.label(
-                                                            RichText::new(alert).color(p.error).strong().size(12.0),
-                                                        );
-                                                        if ui.small_button("Acknowledge ref alert").clicked() {
-                                                            actions.push((task.id.clone(), "acknowledge_refs"));
-                                                        }
-                                                    });
-                                            } else if let Some(note) = task.notes.last() {
-                                                ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
-                                            }
-                                            if open {
-                                                ui.add_space(4.0);
-                                                if editable && task.status == TaskStatus::Planned {
-                                                    let edit = egui::TextEdit::multiline(&mut task.brief)
-                                                        .desired_rows(4)
-                                                        .desired_width(f32::INFINITY);
-                                                    let response = ui.add(edit);
-                                                    editing |= response.has_focus();
-                                                    if response.changed() {
-                                                        actions.push((task.id.clone(), "edited"));
-                                                    }
-                                                } else {
-                                                    ui.label(RichText::new(&task.brief).color(p.foreground).size(12.0));
-                                                }
-                                                for check in &task.acceptance {
-                                                    ui.label(
-                                                        RichText::new(format!("✓ {check}")).color(p.muted).size(11.5),
-                                                    );
-                                                }
-                                            }
-                                            ui.horizontal_wrapped(|ui| {
-                                                if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
-                                                    && ui.small_button("open").clicked()
-                                                {
-                                                    open_session = task.session.clone();
-                                                }
-                                                if read_only {
-                                                    return;
-                                                }
-                                                match task.status {
-                                                    TaskStatus::Planned if approved && ready_ids.contains(&task.id) => {
-                                                        if ui.small_button("start").clicked() {
-                                                            actions.push((task.id.clone(), "start"));
-                                                        }
-                                                    }
-                                                    TaskStatus::Review => {
-                                                        if ui.small_button("accept").clicked() {
-                                                            actions.push((task.id.clone(), "done"));
-                                                        }
-                                                        if ui
-                                                            .small_button("send back")
-                                                            .on_hover_text("Back to running; steer it in the steer bar")
-                                                            .clicked()
-                                                        {
-                                                            actions.push((task.id.clone(), "running"));
-                                                        }
-                                                    }
-                                                    TaskStatus::Blocked => {
-                                                        if ui.small_button("unblock").clicked() {
-                                                            actions.push((task.id.clone(), "running"));
-                                                        }
-                                                    }
-                                                    TaskStatus::Done
-                                                        if task
-                                                            .session
-                                                            .as_ref()
-                                                            .is_some_and(|s| sessions.contains_key(s))
-                                                            && ui.small_button("reopen").clicked() =>
-                                                    {
-                                                        actions.push((task.id.clone(), "review"));
-                                                    }
-                                                    _ => {}
-                                                }
-                                                if task.id != plan::REVIEW_TASK
-                                                    && task.branch.is_some()
-                                                    && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
-                                                {
-                                                    let busy = integrating.contains(&task.id);
-                                                    let label = if busy { "integrating…" } else { "integrate" };
-                                                    if ui
-                                                        .add_enabled(!busy, egui::Button::new(label).small())
-                                                        .on_hover_text(format!(
-                                                            "Commit its changes and merge it into {integration}"
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        actions.push((task.id.clone(), "integrate"));
-                                                    }
-                                                }
-                                            });
-                                        });
-                                    });
+                                card(ui, task);
                                 ui.add_space(6.0);
                             }
                         });
                 }
             });
+        });
+    } else if !tasks.is_empty() {
+        // A phone stacks the statuses that have tasks, one under the other, each card the screen's width.
+        egui::ScrollArea::vertical().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
+            for status in TaskStatus::ALL {
+                let count = tasks.iter().filter(|t| t.status == status).count();
+                if count == 0 {
+                    continue;
+                }
+                ui.add_space(4.0);
+                heading(ui, status, count);
+                ui.add_space(2.0);
+                for task in tasks.iter_mut().filter(|t| t.status == status) {
+                    card(ui, task);
+                    ui.add_space(8.0);
+                }
+            }
         });
     }
 

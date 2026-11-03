@@ -8,6 +8,7 @@ use super::*;
 use crate::driver::Status;
 use crate::fake_host;
 use crate::gesture::{Kind, Phase, Pointer};
+use crate::screens::MAX_TYPED_BYTES;
 use crate::views::{self, Tab, View};
 use crate::world::World;
 
@@ -129,6 +130,7 @@ fn the_phone_shows_the_desktops_grid_and_resizes_only_when_asked() {
     let frame_rect = view.term.overlay.rect.unwrap();
     let fit = fit_size(&Frame {
         rect: frame_rect,
+        pad: vec2(PAD, PAD),
         origin: frame_rect.min,
         size: font,
         cell: vec2(1.0, 1.0),
@@ -225,8 +227,23 @@ fn a_paste_over_the_limit_is_not_typed_and_says_so() {
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste)]);
     assert_eq!(typed(&world), "a");
     let notice = world.driver.remote.notice().expect("a note");
-    assert!(notice.starts_with("Too much to type at once"), "{notice}");
+    assert!(notice.starts_with("Too much to type at once") && notice.contains("up to 1 MiB"), "{notice}");
     assert!(view.term.typing(), "still typing: only the paste was refused");
+}
+
+#[test]
+fn a_paste_before_the_grant_names_the_smaller_limit() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    // The tap asks for the lease; the paste in the same frame would wait for the grant.
+    let paste = "p".repeat(MAX_WAITING_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Paste(paste)]);
+    assert_eq!(typed(&world), "");
+    let notice = world.driver.remote.notice().expect("a note");
+    assert!(notice.contains("Up to 16 KiB waits") && !notice.contains("MiB"), "{notice}");
+    // Once granted, the same paste is typed.
+    let paste = "q".repeat(MAX_WAITING_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste.clone())]);
+    assert_eq!(typed(&world), paste);
 }
 
 #[test]
@@ -365,13 +382,15 @@ fn the_phone_layout_at_phone_widths() {
         let rect = view.term.overlay.rect.expect("a terminal");
         assert_eq!(rect.width(), size.0, "{size:?}: the terminal fills the width");
         assert!(rect.bottom() <= size.1 - crate::layout::BOTTOM_BAR, "{size:?}: above the pane switcher");
-        // Typing: the key bar's space replaces the switcher, and the terminal grows into it.
+        // Typing: the key bar's space replaces the switcher, and the terminal grows into it. The page says
+        // how tall the key bar is in CSS pixels.
         view.viewport.keybar = 88.0;
         view.term.inputs.push(TermInput::Focus(true));
         frame(&ctx, &mut world, &mut client, &mut view, size);
         frame(&ctx, &mut world, &mut client, &mut view, size);
         let typing = view.term.overlay.rect.unwrap();
-        assert_eq!(typing.bottom(), size.1 - 88.0, "{size:?}");
+        // egui rounds the layout to 1/32 of a point.
+        assert!((typing.bottom() - (size.1 - 88.0 / crate::layout::ZOOM)).abs() < 0.05, "{size:?}: {typing:?}");
         // Every pane draws at this width.
         for tab in [Tab::Board, Tab::Plans, Tab::Diffs, Tab::Approvals, Tab::Chief] {
             view.tab = tab;

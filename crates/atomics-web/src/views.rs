@@ -1,9 +1,10 @@
 //! The frame's screens: Board, Plans, Approvals, Diffs, an agent's Terminal and the Chief, drawn by
 //! atomics-ui's draw functions over the remote backend, and terminals by [`TermPane`]. Two layouts
 //! ([`crate::layout`]): on a desktop a top bar with the connection's state and a tab per view; on a phone
-//! one pane at a time, switched from a bottom bar, inside the part of the viewport the user sees. After
-//! each draw the commands the user gave are carried out: a view command here, any other through the
-//! backend.
+//! one pane at a time, switched from a bottom bar, inside the part of the viewport the user sees, in the
+//! phone's look ([`Looks`]): the theme's colours, zoomed, spaced for a finger, with the shared views fitted
+//! to a phone ([`atomics_ui::touch`]). After each draw the commands the user gave are carried out: a view
+//! command here, any other through the backend.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -11,10 +12,12 @@ use std::sync::Arc;
 
 use atomics_core::noise;
 use atomics_core::ops::Grant;
+use atomics_core::theme::ThemeTokens;
 use atomics_core::wire::Role;
-use atomics_ui::theme::{FontHook, Fonts, Palette, definitions};
-use atomics_ui::{Backend, Client, Command, PanelMode, ViewHints, approvals, board, diff_panel};
-use egui::{Align, Align2, Layout, Rect, RichText, Sense, pos2, vec2};
+use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
+use atomics_ui::touch::{self, Touch};
+use atomics_ui::{Backend, Client, Command, PanelMode, PlanRow, ViewHints, approvals, board, diff_panel};
+use egui::{Align, Layout, Rect, RichText, Sense, Stroke, TextStyle, pos2, vec2};
 
 use crate::boot::Boot;
 use crate::driver::{Driver, Status};
@@ -80,6 +83,7 @@ pub struct View {
     pub now_ms: f64,
     /// The last frame drew the phone layout.
     pub compact: bool,
+    pub looks: Looks,
 }
 
 /// egui's bundled fonts: a browser has no font lookup, and a theme's named fonts are the desktop's.
@@ -91,11 +95,73 @@ impl FontHook for BundledFonts {
     }
 }
 
-/// Look as the hosting page does: its theme, or a built-in one of its scheme.
-pub fn apply_theme(ctx: &egui::Context, client: &mut Client, boot: &Boot) {
-    let palette = Arc::new(Palette::new(&boot.theme_tokens(), Fonts::default()));
-    palette.apply(ctx, &BundledFonts);
-    client.palette = palette;
+/// The theme in each layout's look: as the desktop draws it, and on a phone with proportional UI text
+/// (monospace stays for code, terminals and IDs), zoomed by [`layout::ZOOM`] through the theme's UI size,
+/// with controls a finger's size and room between them.
+pub struct Looks {
+    pub desktop: Arc<Palette>,
+    pub phone: Arc<Palette>,
+    /// The look egui has: the phone's (`true`) or the desktop's; `None` until a frame gives it one.
+    applied: Option<bool>,
+}
+
+impl Looks {
+    pub fn new(tokens: &ThemeTokens) -> Looks {
+        let mut phone = tokens.clone();
+        phone.mono_ui = Some(false);
+        let zoomed = Fonts { ui_size: Some(UI_SIZE * layout::ZOOM), ..Fonts::default() };
+        Looks {
+            desktop: Arc::new(Palette::new(tokens, Fonts::default())),
+            phone: Arc::new(Palette::new(&phone, zoomed)),
+            applied: None,
+        }
+    }
+
+    /// Give egui and the client the look of the layout this frame draws. A change discards the frame, and
+    /// egui draws it again at the look's zoom.
+    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, compact: bool) {
+        client.touch = compact.then_some(Touch { target: layout::TOUCH, gutter: layout::GUTTER });
+        if self.applied == Some(compact) {
+            return;
+        }
+        let palette = if compact { &self.phone } else { &self.desktop };
+        palette.apply(ctx, &BundledFonts);
+        if compact {
+            ctx.all_styles_mut(phone_style);
+        }
+        client.palette = palette.clone();
+        self.applied = Some(compact);
+        ctx.request_discard("the layout changed");
+    }
+}
+
+impl Default for Looks {
+    fn default() -> Self {
+        let tokens = atomics_core::theme::builtin(atomics_core::theme::DEFAULT).expect("the default theme is built in");
+        Looks::new(&tokens)
+    }
+}
+
+/// The phone's spacing and text sizes, in its zoomed points.
+fn phone_style(style: &mut egui::Style) {
+    let spacing = &mut style.spacing;
+    spacing.interact_size = vec2(layout::TOUCH, layout::TOUCH);
+    spacing.button_padding = vec2(10.0, 4.0);
+    spacing.item_spacing = vec2(8.0, 6.0);
+    spacing.menu_margin = egui::Margin::same(6);
+    spacing.icon_width = 16.0;
+    spacing.icon_width_inner = 9.0;
+    spacing.icon_spacing = 6.0;
+    for (text, size) in [(TextStyle::Small, 10.5), (TextStyle::Monospace, 11.0), (TextStyle::Heading, 16.0)] {
+        if let Some(font) = style.text_styles.get_mut(&text) {
+            font.size = size;
+        }
+    }
+}
+
+/// Look as the hosting page does: its theme, or a built-in one of its scheme, from the next frame on.
+pub fn apply_theme(view: &mut View, boot: &Boot) {
+    view.looks = Looks::new(&boot.theme_tokens());
 }
 
 /// One frame, and then what the user asked for in it.
@@ -104,7 +170,10 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     open_ticket(driver, view);
     view.term.begin_frame();
     let screen = ui.max_rect();
-    view.compact = layout::compact(screen.width(), view.viewport.coarse, view.layout);
+    // The layout follows the page's width in CSS pixels, which the phone's zoom leaves as they are.
+    view.compact = layout::compact(screen.width() * ui.ctx().zoom_factor(), view.viewport.coarse, view.layout);
+    view.looks.apply(ui.ctx(), client, view.compact);
+    view.term.touch = client.touch;
     let p = client.palette.clone();
     if view.compact {
         phone(ui, screen, driver, client, view);
@@ -146,12 +215,15 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     // The key bar's space replaces the switcher while it shows (a touch device typing); with a mouse the
     // switcher stays.
     let typing = view.tab.terminal() && view.term.typing() && view.viewport.keybar > 0.0;
-    let regions = layout::regions(screen, &view.viewport, typing);
-    ui.painter().rect_filled(regions.top.with_min_y(screen.top()), 0.0, p.topbar);
-    region(ui, regions.top.shrink2(vec2(12.0, 0.0)), "phone-top", |ui| phone_top(ui, driver, view, &p));
+    let regions = layout::regions(screen, &view.viewport.points(ui.ctx().zoom_factor()), typing);
+    // The bars' colour reaches the screen's edges, under the notch and the home indicator.
+    let top = Rect::from_x_y_ranges(screen.x_range(), screen.top()..=regions.top.bottom());
+    ui.painter().rect_filled(top, 0.0, p.topbar);
+    region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| phone_top(ui, driver, view, &p));
     region(ui, regions.body, "phone-body", |ui| body(ui, driver, client, view));
+    ui.painter().hline(screen.x_range(), top.bottom() - 0.5, Stroke::new(1.0, p.separator));
     if let Some(bar) = regions.bar {
-        pane_bar(ui, bar, driver, view, &p);
+        pane_bar(ui, bar, screen, driver, view, &p);
     }
     if let Some(keys) = regions.keybar {
         ui.painter().rect_filled(keys, 0.0, p.topbar);
@@ -161,18 +233,15 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
 fn phone_top(ui: &mut egui::Ui, driver: &Driver, view: &mut View, p: &Palette) {
     let approvals = driver.remote.with_mirror(|m| m.approvals.len());
     ui.horizontal_centered(|ui| {
-        ui.label(RichText::new("ATOMICS").color(p.accent).strong());
+        ui.label(RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace());
         let (text, good) = status_line(driver);
-        ui.label(RichText::new(text).color(status_color(good, p)).small());
+        ui.label(RichText::new(text).color(status_color(good, p)).size(11.0));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             layout_menu(ui, view);
             if approvals > 0 {
                 let badge = RichText::new(format!("◆ {approvals}")).color(p.warning).strong();
-                if ui
-                    .add(egui::Button::new(badge).min_size(vec2(layout::TOUCH, 30.0)))
-                    .on_hover_text("Approvals")
-                    .clicked()
-                {
+                let button = egui::Button::new(badge).min_size(vec2(layout::TOUCH, layout::TOUCH));
+                if ui.add(button).on_hover_text("Approvals").clicked() {
                     view.tab = Tab::Approvals;
                 }
             }
@@ -182,7 +251,9 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, view: &mut View, p: &Palette) {
 
 /// "Layout": automatic (from the screen), phone or desktop.
 fn layout_menu(ui: &mut egui::Ui, view: &mut View) {
-    ui.menu_button("⋯", |ui| {
+    let button = egui::Button::new("⋯");
+    let button = if view.compact { button.min_size(vec2(layout::TOUCH, layout::TOUCH)) } else { button };
+    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
         ui.label(RichText::new("Layout").small());
         for (mode, label) in
             [(LayoutMode::Auto, "Automatic"), (LayoutMode::Phone, "Phone"), (LayoutMode::Desktop, "Desktop")]
@@ -195,10 +266,10 @@ fn layout_menu(ui: &mut egui::Ui, view: &mut View) {
     });
 }
 
-/// The phone layout's pane switcher.
-fn pane_bar(ui: &mut egui::Ui, bar: Rect, driver: &Driver, view: &mut View, p: &Palette) {
-    ui.painter().rect_filled(bar, 0.0, p.topbar);
-    ui.painter().line_segment([bar.left_top(), bar.right_top()], egui::Stroke::new(1.0, p.separator));
+/// The phone layout's pane switcher: its colour across the screen, its panes inside the safe area.
+fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &mut View, p: &Palette) {
+    ui.painter().rect_filled(Rect::from_x_y_ranges(screen.x_range(), bar.y_range()), 0.0, p.topbar);
+    ui.painter().hline(screen.x_range(), bar.top(), Stroke::new(1.0, p.separator));
     let waiting = driver
         .remote
         .with_mirror(|m| m.approvals.values().any(|a| m.sessions.get(&a.session).is_some_and(|s| !s.chief)));
@@ -217,8 +288,14 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, driver: &Driver, view: &mut View, p: &
                 Rect::from_min_size(item.left_top() + vec2(item.width() * 0.25, 0.0), vec2(item.width() * 0.5, 2.0));
             ui.painter().rect_filled(line, 1.0, p.accent);
         }
-        let text = if *tab == Tab::Terminal && waiting { format!("{label} ◆") } else { label.to_string() };
-        ui.painter().text(item.center(), Align2::CENTER_CENTER, text, p.ui(12.5), color);
+        let galley = ui.painter().layout_no_wrap(label.to_string(), p.ui(12.0), color);
+        let at = item.center() - galley.size() / 2.0;
+        let end = at.x + galley.size().x;
+        ui.painter().galley(at, galley, color);
+        // An agent waits on an approval: a dot by the Terminal pane's name.
+        if *tab == Tab::Terminal && waiting {
+            ui.painter().circle_filled(pos2(end + 5.0, at.y + 3.0), 3.0, p.warning);
+        }
         if response.clicked() {
             view.tab = *tab;
         }
@@ -301,16 +378,67 @@ fn top(ui: &mut egui::Ui, driver: &mut Driver, view: &mut View, p: &Palette) {
     });
 }
 
-fn notice(ui: &mut egui::Ui, driver: &Driver) {
+fn notice(ui: &mut egui::Ui, driver: &Driver, touch: Option<Touch>) {
     let remote = &driver.remote;
     if let Some(notice) = remote.notice() {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(notice).small());
-            if ui.small_button("×").on_hover_text("Dismiss").clicked() {
+            if touch::small_button(ui, touch, "×").on_hover_text("Dismiss").clicked() {
                 remote.dismiss_notice();
             }
         });
     }
+}
+
+/// The space a phone keeps between the screen's sides and text; none on a desktop.
+fn gutter(client: &Client) -> f32 {
+    client.touch.map_or(0.0, |touch| touch.gutter)
+}
+
+/// `add`, `gutter` away from both sides, below what the ui holds already.
+fn padded<R>(ui: &mut egui::Ui, gutter: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    if gutter <= 0.0 {
+        return add(ui);
+    }
+    let rect = ui.available_rect_before_wrap().shrink2(vec2(gutter, 0.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+    let inner = add(&mut child);
+    ui.advance_cursor_after_rect(child.min_rect());
+    inner
+}
+
+/// A phone's list: rows a finger can tap, scrolling under the top bar.
+fn list(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_space(8.0);
+        add(ui);
+    });
+}
+
+/// One row of a phone's list: a card as wide as the list and at least a finger tall, tapped as a whole.
+fn list_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    add: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let card = egui::Frame::new()
+        .fill(p.raised)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(10, 8));
+    let shown = card.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_min_height(layout::TOUCH - 16.0);
+        ui.style_mut().interaction.selectable_labels = false;
+        add(ui);
+    });
+    let response = ui.interact(shown.response.rect, ui.scope_id().with(("row", id)), Sense::click());
+    if response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(shown.response.rect, 4.0, p.hover());
+    }
+    ui.add_space(8.0);
+    response.clicked()
 }
 
 fn centred(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -322,73 +450,79 @@ fn centred(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 
 fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
     let p = client.palette.clone();
+    // A phone keeps text off the screen's sides; the panes that reach them keep to the gutter themselves.
+    let gutter = gutter(client);
     let has_board = driver.remote.with_mirror(|m| !m.plans.is_empty() || !m.sessions.is_empty());
     match driver.status().clone() {
         Status::Pairing { code } => {
-            return centred(ui, |ui| {
-                ui.label(RichText::new("Pairing this browser with your computer").size(18.0));
-                ui.add_space(16.0);
-                match code {
-                    Some(code) => {
-                        ui.label(RichText::new(noise::show_code(&code)).monospace().size(40.0).color(p.accent));
-                        ui.add_space(16.0);
-                        ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
+            return padded(ui, gutter, |ui| {
+                centred(ui, |ui| {
+                    ui.label(RichText::new("Pairing this browser with your computer").size(18.0));
+                    ui.add_space(16.0);
+                    match code {
+                        Some(code) => {
+                            ui.label(RichText::new(noise::show_code(&code)).monospace().size(40.0).color(p.accent));
+                            ui.add_space(16.0);
+                            ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
+                        }
+                        None if driver.pairing_busy() => {
+                            let busy = "Another device is pairing with the computer right now. Trying again…";
+                            ui.label(RichText::new(busy).color(p.muted));
+                        }
+                        None => {
+                            ui.label(RichText::new("Connecting…").color(p.muted));
+                        }
                     }
-                    None if driver.pairing_busy() => {
-                        ui.label(
-                            RichText::new(
-                                "No pairing is open on the computer right now; another device may be pairing. Trying again…",
-                            )
-                            .color(p.muted),
-                        );
-                    }
-                    None => {
-                        ui.label(RichText::new("Connecting…").color(p.muted));
-                    }
-                }
+                })
             });
         }
         Status::ConfirmRepair => {
-            return centred(ui, |ui| {
-                ui.label(RichText::new("Pair this browser again?").size(18.0));
-                ui.add_space(16.0);
-                ui.label(
-                    "This browser is already paired with this computer, under another key. Pairing again replaces it. \
-                     Go on only if you started this pairing yourself, just now, from Remote devices in ATOMICS on the computer.",
-                );
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Pair again").clicked() {
-                        driver.repair(true);
-                    }
-                    if ui.button("Keep the current pairing").clicked() {
-                        driver.repair(false);
-                    }
-                });
+            return padded(ui, gutter, |ui| {
+                centred(ui, |ui| {
+                    ui.label(RichText::new("Pair this browser again?").size(18.0));
+                    ui.add_space(16.0);
+                    ui.label(
+                        "This browser is already paired with this computer, under another key. Pairing again \
+                         replaces it. Go on only if you started this pairing yourself, just now, from Remote devices \
+                         in ATOMICS on the computer.",
+                    );
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Pair again").clicked() {
+                            driver.repair(true);
+                        }
+                        if ui.button("Keep the current pairing").clicked() {
+                            driver.repair(false);
+                        }
+                    });
+                })
             });
         }
         Status::Stopped(stop) if !has_board => {
-            return centred(ui, |ui| {
-                ui.label(stop.message());
+            return padded(ui, gutter, |ui| {
+                centred(ui, |ui| {
+                    ui.label(stop.message());
+                })
             });
         }
         Status::Stopped(stop) => {
-            ui.label(RichText::new(stop.message()).color(p.error));
+            padded(ui, gutter, |ui| ui.label(RichText::new(stop.message()).color(p.error)));
         }
         Status::Reconnecting { .. } if has_board => {
-            ui.label(
-                RichText::new("Reconnecting. The board may be out of date, and nothing can be changed until the computer is back.")
-                    .color(p.warning),
-            );
+            let stale = "Reconnecting. The board may be out of date, and nothing can be changed until the computer \
+                         is back.";
+            padded(ui, gutter, |ui| ui.label(RichText::new(stale).color(p.warning)));
         }
         Status::Waiting | Status::Connecting | Status::Reconnecting { .. } if !has_board => {
-            return centred(ui, |ui| {
-                ui.label(RichText::new("Connecting to your computer…").color(p.muted));
+            return padded(ui, gutter, |ui| {
+                centred(ui, |ui| {
+                    ui.label(RichText::new("Connecting to your computer…").color(p.muted));
+                })
             });
         }
         _ => {}
     }
-    notice(ui, driver);
+    padded(ui, gutter, |ui| notice(ui, driver, client.touch));
     let backend: &dyn Backend = &driver.remote;
     match view.tab {
         Tab::Board => board_tab(ui, backend, client, view),
@@ -410,21 +544,28 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
     let session =
         view.session.clone().filter(|id| agents.iter().any(|s| &s.id == id)).unwrap_or_else(|| agents[0].id.clone());
     let p = client.palette.clone();
-    ui.horizontal(|ui| {
-        let title = |s: &atomics_ui::SessionRow| {
-            if s.pending_approvals > 0 { format!("◆ {}", s.title) } else { s.title.clone() }
-        };
-        let current = agents.iter().find(|s| s.id == session).map(title).unwrap_or_default();
-        egui::ComboBox::from_id_salt("terminal-session")
-            .selected_text(RichText::new(current).color(p.foreground))
-            .width(ui.available_width().min(320.0))
-            .show_ui(ui, |ui| {
-                for agent in &agents {
-                    if ui.selectable_label(agent.id == session, title(agent)).clicked() {
-                        view.session = Some(agent.id.clone());
+    let gutter = gutter(client);
+    if gutter > 0.0 {
+        ui.add_space(6.0);
+    }
+    padded(ui, gutter, |ui| {
+        ui.horizontal(|ui| {
+            let title = |s: &atomics_ui::SessionRow| {
+                if s.pending_approvals > 0 { format!("◆ {}", s.title) } else { s.title.clone() }
+            };
+            let current = agents.iter().find(|s| s.id == session).map(title).unwrap_or_default();
+            let width = if gutter > 0.0 { ui.available_width() } else { ui.available_width().min(320.0) };
+            egui::ComboBox::from_id_salt("terminal-session")
+                .selected_text(RichText::new(current).color(p.foreground))
+                .width(width)
+                .show_ui(ui, |ui| {
+                    for agent in &agents {
+                        if ui.selectable_label(agent.id == session, title(agent)).clicked() {
+                            view.session = Some(agent.id.clone());
+                        }
                     }
-                }
-            });
+                });
+        });
     });
     let session = view.session.clone().filter(|id| agents.iter().any(|s| &s.id == id)).unwrap_or(session);
     let now = view.now_ms;
@@ -444,8 +585,10 @@ fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
 
 fn empty(ui: &mut egui::Ui, client: &Client, text: &str) {
     let muted = client.palette.muted;
-    centred(ui, |ui| {
-        ui.label(RichText::new(text).color(muted));
+    padded(ui, gutter(client), |ui| {
+        centred(ui, |ui| {
+            ui.label(RichText::new(text).color(muted));
+        })
     });
 }
 
@@ -464,13 +607,16 @@ fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view
     view.plan = view.plan.min(plans.len() - 1);
     if plans.len() > 1 {
         let p = client.palette.clone();
-        ui.horizontal_wrapped(|ui| {
-            for (index, row) in plans.iter().enumerate() {
-                let label = RichText::new(row.state.label(&row.tab_name)).color(row.state.color(&p));
-                if ui.selectable_label(index == view.plan, label).clicked() {
-                    client.send(Command::ShowPlan(index));
+        let gutter = gutter(client);
+        padded(ui, gutter, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (index, row) in plans.iter().enumerate() {
+                    let label = RichText::new(row.state.label(&row.tab_name)).color(row.state.color(&p));
+                    if ui.selectable_label(index == view.plan, label).clicked() {
+                        client.send(Command::ShowPlan(index));
+                    }
                 }
-            }
+            })
         });
     }
     fill(ui, |ui, rect| board::draw(ui, rect, view.plan, backend, client));
@@ -482,6 +628,21 @@ fn plans_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         return empty(ui, client, "No plans on this computer yet.");
     }
     let p = client.palette.clone();
+    if client.touch.is_some() {
+        return padded(ui, gutter(client), |ui| {
+            list(ui, |ui| {
+                for (index, row) in plans.iter().enumerate() {
+                    let tapped = list_row(ui, &p, ("plan", index), |ui| {
+                        ui.label(RichText::new(row.state.label(&row.goal)).color(row.state.color(&p)).size(13.5));
+                        ui.label(RichText::new(plan_facts(row)).color(p.muted).small());
+                    });
+                    if tapped {
+                        client.send(Command::ShowPlan(index));
+                    }
+                }
+            })
+        });
+    }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for (index, row) in plans.iter().enumerate() {
             ui.horizontal_wrapped(|ui| {
@@ -489,15 +650,20 @@ fn plans_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 if ui.add(egui::Button::new(label).frame(false)).clicked() {
                     client.send(Command::ShowPlan(index));
                 }
-                let mut facts = format!("{}/{} done", row.done, row.total);
-                if row.attention > 0 {
-                    facts.push_str(&format!(" · {} need review", row.attention));
-                }
-                ui.label(RichText::new(facts).color(p.muted).small());
+                ui.label(RichText::new(plan_facts(row)).color(p.muted).small());
             });
             ui.separator();
         }
     });
+}
+
+/// A plan's progress: its tasks done, and those waiting for a review.
+fn plan_facts(row: &PlanRow) -> String {
+    let mut facts = format!("{}/{} done", row.done, row.total);
+    if row.attention > 0 {
+        facts.push_str(&format!(" · {} need review", row.attention));
+    }
+    facts
 }
 
 fn approvals_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
@@ -508,14 +674,21 @@ fn approvals_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
         return empty(ui, client, "Nothing is waiting for you.");
     }
     let p = client.palette.clone();
+    // On a phone the banners span the screen, as over a terminal, and the rest keeps to the gutter.
+    let gutter = gutter(client);
     if driver.remote.welcome().is_some() && !driver.remote.may(Grant::Approve) {
-        ui.label(RichText::new("This browser may only view this computer.").color(p.muted));
+        padded(ui, gutter, |ui| ui.label(RichText::new("This browser may only view this computer.").color(p.muted)));
     }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        if gutter > 0.0 {
+            ui.add_space(8.0);
+        }
         for index in waiting {
             let session = &sessions[index];
-            ui.label(RichText::new(&session.title).strong());
-            ui.label(RichText::new(backend.display(&session.root)).color(p.muted).small());
+            padded(ui, gutter, |ui| {
+                ui.label(RichText::new(&session.title).strong());
+                ui.label(RichText::new(backend.display(&session.root)).color(p.muted).small());
+            });
             let top = ui.cursor().min;
             let width = ui.available_width();
             // The banner takes what it needs of this; the rest stays free.
@@ -540,11 +713,32 @@ fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     let rows: Vec<(String, usize, usize, usize)> = driver.remote.with_mirror(|m| {
         m.diffs.values().map(|d| (d.worktree.clone(), d.files.len(), d.additions(), d.deletions())).collect()
     });
+    let name =
+        |worktree: &str| Path::new(worktree).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if client.touch.is_some() {
+        return padded(ui, gutter(client), |ui| {
+            list(ui, |ui| {
+                for (worktree, files, added, removed) in rows {
+                    let tapped = list_row(ui, &p, ("diff", &worktree), |ui| {
+                        ui.label(RichText::new(name(&worktree)).color(p.foreground).strong().size(13.5));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("+{added}")).color(p.success));
+                            ui.label(RichText::new(format!("−{removed}")).color(p.error));
+                            ui.label(RichText::new(format!("{files} files")).color(p.muted));
+                        });
+                        ui.add(egui::Label::new(RichText::new(&worktree).color(p.muted).monospace()).truncate());
+                    });
+                    if tapped {
+                        client.send(Command::ShowRoot(PathBuf::from(&worktree)));
+                    }
+                }
+            })
+        });
+    }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for (worktree, files, added, removed) in rows {
             ui.horizontal_wrapped(|ui| {
-                let name =
-                    Path::new(&worktree).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = name(&worktree);
                 if ui.add(egui::Button::new(RichText::new(name).size(14.0)).frame(false)).clicked() {
                     client.send(Command::ShowRoot(PathBuf::from(&worktree)));
                 }
