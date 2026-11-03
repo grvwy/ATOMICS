@@ -205,6 +205,13 @@ impl Journal {
         Ok(journal)
     }
 
+    /// Why the journal cannot be written, once it could not: kept until the host restarts (no
+    /// record may follow one that failed), so new client mutations are refused meanwhile. The
+    /// desktop's Remote devices and `atomics ctl '{"cmd":"remote"}'` show it.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Operations remembered, for tests and diagnostics.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
@@ -371,8 +378,10 @@ mod tests {
         let path = dir.path().join("ops.jsonl");
         let mut journal = Journal::open(&path, 0).unwrap();
         assert_eq!(begin(&mut journal, &steer("old", "x"), 0), Begun::Fresh);
+        assert_eq!(journal.error(), None);
         assert!(journal.compact_with(|_| Err(io::Error::other("injected reopen failure"))).is_err());
         assert!(journal.log.is_none());
+        assert_eq!(journal.error(), Some("injected reopen failure"), "kept, for the desktop to show");
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(begin(&mut journal, &steer("new", "x"), 0), Begun::Unwritable(_)));
         assert_eq!(std::fs::read(&path).unwrap(), before);

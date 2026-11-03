@@ -159,6 +159,17 @@ fn a_pairing_boot_reads_the_links_keys() {
     let pairing = boot.pairing.as_ref().expect("a pairing");
     assert_eq!((pairing.host_id.as_str(), pairing.host_key.text()), (HOST, host_key.clone()));
     assert!(!format!("{boot:?}").contains(&psk), "Debug never shows the psk");
+    assert_eq!(boot.pairing_age_ms, 0, "no age: the link's time runs from the boot");
+
+    // How long ago the page got the link; a malformed age counts as none, and refuses nothing.
+    for (age, read_as) in
+        [(json!(90_000), 90_000), (json!(1500.7), 1500), (json!(-5), 0), (json!("90000"), 0), (json!(null), 0)]
+    {
+        let mut aged = message.clone();
+        aged["pair"]["age_ms"] = age.clone();
+        let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &aged) else { panic!("a boot with age {age}") };
+        assert_eq!(boot.pairing_age_ms, read_as, "age {age}");
+    }
 
     for (field, value) in [
         ("v", json!(2)),

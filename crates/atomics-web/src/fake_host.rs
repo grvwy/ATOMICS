@@ -46,6 +46,8 @@ pub struct FakeHost {
     secret: Secret,
     pub allowed: Vec<(PublicKey, Access)>,
     pub pairing: Option<Pairing>,
+    /// Another device is pairing with [`FakeHost::pairing`]: a device answering it is told to wait.
+    pub busy: bool,
     /// What a pairing's user answers: the device's access, or `None` to refuse it.
     pub answer: Option<Access>,
     /// The code this host showed for the last pairing.
@@ -253,6 +255,7 @@ impl FakeHost {
             secret: Secret::generate().unwrap(),
             allowed: Vec::new(),
             pairing: None,
+            busy: false,
             answer: Some(Access::Control),
             code: None,
             named: None,
@@ -419,7 +422,13 @@ impl FakeHost {
             Some(Stage::First) => {
                 let kind = Kind::of(message).map_err(|_| close::REFUSED)?;
                 let psk = match kind {
-                    Kind::Pair => Some(self.pairing.as_ref().ok_or(close::NO_PAIRING)?.psk().clone()),
+                    Kind::Pair => {
+                        let pairing = self.pairing.as_ref().ok_or(close::NO_PAIRING)?;
+                        if self.busy {
+                            return Err(close::PAIRING_BUSY);
+                        }
+                        Some(pairing.psk().clone())
+                    }
                     Kind::Session => None,
                 };
                 let responder =

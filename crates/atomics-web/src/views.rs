@@ -336,10 +336,8 @@ fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                     }
                     None if driver.pairing_busy() => {
                         ui.label(
-                            RichText::new(
-                                "No pairing is open on the computer right now; another device may be pairing. Trying again…",
-                            )
-                            .color(p.muted),
+                            RichText::new("Another device is pairing with the computer right now. Trying again…")
+                                .color(p.muted),
                         );
                     }
                     None => {

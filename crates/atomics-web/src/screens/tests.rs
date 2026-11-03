@@ -209,7 +209,7 @@ fn a_slow_program_gets_at_most_a_mebibyte_again_per_change_and_more_than_may_wai
 
     let over = "x".repeat(MAX_TYPED_BYTES + 1);
     let before = typed_bytes(&world);
-    assert_eq!(type_text(&mut world, "s1", &over), Err(Refused::TooMuch), "a paste over the limit");
+    assert_eq!(type_text(&mut world, "s1", &over), Err(Refused::TooMuch(MAX_TYPED_BYTES)), "a paste over the limit");
     assert_eq!(typed_bytes(&world), before, "is not typed at all");
 
     // Two pastes of a mebibyte, sent before the program stopped reading the first: both come back.
@@ -221,7 +221,7 @@ fn a_slow_program_gets_at_most_a_mebibyte_again_per_change_and_more_than_may_wai
     world.driver.flush();
     world.pump();
     assert_eq!(world.host.terminals["s1"].typed, "a");
-    assert_eq!(type_text(&mut world, "s1", "z"), Err(Refused::TooMuch), "no more waits behind them");
+    assert_eq!(type_text(&mut world, "s1", "z"), Err(Refused::TooMuch(MAX_TYPED_BYTES)), "no more waits behind them");
 
     // A change while the program still does not read: one mebibyte is typed again, not all of it.
     let before = typed_bytes(&world);
@@ -392,7 +392,7 @@ fn text_waiting_for_the_grant_is_bounded() {
     world.driver.remote.acquire("s1", false);
     let most = "w".repeat(MAX_WAITING_BYTES);
     assert_eq!(world.driver.remote.type_text("s1", &most), Ok(()));
-    assert_eq!(world.driver.remote.type_text("s1", "!"), Err(Refused::TooMuch));
+    assert_eq!(world.driver.remote.type_text("s1", "!"), Err(Refused::TooMuch(MAX_WAITING_BYTES)));
     world.driver.flush();
     world.pump();
     assert_eq!(world.host.terminals["s1"].typed, most);

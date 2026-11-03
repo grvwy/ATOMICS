@@ -69,7 +69,7 @@ pub enum Stop {
     NotPaired,
     /// The channel was closed as not paired, but the host did not say so itself: the key is kept.
     NotPairedUnconfirmed,
-    /// No pairing is open on the host.
+    /// The pairing link was used or has expired (or the host withdrew it): only a new one helps.
     NoPairing,
     /// The host's user refused this browser: the codes differed.
     PairRefused,
@@ -98,9 +98,7 @@ impl Stop {
             Stop::NotPairedUnconfirmed => {
                 "The connection was closed as not paired, but the computer did not confirm it, so this browser keeps its key. Reload the page to try again; if this keeps happening, pair again from Remote devices."
             }
-            Stop::NoPairing => {
-                "No pairing is open on the computer: it expired, was used, or another device is pairing. Start a new one from Remote devices."
-            }
+            Stop::NoPairing => "This pairing link was used or has expired. Show a new code on the computer.",
             Stop::PairRefused => "The computer refused this browser: the codes did not match.",
             Stop::PairFailed => "The pairing link was not accepted. Start a new pairing from Remote devices.",
             Stop::PairInterrupted => "The connection dropped while pairing. Start a new pairing from Remote devices.",
@@ -175,10 +173,11 @@ pub struct Driver {
     device: Option<Device>,
     /// A pairing boot's link and the key this browser pairs with, until the host accepts it.
     pairing: Option<(Pairing, Secret)>,
-    /// When a pairing boot's link has surely expired (its lifetime after the boot): until then a host
-    /// with no pairing open for this device is asked again.
+    /// When a pairing boot's link has surely expired: its lifetime after the hosting page got it
+    /// ([`Boot::pairing_age_ms`] before the boot). Until then a host busy pairing another device is
+    /// asked again.
     pair_until_ms: u64,
-    /// The last try found no pairing open on the host, and another is due.
+    /// The last try found the host pairing another device, and another try is due.
     pair_busy: bool,
     /// [`Output::LoadDevice`] went out and its answer has not come.
     loading: bool,
@@ -252,13 +251,14 @@ impl Driver {
                 self.ticket = Some(boot.ticket.clone());
                 let host_id = boot.host_id.clone();
                 let pairing = boot.pairing.clone();
+                let lifetime_ms = (PAIRING_LIFETIME_SECS * 1000).saturating_sub(boot.pairing_age_ms);
                 self.boot = Some(boot);
                 match pairing {
                     // Pairing: first, whether this browser already holds a key for the host.
                     Some(pairing) => match Secret::generate() {
                         Ok(secret) => {
                             self.pairing = Some((pairing, secret));
-                            self.pair_until_ms = self.now_ms + PAIRING_LIFETIME_SECS * 1000;
+                            self.pair_until_ms = self.now_ms + lifetime_ms;
                             self.status = Status::Pairing { code: None };
                             self.load(host_id);
                         }
@@ -326,7 +326,7 @@ impl Driver {
         self.dial();
     }
 
-    /// Whether the last pairing try found no pairing open on the host, and the frame tries again.
+    /// Whether the last pairing try found the host pairing another device, and the frame tries again.
     pub fn pairing_busy(&self) -> bool {
         self.pair_busy && matches!(self.status, Status::Pairing { .. })
     }
@@ -489,8 +489,9 @@ impl Driver {
     fn ended(&mut self, end: End) {
         let pairing = self.pairing.is_some();
         let compared = matches!(self.status, Status::Pairing { code: Some(_) });
-        // Another device may hold the host's pairing for a while: try again while the link may be valid.
-        let busy = matches!(end, End::Code(close::NO_PAIRING)) && pairing && self.now_ms < self.pair_until_ms;
+        // Another device holds the host's pairing link for a while: try again while the link may be valid.
+        // A used or expired link (`no_pairing`) cannot come back, so it stops at once.
+        let busy = matches!(end, End::Code(close::PAIRING_BUSY)) && pairing && self.now_ms < self.pair_until_ms;
         self.pair_busy = busy;
         let stop = match end {
             // Sealed by the host itself: the one sign to forget the key on.
@@ -502,8 +503,9 @@ impl Driver {
             }
             End::Code(close::NOT_PAIRED) if pairing => Some(Stop::PairRefused),
             End::Code(close::NOT_PAIRED) => Some(Stop::NotPairedUnconfirmed),
-            End::Code(close::NO_PAIRING) if busy => None,
-            End::Code(close::NO_PAIRING) => Some(Stop::NoPairing),
+            End::Code(close::PAIRING_BUSY) if busy => None,
+            // Still busy when the link has surely expired: it is gone by now.
+            End::Code(close::PAIRING_BUSY | close::NO_PAIRING) => Some(Stop::NoPairing),
             End::Code(close::REVOKED) => Some(Stop::Revoked),
             End::Failure(Failure::Refused) => Some(Stop::PairRefused),
             End::Failure(Failure::Handshake(NoiseError::Refused)) if pairing => Some(Stop::PairFailed),

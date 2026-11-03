@@ -458,7 +458,9 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   resend an unanswered operation only while it is younger (`Pending::resend`): an older one needs the user's fresh
   intent. With `[remote]` off the journal is in memory and there is no file.
   An incomplete final line is truncated on open. If opening or writing the journal fails,
-  new client mutations are refused; a failed reopen after compaction disables further writes.
+  new client mutations are refused until the host restarts (no record may follow one that failed); a failed
+  reopen after compaction disables further writes. The desktop says why: in Remote devices, with a warning dot
+  on the Remote indicator and the reason in its hover, and as `journal_error` in `atomics ctl '{"cmd":"remote"}'`.
   Desktop actions use fresh operation IDs, bypass the client capacity limit, and still run
   without journaling when the journal is unwritable. Outcome records are appended under the
   State lock, then synced after releasing it, before client replies are sent. The beginning
@@ -628,7 +630,8 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   (`protocol::Sessions`), with the role of the paired device (below). At most four at once; one more is closed with
   `quota` (4429), and a channel the host closes gives its place back at once, before the service's `left`. A
   channel ends with 1000, `refused` (4000) for a protocol error or a message that fails to decrypt, `idle` (4001),
-  `not_paired` (4003), `no_pairing` (4004) or `slow` (4408); one the host cannot start gets `unavailable` (4002).
+  `not_paired` (4003), `no_pairing` (4004), `pairing_busy` (4005) or `slow` (4408); one the host cannot start gets
+  `unavailable` (4002).
   Each channel may queue 1 MiB
   toward the service (a session waits up to 5 s for room, then ends as slow), and a channel whose session stops
   reading 1 MiB of what arrives is closed as slow.
@@ -642,12 +645,13 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   every 30 s; an `unknown` host id a minute after registering registers again.
 - **Status.** A "Remote" indicator in the top bar while `[remote.rendezvous]` is enabled (online in the success
   colour, waiting or stopped with a dot, connecting muted; the hover says why), and `atomics ctl '{"cmd":"remote"}'`:
-  the protocol server's URL and the rendezvous's `phase`, `service`, `host`, `registered`, `host_id`, `online`,
-  `channels` and `note`. The headless host logs whether it started.
+  the protocol server's URL (and `journal_error` while the operation journal cannot be written, above) and the
+  rendezvous's `phase`, `service`, `host`, `registered`, `host_id`, `online`, `channels` and `note`. The headless
+  host logs whether it started.
 - **Tests.** `protocol::rendezvous::tests` runs the host against an in-process service that admits only unused
   passes from a fake issuer, with browsers speaking `atomics_core::noise` on its channels: registration, the
   upgrade's headers, pairing (controller and view-only, a wrong psk and the link given back, a device racing the
-  link, no pairing open), sessions of paired devices, an unknown device refused inside the channel, plaintext and
+  link and told it is busy, a used link and no pairing open), sessions of paired devices, an unknown device refused inside the channel, plaintext and
   forged channels, replays (a replayed handshake marks nothing connected and writes nothing), revoking, renewal at
   half-life, every close code, a dropped socket and a silent service, refused upgrades, the channel limit, issuer
   refusals, and a stop. The profile issuer is tested against an in-process MCP server (whoami, signatures, refusal
@@ -668,7 +672,10 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   characters of unpadded base64url. `pair_url` must be `https://` (or `http://` to this machine) and end in
   `#{pairing}`, so the psk travels only in the fragment, which browsers never send. The link works once, for five
   minutes, and only one is open. A device answers it with `Noise_IKpsk2_25519_ChaChaPoly_SHA256`; one at a time
-  (another gets `no_pairing`, and a browser asks again while its link may be valid). The handshake proves nothing
+  (another gets `pairing_busy`, 4005, and a browser asks again while its link may be valid). A link that was
+  never offered, was used, expired or was withdrawn gets `no_pairing` (4004): asking again cannot help. An older
+  host says `no_pairing` for both; an older browser reads `pairing_busy` as a dropped channel and dials again,
+  until the link is used or expires and the host says `no_pairing`. The handshake proves nothing
   about the psk, so the link goes back as soon as the device's first message fails to decrypt or the device leaves,
   and at the latest after 30 s. Its first message (`PairRequest`, its name) proves the psk; then the desktop asks
   "Pair “name”?" beside the six-digit code from the handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
@@ -739,7 +746,7 @@ sustained 2 MiB/s per host with an 8 MiB burst, ping every 25 s with a 60 s idle
 and channels. The broker cannot read frames, so it cannot supersede screen deltas: the host applies the queue
 policy from Terminal streaming before encrypting, and a closed slow channel reconnects to a fresh snapshot.
 Close codes are typed: `unauthorised`, `revoked`, `slow`, `replaced`, `quota`; the host's own, on a channel, are
-`refused`, `idle`, `unavailable`, `not_paired` and `no_pairing`.
+`refused`, `idle`, `unavailable`, `not_paired`, `no_pairing` and `pairing_busy`.
 
 **Reconnect.** Jittered backoff. A dropped broker socket detaches channels without touching sessions. The host
 redials with a fresh pass; each browser reconnects, handshakes again and sends `hello` with its prior epoch and
@@ -813,7 +820,7 @@ clipboard could not be read, and pasting with the keyboard still works.
 | `view` | no | Where to open: `board` (the default), `plans`, `approvals`, `diffs`, `terminal` (an agent's) or `chief`; an unknown name opens the board |
 | `ticket_key` | no | A ticket's key (`docs/tickets.md`; its id where it has no key): opens the plan that follows it, else one with a task for it (open plans first, keys compared without regard to ASCII case), or the board when none does. Wins over `view`. A text like the others; empty is ignored. (`ticket` is the connect ticket.) |
 | `mode` | no | Absent, or `pair` on a pairing page |
-| `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk}`: the pairing link's fields, each key 43 characters of unpadded base64url |
+| `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk, age_ms}`: the pairing link's fields, each key 43 characters of unpadded base64url, and optionally `age_ms`, how many milliseconds before this boot the page got the link (opened, scanned or pasted). The link's five minutes run from then; without it, or with anything but a number of at least 0, from the boot |
 
 A boot with a malformed required field, an unknown `mode` or a malformed `pair` is ignored. Texts are trimmed,
 stripped of control characters and cut at 200 characters.
@@ -842,10 +849,12 @@ the board holds, so the host replays what was missed or sends a snapshot. A gap 
 `resync`. Operations still unanswered are sent again with the same IDs while younger than `op_ttl_secs`; older
 ones say to check the board. At most 64 wait (`max_pending_ops`); past that the browser refuses new ones until
 some are answered. A transport message that fails to decrypt ends the channel, and the frame dials again. While
-pairing, `no_pairing` is tried again with the same waits until five minutes after the boot (the link's lifetime).
-It stops for good on the host's sealed refusal (and forgets the key), a bare `not_paired` close (it keeps the key),
-`no_pairing` after that, `revoked`, a refused or failed pairing, a drop while the codes are being compared, or a
-handshake answer that does not authenticate (the host's key is not the one this browser paired with).
+pairing, `pairing_busy` (another device is pairing) is tried again with the same waits, saying so, until the link's
+five minutes are up, counted from when the page got it (`pair.age_ms`). It stops for good on `no_pairing` at once
+("This pairing link was used or has expired. Show a new code on the computer."), on `pairing_busy` once the link's
+time is up, on the host's sealed refusal (and forgets the key), a bare `not_paired` close (it keeps the key),
+`revoked`, a refused or failed pairing, a drop while the codes are being compared, or a handshake answer that does
+not authenticate (the host's key is not the one this browser paired with).
 
 **What it offers.** The board, the plans, the approvals, the diffs and the terminals, with `board`, `plans`,
 `approvals`, `diffs`, `terminals`, `input` and `mutations` asked for in `hello`. It answers approvals
@@ -891,7 +900,8 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
   the focus away, and what was in flight then is dropped: keys of that frame, a word the keyboard commits as the
   field loses the focus, a Paste whose clipboard read finishes late. Typing again is a new tap. A paste over
-  1 MiB, or more than may wait, is not typed, with a note that says so. Input refused as `slow_client` is typed
+  1 MiB, or more than may wait, is not typed, with a note naming the limit that refused it (16 KiB while waiting
+  for the grant, else 1 MiB). Input refused as `slow_client` is typed
   again from the screen's next change on, at most 1 MiB per change. Lease requests, input and resizes carry
   request IDs, so a refusal names what it refuses; the client keeps at most 1024, forgetting input once a lease
   state shows it applied. A view-only device's field is always read-only.

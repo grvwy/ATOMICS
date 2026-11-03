@@ -11,8 +11,9 @@
 //!   controller, so H4's grants (`welcome.may`) follow from what the user chose when pairing. Its
 //!   paired name, not the `client_id` its `hello` chose, is the lease holder others see and the
 //!   sender the operation journal records (`protocol::Peer`).
-//! - **Pairing** (`Noise_IKpsk2`): only while the desktop offers a link, and one device at a time
-//!   (otherwise `no_pairing`, 4004). The device's first message proves the psk and names it; the
+//! - **Pairing** (`Noise_IKpsk2`): only while the desktop offers a link (otherwise `no_pairing`, 4004),
+//!   and one device at a time (another gets `pairing_busy`, 4005, and may ask again while its link
+//!   may be valid: `devices::Unavailable`). The device's first message proves the psk and names it; the
 //!   desktop shows its name and the code and asks; the answer goes back encrypted
 //!   ([`PairAnswer`]). A paired device's channel goes on as its session.
 //! - Before the handshake the host reads one bounded frame and parses nothing else. A message
@@ -227,7 +228,10 @@ fn session(mut raw: Raw, gate: &Gate, first: &[u8]) {
 
 /// A device answering the pairing link.
 fn pair(mut raw: Raw, gate: &Gate, first: &[u8]) {
-    let Some((attempt, psk)) = gate.devices.begin() else { return raw.close(close::NO_PAIRING) };
+    let (attempt, psk) = match gate.devices.begin() {
+        Ok(begun) => begun,
+        Err(why) => return raw.close(why.close_code()),
+    };
     // Until the device has proved the psk, a failure gives the link back for another try.
     let failed = |mut raw: Raw, code: u16| {
         gate.devices.abandon(attempt);
@@ -259,8 +263,8 @@ fn pair(mut raw: Raw, gate: &Gate, first: &[u8]) {
         gate.devices.abandon(attempt);
         return link.raw.close(close::REFUSED);
     };
-    if !gate.devices.claim(attempt, noise::device_name(&request.name), code, key, link.raw.waker()) {
-        return link.raw.close(close::NO_PAIRING);
+    if let Err(why) = gate.devices.claim(attempt, noise::device_name(&request.name), code, key, link.raw.waker()) {
+        return link.raw.close(why.close_code());
     }
     let Some(answer) = await_answer(&mut link.raw, &gate.devices, attempt) else {
         return gate.devices.abandon(attempt);

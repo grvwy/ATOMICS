@@ -1364,6 +1364,15 @@ fn desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refu
                     matches!(outcome, Outcome::Refused { code, .. } if code == if unwritable { ErrorCode::Internal } else { ErrorCode::TooMany }),
                     "{outcome:?}"
                 );
+                // `atomics ctl '{"cmd":"remote"}'` says why; a full journal is no error.
+                let remote = state.remote_json();
+                let error = &remote["protocol"]["journal_error"];
+                if unwritable {
+                    assert!(error.as_str().is_some_and(|e| !e.is_empty()), "{remote}");
+                    assert!(state.journal_problem().unwrap().contains("until ATOMICS restarts"));
+                } else {
+                    assert!(error.is_null() && state.journal_problem().is_none(), "{remote}");
+                }
                 for decision in [Decision::Allow, Decision::Deny] {
                     let hook = waiting_approval(&mut state.sessions[0], "ask");
                     let outcome = state.mutate_desktop(|op| {
