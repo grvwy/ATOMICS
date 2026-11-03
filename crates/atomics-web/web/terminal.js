@@ -165,6 +165,10 @@ function buildOverlay() {
     composing = false;
     ta.value = "";
     if (quiet) return;
+    // The caret stays in a field that lost the focus, and text a keyboard or IME commits after that would
+    // focus the field again, be typed and ask for the lease: it goes with the focus. Typing again is a tap.
+    const selection = getSelection();
+    if (selection) selection.removeAllRanges();
     send({ kind: "focus", on: false });
     showBar(false);
   });
