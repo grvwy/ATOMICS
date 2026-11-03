@@ -84,10 +84,20 @@ fn the_theme_follows_the_hosting_page() {
     data["theme"] = json!("light");
     world.driver.message(PARENT, true, &data).unwrap();
     world.pump();
-    let ctx = egui::Context::default();
-    let mut client = Client::default();
-    apply_theme(&ctx, &mut client, world.driver.boot().unwrap());
-    assert_eq!(client.palette.mode, ThemeMode::Light);
+    let (ctx, mut client, mut view) = (egui::Context::default(), Client::default(), View::default());
+    apply_theme(&mut view, world.driver.boot().unwrap());
+    assert_eq!(view.looks.desktop.mode, ThemeMode::Light);
+    // A phone's frame draws in the phone's look of the theme: proportional UI text, zoomed, sized for touch.
+    frame(&ctx, &mut world, &mut client, &mut view);
+    assert_eq!((client.palette.mode, client.palette.mono_ui), (ThemeMode::Light, false));
+    assert_eq!(ctx.zoom_factor(), layout::ZOOM);
+    assert_eq!(client.touch.map(|t| t.target), Some(layout::TOUCH));
+    assert_eq!(ctx.global_style().spacing.interact_size.y, layout::TOUCH);
+    // A desktop's in the desktop's.
+    view.layout = LayoutMode::Desktop;
+    frame(&ctx, &mut world, &mut client, &mut view);
+    assert!(std::sync::Arc::ptr_eq(&client.palette, &view.looks.desktop) && client.touch.is_none());
+    assert_eq!(ctx.zoom_factor(), 1.0);
     assert_eq!(Tab::named("approvals"), Tab::Approvals);
     assert_eq!(Tab::named("TICKET-1"), Tab::Board, "a view this client cannot name opens the board");
 }

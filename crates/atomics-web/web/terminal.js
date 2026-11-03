@@ -44,6 +44,7 @@ function viewport() {
   send({
     kind: "viewport", ...view, coarse: coarse.matches, keybar,
     insetTop: insets ? px(insets.paddingTop) : 0, insetBottom: insets ? px(insets.paddingBottom) : 0,
+    insetLeft: insets ? px(insets.paddingLeft) : 0, insetRight: insets ? px(insets.paddingRight) : 0,
   });
 }
 

@@ -25,7 +25,7 @@
 //! the desktop takes the terminal back the field has lost the focus and typing sends nothing. Every screen
 //! is saved as a PNG in `target/phone-shots/` (emptied first) for a person to look at. The client draws on a
 //! canvas, so the test finds what to tap by colour in the screenshots, using the palette the client draws
-//! with, and the pane bar from the client's own layout code.
+//! with, and the pane bar from the client's own layout code, whose points are `layout::ZOOM` CSS pixels.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -953,16 +953,21 @@ fn the_bundle_works_on_a_phone_by_touch() {
     let frame_rect: Vec<f64> = (0..4).filter_map(|i| offset[i].as_f64()).collect();
     assert_eq!(frame_rect, [0.0, 0.0, f64::from(width), f64::from(height)], "the frame fills the screen");
 
-    // What the client draws with: the boot's theme, and the phone layout of its own code.
+    // What the client draws with: the boot's theme, and the phone layout of its own code, in its zoomed points
+    // and then in CSS pixels, which the screenshots and taps are in.
     let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
     let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
     let p = Palette::new(&booted.theme_tokens(), Fonts::default());
     assert_ne!(p.panel, p.background, "the approval banner stands out from the page");
-    let screen = Rect::from_min_size(Pos2::ZERO, vec2(PHONE.0, PHONE.1));
+    let css = |r: Rect| {
+        Rect::from_min_max((r.min.to_vec2() * layout::ZOOM).to_pos2(), (r.max.to_vec2() * layout::ZOOM).to_pos2())
+    };
+    let points = Rect::from_min_size(Pos2::ZERO, vec2(PHONE.0, PHONE.1) / layout::ZOOM);
     let regions =
-        layout::regions(screen, &Viewport { visible: Some(screen), coarse: true, ..Viewport::default() }, false);
-    let (top, body, bar) = (regions.top, regions.body, regions.bar.expect("the pane bar"));
-    let items = layout::bar_items(bar, views::BAR.len());
+        layout::regions(points, &Viewport { visible: Some(points), coarse: true, ..Viewport::default() }, false);
+    let bar = regions.bar.expect("the pane bar");
+    let items: Vec<Rect> = layout::bar_items(bar, views::BAR.len()).into_iter().map(css).collect();
+    let (screen, top, body, bar) = (css(points), css(regions.top), css(regions.body), css(bar));
     let pane = |tab: Tab| items[views::BAR.iter().position(|(t, _)| *t == tab).expect("a pane")].center();
     // The pane the bar marks, by its accent line on the bar's top edge; none while the key bar replaces it.
     let active = |page: &mut DevTools| {
@@ -970,9 +975,11 @@ fn the_bundle_works_on_a_phone_by_touch() {
         let line = boxes(page, p.accent, 8, edge, 10.0).first().map(|b| b.center().x);
         line.and_then(|x| items.iter().position(|i| i.x_range().contains(x))).map(|i| views::BAR[i].0)
     };
-    // The plan's Approve button: the accent-filled box in the right half of the board's header.
-    let header = Rect::from_min_max(pos2(screen.center().x, body.top()), pos2(screen.right(), body.top() + 60.0));
-    let approve = |page: &mut DevTools| boxes(page, p.accent, 6, header, 150.0).into_iter().find(|b| b.width() >= 40.0);
+    // The plan's Approve button: the accent-filled box, a finger's size, in the board's header rows.
+    let header = Rect::from_min_max(body.left_top(), pos2(screen.right(), body.top() + 220.0));
+    let approve = |page: &mut DevTools| {
+        boxes(page, p.accent, 6, header, 150.0).into_iter().find(|b| b.width() >= 40.0 && b.height() >= 40.0)
+    };
     // A tool request's banner, and its first button (Allow).
     let banner = |page: &mut DevTools| {
         boxes(page, p.panel, 2, body, 5000.0).into_iter().find(|b| b.width() >= 300.0 && b.height() >= 100.0)
@@ -998,8 +1005,10 @@ fn the_bundle_works_on_a_phone_by_touch() {
     screens.save(&mut page, "plans", |page| active(page) == Some(Tab::Plans));
     page.tap(pane(Tab::Diffs));
     screens.save(&mut page, "diffs", |page| active(page) == Some(Tab::Diffs));
-    // The worktree's name, first in the list, opens its diff.
-    page.tap(body.left_top() + vec2(24.0, 10.0));
+    // The worktree's row, first in the list, opens its diff.
+    let first =
+        css(Rect::from_min_size(regions.body.left_top() + vec2(layout::GUTTER, 8.0), vec2(80.0, layout::TOUCH)));
+    page.tap(first.center());
     wait_host(&host, "both files of the diff asked for", |h| {
         let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
         asked("src/a.rs") && asked("src/b.rs")
@@ -1019,9 +1028,8 @@ fn the_bundle_works_on_a_phone_by_touch() {
     });
     wait_host(&host, "the plan approved", |h| h.board.plans[0].approved);
     screens.save(&mut page, "plan-approved", |page| {
-        // "approved ✓", wherever the header's row puts it.
-        let row = Rect::from_min_max(pos2(screen.left(), header.top()), header.max);
-        approve(page).is_none() && amount(page, p.success, 24, row) >= 10.0
+        // "approved ✓", wherever the header's rows put it.
+        approve(page).is_none() && amount(page, p.success, 24, header) >= 10.0
     });
     let corner = Rect::from_min_max(pos2(screen.center().x, top.top()), top.max);
     let (badge, _) = until(&mut page, "the approvals badge", |page| {
@@ -1032,8 +1040,9 @@ fn the_bundle_works_on_a_phone_by_touch() {
     let (allow, _) = until(&mut page, "the Allow button", |page| {
         let banner = banner(page)?;
         let buttons = boxes(page, p.raised, 2, banner, 100.0).into_iter();
+        // A finger's target: 44 CSS pixels each way, less the outline.
         buttons
-            .filter(|b| b.width() >= 30.0 && (14.0..=48.0).contains(&b.height()))
+            .filter(|b| b.width() >= 40.0 && (40.0..=50.0).contains(&b.height()))
             .min_by(|a, b| (a.top() as i32, a.left() as i32).cmp(&(b.top() as i32, b.left() as i32)))
     });
     page.tap(allow.center());

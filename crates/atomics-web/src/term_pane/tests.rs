@@ -129,6 +129,7 @@ fn the_phone_shows_the_desktops_grid_and_resizes_only_when_asked() {
     let frame_rect = view.term.overlay.rect.unwrap();
     let fit = fit_size(&Frame {
         rect: frame_rect,
+        pad: vec2(PAD, PAD),
         origin: frame_rect.min,
         size: font,
         cell: vec2(1.0, 1.0),
@@ -365,13 +366,15 @@ fn the_phone_layout_at_phone_widths() {
         let rect = view.term.overlay.rect.expect("a terminal");
         assert_eq!(rect.width(), size.0, "{size:?}: the terminal fills the width");
         assert!(rect.bottom() <= size.1 - crate::layout::BOTTOM_BAR, "{size:?}: above the pane switcher");
-        // Typing: the key bar's space replaces the switcher, and the terminal grows into it.
+        // Typing: the key bar's space replaces the switcher, and the terminal grows into it. The page says
+        // how tall the key bar is in CSS pixels.
         view.viewport.keybar = 88.0;
         view.term.inputs.push(TermInput::Focus(true));
         frame(&ctx, &mut world, &mut client, &mut view, size);
         frame(&ctx, &mut world, &mut client, &mut view, size);
         let typing = view.term.overlay.rect.unwrap();
-        assert_eq!(typing.bottom(), size.1 - 88.0, "{size:?}");
+        // egui rounds the layout to 1/32 of a point.
+        assert!((typing.bottom() - (size.1 - 88.0 / crate::layout::ZOOM)).abs() < 0.05, "{size:?}: {typing:?}");
         // Every pane draws at this width.
         for tab in [Tab::Board, Tab::Plans, Tab::Diffs, Tab::Approvals, Tab::Chief] {
             view.tab = tab;
