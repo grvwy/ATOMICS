@@ -31,7 +31,10 @@ pub enum McpError {
     Server(String),
     /// A tool error with `structuredContent`: users see `message`, while `details` (the
     /// content as JSON, such as an error code) is only for telling refusals apart.
-    Tool { message: String, details: String },
+    Tool {
+        message: String,
+        details: String,
+    },
     /// The server needs a person to sign in (again): never retried, never a browser by itself.
     SignInRequired(String),
 }

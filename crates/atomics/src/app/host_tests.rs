@@ -676,7 +676,9 @@ fn threads_named(prefix: &str) -> Option<usize> {
     Some(
         tasks
             .flatten()
-            .filter(|task| std::fs::read_to_string(task.path().join("comm")).is_ok_and(|n| n.trim().starts_with(prefix)))
+            .filter(|task| {
+                std::fs::read_to_string(task.path().join("comm")).is_ok_and(|n| n.trim().starts_with(prefix))
+            })
             .count(),
     )
 }

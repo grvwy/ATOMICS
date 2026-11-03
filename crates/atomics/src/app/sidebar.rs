@@ -62,7 +62,10 @@ impl Desktop<'_> {
         let mut find = false;
         section(ui, p, "TICKETS");
         let plan = self.runtime.plan_view.then(|| &self.runtime.plans[self.runtime.selected_plan]);
-        let row = |ui: &mut egui::Ui, depth: usize, link: &atomics_core::tickets::TicketLink, status: Option<TaskStatus>| {
+        let row = |ui: &mut egui::Ui,
+                   depth: usize,
+                   link: &atomics_core::tickets::TicketLink,
+                   status: Option<TaskStatus>| {
             let dot = match (&link.state, status) {
                 (Some(state), _) => config.states.status_of(state).map_or(p.muted, |s| super::board::task_color(s, p)),
                 (None, Some(status)) => super::board::task_color(status, p),
@@ -77,7 +80,8 @@ impl Desktop<'_> {
             );
             ui.horizontal(|ui| {
                 ui.add_space(depth as f32 * 12.0);
-                ui.add(egui::Button::selectable(false, text).truncate()).on_hover_text(link.title.as_deref().unwrap_or(""))
+                ui.add(egui::Button::selectable(false, text).truncate())
+                    .on_hover_text(link.title.as_deref().unwrap_or(""))
             })
             .inner
             .clicked()

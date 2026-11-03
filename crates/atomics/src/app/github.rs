@@ -102,15 +102,41 @@ pub(super) struct PrDiff {
 
 enum Done {
     Polled(gh::Polled),
-    GhChecked { host: String, found: Option<(Token, Result<String, ApiError>)>, client_id: String },
-    DeviceCode { result: Result<gh::DeviceCode, String>, cancel: Arc<AtomicBool> },
-    Connected { host: String, result: Result<String, String> },
-    Disconnected { host: String, result: Result<(), String> },
-    Merged { repo: RepoId, number: u64, admin: bool, result: Result<String, String> },
-    Dispatched { repo: RepoId, label: String, result: Result<String, String> },
+    GhChecked {
+        host: String,
+        found: Option<(Token, Result<String, ApiError>)>,
+        client_id: String,
+    },
+    DeviceCode {
+        result: Result<gh::DeviceCode, String>,
+        cancel: Arc<AtomicBool>,
+    },
+    Connected {
+        host: String,
+        result: Result<String, String>,
+    },
+    Disconnected {
+        host: String,
+        result: Result<(), String>,
+    },
+    Merged {
+        repo: RepoId,
+        number: u64,
+        admin: bool,
+        result: Result<String, String>,
+    },
+    Dispatched {
+        repo: RepoId,
+        label: String,
+        result: Result<String, String>,
+    },
     Runs(Vec<((RepoId, String), RunStatus)>),
     /// The diff and the head commit it was loaded at.
-    Diff { repo: RepoId, number: u64, result: Result<(Arc<diff_view::Prepared>, String), String> },
+    Diff {
+        repo: RepoId,
+        number: u64,
+        result: Result<(Arc<diff_view::Prepared>, String), String>,
+    },
 }
 
 /// What the top-bar counter shows.
