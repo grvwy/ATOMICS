@@ -890,7 +890,8 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   client typing makes the field read-only, with **Take over**. The lease is renewed every 10 s while the field has
   the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
   the focus away, and what was in flight then is dropped: keys of that frame, a word the keyboard commits as the
-  field loses the focus, a Paste whose clipboard read finishes late. Typing again is a new tap. A paste over
+  field loses the focus, a Paste whose clipboard read finishes late. The caret goes with the focus, so text a
+  keyboard commits later cannot focus the field again. Typing again is a new tap. A paste over
   1 MiB, or more than may wait, is not typed, with a note that says so. Input refused as `slow_client` is typed
   again from the screen's next change on, at most 1 MiB per change. Lease requests, input and resizes carry
   request IDs, so a refusal names what it refuses; the client keeps at most 1024, forgetting input once a lease
@@ -903,8 +904,25 @@ board, commands and grants, reconnecting and every stop against an in-process ho
 (`src/fake_host.rs`, whose terminals echo under leases); the terminals' leases, typing, history, no replay and
 `slow_client`; that nothing typed after a take back types or asks for the lease; the gestures; the overlay's
 events; the phone layout at 360, 390 and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
-the views drawn headless; the manifest; and that the crate names no hosting product. `tests/browser.rs` (ignored; needs the bundle and Chrome) also types into a terminal of the real
-bundle through DevTools, sees the echo, and loses and regains the lease.
+the views drawn headless; the manifest; and that the crate names no hosting product.
+
+`tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker. On a desktop
+it pairs, reconnects and reloads, types into a terminal through DevTools, sees the echo, and loses and regains the
+lease. As an iPhone (390 × 844 points at 3×, a touch screen, Safari's user agent, framed full screen) it is used
+by touch alone: it pairs, shows the board, the plans and a two-file diff, approves the plan and a tool request
+with a tap on their buttons, focuses a terminal with a tap, types `ls`, Return, Backspace and the key bar's ↑
+(checking the bytes the host receives), and once the desktop takes the terminal back checks that the field lost
+the focus and typing sends nothing. It saves every screen as a PNG in `target/phone-shots/` for a person to
+review. Both need the bundle and Chrome, so they are ignored by default:
+
+```sh
+scripts/build-web.sh
+cargo test -p atomics-web --test browser -- --ignored
+# the phone alone, printing where its screenshots are:
+cargo test -p atomics-web --test browser -- --ignored --nocapture the_bundle_works_on_a_phone_by_touch
+```
+
+`ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser.
 `crates/atomics-ui/tests/dependencies.rs` keeps desktop-only crates out of `atomics-ui` and `atomics-web` on both
 targets, and CI checks both for `wasm32-unknown-unknown`.
 
