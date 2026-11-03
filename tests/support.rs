@@ -27,10 +27,40 @@ impl Drop for TempDir {
         let path = dir.path().to_path_buf();
         let result = dir.close();
         if !std::thread::panicking() {
-            result.unwrap_or_else(|err| panic!("test left temporary resources at {}: {err}", path.display()));
-            assert!(!path.exists(), "test leaked {}", path.display());
+            result.unwrap_or_else(|err| {
+                panic!("test left temporary resources at {}: {err}\n{}", path.display(), leftovers(&path))
+            });
+            assert!(!path.exists(), "test leaked {}\n{}", path.display(), leftovers(&path));
         }
     }
+}
+
+/// What is still in `path`, and which processes have it as their working directory or hold a file
+/// in it (Linux `/proc` only): whatever wrote there after the test.
+fn leftovers(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut folders = vec![path.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            out.push_str(&format!("  left: {}\n", entry.path().display()));
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                folders.push(entry.path());
+            }
+        }
+    }
+    for process in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let base = process.path();
+        let fds = std::fs::read_dir(base.join("fd")).into_iter().flatten().flatten().map(|fd| fd.path());
+        let holds = std::iter::once(base.join("cwd"))
+            .chain(fds)
+            .any(|link| std::fs::read_link(link).is_ok_and(|target| target.starts_with(path)));
+        if holds {
+            let command = std::fs::read(base.join("cmdline")).unwrap_or_default();
+            let command = String::from_utf8_lossy(&command).replace('\0', " ");
+            out.push_str(&format!("  held by pid {}: {command}\n", process.file_name().to_string_lossy()));
+        }
+    }
+    out
 }
 
 pub const CHILD_TIMEOUT: Duration = Duration::from_secs(180);

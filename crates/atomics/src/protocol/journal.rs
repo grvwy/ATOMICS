@@ -10,8 +10,11 @@
 //! host never guesses whether a message was typed or a merge ran. Each line is synced to disk
 //! (`sync_data`) before the work starts and before the outcome is answered, so neither the process
 //! dying nor the machine losing power can make the host forget an operation it began and run it
-//! again. Mutations are rare, so the sync costs little. Compaction writes and syncs a new file,
-//! renames it into place and syncs the directory.
+//! again. That is why a beginning is synced under the `State` lock: the operation must be durable
+//! before it can run, so a retry after a power cut is answered, not run again. Mutations come from
+//! people's clicks and are rare, so the sync costs little. An outcome is synced after the lock is
+//! released (`take_sync`), before any client is answered with it. Compaction writes and syncs a new
+//! file, renames it into place and syncs the directory.
 //!
 //! Outcomes are kept for `KEEP_SECS` from when the operation began (twice the `op_ttl_secs` that
 //! clients are told), at most `CAPACITY` at once; an operation still running is never forgotten.
@@ -226,6 +229,8 @@ impl Journal {
         }
         let by = by.map(str::to_string);
         let record = Record::Begin { key: key.clone(), fingerprint: fingerprint.into(), at: now, by: by.clone() };
+        // Synced now, under the `State` lock: the operation must be durable before it can run, so a
+        // retry after a power cut is answered and not run again.
         if let Err(e) = self.append(&record) {
             self.error = Some(e.to_string());
             return Begun::Unwritable(e.to_string());
