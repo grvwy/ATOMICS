@@ -5,6 +5,10 @@
 //! The parent origin comes from the hosting page's config script (`config.js` beside the bundle sets
 //! `window.ATOMICS_PARENT_ORIGIN`). A message from any other origin, or from a window other than the one
 //! that framed this page, is dropped before its data is read.
+//!
+//! Terminal input is the page's `<textarea>` overlay and key bar (`web/terminal.js`): what it reports is
+//! read by [`crate::page`] and handed to the terminal pane, and after each frame the overlay is placed and
+//! set as the pane says ([`Overlay`]).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -13,6 +17,7 @@ use std::time::Duration;
 
 use atomics_core::noise::{KEY_BYTES, PublicKey, Secret};
 use atomics_ui::Client;
+use atomics_ui::theme::Palette;
 use js_sys::{Array, ArrayBuffer, JSON, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -22,6 +27,9 @@ use zeroize::Zeroizing;
 use crate::boot::{self, ParentOrigin};
 use crate::device::{self, Device};
 use crate::driver::{Driver, Output};
+use crate::layout::{self, LayoutMode};
+use crate::page::{self, PageEvent};
+use crate::term_pane::Overlay;
 use crate::views::{self, BundledFonts, Tab, View};
 
 /// The largest message event read from the parent, as JSON text.
@@ -37,6 +45,49 @@ extern "C" {
     async fn forget_device(host_id: &str) -> Result<JsValue, JsValue>;
 }
 
+#[wasm_bindgen(module = "/web/terminal.js")]
+extern "C" {
+    fn install(keys: &str, callback: &Closure<dyn FnMut(JsValue)>);
+    fn place(x: f32, y: f32, width: f32, height: f32);
+    fn hide();
+    #[wasm_bindgen(js_name = setWritable)]
+    fn set_writable(on: bool);
+    #[wasm_bindgen(js_name = blurInput)]
+    fn blur_input();
+    #[wasm_bindgen(js_name = setSticky)]
+    fn set_sticky(ctrl: bool, alt: bool);
+    #[wasm_bindgen(js_name = setCopy)]
+    fn set_copy(text: Option<String>, x: f32, y: f32);
+    #[wasm_bindgen(js_name = setTheme)]
+    fn set_theme(colors: &str);
+    #[wasm_bindgen(js_name = loadLayout)]
+    fn load_layout() -> String;
+    #[wasm_bindgen(js_name = saveLayout)]
+    fn save_layout(name: &str);
+}
+
+/// The page's own controls (the key bar, the Copy chip) in the theme's colours.
+fn theme_colors(p: &Palette) -> String {
+    let css = |c: egui::Color32| {
+        let [r, g, b, a] = c.to_srgba_unmultiplied();
+        format!("rgba({r}, {g}, {b}, {:.3})", f32::from(a) / 255.0)
+    };
+    serde_json::json!({
+        "bar": css(p.topbar),
+        "key": css(p.raised),
+        "key-text": css(p.foreground),
+        "border": css(p.border),
+        "accent": css(p.accent),
+        "on-accent": css(p.on_accent),
+    })
+    .to_string()
+}
+
+/// A clock for gestures: the page's, which its events are stamped with.
+fn page_now() -> f64 {
+    web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())
+}
+
 /// What happened in the browser since the last frame.
 enum Input {
     Message { origin: String, data: serde_json::Value },
@@ -45,6 +96,7 @@ enum Input {
     Closed { socket: u64, code: u16 },
     Device(Option<Device>),
     Note(&'static str),
+    Page(PageEvent),
 }
 
 type Inbox = Rc<RefCell<VecDeque<Input>>>;
@@ -82,6 +134,11 @@ struct App {
     socket: Option<Live>,
     themed: bool,
     _listener: Closure<dyn FnMut(MessageEvent)>,
+    _page: Closure<dyn FnMut(JsValue)>,
+    /// What the overlay was last set to.
+    applied: Overlay,
+    /// The layout last kept in the page's storage.
+    saved_layout: LayoutMode,
 }
 
 /// Start the client on the page's `#atomics` canvas.
@@ -153,17 +210,64 @@ impl App {
             })
         };
         let _ = window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref());
+        let page = {
+            let (inbox, ctx) = (inbox.clone(), ctx.clone());
+            Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+                let Ok(text) = JSON::stringify(&event) else { return };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&String::from(text)) else { return };
+                if let Some(event) = page::read(&value, ctx.zoom_factor()) {
+                    push(&inbox, &ctx, Input::Page(event));
+                }
+            })
+        };
+        install(&layout::keybar_json().to_string(), &page);
+        set_theme(&theme_colors(&client.palette));
+        let layout = LayoutMode::named(&load_layout());
+        let view = View { layout, ..View::default() };
         Self {
             driver,
             client,
-            view: View::default(),
+            view,
             inbox,
             ctx,
             parent,
             socket: None,
             themed: false,
             _listener: listener,
+            _page: page,
+            applied: Overlay::default(),
+            saved_layout: layout,
         }
+    }
+
+    /// Place and set the overlay as the terminal pane says, telling the page only what changed.
+    fn apply_overlay(&mut self) {
+        let zoom = self.ctx.zoom_factor();
+        let overlay = &mut self.view.term.overlay;
+        if std::mem::take(&mut overlay.blur) {
+            blur_input();
+        }
+        let now = overlay.clone();
+        let last = &self.applied;
+        if now.writable != last.writable {
+            set_writable(now.writable);
+        }
+        if now.rect != last.rect {
+            match now.rect {
+                Some(r) => place(r.left() * zoom, r.top() * zoom, r.width() * zoom, r.height() * zoom),
+                None => hide(),
+            }
+        }
+        if (now.ctrl, now.alt) != (last.ctrl, last.alt) {
+            set_sticky(now.ctrl, now.alt);
+        }
+        if now.copy != last.copy {
+            match &now.copy {
+                Some((text, at)) => set_copy(Some(text.clone()), at.x * zoom, at.y * zoom),
+                None => set_copy(None, 0.0, 0.0),
+            }
+        }
+        self.applied = now;
     }
 
     fn post(&self, kind: &str) {
@@ -292,6 +396,9 @@ impl eframe::App for App {
                 }
                 Input::Device(device) => self.driver.device_loaded(device),
                 Input::Note(note) => self.driver.remote.say(note),
+                Input::Page(PageEvent::Term(input)) => self.view.term.inputs.push(input),
+                Input::Page(PageEvent::Viewport(viewport)) => self.view.viewport = viewport,
+                Input::Page(PageEvent::Note(note)) => self.driver.remote.say(note),
             }
         }
         self.run_outputs();
@@ -299,16 +406,28 @@ impl eframe::App for App {
             && let Some(boot) = self.driver.boot()
         {
             views::apply_theme(ctx, &mut self.client, boot);
+            set_theme(&theme_colors(&self.client.palette));
             self.view.tab = boot.view.as_deref().map_or(Tab::Board, Tab::named);
+            self.view.ticket_key.clone_from(&boot.ticket_key);
             self.themed = true;
         }
+        self.view.now_ms = page_now();
         if let Some(wait) = self.driver.wake_in() {
             ctx.request_repaint_after(Duration::from_millis(wait.max(16)));
+        }
+        if let Some(due) = self.view.term.due_ms() {
+            let wait = (due - self.view.now_ms).max(16.0);
+            ctx.request_repaint_after(Duration::from_millis(wait as u64));
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
         self.run_outputs();
+        self.apply_overlay();
+        if self.view.layout != self.saved_layout {
+            save_layout(self.view.layout.name());
+            self.saved_layout = self.view.layout;
+        }
     }
 }

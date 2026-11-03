@@ -92,7 +92,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `history_chunk` | Retained lines or an explicit indication that the requested history was evicted. |
 | Host → client | `diff_summary`, `diff_file`, `file_content` | Worktree ID, revision, base commit, paths, hunks, counts and highlight spans. |
 | Client → host | `diff_get`, `file_get`, `review_command` | Bounded content request, or add/remove/send comments against a diff revision. |
-| Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch and report. |
+| Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch, report, and the key of the ticket a plan or task follows (`ticket`, optional). |
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. |
 | Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
@@ -396,8 +396,13 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   back. The headless gate (`tests/headless_host.rs`) types into a shell that ctl started. `protocol/link.rs` races
   wakes against the wake pipe's drain and checks that a later wake still ends a wait at once.
 - **Who holds it.** `holder` is a paired device's name, the one it was paired under (so a client can say
-  "typing from iPhone"); a loopback client's is the `client_id` it chose.
-- **Not yet.** Encoding mouse reports and the clipboard opt-in is client work (C3, C4).
+  "typing from iPhone"); a loopback client's is the `client_id` it chose. The desktop shows it too: while a
+  remote client holds a terminal's lease, its pane carries "Typing from <device>" (with "· sized for it" while the
+  client's size is in force) and **Take back**, which ends the lease as typing in the pane does
+  (`TerminalView::holder_pill`). The pill floats over the cells, so the pane keeps its size.
+- **Encoding.** Keys, typed text, a paste and mouse reports are encoded by `atomics_ui::terminal::encode` from the
+  screen's published modes, on the desktop and in the browser alike. A program's clipboard escape (OSC 52) never
+  reaches a browser's clipboard: there is no opt-in yet.
 
 Keystroke echo on loopback (2026-11-02, `protocol::echo_bench`, ignored by default; release build, shared 18-core
 machine). A real PTY runs `cat` in cooked mode, so the kernel echoes each key. A client on a loopback socket with
@@ -736,8 +741,9 @@ the browser glue (`src/web.rs`) builds natively, and the tests run it against an
 
 **The bundle.** `scripts/build-web.sh` runs trunk (`crates/atomics-web/Trunk.toml`, profile `web`) into
 `crates/atomics-web/dist`: `index.html`, `boot.js`, the content-hashed `atomics-web-<hash>.js`, `_bg.wasm` and
-`style-<hash>.css`, `snippets/` (the device store) and `manifest.json` (`atomics_version`, `protocol_major`,
-`protocol_minor_max`, `wasm_sha256`, `built_from`, and every file's SHA-256). It then packs
+`style-<hash>.css`, `snippets/` (the device store, and the terminal's input overlay and key bar) and
+`manifest.json` (`atomics_version`, `protocol_major`, `protocol_minor_max`, `wasm_sha256`, `built_from`, and
+every file's SHA-256). It then packs
 `target/web/atomics-web-<version>.tar.gz` with a `.sha256` beside it; the `Web bundle` workflow publishes both
 on tags. Every URL in the bundle is relative: serve the folder as it is, one per protocol major. There is no
 inline script or style, so the client's origin can send `Content-Security-Policy: default-src 'none';
@@ -778,7 +784,8 @@ frame, the client says to open it from its hosting page and does nothing else.
 | `theme` | no | The page's theme. A built-in ATOMICS theme of that name is used, else the first built-in of `scheme` |
 | `scheme` | no | `dark` (the default) or `light` |
 | `locale` | no | The page's locale |
-| `view` | no | Where to open: `board` (the default), `plans`, `approvals` or `diffs`; an unknown name opens the board |
+| `view` | no | Where to open: `board` (the default), `plans`, `approvals`, `diffs`, `terminal` (an agent's) or `chief`; an unknown name opens the board |
+| `ticket_key` | no | A ticket's key (`docs/tickets.md`; its id where it has no key): opens the plan that follows it, else one with a task for it (open plans first, keys compared without regard to ASCII case), or the board when none does. Wins over `view`. A text like the others; empty is ignored. (`ticket` is the connect ticket.) |
 | `mode` | no | Absent, or `pair` on a pairing page |
 | `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk}`: the pairing link's fields, each key 43 characters of unpadded base64url |
 
@@ -807,15 +814,56 @@ the board holds, so the host replays what was missed or sends a snapshot. A gap 
 ones say to check the board. It stops for good on `not_paired` (and forgets the key), `no_pairing`, `revoked`, a
 refused or failed pairing, a drop while the codes are being compared, or a host key that no longer matches.
 
-**What it offers.** The board, the plans, the approvals and the diffs, read-only, with `board`, `plans`,
-`approvals`, `diffs` and `mutations` asked for in `hello`. It answers approvals (`approval_decide`) and approves
-plans (`plan_command` `approve`, with the plan's digest) when `welcome`'s `may` grants it; any other command says
-it is not available in the browser yet. A diff on screen is fetched file by file with `diff_get`, four files at a
-time, up to 16 pages each; the browser draws it without syntax colours. Terminals come with C3 and C4.
+**What it offers.** The board, the plans, the approvals, the diffs and the terminals, with `board`, `plans`,
+`approvals`, `diffs`, `terminals`, `input` and `mutations` asked for in `hello`. It answers approvals
+(`approval_decide`), approves plans (`plan_command` `approve`, with the plan's digest) and types into terminals
+when `welcome`'s `may` grants it; any other command says it is not available in the browser yet. A diff on screen
+is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the browser draws it without
+syntax colours.
+
+**Layouts (C4).** On a desktop, a top bar with the connection's state and a tab per view: Board, Plans,
+Approvals, Diffs, Terminal (an agent's, picked from a list) and Chief. On a phone (narrower than 600 points, or 900
+with a coarse pointer; the ⋯ menu overrides it, remembered in the client origin's `localStorage`), one pane at a
+time (Board, Plans, Diffs, Terminal, Chief) from a bottom bar, the approvals behind the top bar's ◆ badge, all
+inside `visualViewport` and the safe-area insets. Everything is drawn in the boot's ATOMICS theme (`Palette`);
+the page's own controls take its colours as CSS custom properties.
+
+**Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed. Its
+cells are the desktop's grid, drawn by the shared painter: the font fits the width until the user pinches, a wider
+grid pans, and a grid taller than the pane keeps the cursor in view. Looking never resizes the PTY. **Fit to this
+screen** sends `terminal_resize` for the pane at the current font, shown on the desktop, and lasts as long as the
+lease (**Computer's size** gives it back early).
+
+- **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
+  text, composition as preedit (drawn over the cursor), Return and Backspace from `beforeinput`, a hardware
+  keyboard's named keys and Ctrl+character from `keydown` (Ctrl+V and Cmd stay the browser's), and pastes. The
+  field has autocorrect, autocapitalisation, autocomplete and spellcheck off. A touch on it is handled by the client:
+  a tap focuses it from the touch's own handler (which opens the keyboard), and the browser's loupe, callout and page
+  zoom never start.
+- **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
+  while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, and takes the bottom
+  bar's place. Its keys never take the focus; Paste reads the clipboard on the touch's end.
+- **Touch and mouse.** A tap clicks the cell (press and release) where the program asked for mouse reports and this
+  client types; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
+  output does not move a view scrolled back) and pans; a long press (450 ms) selects, and a **Copy** chip copies
+  on its touch's end; a pinch sets the font size (5-28 points). A mouse clicks and drag-selects, and its wheel
+  scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a scroll sends arrows or wheel
+  reports instead, as the desktop does, only while this client types.
+- **Typing needs the lease.** Focusing the field asks for a free lease; text typed meanwhile waits for the grant
+  (16 KiB at most, this connection only). Another client typing makes the field read-only, with **Take over**. The
+  lease is renewed every 10 s while the field has the focus. Losing it (the desktop types, another client takes
+  over) takes the focus away, so typing again is a new tap. Input refused as `slow_client` is typed again at the
+  screen's next change. A view-only device's field is always read-only.
+- **Offline.** The screen stays on view, marked "Disconnected"; the field is read-only and nothing typed is kept:
+  the lease and anything waiting end with the channel, and the screen is subscribed again after `welcome`.
 
 **Tests.** `cargo test -p atomics-web`: the boot's origin, window and field rules; the channel, pairing, the
 board, commands and grants, reconnecting and every stop against an in-process host built from `atomics_core`
-(`src/fake_host.rs`); the views drawn headless; the manifest; and that the crate names no hosting product.
+(`src/fake_host.rs`, whose terminals echo under leases); the terminals' leases, typing, history, no replay and
+`slow_client`; the gestures; the overlay's events; the phone layout at 360, 390 and 430 points; key encoding per
+terminal mode (`atomics_ui::terminal::encode`); the views drawn headless; the manifest; and that the crate names no
+hosting product. `tests/browser.rs` (ignored; needs the bundle and Chrome) also types into a terminal of the real
+bundle through DevTools, sees the echo, and loses and regains the lease.
 `crates/atomics-ui/tests/dependencies.rs` keeps desktop-only crates out of `atomics-ui` and `atomics-web` on both
 targets, and CI checks both for `wasm32-unknown-unknown`.
 

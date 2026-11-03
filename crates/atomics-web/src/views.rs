@@ -1,7 +1,9 @@
-//! The frame's screens: a top bar with the connection's state and four views (Board, Plans, Approvals and
-//! Diffs), drawn by atomics-ui's draw functions over the remote backend. After each draw the commands the
-//! user gave are carried out: a view command here, any other through the backend. A minimal layout; the
-//! phone layout comes with the terminal client.
+//! The frame's screens: Board, Plans, Approvals, Diffs, an agent's Terminal and the Chief, drawn by
+//! atomics-ui's draw functions over the remote backend, and terminals by [`TermPane`]. Two layouts
+//! ([`crate::layout`]): on a desktop a top bar with the connection's state and a tab per view; on a phone
+//! one pane at a time, switched from a bottom bar, inside the part of the viewport the user sees. After
+//! each draw the commands the user gave are carried out: a view command here, any other through the
+//! backend.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,17 +14,24 @@ use atomics_core::ops::Grant;
 use atomics_core::wire::Role;
 use atomics_ui::theme::{FontHook, Fonts, Palette, definitions};
 use atomics_ui::{Backend, Client, Command, PanelMode, ViewHints, approvals, board, diff_panel};
-use egui::{Align, Layout, Rect, RichText, Sense, pos2, vec2};
+use egui::{Align, Align2, Layout, Rect, RichText, Sense, pos2, vec2};
 
 use crate::boot::Boot;
 use crate::driver::{Driver, Status};
+use crate::layout::{self, LayoutMode, Viewport};
+use crate::term_pane::TermPane;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tab {
+    #[default]
     Board,
     Plans,
     Approvals,
     Diffs,
+    /// An agent's terminal.
+    Terminal,
+    /// The chief's terminal.
+    Chief,
 }
 
 impl Tab {
@@ -32,25 +41,45 @@ impl Tab {
             "plans" => Tab::Plans,
             "approvals" => Tab::Approvals,
             "diffs" => Tab::Diffs,
+            "terminal" => Tab::Terminal,
+            "chief" => Tab::Chief,
             _ => Tab::Board,
         }
     }
+
+    fn terminal(self) -> bool {
+        matches!(self, Tab::Terminal | Tab::Chief)
+    }
 }
 
+/// The phone layout's pane switcher, in order.
+pub const BAR: [(Tab, &str); 5] = [
+    (Tab::Board, "Board"),
+    (Tab::Plans, "Plans"),
+    (Tab::Diffs, "Diffs"),
+    (Tab::Terminal, "Terminal"),
+    (Tab::Chief, "Chief"),
+];
+
 /// What this frame shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct View {
     pub tab: Tab,
     /// The board's plan, by position in the plan list.
     pub plan: usize,
     /// The worktree whose diff is open.
     pub diff: Option<PathBuf>,
-}
-
-impl Default for View {
-    fn default() -> Self {
-        Self { tab: Tab::Board, plan: 0, diff: None }
-    }
+    /// The agent the Terminal tab shows; the first agent while none was picked.
+    pub session: Option<String>,
+    pub layout: LayoutMode,
+    pub viewport: Viewport,
+    pub term: TermPane,
+    /// A ticket key from the boot, opened once the board is in.
+    pub ticket_key: Option<String>,
+    /// The clock, in milliseconds.
+    pub now_ms: f64,
+    /// The last frame drew the phone layout.
+    pub compact: bool,
 }
 
 /// egui's bundled fonts: a browser has no font lookup, and a theme's named fonts are the desktop's.
@@ -72,14 +101,128 @@ pub fn apply_theme(ctx: &egui::Context, client: &mut Client, boot: &Boot) {
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
     sync(driver, client, view);
+    open_ticket(driver, view);
+    view.term.begin_frame();
+    let screen = ui.max_rect();
+    view.compact = layout::compact(screen.width(), view.viewport.coarse, view.layout);
     let p = client.palette.clone();
-    egui::Panel::top("atomics-top")
-        .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(12, 6)))
-        .show(ui, |ui| top(ui, driver, view, &p));
-    egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(8)))
-        .show(ui, |ui| body(ui, driver, client, view));
+    if view.compact {
+        phone(ui, screen, driver, client, view);
+    } else {
+        egui::Panel::top("atomics-top")
+            .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show(ui, |ui| top(ui, driver, view, &p));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(8)))
+            .show(ui, |ui| body(ui, driver, client, view));
+    }
+    view.term.end_frame();
+    driver.remote.end_frame();
     carry_out(driver, client, view);
+}
+
+/// The boot's ticket key, once the board is in: its plan on the board, or the board when none names it.
+fn open_ticket(driver: &Driver, view: &mut View) {
+    let remote = &driver.remote;
+    if view.ticket_key.is_none() || !remote.live() || remote.with_mirror(|m| m.epoch.is_none()) {
+        return;
+    }
+    let key = view.ticket_key.take().expect("checked");
+    view.tab = Tab::Board;
+    view.plan = remote.plan_for_ticket(&key).unwrap_or(0);
+}
+
+/// A child drawing into `rect` alone.
+fn region(ui: &mut egui::Ui, rect: Rect, salt: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(salt).max_rect(rect));
+    child.set_clip_rect(rect);
+    add(&mut child);
+}
+
+/// The phone layout: the top bar, one pane, and the pane switcher or the key bar's space.
+fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    let p = client.palette.clone();
+    ui.painter().rect_filled(screen, 0.0, p.background);
+    // The key bar's space replaces the switcher while it shows (a touch device typing); with a mouse the
+    // switcher stays.
+    let typing = view.tab.terminal() && view.term.typing() && view.viewport.keybar > 0.0;
+    let regions = layout::regions(screen, &view.viewport, typing);
+    ui.painter().rect_filled(regions.top.with_min_y(screen.top()), 0.0, p.topbar);
+    region(ui, regions.top.shrink2(vec2(12.0, 0.0)), "phone-top", |ui| phone_top(ui, driver, view, &p));
+    region(ui, regions.body, "phone-body", |ui| body(ui, driver, client, view));
+    if let Some(bar) = regions.bar {
+        pane_bar(ui, bar, driver, view, &p);
+    }
+    if let Some(keys) = regions.keybar {
+        ui.painter().rect_filled(keys, 0.0, p.topbar);
+    }
+}
+
+fn phone_top(ui: &mut egui::Ui, driver: &Driver, view: &mut View, p: &Palette) {
+    let approvals = driver.remote.with_mirror(|m| m.approvals.len());
+    ui.horizontal_centered(|ui| {
+        ui.label(RichText::new("ATOMICS").color(p.accent).strong());
+        let (text, good) = status_line(driver);
+        ui.label(RichText::new(text).color(status_color(good, p)).small());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            layout_menu(ui, view);
+            if approvals > 0 {
+                let badge = RichText::new(format!("◆ {approvals}")).color(p.warning).strong();
+                if ui
+                    .add(egui::Button::new(badge).min_size(vec2(layout::TOUCH, 30.0)))
+                    .on_hover_text("Approvals")
+                    .clicked()
+                {
+                    view.tab = Tab::Approvals;
+                }
+            }
+        });
+    });
+}
+
+/// "Layout": automatic (from the screen), phone or desktop.
+fn layout_menu(ui: &mut egui::Ui, view: &mut View) {
+    ui.menu_button("⋯", |ui| {
+        ui.label(RichText::new("Layout").small());
+        for (mode, label) in
+            [(LayoutMode::Auto, "Automatic"), (LayoutMode::Phone, "Phone"), (LayoutMode::Desktop, "Desktop")]
+        {
+            if ui.radio(view.layout == mode, label).clicked() {
+                view.layout = mode;
+                ui.close();
+            }
+        }
+    });
+}
+
+/// The phone layout's pane switcher.
+fn pane_bar(ui: &mut egui::Ui, bar: Rect, driver: &Driver, view: &mut View, p: &Palette) {
+    ui.painter().rect_filled(bar, 0.0, p.topbar);
+    ui.painter().line_segment([bar.left_top(), bar.right_top()], egui::Stroke::new(1.0, p.separator));
+    let waiting = driver
+        .remote
+        .with_mirror(|m| m.approvals.values().any(|a| m.sessions.get(&a.session).is_some_and(|s| !s.chief)));
+    for ((tab, label), item) in BAR.iter().zip(layout::bar_items(bar, BAR.len())) {
+        let response = ui.interact(item, ui.scope_id().with(("pane", label)), Sense::click());
+        let active = view.tab == *tab || (*tab == Tab::Board && view.tab == Tab::Approvals);
+        let color = if active {
+            p.accent
+        } else if response.hovered() {
+            p.foreground
+        } else {
+            p.muted
+        };
+        if active {
+            let line =
+                Rect::from_min_size(item.left_top() + vec2(item.width() * 0.25, 0.0), vec2(item.width() * 0.5, 2.0));
+            ui.painter().rect_filled(line, 1.0, p.accent);
+        }
+        let text = if *tab == Tab::Terminal && waiting { format!("{label} ◆") } else { label.to_string() };
+        ui.painter().text(item.center(), Align2::CENTER_CENTER, text, p.ui(12.5), color);
+        if response.clicked() {
+            view.tab = *tab;
+        }
+    }
 }
 
 /// Bring the client's own state in line with the backend before drawing.
@@ -127,18 +270,21 @@ fn status_line(driver: &Driver) -> (String, Option<bool>) {
     }
 }
 
+fn status_color(good: Option<bool>, p: &Palette) -> egui::Color32 {
+    match good {
+        Some(true) => p.success,
+        Some(false) => p.warning,
+        None => p.muted,
+    }
+}
+
 fn top(ui: &mut egui::Ui, driver: &mut Driver, view: &mut View, p: &Palette) {
     let remote = &driver.remote;
     let (plans, approvals, diffs) = remote.with_mirror(|m| (m.plans.len(), m.approvals.len(), m.diffs.len()));
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("ATOMICS").color(p.accent).strong());
         let (text, good) = status_line(driver);
-        let color = match good {
-            Some(true) => p.success,
-            Some(false) => p.warning,
-            None => p.muted,
-        };
-        ui.label(RichText::new(text).color(color).small());
+        ui.label(RichText::new(text).color(status_color(good, p)).small());
         ui.separator();
         let mut tab = |ui: &mut egui::Ui, which: Tab, label: String| {
             if ui.selectable_label(view.tab == which, label).clicked() {
@@ -149,7 +295,14 @@ fn top(ui: &mut egui::Ui, driver: &mut Driver, view: &mut View, p: &Palette) {
         tab(ui, Tab::Plans, format!("Plans {plans}"));
         tab(ui, Tab::Approvals, if approvals > 0 { format!("Approvals ◆ {approvals}") } else { "Approvals".into() });
         tab(ui, Tab::Diffs, format!("Diffs {diffs}"));
+        tab(ui, Tab::Terminal, "Terminal".into());
+        tab(ui, Tab::Chief, "Chief".into());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| layout_menu(ui, view));
     });
+}
+
+fn notice(ui: &mut egui::Ui, driver: &Driver) {
+    let remote = &driver.remote;
     if let Some(notice) = remote.notice() {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(notice).small());
@@ -208,13 +361,58 @@ fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
         }
         _ => {}
     }
+    notice(ui, driver);
     let backend: &dyn Backend = &driver.remote;
     match view.tab {
         Tab::Board => board_tab(ui, backend, client, view),
         Tab::Plans => plans_tab(ui, backend, client),
         Tab::Approvals => approvals_tab(ui, driver, client),
         Tab::Diffs => diffs_tab(ui, driver, client, view),
+        Tab::Terminal => terminal_tab(ui, driver, client, view),
+        Tab::Chief => chief_tab(ui, driver, client, view),
     }
+}
+
+/// An agent's terminal, picked from the agents on the computer.
+fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
+    let backend: &dyn Backend = &driver.remote;
+    let agents: Vec<_> = backend.session_list().into_iter().filter(|s| !s.chief).collect();
+    if agents.is_empty() {
+        return empty(ui, client, "No agents are running on this computer.");
+    }
+    let session =
+        view.session.clone().filter(|id| agents.iter().any(|s| &s.id == id)).unwrap_or_else(|| agents[0].id.clone());
+    let p = client.palette.clone();
+    ui.horizontal(|ui| {
+        let title = |s: &atomics_ui::SessionRow| {
+            if s.pending_approvals > 0 { format!("◆ {}", s.title) } else { s.title.clone() }
+        };
+        let current = agents.iter().find(|s| s.id == session).map(title).unwrap_or_default();
+        egui::ComboBox::from_id_salt("terminal-session")
+            .selected_text(RichText::new(current).color(p.foreground))
+            .width(ui.available_width().min(320.0))
+            .show_ui(ui, |ui| {
+                for agent in &agents {
+                    if ui.selectable_label(agent.id == session, title(agent)).clicked() {
+                        view.session = Some(agent.id.clone());
+                    }
+                }
+            });
+    });
+    let session = view.session.clone().filter(|id| agents.iter().any(|s| &s.id == id)).unwrap_or(session);
+    let now = view.now_ms;
+    let term = &mut view.term;
+    fill(ui, |ui, rect| term.draw(ui, rect, &session, &driver.remote, client, now));
+}
+
+fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
+    let backend: &dyn Backend = &driver.remote;
+    let Some(chief) = backend.session_list().into_iter().find(|s| s.chief) else {
+        return empty(ui, client, "No chief is running on this computer.");
+    };
+    let now = view.now_ms;
+    let term = &mut view.term;
+    fill(ui, |ui, rect| term.draw(ui, rect, &chief.id, &driver.remote, client, now));
 }
 
 fn empty(ui: &mut egui::Ui, client: &Client, text: &str) {

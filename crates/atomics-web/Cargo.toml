@@ -37,6 +37,7 @@ web-sys = { version = "0.3.106", features = [
     "HtmlCanvasElement",
     "MessageEvent",
     "Navigator",
+    "Performance",
     "WebSocket",
     "Window",
     "console",

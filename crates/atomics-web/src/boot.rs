@@ -173,8 +173,12 @@ pub struct Boot {
     pub theme: String,
     pub scheme: Scheme,
     pub locale: String,
-    /// What to open on, if the hosting page asked (`board`, `plans`, `approvals`, `diffs`, …).
+    /// What to open on, if the hosting page asked (`board`, `plans`, `approvals`, `diffs`, `terminal`,
+    /// `chief`; anything else opens the board).
     pub view: Option<String>,
+    /// A ticket's key: open the plan that follows it, or whose task does (`docs/tickets.md`); the board
+    /// when none does. The boot's `ticket` is the connect ticket, hence the name.
+    pub ticket_key: Option<String>,
     /// Set on a pairing boot: the pairing link's host key and psk.
     pub pairing: Option<Pairing>,
 }
@@ -303,6 +307,7 @@ fn boot(data: &Value) -> Result<Boot, Refused> {
         scheme,
         locale: text(data, "locale"),
         view: view.map(str::to_string),
+        ticket_key: Some(text(data, "ticket_key")).filter(|key| !key.is_empty()),
         pairing,
         host_id,
     })

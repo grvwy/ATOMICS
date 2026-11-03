@@ -267,6 +267,13 @@ and the client sets the input's attributes itself instead of relying on eframe's
 autocorrect on. **a** and **a+** are not pursued. Final: **b** passed in iOS Safari, iOS Chrome and the installed
 PWA.
 
+**As built (C4, 2026-11-03).** `docs/daemon.md`, "The browser client and its embedding", describes the mode as
+built. Two things differ from the spike and need an iPhone check before M4. A touch on the overlay is now the client's:
+`touchstart` is prevented, so iOS's loupe, callout and page zoom never start, and a tap focuses the field from its
+own `touchend` handler; the spike let the browser focus it natively. And the key bar shows only on a coarse
+pointer, so a desktop browser's terminal keeps its pane switcher. The rest was checked in headless Chrome
+(`tests/browser.rs`): typing and Return, the echo, losing the lease to the desktop and taking it again.
+
 ### 4.5 The entry point
 
 Where the hosting app shows ATOMICS is its decision; in Relay it is an item in the application switcher, shown on

@@ -1,8 +1,11 @@
 //! The real bundle in headless Chrome. A page on another origin frames it and boots it over `postMessage`,
 //! a third origin's frame keeps posting a boot of its own, and a fake broker passes the channel to the fake
 //! host of the unit tests. The browser pairs (keeping its key in IndexedDB), says `hello`, reconnects with
-//! a fresh ticket and resumes, and after a reload dials again with the key read back from IndexedDB. The
-//! client's page is served under the strict CSP the bundle is built for.
+//! a fresh ticket and resumes, and after a reload dials again with the key read back from IndexedDB, opening
+//! on an agent's terminal. There, through DevTools: a click focuses the input overlay, which takes the
+//! lease; typed text and Return reach the host and echo; a drag selects the echoed line from the client's
+//! own cells; the desktop takes the lease back, which blurs the overlay; and a new click takes it again.
+//! The client's page is served under the strict CSP the bundle is built for.
 //!
 //! It needs the built bundle and Chrome, so it is ignored by default:
 //!
@@ -10,7 +13,8 @@
 //!     cargo test -p atomics-web --test browser -- --ignored
 //!
 //! `ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser binary.
-//! `ATOMICS_WEB_SCREENSHOT=out.png` also saves what the page shows once the board is in.
+//! `ATOMICS_WEB_SCREENSHOT=out.png` also saves what the page shows once the board is in, and
+//! `ATOMICS_WEB_TERMINAL_SCREENSHOT=out.png` the terminal with its echo selected.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -26,7 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use atomics_core::wire::Message;
+use atomics_core::wire::{Message, Topic};
 use serde_json::json;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::http::HeaderValue;
@@ -182,8 +186,18 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// Frames the host sends on its own (the desktop typing, say), which the broker passes on.
+type Pending = Arc<Mutex<Vec<Vec<u8>>>>;
+
 /// The broker and the host behind it: one browser channel at a time, each socket one channel.
-fn broker(listener: TcpListener, host: Arc<Mutex<FakeHost>>, log: Arc<Log>, origin: String, cut: Arc<AtomicBool>) {
+fn broker(
+    listener: TcpListener,
+    host: Arc<Mutex<FakeHost>>,
+    log: Arc<Log>,
+    origin: String,
+    cut: Arc<AtomicBool>,
+    pending: Pending,
+) {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut ticket = String::new();
@@ -227,6 +241,9 @@ fn broker(listener: TcpListener, host: Arc<Mutex<FakeHost>>, log: Arc<Log>, orig
                     log.push("cut");
                     break;
                 }
+                for frame in std::mem::take(&mut *pending.lock().unwrap()) {
+                    let _ = socket.send(tungstenite::Message::binary(frame));
+                }
                 let bytes = match socket.read() {
                     Ok(tungstenite::Message::Binary(bytes)) => bytes,
                     Ok(tungstenite::Message::Close(_)) => break,
@@ -246,8 +263,22 @@ fn broker(listener: TcpListener, host: Arc<Mutex<FakeHost>>, log: Arc<Log>, orig
                 let before = host.received.len();
                 let result = host.receive(&bytes);
                 for message in &host.received[before..] {
-                    if let Message::Hello { prior_epoch, .. } = message {
-                        log.push(format!("hello {}", prior_epoch.as_deref().unwrap_or("new")));
+                    match message {
+                        Message::Hello { prior_epoch, .. } => {
+                            log.push(format!("hello {}", prior_epoch.as_deref().unwrap_or("new")));
+                        }
+                        Message::Subscribe { topics } => {
+                            for topic in topics {
+                                if let Topic::Screen { session, .. } = topic {
+                                    log.push(format!("subscribe {session}"));
+                                }
+                            }
+                        }
+                        Message::LeaseAcquire { session, takeover } => {
+                            log.push(format!("acquire {session}{}", if *takeover { " takeover" } else { "" }));
+                        }
+                        Message::TerminalResize { session, .. } => log.push(format!("resize {session}")),
+                        _ => {}
                     }
                 }
                 drop(host);
@@ -291,71 +322,137 @@ fn base64(text: &str) -> Vec<u8> {
     out
 }
 
-/// Save what the page shows, through the DevTools port Chrome wrote into its profile. Every step is
-/// bounded by [`WAIT`], and every read by [`READ`].
-fn screenshot(profile: &Path, out: &Path) {
-    let deadline = Instant::now() + WAIT;
-    let left = |what: &str| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "screenshot: timed out waiting for {what}");
-        left
-    };
-    let port = loop {
-        let active = std::fs::read_to_string(profile.join("DevToolsActivePort")).unwrap_or_default();
-        if let Some(port) = active.lines().next().filter(|p| !p.trim().is_empty()) {
-            break port.trim().to_string();
-        }
-        left("Chrome to write DevToolsActivePort");
-        thread::sleep(Duration::from_millis(100));
-    };
-    let connect = |what: &str| {
-        let stream = TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().unwrap(), left(what))
-            .unwrap_or_else(|e| panic!("screenshot: {what}: {e}"));
-        stream.set_read_timeout(Some(READ)).unwrap();
-        stream.set_write_timeout(Some(READ)).unwrap();
-        stream
-    };
-    // DevTools may keep the connection open: read the headers, then exactly Content-Length bytes.
-    let mut http = BufReader::new(connect("the DevTools HTTP port"));
-    write!(http.get_mut(), "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
-    let mut length = None;
-    loop {
-        let mut header = String::new();
-        http.read_line(&mut header).unwrap_or_else(|e| panic!("screenshot: reading /json/list's headers: {e}"));
-        if header == "\r\n" || header.is_empty() {
-            break;
-        }
-        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse::<usize>().ok();
+/// A DevTools connection to one target of the browser (the page, or the client's frame), through the port
+/// Chrome wrote into its profile. Every step is bounded by [`WAIT`], and every read by [`READ`].
+struct DevTools {
+    socket: tungstenite::WebSocket<TcpStream>,
+    next: u64,
+}
+
+impl DevTools {
+    fn open(profile: &Path, what: &str, pick: impl Fn(&serde_json::Value) -> bool) -> DevTools {
+        let deadline = Instant::now() + WAIT;
+        let left = |step: &str| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "devtools ({what}): timed out waiting for {step}");
+            left
+        };
+        let port = loop {
+            let active = std::fs::read_to_string(profile.join("DevToolsActivePort")).unwrap_or_default();
+            if let Some(port) = active.lines().next().filter(|p| !p.trim().is_empty()) {
+                break port.trim().to_string();
+            }
+            left("Chrome to write DevToolsActivePort");
+            thread::sleep(Duration::from_millis(100));
+        };
+        let connect = |step: &str| {
+            let stream = TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().unwrap(), left(step))
+                .unwrap_or_else(|e| panic!("devtools ({what}): {step}: {e}"));
+            stream.set_read_timeout(Some(READ)).unwrap();
+            stream.set_write_timeout(Some(READ)).unwrap();
+            stream
+        };
+        let url = loop {
+            // DevTools may keep the connection open: read the headers, then exactly Content-Length bytes.
+            let mut http = BufReader::new(connect("the DevTools HTTP port"));
+            write!(http.get_mut(), "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+            let mut length = None;
+            loop {
+                let mut header = String::new();
+                http.read_line(&mut header).unwrap_or_else(|e| panic!("devtools: reading /json/list's headers: {e}"));
+                if header == "\r\n" || header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().ok();
+                }
+            }
+            let mut body = vec![0; length.expect("devtools: /json/list has a Content-Length")];
+            http.read_exact(&mut body).unwrap_or_else(|e| panic!("devtools: reading /json/list: {e}"));
+            let targets: serde_json::Value = serde_json::from_slice(&body).expect("devtools: /json/list is JSON");
+            let found = targets.as_array().unwrap().iter().find(|t| pick(t)).cloned();
+            if let Some(url) = found.as_ref().and_then(|t| t["webSocketDebuggerUrl"].as_str()) {
+                break url.to_string();
+            }
+            left("the target");
+            thread::sleep(Duration::from_millis(200));
+        };
+        let (socket, _) = tungstenite::client(url.as_str(), connect("the DevTools socket"))
+            .unwrap_or_else(|e| panic!("devtools ({what}): the handshake: {e}"));
+        DevTools { socket, next: 0 }
+    }
+
+    /// Call `method` and return its result.
+    fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.next += 1;
+        let id = self.next;
+        let ask = json!({ "id": id, "method": method, "params": params });
+        self.socket.send(tungstenite::Message::text(ask.to_string())).unwrap();
+        let deadline = Instant::now() + WAIT;
+        loop {
+            assert!(Instant::now() < deadline, "devtools: timed out waiting for {method}");
+            let reply = match self.socket.read() {
+                Ok(tungstenite::Message::Text(reply)) => reply,
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("devtools: the socket: {e}"),
+            };
+            let reply: serde_json::Value = serde_json::from_str(reply.as_str()).unwrap();
+            if reply["id"] == id {
+                assert!(reply.get("error").is_none(), "devtools: {method} failed: {reply}");
+                return reply["result"].clone();
+            }
         }
     }
-    let mut body = vec![0; length.expect("screenshot: /json/list has a Content-Length")];
-    http.read_exact(&mut body).unwrap_or_else(|e| panic!("screenshot: reading /json/list: {e}"));
-    let targets: serde_json::Value = serde_json::from_slice(&body).expect("screenshot: /json/list is JSON");
-    let page = targets.as_array().unwrap().iter().find(|t| t["type"] == "page").expect("screenshot: a page target");
-    let url = page["webSocketDebuggerUrl"].as_str().expect("screenshot: the page's DevTools socket");
-    let (mut devtools, _) = tungstenite::client(url, connect("the DevTools socket"))
-        .unwrap_or_else(|e| panic!("screenshot: the DevTools handshake: {e}"));
-    let ask = json!({ "id": 1, "method": "Page.captureScreenshot", "params": { "format": "png" } });
-    devtools.send(tungstenite::Message::text(ask.to_string())).unwrap();
-    loop {
-        left("DevTools to answer Page.captureScreenshot");
-        let reply = match devtools.read() {
-            Ok(tungstenite::Message::Text(reply)) => reply,
-            Ok(_) => continue,
-            Err(tungstenite::Error::Io(e))
-                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-            {
-                continue;
-            }
-            Err(e) => panic!("screenshot: the DevTools socket: {e}"),
-        };
-        let reply: serde_json::Value = serde_json::from_str(reply.as_str()).unwrap();
-        if reply["id"] == 1 {
-            let data = reply["result"]["data"].as_str().unwrap_or_else(|| panic!("screenshot: DevTools said {reply}"));
-            std::fs::write(out, base64(data)).unwrap();
-            return;
+
+    /// The value of a JavaScript expression in the target.
+    fn eval(&mut self, expression: &str) -> serde_json::Value {
+        let result = self.call("Runtime.evaluate", json!({ "expression": expression, "returnByValue": true }));
+        result["result"]["value"].clone()
+    }
+
+    /// Wait until `expression` is true in the target, naming `what` if it never is.
+    fn wait(&mut self, what: &str, expression: &str) {
+        let deadline = Instant::now() + WAIT;
+        while self.eval(expression) != json!(true) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what} ({expression})");
+            thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn mouse(&mut self, kind: &str, (x, y): (f64, f64)) {
+        let pressed = kind != "mouseMoved";
+        let params = json!({
+            "type": kind, "x": x, "y": y, "button": if pressed { "left" } else { "none" },
+            "buttons": if kind == "mouseReleased" { 0 } else { 1 }, "clickCount": if pressed { 1 } else { 0 },
+        });
+        self.call("Input.dispatchMouseEvent", params);
+    }
+
+    fn click(&mut self, at: (f64, f64)) {
+        self.mouse("mousePressed", at);
+        self.mouse("mouseReleased", at);
+    }
+}
+
+/// Save what the page shows.
+fn screenshot(profile: &Path, out: &Path) {
+    let mut page = DevTools::open(profile, "screenshot", |t| t["type"] == "page");
+    let data = page.call("Page.captureScreenshot", json!({ "format": "png" }));
+    let data = data["data"].as_str().unwrap_or_else(|| panic!("screenshot: DevTools said {data}"));
+    std::fs::write(out, base64(data)).unwrap();
+}
+
+/// Wait until `ready` holds for the host, naming `what` if it never does.
+fn wait_host(host: &Mutex<FakeHost>, what: &str, ready: impl Fn(&FakeHost) -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !ready(&host.lock().unwrap()) {
+        assert!(Instant::now() < deadline, "timed out waiting for the host: {what}");
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -402,7 +499,9 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     let mut pair = boot("ticket-0");
     pair["mode"] = json!("pair");
     pair["pair"] = json!({ "v": 1, "host_noise_pubkey": keys[2], "psk": keys[3] });
-    let session = boot("ticket-s");
+    // The reloaded page opens on an agent's terminal.
+    let mut session = boot("ticket-s");
+    session["view"] = json!("terminal");
     let evil = boot("evil");
 
     let csp = format!(
@@ -453,7 +552,8 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
         );
     }
     let cut = Arc::new(AtomicBool::new(false));
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone());
+    let pending: Pending = Arc::default();
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), pending.clone());
 
     let profile = tempfile::tempdir().unwrap();
     let chrome_log = profile.path().join("chrome.log");
@@ -507,6 +607,63 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     log.wait("dial ticket-s", 1);
     log.wait("first 97 bytes, kind 2", 2);
     log.wait("hello new", 2);
+
+    // The terminal: following it takes no lease, and nothing ever resizes it.
+    log.wait("subscribe s1", 1);
+    assert!(!log.has("acquire s1"), "following a terminal never takes its lease");
+    let devtools = profile.path().join("profile");
+    let frame_url = format!("{client_origin}/");
+    let mut frame = DevTools::open(&devtools, "the client's frame", |t| {
+        t["type"] == "iframe" && t["url"].as_str().is_some_and(|u| u.starts_with(&frame_url))
+    });
+    let mut page = DevTools::open(&devtools, "the hosting page", |t| t["type"] == "page");
+    frame.wait("the input overlay over the terminal", "!document.getElementById('atomics-input').hidden");
+    let offset = page.eval(
+        "(() => { const f = document.querySelector('iframe'); const r = f.getBoundingClientRect(); \
+         return [r.left + f.clientLeft, r.top + f.clientTop]; })()",
+    );
+    let overlay = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.left, r.top, r.width]; })()");
+    let number = |v: &serde_json::Value, i: usize| v[i].as_f64().expect("a number");
+    let at =
+        |x: f64, y: f64| (number(&offset, 0) + number(&overlay, 0) + x, number(&offset, 1) + number(&overlay, 1) + y);
+    assert!(number(&overlay, 2) >= 380.0, "the terminal fills the phone frame's width: {overlay}");
+
+    // A click focuses the overlay, which asks for the lease; typing and Return reach the host.
+    frame.wait("a writable overlay", "!document.getElementById('atomics-input').readOnly");
+    page.click(at(40.0, 40.0));
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the overlay", "document.activeElement === document.getElementById('atomics-input')");
+    page.call("Input.insertText", json!({ "text": "echo hi" }));
+    let enter = |kind: &str| json!({ "type": kind, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "text": "\r" });
+    page.call("Input.dispatchKeyEvent", enter("keyDown"));
+    page.call(
+        "Input.dispatchKeyEvent",
+        json!({ "type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13 }),
+    );
+    wait_host(&host, "\"echo hi\\r\" typed", |h| h.terminals["s1"].typed == "echo hi\r");
+
+    // The echo is on the client's screen: a drag over the first line selects it from the client's cells.
+    page.mouse("mousePressed", at(5.0, 6.0));
+    page.mouse("mouseMoved", at(200.0, 6.0));
+    page.mouse("mouseMoved", at(360.0, 6.0));
+    page.mouse("mouseReleased", at(360.0, 6.0));
+    frame.wait("the echoed line selected", "document.getElementById('atomics-copy').title.includes('$ echo hi')");
+    if let Some(out) = std::env::var_os("ATOMICS_WEB_TERMINAL_SCREENSHOT") {
+        thread::sleep(Duration::from_millis(500));
+        screenshot(&devtools, Path::new(&out));
+    }
+
+    // The desktop types: the lease goes back and the overlay loses the focus; a new click takes it again.
+    let back = host.lock().unwrap().desktop_types("s1", "!");
+    pending.lock().unwrap().extend(back);
+    frame.wait("the overlay blurred", "document.activeElement !== document.getElementById('atomics-input')");
+    assert!(host.lock().unwrap().terminals["s1"].lease.is_none());
+    page.click(at(40.0, 40.0));
+    log.wait("acquire s1", 2);
+    frame.wait("the focus back on the overlay", "document.activeElement === document.getElementById('atomics-input')");
+    page.call("Input.insertText", json!({ "text": "x" }));
+    wait_host(&host, "the second typing", |h| h.terminals["s1"].typed == "echo hi\r!x");
+    assert!(!log.has("resize s1"), "the phone never resized the terminal");
 
     log.wait("parent other posted", 1);
     assert!(!log.has("dial evil"), "a boot from another origin was never taken");

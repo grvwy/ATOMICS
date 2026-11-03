@@ -30,3 +30,105 @@ body {
   padding: 16px;
   font: 15px system-ui, sans-serif;
 }
+
+/* The terminal's input overlay (web/terminal.js): over the cells the app draws, its own text and caret
+   invisible. The app draws what it forwards. */
+#atomics-input {
+  position: fixed;
+  z-index: 1;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  /* 16px keeps iOS from zooming the page when the field takes the focus. */
+  font: 16px ui-monospace, monospace;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+
+#atomics-input[hidden],
+#atomics-keybar[hidden],
+#atomics-copy[hidden] {
+  display: none;
+}
+
+/* The key bar sits on the keyboard: left and top stay 0, the transform places it (web/terminal.js). The
+   app lays out its two rows of eight slots (src/layout.rs, KEYBAR). */
+#atomics-keybar {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 2;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  transform-origin: 0 0;
+  background: var(--atomics-bar, #2a2826);
+  border-top: 1px solid var(--atomics-border, #3d3a36);
+}
+
+.atomics-keyrow {
+  display: flex;
+  gap: 4px;
+}
+
+#atomics-keybar button,
+#atomics-copy {
+  font: 15px system-ui, sans-serif;
+  color: var(--atomics-key-text, #e8e4dc);
+  background: var(--atomics-key, #3a3734);
+  border: 1px solid var(--atomics-border, #3d3a36);
+  border-radius: 6px;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#atomics-keybar button {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 38px;
+  padding: 0;
+}
+
+#atomics-keybar button.wide {
+  flex-grow: 2;
+}
+
+#atomics-keybar button.on {
+  color: var(--atomics-on-accent, #1f1e1d);
+  background: var(--atomics-accent, #d97757);
+  border-color: var(--atomics-accent, #d97757);
+}
+
+#atomics-copy {
+  position: fixed;
+  z-index: 3;
+  height: 36px;
+  padding: 0 14px;
+  box-shadow: 0 2px 8px var(--atomics-shadow, rgba(0, 0, 0, 0.35));
+}
+
+/* Reads the safe-area insets for the app's layout. */
+#atomics-insets {
+  position: fixed;
+  visibility: hidden;
+  pointer-events: none;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.atomics-scratch {
+  position: fixed;
+  left: -1000px;
+  top: 0;
+  opacity: 0;
+}

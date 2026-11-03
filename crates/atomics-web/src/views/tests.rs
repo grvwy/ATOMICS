@@ -31,7 +31,7 @@ fn live() -> (egui::Context, World, Client, View) {
 #[test]
 fn every_tab_draws_over_a_live_host() {
     let (ctx, mut world, mut client, mut view) = live();
-    for tab in [Tab::Board, Tab::Plans, Tab::Approvals, Tab::Diffs] {
+    for tab in [Tab::Board, Tab::Plans, Tab::Approvals, Tab::Diffs, Tab::Terminal, Tab::Chief] {
         view.tab = tab;
         frame(&ctx, &mut world, &mut client, &mut view);
         frame(&ctx, &mut world, &mut client, &mut view);
@@ -105,4 +105,47 @@ fn the_pairing_screen_and_a_stop_draw() {
     world.boot(None);
     assert!(matches!(world.driver.status(), Status::Stopped(_)));
     frame(&ctx, &mut world, &mut client, &mut view);
+}
+
+#[test]
+fn a_boots_view_and_ticket_key_open_their_pane_or_plan() {
+    for (view, tab) in
+        [("chief", Tab::Chief), ("terminal", Tab::Terminal), ("diffs", Tab::Diffs), ("ENG-1234", Tab::Board)]
+    {
+        assert_eq!(Tab::named(view), tab, "{view}");
+    }
+    // A second plan, which a task's ticket names; the first plan follows its own ticket.
+    let mut host = fake_host::host();
+    let mut second = host.board.plans[0].clone();
+    second.id = "p2".into();
+    second.goal = "Ship the parser".into();
+    second.ticket = None;
+    second.tasks[1].ticket = Some("ENG-77".into());
+    host.board.plans.push(second);
+    for (key, plan) in [(Some("eng-77"), 1), (Some("ENG-40"), 0), (Some("ENG-41"), 0), (Some("ENG-999"), 0)] {
+        let mut world = World::paired(fake_host::host());
+        world.host.board = host.board.clone();
+        let (ctx, mut client) = (egui::Context::default(), Client::default());
+        let mut view = View { tab: Tab::Chief, ticket_key: key.map(str::to_string), plan: 5, ..View::default() };
+        frame(&ctx, &mut world, &mut client, &mut view);
+        assert_eq!(view.ticket_key.as_deref(), key, "kept until the board is in");
+        world.boot(None);
+        frame(&ctx, &mut world, &mut client, &mut view);
+        assert_eq!((view.tab, view.ticket_key.as_deref()), (Tab::Board, None), "{key:?}: the board");
+        assert_eq!(view.plan, plan, "{key:?}: its plan, else the first");
+    }
+}
+
+#[test]
+fn the_layout_is_the_users_choice_over_the_screens() {
+    let (ctx, mut world, mut client, mut view) = live();
+    frame(&ctx, &mut world, &mut client, &mut view);
+    assert!(view.compact, "a phone's width");
+    view.layout = LayoutMode::Desktop;
+    frame(&ctx, &mut world, &mut client, &mut view);
+    assert!(!view.compact);
+    view.layout = LayoutMode::Auto;
+    view.viewport.coarse = true;
+    frame(&ctx, &mut world, &mut client, &mut view);
+    assert!(view.compact);
 }

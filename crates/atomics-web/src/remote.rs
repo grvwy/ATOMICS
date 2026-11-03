@@ -3,8 +3,9 @@
 //! become mutations through [`Command::remote`], each only when the host's `welcome` grants it. I/O free:
 //! frames come in through [`RemoteBackend::receive`] and go out through [`RemoteBackend::take_outgoing`].
 //!
-//! The browser offers what milestone M3 needs: everything read-only, plus answering approvals and
-//! approving plans where `may` allows. Any other command says so on the notice line.
+//! The browser offers everything read-only, answers approvals and approves plans where `may` allows, and
+//! follows and types into terminals ([`crate::screens`]) where it grants `type`. Any other command says so
+//! on the notice line.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -16,11 +17,13 @@ use atomics_core::config::{AgentKind, FontConfig, KeyConfig};
 use atomics_core::diff::{FileDiff, WorktreeDiff};
 use atomics_core::diff_data::Prepared;
 use atomics_core::layout::LayoutConfig;
+use atomics_core::lease::GridSize;
 use atomics_core::mirror::Mirror;
 use atomics_core::ops::{self, Grant, Outcome, Pending};
 use atomics_core::plan::{Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::projection::{DiffFileBody, DiffFileSummary, PlanInfo, SessionInfo, TaskInfo};
 use atomics_core::repo_workflow::RepoWorkflow;
+use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
 use atomics_ui::{
@@ -28,8 +31,11 @@ use atomics_ui::{
     ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
 };
 
-/// What this client asks the host for. Terminals and typing come with the terminal client.
-pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", wire::MUTATIONS];
+use crate::screens::{Lease, Screens};
+
+/// What this client asks the host for.
+pub const CAPABILITIES: &[&str] =
+    &["board", "plans", "approvals", "diffs", wire::TERMINALS, wire::INPUT, wire::MUTATIONS];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
 /// Pages of one file's diff read before the rest is left out.
@@ -72,6 +78,7 @@ struct State {
     notice: Option<String>,
     now_ms: u64,
     view: ViewHints,
+    screens: Screens,
 }
 
 /// One worktree's diff at one revision.
@@ -136,6 +143,7 @@ impl RemoteBackend {
             notice: None,
             now_ms: 0,
             view: default_hints(),
+            screens: Screens::default(),
         };
         Self { state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
     }
@@ -171,6 +179,7 @@ impl RemoteBackend {
         s.resyncing = false;
         s.outgoing.clear();
         s.requests.clear();
+        s.screens.disconnected();
         for fetched in s.diffs.values_mut() {
             fetched.files.retain(|_, body| matches!(body, Body::Got { more: false, .. } | Body::Failed));
         }
@@ -247,8 +256,96 @@ impl RemoteBackend {
     /// One frame from the host.
     pub fn receive(&self, envelope: Envelope) {
         let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        if s.screens.receive(&envelope, &mut s.outgoing) {
+            return;
+        }
         s.receive(envelope);
         s.fetch();
+    }
+
+    /// The plan a ticket key names, by its place in the plan list: an open plan that follows the ticket,
+    /// else an open plan with a task for it, else a closed plan that does either. Keys compare without
+    /// regard to ASCII case. `None` when no plan names it.
+    pub fn plan_for_ticket(&self, key: &str) -> Option<usize> {
+        let s = self.state.borrow();
+        let names = |ticket: &Option<String>| ticket.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(key));
+        let own = |p: &PlanInfo| names(&p.ticket);
+        let task = |p: &PlanInfo| p.tasks.iter().any(|t| names(&t.ticket));
+        let open = |p: &PlanInfo| p.status == PlanStatus::Open;
+        let rules: [&dyn Fn(&PlanInfo) -> bool; 3] =
+            [&|p| open(p) && own(p), &|p| open(p) && task(p), &|p| own(p) || task(p)];
+        rules.iter().find_map(|rule| s.mirror.plans.values().position(rule))
+    }
+
+    /// Connected and greeted: frames sent now are read.
+    pub fn live(&self) -> bool {
+        self.state.borrow().welcome.is_some()
+    }
+
+    /// The UI shows `session`'s terminal this frame ([`Screens::show`]).
+    pub fn show_screen(&self, session: &str, focused: bool) {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        let live = s.welcome.is_some();
+        s.screens.show(session, focused, live, &mut s.outgoing);
+    }
+
+    /// After each frame: stop following the screens it did not show.
+    pub fn end_frame(&self) {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.end_frame(&mut s.outgoing);
+    }
+
+    /// A read of `session`'s screen as received, with whether it is from before a disconnect.
+    pub fn with_screen<R>(&self, session: &str, read: impl FnOnce(Option<(&Screen, bool)>) -> R) -> R {
+        read(self.state.borrow().screens.view(session))
+    }
+
+    /// Fill `view` with `rows` lines of `session` from line ID `top` on ([`Screens::fill`]).
+    pub fn fill_screen(&self, session: &str, top: u64, rows: u16, view: &mut Screen) -> bool {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.fill(session, top, rows, view, &mut s.outgoing).is_some()
+    }
+
+    pub fn lease(&self, session: &str) -> Lease {
+        self.state.borrow().screens.lease(session)
+    }
+
+    /// Ask for `session`'s lease; `takeover` only for the user's explicit act. Not for a view-only device.
+    pub fn acquire(&self, session: &str, takeover: bool) {
+        if !self.may(Grant::Type) {
+            return;
+        }
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.acquire(session, takeover, &mut s.outgoing);
+    }
+
+    /// Type `data` into `session`, already encoded for its modes ([`Screens::type_text`]). Nothing is sent
+    /// without the `type` grant or a channel; nothing is kept for a later one.
+    pub fn type_text(&self, session: &str, data: &str) -> bool {
+        if !self.may(Grant::Type) {
+            return false;
+        }
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.type_text(session, data, &mut s.outgoing)
+    }
+
+    pub fn renew(&self, session: &str) {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.renew(session, &mut s.outgoing);
+    }
+
+    /// Fit `session` to this screen with a size, or give it back the computer's size with `None`.
+    pub fn resize(&self, session: &str, size: Option<GridSize>) {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.resize(session, size, &mut s.outgoing);
     }
 }
 

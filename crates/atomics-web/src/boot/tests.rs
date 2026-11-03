@@ -78,6 +78,7 @@ fn a_boot_carries_the_host_the_ticket_the_broker_and_the_look() {
     assert_eq!(boot.broker, "wss://app.example/atomics/tunnel");
     assert_eq!((boot.display_name.as_str(), boot.theme.as_str(), boot.locale.as_str()), ("A Person", "dark", "en"));
     assert_eq!((boot.scheme, boot.view.as_deref()), (Scheme::Dark, Some("board")));
+    assert_eq!(boot.ticket_key, None, "no ticket asked for");
     assert!(boot.pairing.is_none());
     assert_eq!(boot.ticket.subprotocol().as_str(), "atomics.ticket.t0K-en.x_1");
     let shown = format!("{boot:?} {:?}", boot.ticket);
@@ -134,6 +135,18 @@ fn malformed_boots_are_refused_by_field() {
     local["display_name"] = json!("  A\u{7}Person  ");
     let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &local) else { panic!("a boot") };
     assert_eq!((boot.view, boot.display_name.as_str()), (None, "APerson"));
+    // A ticket key is a text like the others; an empty or odd one opens nothing in particular.
+    for (value, key) in [
+        (json!(" ENG-40\u{1b} "), Some("ENG-40")),
+        (json!("  "), None),
+        (json!(42), None),
+        (json!("k".repeat(300)), Some(&*"k".repeat(200))),
+    ] {
+        let mut message = boot_message();
+        message["ticket_key"] = value.clone();
+        let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &message) else { panic!("{value}") };
+        assert_eq!(boot.ticket_key.as_deref(), key, "{value}");
+    }
 }
 
 #[test]
