@@ -10,12 +10,14 @@
 //! minutes, one at a time. A device that answers it goes through these stages:
 //! - *open*: the link waits for a device;
 //! - *handshake*: one device at a time completes the handshake and proves the psk with its first
-//!   message (others get `no_pairing` meanwhile, and a browser tries again while its link may still
+//!   message (others get `pairing_busy` meanwhile, and a browser tries again while its link may still
 //!   be valid). The handshake alone proves nothing about the psk, so the link goes back as soon as
 //!   that first message fails or the device leaves, and at the latest after [`HANDSHAKE_WINDOW`];
 //! - *claimed*: the desktop shows the device's name and the code, and asks whether the codes match;
 //! - the user's answer pairs the device (view-only, or may type and approve) or refuses it. Either
-//!   way the link is used up, as it is when it expires or the device leaves first.
+//!   way the link is used up, as it is when it expires or the device leaves first. A device that
+//!   answers a used-up, expired or withdrawn link gets `no_pairing`, never `pairing_busy`
+//!   ([`Unavailable`]).
 //!
 //! **Revoking** a device removes it and ends its open sessions at once ([`Live`]).
 //!
@@ -90,6 +92,29 @@ pub enum Answer {
     Refused,
     /// The pairing ended without an answer: it expired, or was cancelled.
     Gone,
+}
+
+/// Why a device that answered the link cannot pair now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    /// The link is open, but another device is pairing with it: it may come free.
+    Busy,
+    /// No link is open: none was offered, or it was used, expired or was withdrawn.
+    Closed,
+}
+
+impl Unavailable {
+    /// The code the device's channel is closed with.
+    pub fn close_code(self) -> u16 {
+        match self {
+            Unavailable::Busy => atomics_core::tunnel::close::PAIRING_BUSY,
+            Unavailable::Closed => atomics_core::tunnel::close::NO_PAIRING,
+        }
+    }
+
+    fn of(inner: &Inner) -> Self {
+        if inner.offer.is_some() { Unavailable::Busy } else { Unavailable::Closed }
+    }
 }
 
 /// What the desktop's pairing window shows.
@@ -400,23 +425,24 @@ impl Devices {
         }
     }
 
-    /// A device answered the link: the psk for its handshake, unless no link is open, it
-    /// expired, or another device is pairing now.
-    pub(super) fn begin(&self) -> Option<(u64, Secret)> {
+    /// A device answered the link: the psk for its handshake, unless no link is open (none was
+    /// offered, or it expired or was used) or another device is pairing now.
+    pub(super) fn begin(&self) -> Result<(u64, Secret), Unavailable> {
         self.edit(|inner| {
             Self::expire(inner);
             inner.attempts += 1;
             let attempt = inner.attempts;
-            let offer = inner.offer.as_mut()?;
+            let offer = inner.offer.as_mut().ok_or(Unavailable::Closed)?;
             let free = match offer.stage {
                 Stage::Open => true,
                 Stage::Handshake { since, .. } => since.elapsed() >= HANDSHAKE_WINDOW,
                 Stage::Claimed { .. } => false,
             };
-            free.then(|| {
-                offer.stage = Stage::Handshake { attempt, since: Instant::now() };
-                (attempt, offer.pairing.psk().clone())
-            })
+            if !free {
+                return Err(Unavailable::Busy);
+            }
+            offer.stage = Stage::Handshake { attempt, since: Instant::now() };
+            Ok((attempt, offer.pairing.psk().clone()))
         })
     }
 
@@ -440,16 +466,24 @@ impl Devices {
         });
     }
 
-    /// The device of `attempt` proved the psk: ask the desktop. False when its pairing ended.
-    pub(super) fn claim(&self, attempt: u64, name: String, code: String, key: PublicKey, waker: Arc<Waker>) -> bool {
+    /// The device of `attempt` proved the psk: ask the desktop. Refused when its pairing ended, or
+    /// another device took the link over after [`HANDSHAKE_WINDOW`].
+    pub(super) fn claim(
+        &self,
+        attempt: u64,
+        name: String,
+        code: String,
+        key: PublicKey,
+        waker: Arc<Waker>,
+    ) -> Result<(), Unavailable> {
         self.edit(|inner| {
             Self::expire(inner);
             match inner.offer.as_mut() {
                 Some(offer) if matches!(offer.stage, Stage::Handshake { attempt: a, .. } if a == attempt) => {
                     offer.stage = Stage::Claimed { attempt, name, code, key, waker };
-                    true
+                    Ok(())
                 }
-                _ => false,
+                _ => Err(Unavailable::of(inner)),
             }
         })
     }
@@ -540,6 +574,10 @@ mod tests {
         // Registering again under another id withdraws it.
         devices.set_host(Some("another-host"));
         assert!(matches!(devices.view(), PairingView::Idle { note: Some(_) }));
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed), "a withdrawn link is not busy");
+        devices.offer(TEMPLATE).unwrap();
+        devices.cancel();
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed), "nor is a cancelled one");
     }
 
     #[test]
@@ -547,34 +585,38 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let devices = devices(&dir, Duration::from_secs(300));
         devices.set_host(Some(HOST_ID));
-        assert!(devices.begin().is_none(), "no link open");
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed), "no link open");
         devices.offer(TEMPLATE).unwrap();
         let (first, psk) = devices.begin().expect("the link is open");
-        assert!(devices.begin().is_none(), "another device waits for the first");
+        assert_eq!(devices.begin().err(), Some(Unavailable::Busy), "another device waits for the first");
         assert!(matches!(devices.view(), PairingView::Open { busy: true, .. }));
         devices.abandon(first);
         let (second, again) = devices.begin().expect("a failed handshake gives the link back");
         assert_eq!(psk.as_bytes(), again.as_bytes(), "the same link");
         let key = Secret::generate().unwrap().public();
-        assert!(!devices.claim(first, "Old".into(), "000000".into(), key, waker()), "a stale attempt claims nothing");
-        assert!(devices.claim(second, "Phone".into(), "123456".into(), key, waker()));
+        assert_eq!(
+            devices.claim(first, "Old".into(), "000000".into(), key, waker()),
+            Err(Unavailable::Busy),
+            "a stale attempt claims nothing: another device holds the link"
+        );
+        devices.claim(second, "Phone".into(), "123456".into(), key, waker()).unwrap();
         let PairingView::Confirm { name, code, .. } = devices.view() else { panic!("asks") };
         assert_eq!((name.as_str(), code.as_str()), ("Phone", "123456"));
         assert_eq!(devices.answer(second), Answer::Pending);
-        assert!(devices.begin().is_none(), "no second pairing while one is claimed");
+        assert_eq!(devices.begin().err(), Some(Unavailable::Busy), "no second pairing while one is claimed");
         devices.decide(Some(Access::View));
         assert_eq!(devices.answer(second), Answer::Paired(Access::View));
         assert!(
             matches!(devices.view(), PairingView::Idle { note: Some(note) } if note.contains("Paired “Phone” (view only)"))
         );
-        assert!(devices.begin().is_none(), "the link is used up");
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed), "the link is used up");
         assert_eq!(devices.list().len(), 1);
 
         // Refused: nothing is added.
         devices.offer(TEMPLATE).unwrap();
         let (attempt, _) = devices.begin().unwrap();
         let other = Secret::generate().unwrap().public();
-        assert!(devices.claim(attempt, "Racer".into(), "654321".into(), other, waker()));
+        devices.claim(attempt, "Racer".into(), "654321".into(), other, waker()).unwrap();
         devices.decide(None);
         assert_eq!(devices.answer(attempt), Answer::Refused);
         assert_eq!(devices.list().len(), 1);
@@ -583,9 +625,9 @@ mod tests {
         // A device that leaves after proving the psk uses the link up too.
         devices.offer(TEMPLATE).unwrap();
         let (attempt, _) = devices.begin().unwrap();
-        assert!(devices.claim(attempt, "Leaver".into(), "111111".into(), other, waker()));
+        devices.claim(attempt, "Leaver".into(), "111111".into(), other, waker()).unwrap();
         devices.abandon(attempt);
-        assert!(devices.begin().is_none());
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed));
         assert_eq!(devices.answer(attempt), Answer::Gone);
     }
 
@@ -601,13 +643,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(devices.lock().note.as_deref().is_some_and(|n| n.contains("expired")), "dropped with nothing drawn");
-        assert!(devices.begin().is_none());
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed), "an expired link is not busy");
         assert!(matches!(devices.view(), PairingView::Idle { note: Some(note) } if note.contains("expired")));
         devices.offer(TEMPLATE).unwrap();
         let (attempt, _) = devices.begin().unwrap();
-        assert!(devices.claim(attempt, "Slow".into(), "222222".into(), Secret::generate().unwrap().public(), waker()));
+        devices.claim(attempt, "Slow".into(), "222222".into(), Secret::generate().unwrap().public(), waker()).unwrap();
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(devices.answer(attempt), Answer::Gone);
+        assert_eq!(devices.begin().err(), Some(Unavailable::Closed));
         devices.decide(Some(Access::Control));
         assert!(devices.list().is_empty(), "too late to pair");
     }
@@ -621,7 +664,7 @@ mod tests {
         devices.offer(TEMPLATE).unwrap();
         let (attempt, _) = devices.begin().unwrap();
         let key = Secret::generate().unwrap().public();
-        assert!(devices.claim(attempt, "Tablet".into(), "333333".into(), key, waker()));
+        devices.claim(attempt, "Tablet".into(), "333333".into(), key, waker()).unwrap();
         devices.decide(Some(Access::Control));
         let path = dir.path().join("devices.json");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

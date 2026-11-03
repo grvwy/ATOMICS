@@ -738,7 +738,8 @@ tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS
 sandbox mounts. From then on ATOMICS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
 `GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
-it fails, and when ATOMICS starts and sbx no longer has it, however it was removed. If removing an owned
+it fails, and when ATOMICS starts and sbx no longer has it, however it was removed. With no records ATOMICS
+does not ask sbx at start: any sbx command starts sbx's daemon. If removing an owned
 sandbox leaves a folder whose git metadata changed, its named record is replaced by a
 `git-pins/retained-*.json` folder record. The folder stays pinned across restarts until its metadata is
 repaired or the folder is removed; otherwise a later status scan could follow the sandbox's redirect.

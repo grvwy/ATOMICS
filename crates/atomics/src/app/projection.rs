@@ -118,8 +118,21 @@ impl State {
         self.remote.devices.clone()
     }
 
-    /// `atomics ctl '{"cmd":"remote"}'`: the protocol server, the rendezvous and the paired
-    /// devices. Never a token, pass, psk or pairing link.
+    /// Why clients' mutations are refused until restart, when the operation journal could not be
+    /// opened or written ([`crate::protocol::journal::Journal::error`]). The desktop's own actions
+    /// still work.
+    pub(crate) fn journal_problem(&self) -> Option<String> {
+        self.ops.error().map(|error| {
+            format!(
+                "The operation journal cannot be written ({error}), so phones, browsers and other clients cannot \
+                 change anything until ATOMICS restarts."
+            )
+        })
+    }
+
+    /// `atomics ctl '{"cmd":"remote"}'`: the protocol server (with `journal_error` when the operation
+    /// journal cannot be written), the rendezvous and the paired devices. Never a token, pass, psk or
+    /// pairing link.
     pub(crate) fn remote_json(&self) -> serde_json::Value {
         use crate::protocol::rendezvous::devices::PairingView;
         let view = &self.remote;
@@ -149,6 +162,7 @@ impl State {
                 "enabled": view.enabled,
                 "url": view.addr.map(|addr| format!("ws://{addr}")),
                 "error": view.error,
+                "journal_error": self.ops.error(),
             },
             "rendezvous": self.rendezvous_status(),
             "paired": devices,

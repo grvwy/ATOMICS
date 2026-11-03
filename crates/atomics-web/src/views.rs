@@ -466,8 +466,7 @@ fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                             ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
                         }
                         None if driver.pairing_busy() => {
-                            let busy = "No pairing is open on the computer right now; another device may be pairing. \
-                                        Trying again…";
+                            let busy = "Another device is pairing with the computer right now. Trying again…";
                             ui.label(RichText::new(busy).color(p.muted));
                         }
                         None => {

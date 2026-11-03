@@ -363,16 +363,32 @@ fn a_broken_message_reconnects_and_only_a_bad_answer_is_a_key_mismatch() {
 }
 
 #[test]
-fn no_pairing_is_tried_again_while_the_link_may_be_valid() {
-    // Another device holds the host's pairing: this one waits its turn.
+fn a_used_or_expired_link_stops_at_once_with_its_own_message() {
+    let mut host = fake_host::host();
+    let used = host.open_pairing();
+    host.pairing = None;
+    let mut world = World::new(host);
+    world.boot(Some(&used));
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NoPairing));
+    assert!(!world.driver.pairing_busy());
+    assert_eq!(world.dials.len(), 1, "asked once");
+    assert_eq!(world.driver.wake_in(), None, "and never again");
+    assert_eq!(
+        Stop::NoPairing.message(),
+        "This pairing link was used or has expired. Show a new code on the computer."
+    );
+}
+
+#[test]
+fn a_busy_host_is_tried_again_until_its_link_comes_free() {
     let mut host = fake_host::host();
     let link = host.open_pairing();
-    host.pairing = None;
+    host.busy = true;
     let mut world = World::new(host);
     world.boot(Some(&link));
     assert_eq!(world.driver.status(), &Status::Pairing { code: None });
     assert!(world.driver.pairing_busy());
-    world.host.pairing = Some(link);
+    world.host.busy = false;
     world.advance(world.driver.wake_in().expect("a retry is due"));
     world.ticket("ticket-2");
     assert!(world.host.code.is_some(), "the pairing went through");
@@ -380,22 +396,65 @@ fn no_pairing_is_tried_again_while_the_link_may_be_valid() {
     assert!(!world.driver.pairing_busy());
     assert!(world.store.contains_key(HOST_ID));
 
-    // None opens: once the link has surely expired, it stops.
+    // Busy, then used up by the other device: it stops at once.
     let mut host = fake_host::host();
-    let used = host.open_pairing();
-    host.pairing = None;
+    let link = host.open_pairing();
+    host.busy = true;
     let mut world = World::new(host);
-    let booted = world.now;
-    world.boot(Some(&used));
-    let mut tickets = 1;
-    while matches!(world.driver.status(), Status::Pairing { .. }) {
-        assert!(tickets < 40, "it never gives up");
-        world.advance(world.driver.wake_in().expect("a retry is due"));
-        tickets += 1;
-        world.ticket(&format!("ticket-{tickets}"));
-    }
+    world.boot(Some(&link));
+    assert!(world.driver.pairing_busy());
+    (world.host.busy, world.host.pairing) = (false, None);
+    world.advance(world.driver.wake_in().expect("a retry is due"));
+    world.ticket("ticket-2");
     assert_eq!(world.driver.status(), &Status::Stopped(Stop::NoPairing));
-    assert!(world.now - booted >= PAIRING_LIFETIME_SECS * 1000);
+}
+
+#[test]
+fn the_busy_window_runs_from_when_the_page_got_the_link() {
+    // Answer each retry with a fresh ticket until the frame stops: how long that took.
+    let stops_after = |world: &mut World| {
+        let started = world.now;
+        let mut tickets = 1;
+        while matches!(world.driver.status(), Status::Pairing { .. }) {
+            assert!(tickets < 60, "it never gives up");
+            world.advance(world.driver.wake_in().expect("a retry is due"));
+            tickets += 1;
+            world.ticket(&format!("ticket-{tickets}"));
+        }
+        assert_eq!(world.driver.status(), &Status::Stopped(Stop::NoPairing), "the link has surely expired");
+        world.now - started
+    };
+    let lifetime = PAIRING_LIFETIME_SECS * 1000;
+    let busy = || {
+        let mut host = fake_host::host();
+        let link = host.open_pairing();
+        host.busy = true;
+        (World::new(host), link)
+    };
+
+    // The page says nothing: the link's five minutes run from the boot.
+    let (mut world, link) = busy();
+    world.boot(Some(&link));
+    let took = stops_after(&mut world);
+    assert!((lifetime..lifetime + MAX_RETRY_MS).contains(&took), "{took}");
+
+    // The page got the link four minutes before the boot: one minute is left.
+    let (mut world, link) = busy();
+    let mut data = world.boot_data(Some(&link));
+    data["pair"]["age_ms"] = serde_json::json!(4 * 60_000);
+    world.driver.message(PARENT, true, &data).unwrap();
+    world.pump();
+    assert!(world.driver.pairing_busy());
+    let took = stops_after(&mut world);
+    assert!((60_000..60_000 + MAX_RETRY_MS).contains(&took), "{took}");
+
+    // Older than the link's lifetime: busy is not tried again at all.
+    let (mut world, link) = busy();
+    let mut data = world.boot_data(Some(&link));
+    data["pair"]["age_ms"] = serde_json::json!(lifetime);
+    world.driver.message(PARENT, true, &data).unwrap();
+    world.pump();
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NoPairing));
 }
 
 #[test]

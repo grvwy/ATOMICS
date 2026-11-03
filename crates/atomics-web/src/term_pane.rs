@@ -31,7 +31,7 @@ use egui::{Align2, Key, Modifiers, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2
 
 use crate::gesture::{Gesture, Pointer, Recognizer};
 use crate::remote::RemoteBackend;
-use crate::screens::{Lease, Lost, MAX_TYPED_BYTES, Refused};
+use crate::screens::{Lease, Lost, MAX_WAITING_BYTES, Refused};
 
 /// The font size range a pinch moves in, and the fitted default's.
 pub const MIN_FONT: f32 = 5.0;
@@ -341,11 +341,7 @@ impl TermPane {
             self.top = None;
             match remote.type_text(session, &typed) {
                 Ok(()) => {}
-                Err(Refused::TooMuch) => remote.say(format!(
-                    "Too much to type at once, so none of it was typed. A paste takes up to {} MiB, and less \
-                     while earlier input still waits.",
-                    MAX_TYPED_BYTES >> 20
-                )),
+                Err(Refused::TooMuch(limit)) => remote.say(too_much(limit)),
                 Err(Refused::NoLease) if lease.holder.is_some() && !lease.yours => {
                     remote.say("Someone else is typing in this terminal. Take over to type here.")
                 }
@@ -706,6 +702,22 @@ impl TermPane {
             }
         }
         out
+    }
+}
+
+/// The note for typing refused as too much ([`Refused::TooMuch`]), naming the limit that refused it.
+fn too_much(limit: usize) -> String {
+    let size = if limit >= 1 << 20 { format!("{} MiB", limit >> 20) } else { format!("{} KiB", limit >> 10) };
+    if limit == MAX_WAITING_BYTES {
+        format!(
+            "Too much to type before this browser may type here, so none of it was typed. Up to {size} waits \
+             until then."
+        )
+    } else {
+        format!(
+            "Too much to type at once, so none of it was typed. A paste takes up to {size}, and less while \
+             earlier input still waits."
+        )
     }
 }
 

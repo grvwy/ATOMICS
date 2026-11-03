@@ -10,8 +10,11 @@
 //! host never guesses whether a message was typed or a merge ran. Each line is synced to disk
 //! (`sync_data`) before the work starts and before the outcome is answered, so neither the process
 //! dying nor the machine losing power can make the host forget an operation it began and run it
-//! again. Mutations are rare, so the sync costs little. Compaction writes and syncs a new file,
-//! renames it into place and syncs the directory.
+//! again. That is why a beginning is synced under the `State` lock: the operation must be durable
+//! before it can run, so a retry after a power cut is answered, not run again. Mutations come from
+//! people's clicks and are rare, so the sync costs little. An outcome is synced after the lock is
+//! released (`take_sync`), before any client is answered with it. Compaction writes and syncs a new
+//! file, renames it into place and syncs the directory.
 //!
 //! Outcomes are kept for `KEEP_SECS` from when the operation began (twice the `op_ttl_secs` that
 //! clients are told), at most `CAPACITY` at once; an operation still running is never forgotten.
@@ -205,6 +208,13 @@ impl Journal {
         Ok(journal)
     }
 
+    /// Why the journal cannot be written, once it could not: kept until the host restarts (no
+    /// record may follow one that failed), so new client mutations are refused meanwhile. The
+    /// desktop's Remote devices and `atomics ctl '{"cmd":"remote"}'` show it.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Operations remembered, for tests and diagnostics.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
@@ -226,6 +236,8 @@ impl Journal {
         }
         let by = by.map(str::to_string);
         let record = Record::Begin { key: key.clone(), fingerprint: fingerprint.into(), at: now, by: by.clone() };
+        // Synced now, under the `State` lock: the operation must be durable before it can run, so a
+        // retry after a power cut is answered and not run again.
         if let Err(e) = self.append(&record) {
             self.error = Some(e.to_string());
             return Begun::Unwritable(e.to_string());
@@ -371,8 +383,10 @@ mod tests {
         let path = dir.path().join("ops.jsonl");
         let mut journal = Journal::open(&path, 0).unwrap();
         assert_eq!(begin(&mut journal, &steer("old", "x"), 0), Begun::Fresh);
+        assert_eq!(journal.error(), None);
         assert!(journal.compact_with(|_| Err(io::Error::other("injected reopen failure"))).is_err());
         assert!(journal.log.is_none());
+        assert_eq!(journal.error(), Some("injected reopen failure"), "kept, for the desktop to show");
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(begin(&mut journal, &steer("new", "x"), 0), Begun::Unwritable(_)));
         assert_eq!(std::fs::read(&path).unwrap(), before);

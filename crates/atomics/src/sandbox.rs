@@ -373,15 +373,17 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
 /// Drops the records of sandboxes sbx no longer has, as ATOMICS starts: a record outliving its
 /// sandbox would keep git out of a folder for good. A folder whose git files no longer match its
 /// record stays pinned, since the sandbox may have changed them and git would follow. Without an
-/// sbx that answers, which sandboxes exist is unknown, and every record stays.
+/// sbx that answers, which sandboxes exist is unknown, and every record stays. Without a record,
+/// sbx is not asked: asking starts its daemon, which outlives ATOMICS.
 pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
-    if !installed(program) {
+    let records = read_pins(dir);
+    if records.is_empty() || !installed(program) {
         return;
     }
     let Ok(sandboxes) = list(program) else { return };
     let Ok(owned) = ownership::owned(home) else { return };
     let names: std::collections::HashSet<String> = sandboxes.into_iter().map(|sandbox| sandbox.name).collect();
-    for (name, pins) in read_pins(dir) {
+    for (name, pins) in records {
         if names.contains(&name) || owned.get(&name).is_some_and(ownership::building) {
             continue;
         }

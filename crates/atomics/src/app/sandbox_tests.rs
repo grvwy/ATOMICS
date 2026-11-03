@@ -47,6 +47,22 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
 }
 
 #[test]
+fn a_fresh_home_starts_no_sbx_process() {
+    with_app("app::sandbox_tests::a_fresh_home_starts_no_sbx_process", |app, _ctx| {
+        if let Some(job) = app.runtime.startup_cleanup.take() {
+            job.join().unwrap();
+        }
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        // Nothing to sweep and no git records to prune: any sbx command would start its daemon,
+        // which outlives ATOMICS.
+        app.runtime.begin_startup_cleanup();
+        app.runtime.startup_cleanup.take().unwrap().join().unwrap();
+        assert_eq!(fake::calls(bin.path()), Vec::<Vec<String>>::new());
+    });
+}
+
+#[test]
 fn archiving_during_worktree_creation_does_not_launch_the_agent() {
     with_app("app::sandbox_tests::archiving_during_worktree_creation_does_not_launch_the_agent", |app, ctx| {
         let (dir, repo) = repository();

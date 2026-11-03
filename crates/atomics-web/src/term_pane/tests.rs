@@ -8,6 +8,7 @@ use super::*;
 use crate::driver::Status;
 use crate::fake_host;
 use crate::gesture::{Kind, Phase, Pointer};
+use crate::screens::MAX_TYPED_BYTES;
 use crate::views::{self, Tab, View};
 use crate::world::World;
 
@@ -226,8 +227,23 @@ fn a_paste_over_the_limit_is_not_typed_and_says_so() {
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste)]);
     assert_eq!(typed(&world), "a");
     let notice = world.driver.remote.notice().expect("a note");
-    assert!(notice.starts_with("Too much to type at once"), "{notice}");
+    assert!(notice.starts_with("Too much to type at once") && notice.contains("up to 1 MiB"), "{notice}");
     assert!(view.term.typing(), "still typing: only the paste was refused");
+}
+
+#[test]
+fn a_paste_before_the_grant_names_the_smaller_limit() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    // The tap asks for the lease; the paste in the same frame would wait for the grant.
+    let paste = "p".repeat(MAX_WAITING_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Paste(paste)]);
+    assert_eq!(typed(&world), "");
+    let notice = world.driver.remote.notice().expect("a note");
+    assert!(notice.contains("Up to 16 KiB waits") && !notice.contains("MiB"), "{notice}");
+    // Once granted, the same paste is typed.
+    let paste = "q".repeat(MAX_WAITING_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste.clone())]);
+    assert_eq!(typed(&world), paste);
 }
 
 #[test]
