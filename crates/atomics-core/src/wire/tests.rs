@@ -39,8 +39,10 @@ fn plan() -> PlanInfo {
             additions: 3,
             deletions: 1,
             report: Some(report()),
+            ticket: Some("ENG-7".into()),
         }],
         digest: "cedf306324d4".into(),
+        ticket: Some("ENG-1".into()),
     }
 }
 

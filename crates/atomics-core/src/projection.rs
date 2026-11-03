@@ -94,6 +94,9 @@ pub struct TaskInfo {
     pub additions: usize,
     pub deletions: usize,
     pub report: Option<ReportInfo>,
+    /// The key of the ticket saying what the task is for (its id where it has no key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +113,10 @@ pub struct PlanInfo {
     /// user approves or replaces exactly the plan they saw. Empty for a closed plan.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub digest: String,
+    /// The key of the ticket (ticket mode) or board (board mode) the plan follows, its id where it has
+    /// no key. A client opens the plan a ticket names by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

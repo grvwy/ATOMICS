@@ -224,10 +224,12 @@ impl State {
                             summary: r.summary.clone(),
                             at: r.at,
                         }),
+                        ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
                     })
                     .collect(),
                 // Only an open plan can be approved or replaced, so only its scope is hashed.
                 digest: if p.status == atomics_core::plan::PlanStatus::Open { p.digest() } else { String::new() },
+                ticket: p.ticket.as_ref().map(|ticket| ticket.label().to_string()),
             })
             .collect()
     }

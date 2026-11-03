@@ -49,6 +49,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
         integration: None,
         tasks: Vec::new(),
         digest: String::new(),
+        ticket: None,
     }
 }
 

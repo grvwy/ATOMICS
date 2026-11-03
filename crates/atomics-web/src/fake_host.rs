@@ -355,6 +355,7 @@ pub fn board() -> Board {
         additions: 3,
         deletions: 1,
         report: None,
+        ticket: (id == "t1").then(|| "ENG-41".into()),
     };
     let file = |path: &str| DiffFileSummary {
         old_path: Some(path.into()),
@@ -376,6 +377,7 @@ pub fn board() -> Board {
             integration: None,
             tasks: vec![task("t1", TaskStatus::Running, &[]), task("t2", TaskStatus::Planned, &["t1"])],
             digest: "digest-1".into(),
+            ticket: Some("ENG-40".into()),
         }],
         approvals: vec![ApprovalInfo {
             id: "a1".into(),
