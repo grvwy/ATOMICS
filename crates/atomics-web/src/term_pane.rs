@@ -11,8 +11,12 @@
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
 //!   only) and pans; a long press selects, with Copy; a pinch sets the font size. A mouse clicks and
 //!   drag-selects; its wheel scrolls.
-//! - **Typing needs the lease**, taken when the overlay gains focus and only where `welcome` grants
-//!   `type`. Losing it to the desktop or another client blurs the overlay, so typing again is a new tap.
+//! - **Typing needs the lease**, asked for only when the overlay gains the focus (a tap) and only where
+//!   `welcome` grants `type`. Losing it to the desktop or another client, or being refused it, blurs the
+//!   overlay, so typing again is a new tap. Text, keys and pastes forwarded while the overlay does not
+//!   have the focus, or in the frame the lease was lost, are dropped: what was in flight then (keys of
+//!   that frame, a word the keyboard commits as the overlay loses the focus, a Paste whose clipboard read
+//!   finishes late) neither types nor asks for the lease again.
 //! - **Offline** the screen shows as it was, marked disconnected, and nothing is typed.
 
 use atomics_core::lease::{GridSize, MAX_CELL_PIXELS};
@@ -24,7 +28,7 @@ use egui::{Align2, Key, Modifiers, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2
 
 use crate::gesture::{Gesture, Pointer, Recognizer};
 use crate::remote::RemoteBackend;
-use crate::screens::{Lease, Lost};
+use crate::screens::{Lease, Lost, MAX_TYPED_BYTES, Refused};
 
 /// The font size range a pinch moves in, and the fitted default's.
 pub const MIN_FONT: f32 = 5.0;
@@ -221,6 +225,7 @@ impl TermPane {
             self.selection = None;
             self.preedit.clear();
             self.held = false;
+            self.gestures = Recognizer::default();
         }
     }
 
@@ -239,10 +244,17 @@ impl TermPane {
         if self.drawn {
             return;
         }
-        self.inputs.clear();
+        self.drop_inputs();
         self.preedit.clear();
         let blur = std::mem::take(&mut self.focused);
         self.overlay = Overlay { blur, ..Overlay::default() };
+    }
+
+    /// Drop what the overlay forwarded, and the gestures in progress with it: a touch whose lift is
+    /// dropped would otherwise stay down, and make every later touch a pinch.
+    fn drop_inputs(&mut self) {
+        self.inputs.clear();
+        self.gestures = Recognizer::default();
     }
 
     /// When the pane wants a frame without input: a long press coming due, or a lease to renew.
@@ -289,23 +301,42 @@ impl TermPane {
             ui.painter().rect_filled(body, 0.0, p.terminal);
             let text = if live { "Waiting for the terminal…" } else { "Not connected" };
             ui.painter().text(body.center(), Align2::CENTER_CENTER, text, p.ui(13.0), p.muted);
-            self.inputs.clear();
+            self.drop_inputs();
             self.overlay = Overlay { blur: std::mem::take(&mut self.focused), ..Overlay::default() };
             return;
         };
 
+        // Losing the lease ends this round of typing, before anything the overlay forwarded since is
+        // carried out: the overlay loses the focus, so that text in flight is dropped (see the module's
+        // notes), and typing again is a new tap.
+        let lost = self.held && !lease.yours;
+        if lost {
+            self.focused = false;
+            self.held = false;
+            self.preedit.clear();
+            (self.ctrl, self.alt) = (false, false);
+        }
         let modes = remote.with_screen(session, |s| s.map(|(screen, _)| screen.modes)).unwrap_or_default();
         let mut typed = String::new();
         for input in std::mem::take(&mut self.inputs) {
-            self.input(input, &frame, &modes, &lease, remote, session, &mut typed, now_ms);
+            self.input(input, &frame, &modes, &lease, lost, remote, session, &mut typed, now_ms);
         }
         for gesture in self.gestures.tick(now_ms) {
             self.gesture(gesture, &frame, &modes, &lease, &mut typed);
         }
         if !typed.is_empty() && live && may_type {
             self.top = None;
-            if !remote.type_text(session, &typed) {
-                remote.say("Someone else is typing in this terminal. Take over to type here.");
+            match remote.type_text(session, &typed) {
+                Ok(()) => {}
+                Err(Refused::TooMuch) => remote.say(format!(
+                    "Too much to type at once, so none of it was typed. A paste takes up to {} MiB, and less \
+                     while earlier input still waits.",
+                    MAX_TYPED_BYTES >> 20
+                )),
+                Err(Refused::NoLease) if lease.holder.is_some() && !lease.yours => {
+                    remote.say("Someone else is typing in this terminal. Take over to type here.")
+                }
+                Err(Refused::NoLease) => {}
             }
             self.active_ms = now_ms;
         }
@@ -319,9 +350,8 @@ impl TermPane {
             remote.resize(session, size.then(|| fit_size(&frame)));
         }
 
-        // Losing the lease ends this round of typing: typing again is a new tap.
+        // The lease as it is now (a tap may have asked for it), renewed while the user is at the terminal.
         let lease = remote.lease(session);
-        let lost = self.held && !lease.yours;
         self.held = lease.yours;
         if lease.yours && self.focused && now_ms - self.active_ms >= RENEW_MS {
             remote.renew(session);
@@ -337,13 +367,16 @@ impl TermPane {
             let at = frame.origin + vec2(0.0, (a.line.min(b.line).saturating_sub(frame.top)) as f32 * frame.cell.y);
             (!text.is_empty()).then(|| (text, pos2(frame.rect.center().x, at.y.max(frame.rect.top()))))
         });
+        // The overlay keeps the focus only while typing goes somewhere: this client holds the lease or is
+        // asking for it. Otherwise (lost, refused, read only) it loses it, and typing again is a new tap.
+        let typing = lease.yours || lease.acquiring;
         self.overlay = Overlay {
             rect: Some(frame.rect),
             writable,
             ctrl: self.ctrl,
             alt: self.alt,
             copy,
-            blur: (lost && self.focused) || (!writable && self.focused),
+            blur: lost || (self.focused && !(writable && typing)),
         };
         if self.overlay.blur {
             self.focused = false;
@@ -432,6 +465,8 @@ impl TermPane {
         Some(Frame { rect: body, origin, size, cell, first, top, rows: shown, cols, live_top, oldest })
     }
 
+    /// Carry out one input. `lost`: the lease was lost since the last frame, so nothing typed in this one
+    /// counts, and a focus from before the overlay was told to give it up does not ask for the lease.
     #[allow(clippy::too_many_arguments)]
     fn input(
         &mut self,
@@ -439,12 +474,17 @@ impl TermPane {
         frame: &Frame,
         modes: &Modes,
         lease: &Lease,
+        lost: bool,
         remote: &RemoteBackend,
         session: &str,
         typed: &mut String,
         now_ms: f64,
     ) {
+        // Typing counts only while the overlay has the focus (never in the frame the lease was lost, see
+        // `draw`). A key bar's sticky modifier is typing too.
+        let typing = self.focused;
         match input {
+            TermInput::Text(_) | TermInput::Preedit(_) | TermInput::Key { .. } | TermInput::Paste(_) if !typing => {}
             TermInput::Text(text) => {
                 typed.push_str(&encode::text(&text, self.ctrl, self.alt));
                 (self.ctrl, self.alt) = (false, false);
@@ -459,9 +499,11 @@ impl TermPane {
                 (self.ctrl, self.alt) = (false, false);
             }
             TermInput::Paste(text) => typed.push_str(&encode::paste(&text, modes)),
+            TermInput::Focus(true) if lost => {}
             TermInput::Focus(true) => {
                 self.focused = true;
                 self.active_ms = now_ms;
+                // The tap that focuses the overlay is the only thing that asks for the lease.
                 if !lease.yours && lease.holder.is_none() {
                     remote.acquire(session, false);
                 }

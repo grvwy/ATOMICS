@@ -7,13 +7,9 @@ use std::time::{Duration, Instant};
 use atomics_core::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
 use atomics_core::mirror::{Applied, Mirror};
 use atomics_core::plan::PlanStatus;
-use atomics_core::projection::{
-    ApprovalInfo, DiffFileSummary, DiffSummary, PlanInfo, Projections, SessionInfo,
-};
+use atomics_core::projection::{ApprovalInfo, DiffFileSummary, DiffSummary, PlanInfo, Projections, SessionInfo};
 use atomics_core::session::AgentStatus;
-use atomics_core::wire::{
-    self, CAPABILITIES, Envelope, ErrorCode, Message, ResetReason, Resume, Seq, VERSION,
-};
+use atomics_core::wire::{self, CAPABILITIES, Envelope, ErrorCode, Message, ResetReason, Resume, Seq, VERSION};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{HandshakeError, WebSocket};
 
@@ -237,7 +233,9 @@ impl TestClient {
     pub(crate) fn next(&mut self) -> Option<Envelope> {
         loop {
             match self.ws.read() {
-                Ok(tungstenite::Message::Text(t)) => return Some(wire::decode(t.as_str()).expect("the host sends valid frames")),
+                Ok(tungstenite::Message::Text(t)) => {
+                    return Some(wire::decode(t.as_str()).expect("the host sends valid frames"));
+                }
                 Ok(tungstenite::Message::Close(_)) | Err(_) => return None,
                 Ok(_) => {}
             }
@@ -284,7 +282,10 @@ fn a_loopback_client_gets_the_board_and_a_diff() {
     assert!(f.server.addr().ip().is_loopback());
     client.hello();
     client.sync_until(|m| board_matches(m, &f.projections) && m.cursor > 0);
-    assert_eq!(client.resume(), Some(Resume::Reset { cursor: Seq(client.mirror.cursor), reason: ResetReason::NewClient }));
+    assert_eq!(
+        client.resume(),
+        Some(Resume::Reset { cursor: Seq(client.mirror.cursor), reason: ResetReason::NewClient })
+    );
     assert_eq!(client.mirror.diffs["/w/a"].files[0].new_path.as_deref(), Some("a.rs"));
 
     client.send(
@@ -375,7 +376,10 @@ fn upgrades_without_the_token_a_good_origin_or_the_subprotocol_fail() {
     let (addr, token) = (f.server.addr(), f.server.token().to_string());
     assert_eq!(status_of(TestClient::try_connect(addr, None, None, true).err().unwrap()), 401);
     assert_eq!(status_of(TestClient::try_connect(addr, Some("wrong"), None, true).err().unwrap()), 401);
-    assert_eq!(status_of(TestClient::try_connect(addr, Some(&token), Some("https://evil.example"), true).err().unwrap()), 403);
+    assert_eq!(
+        status_of(TestClient::try_connect(addr, Some(&token), Some("https://evil.example"), true).err().unwrap()),
+        403
+    );
     assert_eq!(status_of(TestClient::try_connect(addr, Some(&token), None, false).err().unwrap()), 400);
     assert!(TestClient::try_connect(addr, Some(&token), Some("https://app.example"), true).is_ok());
     assert!(TestClient::try_connect(addr, Some(&token), None, true).is_ok());
@@ -393,10 +397,15 @@ fn malformed_unknown_and_version_mismatched_frames_get_typed_errors() {
         (r#"{"v":{"major":1,"minor":0},"kind":"teleport"}"#, ErrorCode::UnknownKind),
         (r#"{"v":{"major":2,"minor":0},"kind":"ping"}"#, ErrorCode::UnsupportedVersion),
         (r#"{"v":{"major":1,"minor":0},"kind":"state_snapshot"}"#, ErrorCode::Malformed),
-        (r#"{"v":{"major":1,"minor":0},"kind":"welcome","version":{"major":1,"minor":0},"capabilities":[],"limits":{"max_frame_bytes":1,"max_subscriptions":1,"max_pending_ops":1,"max_queued_frames":1},"role":"controller","resume":{"mode":"replay","after":"0"}}"#, ErrorCode::Malformed),
+        (
+            r#"{"v":{"major":1,"minor":0},"kind":"welcome","version":{"major":1,"minor":0},"capabilities":[],"limits":{"max_frame_bytes":1,"max_subscriptions":1,"max_pending_ops":1,"max_queued_frames":1},"role":"controller","resume":{"mode":"replay","after":"0"}}"#,
+            ErrorCode::Malformed,
+        ),
     ] {
         client.send_text(frame);
-        let Message::Error { code: got, .. } = client.step().unwrap().message else { panic!("expected an error for {frame}") };
+        let Message::Error { code: got, .. } = client.step().unwrap().message else {
+            panic!("expected an error for {frame}")
+        };
         assert_eq!(got, code, "{frame}");
     }
     // The connection survives a bad frame and still answers.
@@ -408,7 +417,8 @@ fn malformed_unknown_and_version_mismatched_frames_get_typed_errors() {
 fn a_hello_the_host_cannot_serve_is_refused_before_any_state_is_sent() {
     let f = start();
     let mut client = TestClient::connect(f.server.addr(), f.server.token());
-    client.send_text(r#"{"v":{"major":9,"minor":0},"kind":"hello","client_id":"c","versions":[{"major":9,"minor":0}]}"#);
+    client
+        .send_text(r#"{"v":{"major":9,"minor":0},"kind":"hello","client_id":"c","versions":[{"major":9,"minor":0}]}"#);
     let Message::Error { code, .. } = client.next().unwrap().message else { panic!("expected an error") };
     assert_eq!(code, ErrorCode::UnsupportedVersion);
     assert!(client.next().is_none(), "the host closes after refusing the version");
@@ -426,7 +436,10 @@ fn oversize_and_binary_frames_are_rejected_and_the_server_carries_on() {
     let mut client = TestClient::connect(f.server.addr(), f.server.token());
     client.hello();
     client.sync_until(|m| m.cursor > 0);
-    client.send_text(&format!(r#"{{"v":{{"major":1,"minor":0}},"kind":"ping","nonce":"{}"}}"#, "x".repeat(wire::MAX_FRAME_BYTES)));
+    client.send_text(&format!(
+        r#"{{"v":{{"major":1,"minor":0}},"kind":"ping","nonce":"{}"}}"#,
+        "x".repeat(wire::MAX_FRAME_BYTES)
+    ));
     // The error frame can lose a race with the close; when it arrives it names the limit.
     while let Some(envelope) = client.next() {
         if let Message::Error { code, .. } = envelope.message {
@@ -515,7 +528,11 @@ fn reconnect_resets_when_replay_is_not_possible() {
     client.mirror = held.clone();
     client.hello();
     client.sync_until(|m| board_matches(m, &f.projections) && m.cursor > held.cursor);
-    assert!(matches!(client.resume(), Some(Resume::Reset { reason: ResetReason::CursorTooOld, .. })), "{:?}", client.resume());
+    assert!(
+        matches!(client.resume(), Some(Resume::Reset { reason: ResetReason::CursorTooOld, .. })),
+        "{:?}",
+        client.resume()
+    );
 
     // A cursor from the future, and one from another boot.
     for (epoch, cursor, reason) in [
@@ -580,7 +597,8 @@ fn a_reader_that_stops_reading_is_dropped_without_delaying_anyone() {
                     let envelope = wire::decode(t.as_str()).unwrap();
                     good.mirror.apply(&envelope).ok();
                 }
-                if (stop.load(Ordering::Acquire) && board_matches(&good.mirror, &projections)) || Instant::now() > until {
+                if (stop.load(Ordering::Acquire) && board_matches(&good.mirror, &projections)) || Instant::now() > until
+                {
                     return good.mirror;
                 }
             }

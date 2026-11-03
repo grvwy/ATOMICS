@@ -275,7 +275,12 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
     let plan = atomics_core::plan::Plan {
         id: "p1".into(),
         goal: "Sign in".into(),
-        ticket: Some(TicketLink { id: "1".into(), key: Some("T-1".into()), system: "echo".into(), ..TicketLink::default() }),
+        ticket: Some(TicketLink {
+            id: "1".into(),
+            key: Some("T-1".into()),
+            system: "echo".into(),
+            ..TicketLink::default()
+        }),
         ..Default::default()
     };
     let path = dir.path().join("plan.json");
@@ -288,7 +293,9 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
         st.access.clear();
         st.refresh.clear();
     }
-    outputs.push(McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap().to_string());
+    outputs.push(
+        McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap().to_string(),
+    );
     let (done, results) = crate::host::Wake::default().channel();
     let jobs = spawn_with(done, oauth.clone());
     config.server = server.clone();

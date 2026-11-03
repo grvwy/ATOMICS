@@ -557,9 +557,9 @@ may give the service a label for the UI. Device keys live in the OS credential s
 | What the attacker controls | What they get |
 | --- | --- |
 | The broker only, passive (logs, DB dump) | Account↔host bindings, names, public keys, times, IPs, traffic volume. No content |
-| The broker, active | Denial of service; dropped or delayed frames; a failed or refused handshake. No content, no forged commands: the host drops any frame that is not valid Noise from an allowlisted key |
+| The broker, active | Denial of service; dropped or delayed frames; a failed or refused handshake; close codes, which are not authenticated, so it can stop a browser with a false `not_paired`. No content, no forged commands: the host drops any frame that is not valid Noise from an allowlisted key. No lost pairings: a browser forgets its key only on the host's refusal sealed into the channel, which the broker cannot make |
 | The hosting app's session store | Attackers can mint connect tickets, but still lack the phone's static key, so the handshake fails |
-| The hosting app's origin (XSS or a modified app) | With the dedicated origin: the boot object and connect tickets, which are useless without a device key. Same-origin: everything the device sees and may type |
+| The hosting app's origin (XSS or a modified app) | With the dedicated origin: the boot object and connect tickets, which are useless without a device key. The boot also names the host and broker, so a pairing boot can point the frame at a host the attacker runs. What stops that is the user: the frame asks before it replaces the key of a host it already knows, and a pairing with any other host shows a code that no prompt on the user's own computer matches. A user who does not check that is paired with the attacker's host. Same-origin: everything the device sees and may type |
 | The ATOMICS bundle | Everything that device views and anything it may type. This is 6.4's limit. Defence: signed, hash-pinned bundles and a native or direct client for the cautious |
 | A phone or its browser profile | What the user can do from it, while its session on the hosting app lasts. The desktop can revoke it at once |
 

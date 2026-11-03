@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Advertisement {
     pub url: String,
     pub token: String,
@@ -22,6 +22,18 @@ pub struct Advertisement {
     /// When the server started, in Unix seconds; for people reading the file.
     #[serde(default)]
     pub started_at: u64,
+}
+
+impl std::fmt::Debug for Advertisement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Advertisement")
+            .field("url", &self.url)
+            .field("token", &"[redacted]")
+            .field("pid", &self.pid)
+            .field("pid_start", &self.pid_start)
+            .field("started_at", &self.started_at)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -118,6 +130,15 @@ mod tests {
         let path = dir.join("protocol.json");
         std::fs::write(&path, serde_json::to_vec(advert).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn debug_redacts_the_token() {
+        let advert = Advertisement::current("ws://127.0.0.1:1", "private-token-fixture");
+        let debug = format!("{advert:?}");
+        assert!(!debug.contains(&advert.token));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains(&advert.url));
     }
 
     #[test]

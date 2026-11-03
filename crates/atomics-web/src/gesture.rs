@@ -5,6 +5,10 @@
 //! A touch: a tap, a one-finger drag (history and panning), a long press that starts a selection and
 //! drags it out, or two fingers pinching (the font size). A mouse: a click, or a drag that selects, as
 //! on the desktop.
+//!
+//! A pointer whose lift never arrives would stay down and make every later touch a pinch. The page
+//! cancels any pointer still down when a primary one (a new touch's first finger, or a mouse) goes down,
+//! and the terminal pane starts a new recognizer when it drops the overlay's input.
 
 use std::collections::BTreeMap;
 
@@ -260,6 +264,28 @@ mod tests {
         );
         assert_eq!(pinch, [Gesture::Pinch { factor: 2.0, center: pos2(200.0, 100.0) }], "no tap or drag after a pinch");
         assert!(r.tick(10_000.0).is_empty(), "and no long press");
+    }
+
+    #[test]
+    fn a_pointer_cancelled_for_a_lost_lift_leaves_the_next_touch_a_tap() {
+        let (t, mut r) = (Kind::Touch, Recognizer::default());
+        // Finger 1's lift never came; the page cancels it as finger 2, a new primary, goes down.
+        let events = [
+            at(1, Phase::Down, 10.0, 10.0, t, 0.0),
+            at(1, Phase::Cancel, 60.0, 60.0, t, 500.0),
+            at(2, Phase::Down, 60.0, 60.0, t, 500.0),
+            at(2, Phase::Up, 60.0, 60.0, t, 560.0),
+        ];
+        assert_eq!(run(&mut r, &events), [Gesture::Tap(pos2(60.0, 60.0))]);
+        let drag = run(
+            &mut r,
+            &[
+                at(3, Phase::Down, 0.0, 0.0, t, 600.0),
+                at(3, Phase::Move, 0.0, 40.0, t, 620.0),
+                at(3, Phase::Up, 0.0, 40.0, t, 640.0),
+            ],
+        );
+        assert_eq!(drag, [Gesture::Drag(vec2(0.0, 40.0))], "and the touch after it");
     }
 
     #[test]

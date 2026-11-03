@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use atomics_core::noise::{KEY_BYTES, PublicKey, Secret};
+use atomics_core::tunnel;
 use atomics_ui::Client;
 use atomics_ui::theme::Palette;
 use js_sys::{Array, ArrayBuffer, JSON, Object, Reflect, Uint8Array};
@@ -106,7 +107,7 @@ fn push(inbox: &Inbox, ctx: &egui::Context, input: Input) {
     ctx.request_repaint();
 }
 
-/// The broker's socket, with the handlers that feed the inbox. Dropping it detaches them and closes it.
+/// The broker's socket, with the handlers that feed the inbox. Dropping it closes it normally.
 struct Live {
     id: u64,
     ws: WebSocket,
@@ -115,12 +116,22 @@ struct Live {
     _close: Closure<dyn FnMut(CloseEvent)>,
 }
 
-impl Drop for Live {
-    fn drop(&mut self) {
+impl Live {
+    /// Detach the handlers, so nothing from this socket reaches the driver again and no event finds
+    /// its closure dropped, then close it with `code` unless it is closing already.
+    fn close(&self, code: u16) {
         self.ws.set_onopen(None);
         self.ws.set_onmessage(None);
         self.ws.set_onclose(None);
-        let _ = self.ws.close();
+        if self.ws.ready_state() < WebSocket::CLOSING {
+            let _ = self.ws.close_with_code(code);
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.close(tunnel::close::NORMAL);
     }
 }
 
@@ -319,7 +330,7 @@ impl App {
             }
             Output::Close { socket, code } => {
                 if let Some(live) = self.socket.take_if(|live| live.id == socket) {
-                    let _ = live.ws.close_with_code(code);
+                    live.close(code);
                 }
             }
             Output::LoadDevice(host) => {

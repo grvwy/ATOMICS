@@ -310,9 +310,10 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        Some(Command::Tickets { command }) => {
-            std::process::exit(ticket_signin::run_cli(matches!(command, TicketsCommand::Login), cli.workspace.as_deref()))
-        }
+        Some(Command::Tickets { command }) => std::process::exit(ticket_signin::run_cli(
+            matches!(command, TicketsCommand::Login),
+            cli.workspace.as_deref(),
+        )),
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane, chief }) => {
             hook_client::run(socket, pane, chief);

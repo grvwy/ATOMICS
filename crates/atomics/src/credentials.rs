@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::relay::{Authorization, Credential, Keychain, Rule};
 
@@ -464,11 +465,11 @@ impl Store {
             return Ok(text);
         }
         let text = make()?;
-        let encoded = text.bytes().fold(String::new(), |mut hex, b| {
+        let encoded = Zeroizing::new(text.bytes().fold(String::with_capacity(text.len() * 2), |mut hex, b| {
             use std::fmt::Write;
             let _ = write!(hex, "{b:02x}");
             hex
-        });
+        }));
         self.keychain.write_item(DEVICE, slot, DEVICE_LABEL, &encoded)?;
         Ok(text)
     }
@@ -485,6 +486,7 @@ impl Store {
         let invalid =
             || anyhow::anyhow!("OS credential item is malformed (contents hidden); remove it to make new keys");
         let Some(encoded) = self.keychain.read_item(DEVICE, slot)? else { return Ok(None) };
+        let encoded = Zeroizing::new(encoded);
         if encoded.len() > OAUTH_CHUNK || !encoded.len().is_multiple_of(2) {
             return Err(invalid());
         }

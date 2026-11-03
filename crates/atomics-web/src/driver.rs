@@ -6,10 +6,16 @@
 //! Reconnecting: when the channel drops, the driver waits (jittered, 1 s doubling to 30 s), asks the
 //! hosting page for a fresh ticket ([`boot::WANTS_TICKET`]), dials again, and resumes with `hello`'s
 //! prior epoch and cursor, so the host replays what was missed or sends a snapshot.
+//!
+//! What it trusts: close codes and anything else outside the encrypted channel come through the
+//! broker unauthenticated. So the stored key is forgotten only on the host's refusal sealed into the
+//! channel (`wire::not_paired`); a bare `not_paired` close stops the frame but keeps the key. Only a
+//! failed handshake answer says the host's key differs; a transport message that fails ends the
+//! channel and the frame dials again.
 
 use std::fmt;
 
-use atomics_core::noise::{NoiseError, Pairing, Secret};
+use atomics_core::noise::{NoiseError, PAIRING_LIFETIME_SECS, Pairing, Secret};
 use atomics_core::tunnel::{self, close};
 use atomics_core::wire;
 use serde_json::Value;
@@ -42,6 +48,9 @@ pub enum Status {
     Pairing {
         code: Option<String>,
     },
+    /// A pairing boot names a host this browser already holds another key for: pairing would replace
+    /// it, so the frame asks first ([`Driver::repair`]).
+    ConfirmRepair,
     Live,
     Reconnecting {
         attempt: u32,
@@ -56,8 +65,10 @@ pub enum Stop {
     NoParent,
     /// This browser has no key for the host: it never paired here.
     NotHere,
-    /// The host no longer knows this browser's key.
+    /// The host said, inside the encrypted channel, that it does not know this browser's key.
     NotPaired,
+    /// The channel was closed as not paired, but the host did not say so itself: the key is kept.
+    NotPairedUnconfirmed,
     /// No pairing is open on the host.
     NoPairing,
     /// The host's user refused this browser: the codes differed.
@@ -83,6 +94,9 @@ impl Stop {
             }
             Stop::NotPaired => {
                 "The computer no longer knows this browser. Pair it again from Remote devices in ATOMICS on the computer."
+            }
+            Stop::NotPairedUnconfirmed => {
+                "The connection was closed as not paired, but the computer did not confirm it, so this browser keeps its key. Reload the page to try again; if this keeps happening, pair again from Remote devices."
             }
             Stop::NoPairing => {
                 "No pairing is open on the computer: it expired, was used, or another device is pairing. Start a new one from Remote devices."
@@ -161,6 +175,16 @@ pub struct Driver {
     device: Option<Device>,
     /// A pairing boot's link and the key this browser pairs with, until the host accepts it.
     pairing: Option<(Pairing, Secret)>,
+    /// When a pairing boot's link has surely expired (its lifetime after the boot): until then a host
+    /// with no pairing open for this device is asked again.
+    pair_until_ms: u64,
+    /// The last try found no pairing open on the host, and another is due.
+    pair_busy: bool,
+    /// [`Output::LoadDevice`] went out and its answer has not come.
+    loading: bool,
+    /// What this browser holds for a host a pairing boot names, while the frame asks whether to
+    /// replace it.
+    known: Option<Device>,
     ticket: Option<Ticket>,
     socket: Option<Socket>,
     sockets: u64,
@@ -174,6 +198,8 @@ pub struct Driver {
 enum End {
     Code(u16),
     Failure(Failure),
+    /// The host's refusal, sealed into the channel.
+    HostRefused,
 }
 
 impl Driver {
@@ -189,6 +215,10 @@ impl Driver {
             device_name: device_name.to_string(),
             device: None,
             pairing: None,
+            pair_until_ms: 0,
+            pair_busy: false,
+            loading: false,
+            known: None,
             ticket: None,
             socket: None,
             sockets: 0,
@@ -224,17 +254,19 @@ impl Driver {
                 let pairing = boot.pairing.clone();
                 self.boot = Some(boot);
                 match pairing {
+                    // Pairing: first, whether this browser already holds a key for the host.
                     Some(pairing) => match Secret::generate() {
                         Ok(secret) => {
                             self.pairing = Some((pairing, secret));
+                            self.pair_until_ms = self.now_ms + PAIRING_LIFETIME_SECS * 1000;
                             self.status = Status::Pairing { code: None };
-                            self.dial();
+                            self.load(host_id);
                         }
                         Err(_) => self.status = Status::Stopped(Stop::Failed),
                     },
                     None => {
                         self.status = Status::Connecting;
-                        self.outputs.push(Output::LoadDevice(host_id));
+                        self.load(host_id);
                     }
                 }
             }
@@ -249,19 +281,54 @@ impl Driver {
         Ok(())
     }
 
+    fn load(&mut self, host_id: String) {
+        self.loading = true;
+        self.outputs.push(Output::LoadDevice(host_id));
+    }
+
     /// The stored device for the booted host, as [`Output::LoadDevice`] asked.
     pub fn device_loaded(&mut self, device: Option<Device>) {
-        if self.device.is_some() || self.pairing.is_some() || self.status != Status::Connecting {
+        if !std::mem::take(&mut self.loading) {
             return;
         }
         let host = self.boot.as_ref().map(|b| b.host_id.clone());
-        match device {
-            Some(device) if Some(&device.host_id) == host.as_ref() => {
+        let device = device.filter(|d| Some(&d.host_id) == host.as_ref());
+        match (&self.pairing, device) {
+            // Pairing would replace the host key this browser trusts for that host: ask first. The
+            // same key needs no question, since only that host can answer the pairing.
+            (Some((pairing, _)), Some(known)) if known.host_key != pairing.host_key => {
+                self.known = Some(known);
+                self.status = Status::ConfirmRepair;
+            }
+            (Some(_), _) => self.dial(),
+            (None, Some(device)) => {
                 self.device = Some(device);
                 self.dial();
             }
-            _ => self.status = Status::Stopped(Stop::NotHere),
+            (None, None) => self.status = Status::Stopped(Stop::NotHere),
         }
+    }
+
+    /// The answer to [`Status::ConfirmRepair`]: pair, replacing the key this browser holds for the
+    /// host once the host accepts it, or keep that key and connect with it.
+    pub fn repair(&mut self, pair: bool) {
+        if self.status != Status::ConfirmRepair {
+            return;
+        }
+        let known = self.known.take();
+        if pair {
+            self.status = Status::Pairing { code: None };
+        } else {
+            self.pairing = None;
+            self.device = known;
+            self.status = Status::Connecting;
+        }
+        self.dial();
+    }
+
+    /// Whether the last pairing try found no pairing open on the host, and the frame tries again.
+    pub fn pairing_busy(&self) -> bool {
+        self.pair_busy && matches!(self.status, Status::Pairing { .. })
     }
 
     fn dial(&mut self) {
@@ -315,7 +382,10 @@ impl Driver {
         };
         for event in events {
             match event {
-                Event::Code(code) => self.status = Status::Pairing { code: Some(code) },
+                Event::Code(code) => {
+                    self.pair_busy = false;
+                    self.status = Status::Pairing { code: Some(code) };
+                }
                 Event::Paired(_) => {
                     let Some((pairing, secret)) = self.pairing.take() else { continue };
                     let device = Device { host_id: pairing.host_id.clone(), host_key: pairing.host_key, secret };
@@ -331,9 +401,11 @@ impl Driver {
                 }
                 // A frame this client cannot read (a kind from a newer minor) is skipped.
                 Event::Frame(text) => {
-                    if let Ok(envelope) = wire::decode(&text) {
-                        self.remote.receive(envelope);
+                    let Ok(envelope) = wire::decode(&text) else { continue };
+                    if wire::is_not_paired(&envelope) {
+                        return self.fail(socket, End::HostRefused);
                     }
+                    self.remote.receive(envelope);
                 }
             }
         }
@@ -417,19 +489,25 @@ impl Driver {
     fn ended(&mut self, end: End) {
         let pairing = self.pairing.is_some();
         let compared = matches!(self.status, Status::Pairing { code: Some(_) });
+        // Another device may hold the host's pairing for a while: try again while the link may be valid.
+        let busy = matches!(end, End::Code(close::NO_PAIRING)) && pairing && self.now_ms < self.pair_until_ms;
+        self.pair_busy = busy;
         let stop = match end {
-            End::Code(close::NOT_PAIRED) if pairing => Some(Stop::PairRefused),
-            End::Code(close::NOT_PAIRED) => {
+            // Sealed by the host itself: the one sign to forget the key on.
+            End::HostRefused => {
                 if let Some(device) = self.device.take() {
                     self.outputs.push(Output::ForgetDevice(device.host_id));
                 }
                 Some(Stop::NotPaired)
             }
+            End::Code(close::NOT_PAIRED) if pairing => Some(Stop::PairRefused),
+            End::Code(close::NOT_PAIRED) => Some(Stop::NotPairedUnconfirmed),
+            End::Code(close::NO_PAIRING) if busy => None,
             End::Code(close::NO_PAIRING) => Some(Stop::NoPairing),
             End::Code(close::REVOKED) => Some(Stop::Revoked),
             End::Failure(Failure::Refused) => Some(Stop::PairRefused),
-            End::Failure(Failure::Noise(NoiseError::Refused)) if pairing => Some(Stop::PairFailed),
-            End::Failure(Failure::Noise(NoiseError::Refused)) => Some(Stop::KeyMismatch),
+            End::Failure(Failure::Handshake(NoiseError::Refused)) if pairing => Some(Stop::PairFailed),
+            End::Failure(Failure::Handshake(NoiseError::Refused)) => Some(Stop::KeyMismatch),
             _ if pairing && compared => Some(Stop::PairInterrupted),
             _ => None,
         };
@@ -450,9 +528,8 @@ impl Driver {
         self.retry.attempt += 1;
         self.retry.due_ms = Some(self.now_ms + wait);
         self.retry.open_ms = None;
-        if !matches!(self.status, Status::Pairing { .. }) {
-            self.status = Status::Reconnecting { attempt: self.retry.attempt };
-        }
+        self.status =
+            if pairing { Status::Pairing { code: None } } else { Status::Reconnecting { attempt: self.retry.attempt } };
     }
 }
 

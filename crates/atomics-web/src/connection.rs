@@ -51,9 +51,13 @@ pub enum Event {
 /// Why the channel ended. Any of these ends it: nothing after can be read or sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
-    /// The handshake or a message did not authenticate, or broke the framing. For a pairing's
-    /// handshake, a wrong psk or host key.
-    Noise(NoiseError),
+    /// The host's answer to the first frame (Noise message 2) failed: the host does not hold the key
+    /// this browser expects, or (pairing) the link's psk.
+    Handshake(NoiseError),
+    /// A transport message failed to open or broke the framing, or one could not be sealed. It says
+    /// nothing about the keys: it was cut, dropped or forged on the way, and a new channel may
+    /// succeed.
+    Transport(NoiseError),
     /// The host's pairing answer or a frame was not well formed.
     Malformed,
     /// The host's user refused this device: the codes differed.
@@ -89,19 +93,19 @@ impl Connection {
     pub fn receive(&mut self, message: &[u8]) -> Result<Vec<Event>, Failure> {
         match mem::replace(&mut self.stage, Stage::Ended) {
             Stage::Handshake { initiator, pairing } => {
-                let done = initiator.finish(message).map_err(Failure::Noise)?;
+                let done = initiator.finish(message).map_err(Failure::Handshake)?;
                 let mut channel = done.channel;
                 let Some(name) = pairing else {
                     self.stage = Stage::Open { channel };
                     return Ok(vec![Event::Open]);
                 };
                 let request = serde_json::to_vec(&PairRequest { name }).map_err(|_| Failure::Malformed)?;
-                self.outgoing.extend(channel.seal(&request).map_err(Failure::Noise)?);
+                self.outgoing.extend(channel.seal(&request).map_err(Failure::Transport)?);
                 self.stage = Stage::Confirming { channel };
                 Ok(vec![Event::Code(done.code)])
             }
             Stage::Confirming { mut channel } => {
-                let Some(frame) = channel.open(message).map_err(Failure::Noise)? else {
+                let Some(frame) = channel.open(message).map_err(Failure::Transport)? else {
                     self.stage = Stage::Confirming { channel };
                     return Ok(Vec::new());
                 };
@@ -116,7 +120,7 @@ impl Connection {
                 Ok(vec![Event::Paired(answer.may), Event::Open])
             }
             Stage::Open { mut channel } => {
-                let frame = channel.open(message).map_err(Failure::Noise)?;
+                let frame = channel.open(message).map_err(Failure::Transport)?;
                 let event = match frame {
                     Some(frame) => Some(Event::Frame(String::from_utf8(frame).map_err(|_| Failure::Malformed)?)),
                     None => None,
@@ -138,7 +142,7 @@ impl Connection {
             }
             Err(error) => {
                 self.stage = Stage::Ended;
-                Err(Failure::Noise(error))
+                Err(Failure::Transport(error))
             }
         }
     }

@@ -259,7 +259,7 @@ fn status_line(driver: &Driver) -> (String, Option<bool>) {
     match driver.status() {
         Status::Waiting => ("Waiting for the page".into(), None),
         Status::Connecting => ("Connecting".into(), None),
-        Status::Pairing { .. } => ("Pairing".into(), None),
+        Status::Pairing { .. } | Status::ConfirmRepair => ("Pairing".into(), None),
         Status::Live => match driver.remote.welcome() {
             Some(welcome) if welcome.role == Role::Viewer => ("Connected · view only".into(), Some(true)),
             Some(_) => ("Connected".into(), Some(true)),
@@ -334,10 +334,37 @@ fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                         ui.add_space(16.0);
                         ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
                     }
+                    None if driver.pairing_busy() => {
+                        ui.label(
+                            RichText::new(
+                                "No pairing is open on the computer right now; another device may be pairing. Trying again…",
+                            )
+                            .color(p.muted),
+                        );
+                    }
                     None => {
                         ui.label(RichText::new("Connecting…").color(p.muted));
                     }
                 }
+            });
+        }
+        Status::ConfirmRepair => {
+            return centred(ui, |ui| {
+                ui.label(RichText::new("Pair this browser again?").size(18.0));
+                ui.add_space(16.0);
+                ui.label(
+                    "This browser is already paired with this computer, under another key. Pairing again replaces it. \
+                     Go on only if you started this pairing yourself, just now, from Remote devices in ATOMICS on the computer.",
+                );
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Pair again").clicked() {
+                        driver.repair(true);
+                    }
+                    if ui.button("Keep the current pairing").clicked() {
+                        driver.repair(false);
+                    }
+                });
             });
         }
         Status::Stopped(stop) if !has_board => {

@@ -231,6 +231,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn approval_errors_keep_their_specific_guidance() {
+        with_app("app::approvals::tests::approval_errors_keep_their_specific_guidance", |app, _| {
+            for (tool, terminal, expected) in [
+                ("Azure REST", false, "the Azure request expired; retry the request"),
+                ("Bash", false, "the permission hook has returned; answer in the agent terminal"),
+                ("Bash", true, "the permission menu is not visible; retry or answer in the terminal"),
+            ] {
+                let mut worker =
+                    session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                if terminal {
+                    worker.terminal = Some(
+                        Terminal::spawn(
+                            app.runtime.wake.clone(),
+                            app.runtime.theme.terminal_colors(),
+                            "/bin/cat".into(),
+                            vec![],
+                            &app.runtime.launch_dir,
+                            HashMap::new(),
+                            100,
+                        )
+                        .unwrap(),
+                    );
+                }
+                worker.approvals.push(PendingApproval {
+                    id: "pending".into(),
+                    request: ApprovalRequest {
+                        tool: tool.into(),
+                        command: Some("touch fixture".into()),
+                        cwd: app.runtime.launch_dir.clone(),
+                        reason: None,
+                        input: json!({}),
+                    },
+                    reply: None,
+                });
+                app.runtime.sessions = vec![worker];
+                app.runtime.approvals_checked = Instant::now();
+                let error = app.runtime.decide("pending", Decision::Allow, None).unwrap_err();
+                assert_eq!(error.message, expected);
+            }
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
     fn azure_writes_from_sandboxes_use_the_permission_banner_and_never_persist_allow_always() {
         with_app(
             "app::approvals::tests::azure_writes_from_sandboxes_use_the_permission_banner_and_never_persist_allow_always",

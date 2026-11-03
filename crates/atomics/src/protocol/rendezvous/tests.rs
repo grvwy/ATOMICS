@@ -225,6 +225,15 @@ impl Admitted {
         Ok((done.channel, done.code))
     }
 
+    /// A session the host does not know, once its `hello` decrypts: the host's sealed refusal, then
+    /// the code it closes the channel with.
+    fn refused(&mut self, channel: u32, noise: &mut noise::Channel) -> u16 {
+        self.hello(channel, noise);
+        let refusal = self.envelope(channel, noise);
+        assert!(wire::is_not_paired(&refusal), "the refusal comes sealed: {refusal:?}");
+        self.closed(channel)
+    }
+
     /// The host's answer to a pairing.
     fn pair_answer(&mut self, channel: u32, noise: &mut noise::Channel) -> PairAnswer {
         serde_json::from_slice(&self.open(channel, noise).expect("an answer")).expect("a pairing answer")
@@ -347,6 +356,29 @@ impl Fixture {
         match self.devices.view() {
             PairingView::Open { link, .. } => link.to_string(),
             _ => panic!("the link is shown"),
+        }
+    }
+
+    /// `devices.json` as it is on disk now.
+    fn allowlist(&self) -> String {
+        std::fs::read_to_string(self._dir.path().join("devices.json")).expect("the allowlist")
+    }
+
+    /// Wait until the desktop's pairing window is free for the next device.
+    fn link_free(&self) {
+        let deadline = Instant::now() + wait(Duration::from_secs(10));
+        while !matches!(self.devices.view(), PairingView::Open { busy: false, .. }) {
+            assert!(Instant::now() < deadline, "the link was never given back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait until no session of the paired devices is open.
+    fn none_connected(&self) {
+        let deadline = Instant::now() + wait(Duration::from_secs(10));
+        while self.devices.list().iter().any(|(_, connected)| *connected) {
+            assert!(Instant::now() < deadline, "a device stayed connected");
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -564,16 +596,20 @@ fn a_view_only_device_is_a_viewer_and_may_change_nothing() {
 }
 
 #[test]
-fn an_unknown_device_or_a_forged_channel_is_refused_before_any_json() {
+fn an_unknown_device_is_refused_inside_the_channel_and_a_forged_one_before_any_json() {
     let ledger = Shared::default();
     let service = FakeService::start(ledger.clone());
     let host = fixture(&service, &ledger, |s| s.handshake_timeout = Duration::from_millis(300));
     let mut socket = service.accept();
     socket.expiry_in(300_000);
     until(&host.status, "online", |s| s.online);
-    // A key the host never paired: closed before the host answers.
-    assert_eq!(socket.connect(1, &host.host_key(), &Secret::generate().unwrap()).err(), Some(close::NOT_PAIRED));
-    socket.send(service::left(1, close::NOT_PAIRED));
+    // A key the host never paired: the host answers, and once the device's first message decrypts
+    // it refuses it inside the channel, then closes with `not_paired`.
+    let mut unknown = socket.connect(1, &host.host_key(), &Secret::generate().unwrap()).expect("an answer");
+    assert_eq!(socket.refused(1, &mut unknown), close::NOT_PAIRED);
+    // Silent after the answer: no refusal, only the idle close.
+    let _silent = socket.connect(6, &host.host_key(), &Secret::generate().unwrap()).expect("an answer");
+    assert_eq!(socket.closed(6), close::IDLE);
     // A handshake meant for another host's key fails to decrypt.
     let device = Secret::generate().unwrap();
     assert_eq!(socket.connect(2, &Secret::generate().unwrap().public(), &device).err(), Some(close::REFUSED));
@@ -618,9 +654,21 @@ fn a_wrong_psk_fails_and_the_link_stays_for_the_right_device() {
     socket.send(tunnel::data(1, &first));
     let answer = socket.body(1).unwrap();
     assert_eq!(initiator.finish(&answer).err(), Some(noise::NoiseError::Refused));
+    assert!(matches!(host.devices.view(), PairingView::Open { busy: true, .. }), "held while it may prove the psk");
     socket.send(tunnel::data(1, &[0x42; 64]));
     assert_eq!(socket.closed(1), close::REFUSED);
-    assert!(matches!(host.devices.view(), PairingView::Open { .. }), "still open for the real device");
+    assert!(
+        matches!(host.devices.view(), PairingView::Open { busy: false, .. }),
+        "given back the moment its first message fails"
+    );
+    // One without the psk that leaves after the answer gives it back as it leaves.
+    socket.send(service::joined(3));
+    let (_, first) = Initiator::pair(&wrong, &Secret::generate().unwrap()).unwrap();
+    socket.send(tunnel::data(3, &first));
+    socket.body(3).unwrap();
+    assert!(matches!(host.devices.view(), PairingView::Open { busy: true, .. }));
+    socket.send(service::left(3, close::NORMAL));
+    host.link_free();
     // The real device pairs with the same link.
     let (mut secure, code) = socket.pair(2, &format!("{address}#{fragment}"), &device, "Phone").unwrap();
     assert_eq!(host.prompt().1, code);
@@ -650,8 +698,8 @@ fn a_device_racing_the_link_shows_another_code_and_is_refused() {
     assert_eq!(socket.pair_answer(1, &mut raced), PairAnswer { paired: false, may: None });
     assert_eq!(socket.closed(1), close::NOT_PAIRED);
     assert!(host.devices.list().is_empty(), "never added");
-    assert_eq!(socket.connect(3, &host.host_key(), &racer).err(), Some(close::NOT_PAIRED));
-    socket.send(service::left(3, close::NOT_PAIRED));
+    let mut later = socket.connect(3, &host.host_key(), &racer).expect("an answer");
+    assert_eq!(socket.refused(3, &mut later), close::NOT_PAIRED);
     // And the link is used up.
     assert_eq!(socket.pair(4, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
 }
@@ -700,6 +748,36 @@ fn a_replayed_session_fails_and_the_service_sees_only_ciphertext() {
 }
 
 #[test]
+fn a_replayed_handshake_marks_nothing_connected_and_writes_nothing() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let host = fixture(&service, &ledger, |s| s.handshake_timeout = Duration::from_millis(300));
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let device = Secret::generate().unwrap();
+    let _paired = host.paired(&mut socket, 1, &device, Access::Control);
+    socket.send(service::left(1, close::NORMAL));
+    host.none_connected();
+    let before = host.allowlist();
+    // A session's first frame as the service saw it, sent again on new channels: each gets an
+    // answer, and with nothing that decrypts after it, an idle close.
+    let (_, first) = Initiator::connect(HOST, &host.host_key(), &device).unwrap();
+    for channel in [2, 3] {
+        socket.send(service::joined(channel));
+        socket.send(tunnel::data(channel, &first));
+        socket.body(channel).expect("an answer");
+        assert!(!host.devices.list()[0].1, "not connected on a handshake alone");
+        assert_eq!(socket.closed(channel), close::IDLE);
+    }
+    assert_eq!(host.allowlist(), before, "devices.json is not written");
+    // The device itself, with its first message, is.
+    let mut session = socket.connect(4, &host.host_key(), &device).unwrap();
+    socket.hello(4, &mut session);
+    assert!(matches!(socket.envelope(4, &mut session).message, Message::Welcome { .. }));
+    assert!(host.devices.list()[0].1, "connected");
+}
+
+#[test]
 fn revoking_a_device_ends_its_session_and_its_next_one() {
     let ledger = Shared::default();
     let service = FakeService::start(ledger.clone());
@@ -712,8 +790,16 @@ fn revoking_a_device_ends_its_session_and_its_next_one() {
     assert!(matches!(socket.envelope(1, &mut secure).message, Message::Welcome { .. }));
     let key = device.public();
     host.devices.revoke(&key);
-    assert_eq!(socket.closed(1), close::NOT_PAIRED, "the open session ends at once");
-    assert_eq!(socket.connect(2, &host.host_key(), &device).err(), Some(close::NOT_PAIRED));
+    // The open session ends at once, with the refusal sealed into it.
+    loop {
+        let frame = socket.open(1, &mut secure).expect("the refusal before the close");
+        if wire::is_not_paired(&wire::decode(std::str::from_utf8(&frame).unwrap()).unwrap()) {
+            break;
+        }
+    }
+    assert_eq!(socket.closed(1), close::NOT_PAIRED);
+    let mut next = socket.connect(2, &host.host_key(), &device).expect("an answer");
+    assert_eq!(socket.refused(2, &mut next), close::NOT_PAIRED);
     assert!(host.devices.list().is_empty());
 }
 
@@ -876,7 +962,17 @@ fn the_host_closes_channels_it_cannot_serve_and_ones_that_break_the_protocol() {
         }
     };
     assert_eq!(refused, close::REFUSED);
+    // The slot is free once the host closed the channel, before the service says it left.
+    socket.send(service::joined(3));
+    socket.send(tunnel::data(3, b"{\"kind\":\"ping\"}"));
+    let next = loop {
+        if let FromHost::Close { channel: 3, code } = socket.next(Duration::from_secs(5)).expect("the channel's end") {
+            break code;
+        }
+    };
+    assert_eq!(next, close::REFUSED, "served, not over the limit");
     socket.send(service::left(1, close::NORMAL));
+    socket.send(service::left(3, close::NORMAL));
     until(&host.status, "no channel", |s| s.channels == 0);
     assert!(host.status.get().online, "a channel's end is not the tunnel's");
 }
@@ -995,7 +1091,7 @@ fn the_host_name_defaults_to_the_machine_and_fits_the_service() {
 
 #[test]
 fn the_rendezvous_modules_name_no_product() {
-    let product = ["re", "lay"].concat();
+    let products = [["re", "lay"].concat(), ["atom", "isk"].concat()];
     for (name, source) in [
         ("mod.rs", include_str!("mod.rs")),
         ("channel.rs", include_str!("channel.rs")),
@@ -1009,8 +1105,14 @@ fn the_rendezvous_modules_name_no_product() {
         ("atomics-core noise.rs", include_str!("../../../../atomics-core/src/noise.rs")),
         ("atomics-core noise tests", include_str!("../../../../atomics-core/src/noise/tests.rs")),
         ("pairing window", include_str!("../../app/pairing.rs")),
+        ("journal", include_str!("../journal.rs")),
+        ("ops", include_str!("../ops.rs")),
+        ("advert", include_str!("../../../../atomics-core/src/advert.rs")),
+        ("mutations", include_str!("../../app/mutations.rs")),
     ] {
-        assert!(!source.to_lowercase().contains(&product), "{name} names a product");
+        for product in &products {
+            assert!(!source.to_lowercase().contains(product), "{name} names a product");
+        }
     }
 }
 

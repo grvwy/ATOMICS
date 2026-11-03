@@ -23,6 +23,10 @@ let writable = false;
 let copyText = null;
 let composing = false;
 let touch = null;
+// The input's focus moves away and back while Copy uses a scratch field; the app is not told.
+let quiet = false;
+// The pointers over the terminal the app was told are down.
+const down = new Set();
 const coarse = matchMedia("(pointer: coarse)");
 const vv = window.visualViewport;
 
@@ -86,16 +90,24 @@ function copy() {
   if (!text) return;
   const done = () => send({ kind: "copied" });
   const fallback = () => {
-    // Older browsers: copy from a selected scratch field.
+    // Older browsers, and a frame its page does not allow to write the clipboard (`allow="clipboard-write"`):
+    // copy from a selected scratch field. The focus goes back only where it was, quietly, so copying neither
+    // asks for the terminal's lease nor opens the keyboard.
+    const typing = document.activeElement === ta;
     const scratch = document.createElement("textarea");
     scratch.value = text;
     scratch.setAttribute("readonly", "");
     scratch.className = "atomics-scratch";
-    document.body.append(scratch);
-    scratch.select();
-    try { document.execCommand("copy"); } catch (_) { /* nothing more to try */ }
-    scratch.remove();
-    if (ta && !ta.hidden && writable) ta.focus({ preventScroll: true });
+    quiet = true;
+    try {
+      document.body.append(scratch);
+      scratch.select();
+      try { document.execCommand("copy"); } catch (_) { /* nothing more to try */ }
+      scratch.remove();
+      if (typing && !ta.hidden) ta.focus({ preventScroll: true });
+    } finally {
+      quiet = false;
+    }
     done();
   };
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
@@ -144,10 +156,15 @@ function buildOverlay() {
   }
   document.body.append(ta);
 
-  ta.addEventListener("focus", () => { send({ kind: "focus", on: true }); showBar(true); });
+  ta.addEventListener("focus", () => {
+    if (quiet) return;
+    send({ kind: "focus", on: true });
+    showBar(true);
+  });
   ta.addEventListener("blur", () => {
     composing = false;
     ta.value = "";
+    if (quiet) return;
     send({ kind: "focus", on: false });
     showBar(false);
   });
@@ -180,10 +197,10 @@ function buildOverlay() {
     ta.value = "";
   });
   ta.addEventListener("keydown", (e) => {
+    // A soft keyboard that names no key (229) is read from beforeinput (above). A key named here is sent
+    // from here, Return and Backspace too: a Backspace in the empty field raises no beforeinput in some
+    // browsers. Preventing the key prevents its beforeinput, so nothing is sent twice.
     if (composing || e.isComposing || e.keyCode === 229 || e.metaKey) return;
-    const modified = e.shiftKey || e.altKey || e.ctrlKey;
-    // The soft keyboard's Return and Backspace come as input (above); a held modifier is a hardware keyboard's.
-    if ((e.key === "Enter" || e.key === "Backspace") && !modified) return;
     if (NAMED.has(e.key)) {
       e.preventDefault();
       send({ kind: "key", text: e.key, mods: mods(e) });
@@ -202,10 +219,21 @@ function buildOverlay() {
 
   // Every pointer over the terminal goes to the app, which tells taps, drags, long presses and pinches.
   const pointer = (phase) => (e) => {
+    const event = (step, id) =>
+      ({ kind: "pointer", phase: step, pointer: e.pointerType, id, x: e.clientX, y: e.clientY, t: e.timeStamp });
     if (phase === "down") {
+      // A primary pointer is a new touch's first finger, or a mouse: one still down here lost its lift on the
+      // way. It is cancelled, or the app would take the new touch for a second finger.
+      if (e.isPrimary) {
+        for (const id of down) if (id !== e.pointerId) send(event("cancel", id));
+        down.clear();
+      }
+      down.add(e.pointerId);
       try { ta.setPointerCapture(e.pointerId); } catch (_) { /* a pointer the page cannot capture */ }
+    } else if (phase !== "move") {
+      down.delete(e.pointerId);
     }
-    send({ kind: "pointer", phase, pointer: e.pointerType, id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp });
+    send(event(phase, e.pointerId));
   };
   ta.addEventListener("pointerdown", pointer("down"));
   ta.addEventListener("pointermove", pointer("move"));

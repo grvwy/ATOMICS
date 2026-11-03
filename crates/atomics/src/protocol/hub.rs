@@ -564,13 +564,8 @@ impl Hub {
     /// start feeding it live events, so nothing published in between is lost or repeated.
     pub fn attach(&mut self, prior_epoch: Option<&str>, prior_cursor: Option<Cursor>) -> Result<Attached, WireError> {
         self.expire_ring();
-        let resume = wire::decide_resume(
-            &self.epoch,
-            Seq(self.head),
-            Seq(self.oldest_retained()),
-            prior_epoch,
-            prior_cursor,
-        );
+        let resume =
+            wire::decide_resume(&self.epoch, Seq(self.head), Seq(self.oldest_retained()), prior_epoch, prior_cursor);
         let outbox = Arc::new(Outbox::new(self.queue_frames, self.queue_bytes));
         match resume {
             Resume::Replay { after } => {

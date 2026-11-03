@@ -3,14 +3,16 @@
 //! **The allowlist** is `devices.json` in the ATOMICS home, readable by this user only: each
 //! device's Noise static public key, its name, what it may do ([`Access`]), and when it paired and
 //! was last seen. It holds no secret, but whoever can write it can add a device. A session channel
-//! whose key is not in it is closed before the host answers (`channel.rs`).
+//! whose key is not in it is refused inside the encrypted channel once the device's first message
+//! decrypts (`channel.rs`).
 //!
 //! **A pairing** is offered from the desktop ("Pair a device"): a link with a fresh psk, for five
 //! minutes, one at a time. A device that answers it goes through these stages:
 //! - *open*: the link waits for a device;
 //! - *handshake*: one device at a time completes the handshake and proves the psk with its first
-//!   message (others are refused meanwhile); one that fails, or takes longer than
-//!   [`HANDSHAKE_WINDOW`], gives the link back;
+//!   message (others get `no_pairing` meanwhile, and a browser tries again while its link may still
+//!   be valid). The handshake alone proves nothing about the psk, so the link goes back as soon as
+//!   that first message fails or the device leaves, and at the latest after [`HANDSHAKE_WINDOW`];
 //! - *claimed*: the desktop shows the device's name and the code, and asks whether the codes match;
 //! - the user's answer pairs the device (view-only, or may type and approve) or refuses it. Either
 //!   way the link is used up, as it is when it expires or the device leaves first.
@@ -474,7 +476,9 @@ impl Devices {
     }
 
     /// A session for `key`: its device (what it may do, its name) and its revocation handle, if
-    /// the key is paired.
+    /// the key is paired. Marks it connected and writes its last-seen time, so the channel calls it
+    /// only once the device's first transport message decrypted: a replayed handshake changes
+    /// nothing here.
     pub(super) fn attach(&self, key: &PublicKey, waker: Arc<Waker>) -> Option<(Device, Arc<Live>)> {
         self.edit(|inner| {
             let device = inner.devices.iter_mut().find(|d| d.key == *key)?;

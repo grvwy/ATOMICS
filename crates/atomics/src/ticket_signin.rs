@@ -98,13 +98,8 @@ impl SignInJob {
                 let notify = |event| {
                     let _ = tx.send(Message::Event(event));
                 };
-                let control = SignInControl {
-                    cancel: &flag,
-                    paste: &pasted,
-                    notify: &notify,
-                    open_browser,
-                    can_paste: true,
-                };
+                let control =
+                    SignInControl { cancel: &flag, paste: &pasted, notify: &notify, open_browser, can_paste: true };
                 let result = oauth.sign_in_with(&server, Duration::from_secs(30), &control).map_err(|e| e.to_string());
                 let _ = tx.send(Message::Finished(result));
             })
@@ -172,7 +167,9 @@ pub fn doctor_line(oauth: &OAuth, config: &TicketConfig) -> Option<String> {
     let host = host_of(&config.server);
     Some(match SignState::of(oauth, &config.server) {
         SignState::SignedIn => {
-            format!("✓ credential MCP sign-in ({host}): present; OS keychain → ATOMICS → that server only (values hidden)")
+            format!(
+                "✓ credential MCP sign-in ({host}): present; OS keychain → ATOMICS → that server only (values hidden)"
+            )
         }
         SignState::Unavailable(why) => format!("✗ credential MCP sign-in ({host}) (warning): {why}"),
         _ => format!(

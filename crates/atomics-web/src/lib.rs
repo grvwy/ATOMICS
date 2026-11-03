@@ -57,10 +57,13 @@ mod names {
         let mut found = Vec::new();
         files(root, &mut found);
         assert!(found.iter().any(|p| p.ends_with("web/device-store.js")), "the walk reaches the browser files");
-        let needle = ["re", "lay"].concat();
+        files(&root.join("../atomics-ui/src"), &mut found);
+        let needles = [["re", "lay"].concat(), ["atom", "isk"].concat()];
         for path in found {
             let text = std::fs::read_to_string(&path).unwrap_or_default().to_lowercase();
-            assert!(!text.contains(&needle), "{} names a hosting product", path.display());
+            for needle in &needles {
+                assert!(!text.contains(needle), "{} names a hosting product", path.display());
+            }
         }
     }
 }

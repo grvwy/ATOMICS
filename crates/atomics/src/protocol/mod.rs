@@ -21,10 +21,10 @@ mod input_tests;
 pub mod journal;
 pub mod lease;
 mod link;
-pub mod rendezvous;
 #[cfg(test)]
 mod mutation_tests;
 pub mod ops;
+pub mod rendezvous;
 #[cfg(test)]
 mod screen_tests;
 mod screens;
@@ -416,8 +416,9 @@ fn authorise(
 ) -> Result<Response, ErrorResponse> {
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
     let port = addr.port();
-    let host_ok = header("host")
-        .is_some_and(|h| [format!("127.0.0.1:{port}"), format!("localhost:{port}")].iter().any(|ok| h.eq_ignore_ascii_case(ok)));
+    let host_ok = header("host").is_some_and(|h| {
+        [format!("127.0.0.1:{port}"), format!("localhost:{port}")].iter().any(|ok| h.eq_ignore_ascii_case(ok))
+    });
     if !host_ok {
         return Err(refuse(403, "unexpected Host"));
     }
@@ -434,8 +435,6 @@ fn authorise(
     if !offers {
         return Err(refuse(400, "subprotocol atomics.v1 is required"));
     }
-    response
-        .headers_mut()
-        .insert("Sec-WebSocket-Protocol", http::HeaderValue::from_static(wire::SUBPROTOCOL));
+    response.headers_mut().insert("Sec-WebSocket-Protocol", http::HeaderValue::from_static(wire::SUBPROTOCOL));
     Ok(response)
 }

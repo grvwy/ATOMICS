@@ -819,8 +819,14 @@ pub struct Keychain {
     mac: bool,
 }
 
+// App tests run in isolated child processes; count keychain discovery and helper calls across host threads.
+#[cfg(test)]
+pub(crate) static KEYCHAIN_ACCESSES: AtomicUsize = AtomicUsize::new(0);
+
 impl Keychain {
     pub fn current() -> Self {
+        #[cfg(test)]
+        KEYCHAIN_ACCESSES.fetch_add(1, Ordering::SeqCst);
         let mac = cfg!(target_os = "macos");
         let program = if mac {
             "/usr/bin/security".into()
@@ -851,6 +857,8 @@ impl Keychain {
     }
 
     fn output(&self, args: &[&str]) -> std::result::Result<std::process::Output, crate::sandbox::setup::OutputError> {
+        #[cfg(test)]
+        KEYCHAIN_ACCESSES.fetch_add(1, Ordering::SeqCst);
         let mut command = std::process::Command::new(&self.program);
         command.args(args);
         for name in [
@@ -968,6 +976,8 @@ impl Keychain {
                 "credential item exceeds macOS security's 4 KiB input limit; existing credentials are unchanged"
             )
         }
+        #[cfg(test)]
+        KEYCHAIN_ACCESSES.fetch_add(1, Ordering::SeqCst);
         crate::sandbox::setup::private_command(&self.program, &args, &input)
             .map_err(|_| anyhow::anyhow!("OS credential store write failed; unlock it and retry"))?;
         if self.read_item(service, account)?.as_deref() != Some(encoded) {

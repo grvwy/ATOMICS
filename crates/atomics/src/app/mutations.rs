@@ -60,15 +60,21 @@ fn from_control(outcome: ControlOutcome) -> Outcome {
 }
 
 impl State {
-    /// What the protocol server hands mutations to. The journal moves to `journal`, a file, so
-    /// that an operation the host stopped during is answered `uncertain` after a restart. Called
-    /// once, as the server starts; a journal that cannot be opened stays in memory.
-    pub(crate) fn serve_commands(&mut self, journal: &Path) -> Arc<dyn crate::protocol::Commands> {
+    /// A sender can be passed to the server before any journal file is opened.
+    pub(crate) fn op_sender(&self) -> crate::host::Sender<OpRequest> {
+        self.op_tx.clone()
+    }
+
+    /// Open the journal only after server startup succeeded. A failed open disables
+    /// client mutations; fresh desktop actions remain available.
+    pub(crate) fn serve_commands(&mut self, journal: &Path) {
         match journal::Journal::open(journal, atomics_core::store::now()) {
             Ok(opened) => self.ops = opened,
-            Err(error) => eprintln!("atomics: the operation journal stays in memory: {error}"),
+            Err(error) => {
+                eprintln!("atomics: client mutations disabled: operation journal cannot be opened: {error}");
+                self.ops = journal::Journal::unwritable(error.to_string());
+            }
         }
-        Arc::new(self.op_tx.clone())
     }
 
     /// A mutation from a protocol client: what is known now goes back at once, and the final
@@ -83,11 +89,12 @@ impl State {
         let op = command.op().to_string();
         let by = device.map(|device| device.name);
         let first = self.mutate(key, by.as_deref(), command, Some(reply.clone()));
-        reply.send(&op, first);
+        self.op_replies.push((reply, op, first));
     }
 
     /// The desktop's own mutation, through the same journal and checks as a client's. Returns
-    /// the first outcome; a later one only lands in the journal.
+    /// the first outcome; a later one only lands in the journal. Fresh desktop IDs
+    /// bypass capacity, and journal failures never block local decisions.
     pub(super) fn mutate_desktop(&mut self, command: impl FnOnce(String) -> Command) -> Outcome {
         let op = uuid::Uuid::new_v4().to_string();
         self.mutate(journal::Key::desktop(op.clone()), None, command(op), None)
@@ -96,7 +103,14 @@ impl State {
     /// Carry out `command` once under `key` (sent by the paired device named `by`, if any).
     /// Returns its outcome, or `accepted` for work that ends later, whose outcome then goes to
     /// `reply`.
-    fn mutate(&mut self, key: journal::Key, by: Option<&str>, command: Command, reply: Option<OpReply>) -> Outcome {
+    pub(super) fn mutate(
+        &mut self,
+        key: journal::Key,
+        by: Option<&str>,
+        command: Command,
+        reply: Option<OpReply>,
+    ) -> Outcome {
+        let desktop = key.origin == "desktop";
         match self.ops.begin(&key, by, &journal::fingerprint(&command), atomics_core::store::now()) {
             Begun::Fresh => {}
             Begun::Known(outcome) => return outcome,
@@ -108,13 +122,14 @@ impl State {
             }
             Begun::Conflict => return refused(ErrorCode::Conflict, "this operation ID was used for another command"),
             Begun::Full => return refused(ErrorCode::TooMany, "too many operations to remember; try again shortly"),
+            Begun::Unwritable(_) if desktop => {}
             Begun::Unwritable(why) => {
                 return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
             }
         }
         match self.execute(command) {
             Started::Now(outcome) => {
-                self.ops.finish(&key, &outcome);
+                self.ops.finish_deferred(&key, &outcome);
                 outcome
             }
             Started::Later(outcome) => {
@@ -142,12 +157,28 @@ impl State {
                 }
             };
             changed = true;
-            self.ops.finish(&flight.key, &outcome);
+            self.ops.finish_deferred(&flight.key, &outcome);
             for reply in &flight.replies {
-                reply.send(&flight.key.op, outcome.clone());
+                self.op_replies.push((reply.clone(), flight.key.op.clone(), outcome.clone()));
             }
         }
         changed
+    }
+
+    /// Capture the durability barrier and replies under State, run it without State.
+    pub(crate) fn take_op_flush(&mut self) -> impl FnOnce() + use<> {
+        let sync = self.ops.take_sync();
+        let replies = std::mem::take(&mut self.op_replies);
+        move || {
+            if let Some(file) = sync
+                && let Err(error) = file.sync_data()
+            {
+                eprintln!("atomics: the operation journal could not sync outcomes: {error}");
+            }
+            for (reply, op, outcome) in replies {
+                reply.send(&op, outcome);
+            }
+        }
     }
 
     fn execute(&mut self, command: Command) -> Started {

@@ -185,6 +185,7 @@ impl Pump<'_> {
             if let Err(ended) = self.send_queued() {
                 return ended;
             }
+            self.sweep();
             if let Some(ended) = self.renewal() {
                 return ended;
             }
@@ -276,6 +277,7 @@ impl Pump<'_> {
         if self.channels.contains_key(&channel) {
             return;
         }
+        self.sweep();
         let settings = &self.ctx.settings;
         if self.channels.len() >= settings.max_channels {
             self.outbound.control(tunnel::close_channel(channel, close::QUOTA));
@@ -287,6 +289,16 @@ impl Pump<'_> {
                 self.count();
             }
             Err(_) => self.outbound.control(tunnel::close_channel(channel, close::UNAVAILABLE)),
+        }
+    }
+
+    /// Forget the channels the host closed: their slots are free before the service's `left`,
+    /// which then finds nothing.
+    fn sweep(&mut self) {
+        let before = self.channels.len();
+        self.channels.retain(|_, inbox| !inbox.has_left());
+        if self.channels.len() != before {
+            self.count();
         }
     }
 

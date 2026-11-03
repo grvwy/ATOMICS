@@ -465,7 +465,9 @@ pub fn show(
     };
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("diff-rows", header.title)));
     let before = egui::scroll_area::State::load(ui.ctx(), scroll_id).map(|s| s.clamped_offset().y).unwrap_or_default();
-    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump.map(|row| row as f32 * row_h)) {
+    if let Some(offset) =
+        keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump.map(|row| row as f32 * row_h))
+    {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;

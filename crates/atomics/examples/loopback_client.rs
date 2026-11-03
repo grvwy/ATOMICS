@@ -136,14 +136,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            {
                 // The host has gone quiet: the board is complete.
                 if quiet_since.elapsed() > Duration::from_millis(300) || started.elapsed() > Duration::from_secs(5) {
                     if !asked {
                         print_board(&mirror);
                         asked = true;
                         let first = mirror.diffs.values().find_map(|d| {
-                            d.files.first().and_then(|f| f.new_path.clone().or(f.old_path.clone())).map(|p| (d.worktree.clone(), p))
+                            d.files
+                                .first()
+                                .and_then(|f| f.new_path.clone().or(f.old_path.clone()))
+                                .map(|p| (d.worktree.clone(), p))
                         });
                         match first {
                             Some((worktree, path)) => {
@@ -262,6 +267,13 @@ fn print_board(m: &Mirror) {
     }
     println!("diffs ({})", m.diffs.len());
     for d in m.diffs.values() {
-        println!("  {} +{} -{} in {} files (vs {})", d.worktree, d.additions(), d.deletions(), d.files.len(), d.base_ref);
+        println!(
+            "  {} +{} -{} in {} files (vs {})",
+            d.worktree,
+            d.additions(),
+            d.deletions(),
+            d.files.len(),
+            d.base_ref
+        );
     }
 }
