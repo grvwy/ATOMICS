@@ -2,7 +2,7 @@
 //! ways it stops. The "network" is synchronous: a message sent is received before the next is sent.
 
 use atomics_core::approvals::Decision;
-use atomics_core::noise::Access;
+use atomics_core::noise::{Access, Secret};
 use atomics_core::session::AgentStatus;
 use atomics_core::wire::{Message, Seq};
 use atomics_ui::{Backend, Command};
@@ -312,12 +312,126 @@ fn it_stops_where_trying_again_cannot_help() {
     let mut world = World::new(host);
     world.boot(Some(&stale));
     assert_eq!(world.driver.status(), &Status::Stopped(Stop::PairFailed));
+}
 
-    // No pairing open on the host.
+#[test]
+fn only_the_hosts_sealed_refusal_forgets_the_key() {
+    // The host refuses inside the channel: the key goes.
+    let mut world = World::paired(fake_host::host());
+    world.host.allowed.clear();
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotPaired));
+    assert!(world.store.is_empty());
+
+    // Revoked during a session: the same sealed refusal.
+    let mut world = World::paired(fake_host::host());
+    world.boot(None);
+    let refusal = world.host.stray(wire::not_paired().message);
+    world.deliver(refusal);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotPaired));
+    assert!(world.store.is_empty());
+
+    // A bare `not_paired` close, which anything on the way could send: it stops, and the key stays.
+    let mut world = World::paired(fake_host::host());
+    world.boot(None);
+    world.drop_socket(close::NOT_PAIRED);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotPairedUnconfirmed));
+    assert!(world.store.contains_key(HOST_ID), "the stored key is kept");
+    assert_eq!(world.driver.wake_in(), None, "and nothing is tried again");
+}
+
+#[test]
+fn a_broken_message_reconnects_and_only_a_bad_answer_is_a_key_mismatch() {
+    let mut world = World::paired(fake_host::host());
+    world.boot(None);
+    let mut ping = world.host.stray(Message::Ping { nonce: Some("n1".into()) });
+    ping[0][3] ^= 1;
+    world.deliver(ping);
+    assert_eq!(world.driver.status(), &Status::Reconnecting { attempt: 1 });
+    assert_eq!(world.closed, [close::REFUSED], "the channel ends");
+    assert!(world.store.contains_key(HOST_ID));
+    world.advance(world.driver.wake_in().expect("a retry is due"));
+    world.ticket("ticket-2");
+    assert_eq!(world.driver.status(), &Status::Live, "a new channel works");
+
+    // The answer to the first frame does not authenticate: not the host this browser paired with.
+    let mut world = World::paired(fake_host::host());
+    world.host.corrupt_answer = true;
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::KeyMismatch));
+    assert!(world.store.contains_key(HOST_ID), "kept: pairing again replaces it");
+}
+
+#[test]
+fn no_pairing_is_tried_again_while_the_link_may_be_valid() {
+    // Another device holds the host's pairing: this one waits its turn.
+    let mut host = fake_host::host();
+    let link = host.open_pairing();
+    host.pairing = None;
+    let mut world = World::new(host);
+    world.boot(Some(&link));
+    assert_eq!(world.driver.status(), &Status::Pairing { code: None });
+    assert!(world.driver.pairing_busy());
+    world.host.pairing = Some(link);
+    world.advance(world.driver.wake_in().expect("a retry is due"));
+    world.ticket("ticket-2");
+    assert!(world.host.code.is_some(), "the pairing went through");
+    assert_eq!(world.driver.status(), &Status::Live);
+    assert!(!world.driver.pairing_busy());
+    assert!(world.store.contains_key(HOST_ID));
+
+    // None opens: once the link has surely expired, it stops.
     let mut host = fake_host::host();
     let used = host.open_pairing();
     host.pairing = None;
     let mut world = World::new(host);
+    let booted = world.now;
     world.boot(Some(&used));
+    let mut tickets = 1;
+    while matches!(world.driver.status(), Status::Pairing { .. }) {
+        assert!(tickets < 40, "it never gives up");
+        world.advance(world.driver.wake_in().expect("a retry is due"));
+        tickets += 1;
+        world.ticket(&format!("ticket-{tickets}"));
+    }
     assert_eq!(world.driver.status(), &Status::Stopped(Stop::NoPairing));
+    assert!(world.now - booted >= PAIRING_LIFETIME_SECS * 1000);
+}
+
+#[test]
+fn pairing_again_under_another_host_key_asks_first() {
+    let replaced = |world: &mut World| {
+        let old = Secret::generate().unwrap().public();
+        world.store.get_mut(HOST_ID).unwrap().host_key = old;
+        old
+    };
+    // Go on: the new key is kept once the host accepts the device.
+    let mut world = World::paired(fake_host::host());
+    let old = replaced(&mut world);
+    let pairing = world.host.open_pairing();
+    world.boot(Some(&pairing));
+    assert_eq!(world.driver.status(), &Status::ConfirmRepair);
+    assert!(world.dials.is_empty(), "nothing is dialed before the answer");
+    assert_eq!(world.store[HOST_ID].host_key, old);
+    world.driver.repair(true);
+    world.pump();
+    assert_eq!(world.driver.status(), &Status::Live);
+    assert_eq!(world.store[HOST_ID].host_key, world.host.public());
+
+    // Keep the current pairing: no pairing, and the key this browser holds is used.
+    let mut world = World::paired(fake_host::host());
+    let old = replaced(&mut world);
+    let pairing = world.host.open_pairing();
+    world.boot(Some(&pairing));
+    world.driver.repair(false);
+    world.pump();
+    assert_eq!(world.dials.len(), 1);
+    assert!(world.host.code.is_none(), "no pairing handshake");
+    assert_eq!(world.store[HOST_ID].host_key, old, "nothing replaced");
+
+    // The same host key: only that host can answer the link, so nothing is asked.
+    let mut world = World::paired(fake_host::host());
+    let pairing = world.host.open_pairing();
+    world.boot(Some(&pairing));
+    assert_eq!(world.driver.status(), &Status::Live);
 }

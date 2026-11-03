@@ -262,6 +262,7 @@ fn broker(
                 let mut host = host.lock().unwrap();
                 let before = host.received.len();
                 let result = host.receive(&bytes);
+                let closing = host.take_close();
                 for message in &host.received[before..] {
                     match message {
                         Message::Hello { prior_epoch, .. } => {
@@ -286,6 +287,12 @@ fn broker(
                     Ok(replies) => {
                         for reply in replies {
                             let _ = socket.send(tungstenite::Message::binary(reply));
+                        }
+                        if let Some(code) = closing {
+                            log.push(format!("host closed {code}"));
+                            let _ = socket.close(Some(CloseFrame { code: CloseCode::from(code), reason: "".into() }));
+                            let _ = socket.flush();
+                            break;
                         }
                     }
                     Err(code) => {

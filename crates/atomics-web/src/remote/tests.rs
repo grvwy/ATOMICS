@@ -119,6 +119,25 @@ fn nothing_is_sent_offline_or_without_a_grant() {
 }
 
 #[test]
+fn operations_waiting_for_the_host_are_bounded() {
+    let remote = connected(Role::Controller);
+    for _ in 0..wire::MAX_PENDING_OPS {
+        remote.send(Command::ApprovePlan(0));
+    }
+    assert_eq!(remote.take_outgoing().len(), wire::MAX_PENDING_OPS);
+    assert_eq!(remote.notice(), None);
+    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    assert!(remote.take_outgoing().is_empty(), "no more than the host takes at once");
+    assert!(remote.notice().unwrap().contains("Too many changes"));
+    assert_eq!(remote.take_refused(), [("s1".to_string(), "a1".to_string())], "the banner may offer it again");
+    // An answer makes room.
+    let done = Outcome::done(serde_json::Value::Null);
+    remote.receive(Envelope::host(EPOCH, Message::CommandResult(CommandResult { op: "op-1".into(), outcome: done })));
+    remote.send(Command::ApprovePlan(0));
+    assert_eq!(remote.take_outgoing().len(), 1);
+}
+
+#[test]
 fn operations_in_flight_are_sent_again_after_a_reconnect_while_young() {
     let remote = connected(Role::Controller);
     remote.send(Command::ApprovePlan(0));
