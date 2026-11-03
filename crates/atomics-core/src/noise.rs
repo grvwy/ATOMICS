@@ -7,7 +7,8 @@
 //!   encrypted. Both ends then show the six-digit [`Established::code`] from the handshake hash,
 //!   and the host adds the device only once its user says the two codes match.
 //! - **Sessions**, `Noise_IK_25519_ChaChaPoly_SHA256`: a paired browser with its stored key. The
-//!   host looks that key up in its allowlist and refuses one it does not hold.
+//!   host looks that key up in its allowlist once the browser's first transport message decrypts,
+//!   and refuses one it does not hold inside the channel ([`wire::not_paired`]).
 //! - The prologue binds `atomics.v1`, the protocol major and the host id ([`prologue`]): a
 //!   handshake meant for another host or major fails.
 //!
@@ -29,8 +30,15 @@
 //!    `pairing.host_key`; the same channel then carries `atomics.v1`, starting with `hello`.
 //!
 //! **A later session**: `Initiator::connect(host_id, &host_key, &device)`, send the frame, then
-//! `finish` the answer and send `hello` through the channel. A host that no longer holds the key
-//! closes the channel with `tunnel::close::NOT_PAIRED` instead of answering.
+//! `finish` the answer and send `hello` through the channel. A host that does not hold the key
+//! answers all the same, and once `hello` decrypts it sends [`wire::not_paired`] through the
+//! channel and closes it with `tunnel::close::NOT_PAIRED`. Only that sealed frame says the host
+//! itself refused the device; the bare close code comes through the broker unauthenticated.
+//!
+//! **Which failure is which.** A [`Initiator::finish`] that fails means the answer did not come from
+//! the host key this browser holds (or, pairing, from a host holding the psk). A transport message
+//! that fails to open ends the channel but says nothing about the keys: it was cut, dropped or
+//! forged on the way, and a new channel may well succeed.
 
 use std::fmt;
 

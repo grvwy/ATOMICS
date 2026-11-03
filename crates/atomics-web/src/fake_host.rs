@@ -30,6 +30,8 @@ enum Stage {
     /// Pairing: the request is in; the host's user compares the codes ([`FakeHost::confirm`]).
     Comparing(Channel),
     Open(Channel),
+    /// A session with a key this host does not hold: its first message gets the sealed refusal.
+    Refusing(Channel),
 }
 
 #[derive(Default, Clone)]
@@ -52,6 +54,10 @@ pub struct FakeHost {
     pub named: Option<String>,
     /// Wait for [`FakeHost::confirm`] before answering a pairing.
     pub hold: bool,
+    /// Spoil the next handshake answer, as a broker that forges one would.
+    pub corrupt_answer: bool,
+    /// The code to close the channel with after the messages [`FakeHost::receive`] just returned.
+    closing: Option<u16>,
     stage: Option<Stage>,
     access: Access,
     pub epoch: String,
@@ -251,6 +257,8 @@ impl FakeHost {
             code: None,
             named: None,
             hold: false,
+            corrupt_answer: false,
+            closing: None,
             stage: None,
             access: Access::View,
             epoch: "epoch-1".into(),
@@ -333,6 +341,7 @@ impl FakeHost {
 
     pub fn join(&mut self) {
         self.stage = Some(Stage::First);
+        self.closing = None;
     }
 
     /// The browser's channel ended: it follows nothing, and its leases end with it.
@@ -416,20 +425,24 @@ impl FakeHost {
                 let responder =
                     Responder::read(message, HOST_ID, &self.secret, psk.as_ref()).map_err(|_| close::REFUSED)?;
                 let device = responder.device();
-                if kind == Kind::Session {
-                    let (_, access) = *self.allowed.iter().find(|(key, _)| *key == device).ok_or(close::NOT_PAIRED)?;
-                    self.access = access;
+                let known = self.allowed.iter().find(|(key, _)| *key == device).map(|(_, access)| *access);
+                let (mut answer, done) = responder.answer().map_err(|_| close::REFUSED)?;
+                if std::mem::take(&mut self.corrupt_answer) {
+                    *answer.last_mut().expect("an answer") ^= 1;
                 }
-                let (answer, done) = responder.answer().map_err(|_| close::REFUSED)?;
-                self.stage = Some(match kind {
-                    Kind::Pair => {
+                self.stage = Some(match (kind, known) {
+                    (Kind::Pair, _) => {
                         self.code = Some(done.code);
                         self.pairing = None; // single use
                         self.access = self.answer.unwrap_or(Access::View);
                         self.allowed.push((device, self.access));
                         Stage::Named(done.channel)
                     }
-                    Kind::Session => Stage::Open(done.channel),
+                    (Kind::Session, Some(access)) => {
+                        self.access = access;
+                        Stage::Open(done.channel)
+                    }
+                    (Kind::Session, None) => Stage::Refusing(done.channel),
                 });
                 Ok(vec![answer])
             }
@@ -445,6 +458,15 @@ impl FakeHost {
                 self.stage = Some(Stage::Comparing(channel));
                 Err(close::REFUSED)
             }
+            // Its first message decrypted: the refusal, sealed, then `not_paired`.
+            Some(Stage::Refusing(mut channel)) => {
+                if channel.open(message).map_err(|_| close::REFUSED)?.is_none() {
+                    self.stage = Some(Stage::Refusing(channel));
+                    return Ok(Vec::new());
+                }
+                self.closing = Some(close::NOT_PAIRED);
+                Ok(Self::seal(&mut channel, &[wire::not_paired()]))
+            }
             Some(Stage::Open(mut channel)) => {
                 let Some(frame) = channel.open(message).map_err(|_| close::REFUSED)? else {
                     self.stage = Some(Stage::Open(channel));
@@ -458,6 +480,12 @@ impl FakeHost {
                 Ok(sealed)
             }
         }
+    }
+
+    /// The code the host closes the channel with once the messages [`FakeHost::receive`] just
+    /// returned are sent, if it does.
+    pub fn take_close(&mut self) -> Option<u16> {
+        self.closing.take()
     }
 
     /// The host's user answers the pairing with [`FakeHost::answer`]: the messages to send.

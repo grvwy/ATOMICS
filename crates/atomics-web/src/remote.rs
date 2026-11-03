@@ -725,6 +725,13 @@ impl Backend for RemoteBackend {
                 continue;
             }
             let mut s = self.state.borrow_mut();
+            // As many as the host takes at once (more are `too_many`): what waits stays bounded, offline too.
+            if s.pending.len() >= wire::MAX_PENDING_OPS {
+                drop(s);
+                self.refuse(&command);
+                self.say("Too many changes are still waiting for the host. Try again once they are answered.");
+                continue;
+            }
             if let (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) = (&mutation, &command)
                 && let Some(row) = self.session_row_in(&s.mirror, *session)
             {

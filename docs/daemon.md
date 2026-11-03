@@ -625,9 +625,10 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
 - **Channels.** Each `joined` gets a thread of its own (`channel.rs`): a Noise handshake, then one `atomics.v1`
   session inside the encrypted channel, served by the protocol server's session code with its queues and limits
   (`protocol::Sessions`), with the role of the paired device (below). At most four at once; one more is closed with
-  `quota` (4429). A channel ends with 1000, `refused` (4000) for a protocol error or a message that fails to
-  decrypt, `idle` (4001), `not_paired` (4003), `no_pairing` (4004) or `slow` (4408); one the host cannot start gets
-  `unavailable` (4002). Each channel may queue 1 MiB
+  `quota` (4429), and a channel the host closes gives its place back at once, before the service's `left`. A
+  channel ends with 1000, `refused` (4000) for a protocol error or a message that fails to decrypt, `idle` (4001),
+  `not_paired` (4003), `no_pairing` (4004) or `slow` (4408); one the host cannot start gets `unavailable` (4002).
+  Each channel may queue 1 MiB
   toward the service (a session waits up to 5 s for room, then ends as slow), and a channel whose session stops
   reading 1 MiB of what arrives is closed as slow.
 - **Renewal.** After each `expiry` the host renews at half the remaining admission, between 15 s and 150 s, so a
@@ -644,8 +645,9 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   `channels` and `note`. The headless host logs whether it started.
 - **Tests.** `protocol::rendezvous::tests` runs the host against an in-process service that admits only unused
   passes from a fake issuer, with browsers speaking `atomics_core::noise` on its channels: registration, the
-  upgrade's headers, pairing (controller and view-only, a wrong psk, a device racing the link, no pairing open),
-  sessions of paired devices, an unknown device, plaintext and forged channels, replays, revoking, renewal at
+  upgrade's headers, pairing (controller and view-only, a wrong psk and the link given back, a device racing the
+  link, no pairing open), sessions of paired devices, an unknown device refused inside the channel, plaintext and
+  forged channels, replays (a replayed handshake marks nothing connected and writes nothing), revoking, renewal at
   half-life, every close code, a dropped socket and a silent service, refused upgrades, the channel limit, issuer
   refusals, and a stop. The profile issuer is tested against an in-process MCP server (whoami, signatures, refusal
   codes, no secret in messages); `atomics_core::tunnel` tests the framing; `atomics_core::noise` checks both
@@ -665,16 +667,21 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   characters of unpadded base64url. `pair_url` must be `https://` (or `http://` to this machine) and end in
   `#{pairing}`, so the psk travels only in the fragment, which browsers never send. The link works once, for five
   minutes, and only one is open. A device answers it with `Noise_IKpsk2_25519_ChaChaPoly_SHA256`; one at a time
-  (another gets `no_pairing`), and one that fails or takes over 30 s gives the link back. Its first message
-  (`PairRequest`, its name) proves the psk; then the desktop asks "Pair “name”?" beside the six-digit code from the
-  handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
+  (another gets `no_pairing`, and a browser asks again while its link may be valid). The handshake proves nothing
+  about the psk, so the link goes back as soon as the device's first message fails to decrypt or the device leaves,
+  and at the latest after 30 s. Its first message (`PairRequest`, its name) proves the psk; then the desktop asks
+  "Pair “name”?" beside the six-digit code from the handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
   it; "Codes differ: refuse" does not. Either answer, the device leaving, or expiry uses the link up. The device gets
   `PairAnswer` (`paired`, `may`); a paired device's channel goes on as its session, a refused one is closed with
   `not_paired`.
-- **Sessions.** A paired device dials `Noise_IK_25519_ChaChaPoly_SHA256` with its stored static key. The host looks
-  the key up in the allowlist and closes the channel with `not_paired` (4003) before answering if it is not there.
-  Its access is its role: view only is a viewer (`may` empty), may type and approve a controller. Its name is
-  its lease holder label and its name in the operation journal.
+- **Sessions.** A paired device dials `Noise_IK_25519_ChaChaPoly_SHA256` with its stored static key. The host
+  answers and waits up to 10 s for the device's first transport message (its `hello`). Only once that decrypts does
+  it look the key up in the allowlist, mark the device connected and write its last-seen time, so a replayed
+  handshake changes nothing. A key that is not there gets the host's refusal sealed into the channel, an
+  `atomics.v1` `error` with code `not_paired` (`wire::not_paired`), and then the close `not_paired` (4003). A
+  browser forgets its key on that sealed frame only: the close code alone comes through the broker
+  unauthenticated. Its access is its role: view only is a viewer (`may` empty), may type and approve a
+  controller. Its name is its lease holder label and its name in the operation journal.
 - **Frames.** The first data body is `[kind u8: 1 pair, 2 session][Noise message 1]`, exactly 97 bytes; the
   host's answer is message 2 (48 bytes); before it, the host reads that one bounded frame and parses nothing. Then
   each body is one Noise transport message (at most 65535 bytes) whose plaintext is `[flags u8][part of a frame]`:
@@ -685,8 +692,8 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   per line.
 - **The allowlist** is `devices.json` in the ATOMICS home (0600, written atomically): each device's public key,
   name, access, and when it paired and was last seen. Remote devices lists them, with "connected" while a session
-  is open; "Revoke…" asks once, removes the device and ends its sessions at once with `not_paired`. A host the
-  service revoked (4403) stops, and withdraws an open pairing link. `atomics ctl '{"cmd":"remote"}'` adds `paired`:
+  is open; "Revoke…" asks once, removes the device and ends its sessions at once with the sealed refusal and
+  `not_paired`. A host the service revoked (4403) stops, and withdraws an open pairing link. `atomics ctl '{"cmd":"remote"}'` adds `paired`:
   the pairing's stage and the devices (no keys, links or secrets).
 - **The browser's half** is `atomics_core::noise` (wasm32-safe, `getrandom`'s `wasm_js` backend): `Pairing::read`,
   `Initiator::pair` or `Initiator::connect`, `finish`, then `Channel::seal` and `Channel::open`. The device's static
@@ -817,7 +824,10 @@ the frame did not ask for is dropped.
 bare tunnel body; the broker must answer `atomics.rendezvous.v1` or the frame closes the socket. Each ticket is
 used once. Then the Noise channel (H5b): on a pairing boot the frame makes a fresh device key, pairs with
 `Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the six-digit code until the host
-answers, and on `paired` keeps the key and posts `atomics.paired`; the channel goes on as the session. Otherwise it
+answers, and on `paired` keeps the key and posts `atomics.paired`; the channel goes on as the session. When the
+boot names a host this browser already holds another host key for, the frame first asks "Pair this browser
+again?": pairing replaces that key once the host accepts the device, and "Keep the current pairing" connects with
+the key it holds. The same host key needs no question, since only that host can answer the link. Otherwise it
 loads the key it holds for `host_id` and dials `Noise_IK`; with none it asks to pair from the host's Remote devices.
 
 **The device key** is kept per host in the client origin's IndexedDB (`web/device-store.js`): the host's key and
@@ -829,8 +839,12 @@ is why the client gets an origin of its own (design §4.2, §6.2).
 channel stayed up 30 s; each try asks the parent for a fresh ticket, then says `hello` with the epoch and cursor
 the board holds, so the host replays what was missed or sends a snapshot. A gap in the events asks for one
 `resync`. Operations still unanswered are sent again with the same IDs while younger than `op_ttl_secs`; older
-ones say to check the board. It stops for good on `not_paired` (and forgets the key), `no_pairing`, `revoked`, a
-refused or failed pairing, a drop while the codes are being compared, or a host key that no longer matches.
+ones say to check the board. At most 64 wait (`max_pending_ops`); past that the browser refuses new ones until
+some are answered. A transport message that fails to decrypt ends the channel, and the frame dials again. While
+pairing, `no_pairing` is tried again with the same waits until five minutes after the boot (the link's lifetime).
+It stops for good on the host's sealed refusal (and forgets the key), a bare `not_paired` close (it keeps the key),
+`no_pairing` after that, `revoked`, a refused or failed pairing, a drop while the codes are being compared, or a
+handshake answer that does not authenticate (the host's key is not the one this browser paired with).
 
 **What it offers.** The board, the plans, the approvals, the diffs and the terminals, with `board`, `plans`,
 `approvals`, `diffs`, `terminals`, `input` and `mutations` asked for in `hello`. It answers approvals

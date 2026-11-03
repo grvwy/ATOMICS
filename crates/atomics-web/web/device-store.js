@@ -48,6 +48,8 @@ async function sealingKey(db) {
   }
 }
 
+// Replaces what was kept for the host. The frame calls it once the host accepted a pairing, and asks the
+// user first when that pairing names another host key than the one kept (driver.rs, ConfirmRepair).
 export async function saveDevice(hostId, hostKey, secret) {
   // The caller's bytes are a view of wasm memory: copy them before anything waits.
   const plain = Uint8Array.from(secret);

@@ -136,6 +136,13 @@ impl World {
                                 for reply in replies {
                                     self.driver.socket_message(socket, &reply);
                                 }
+                                if let Some(code) = self.host.take_close()
+                                    && self.socket == Some(socket)
+                                {
+                                    self.socket = None;
+                                    self.host.left();
+                                    self.driver.socket_closed(socket, code);
+                                }
                             }
                             Err(code) => {
                                 self.socket = None;

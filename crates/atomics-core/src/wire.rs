@@ -109,6 +109,10 @@ pub enum ErrorCode {
     AlreadyResolved,
     /// The operation ID was used before for a different command.
     Conflict,
+    /// The host does not hold this device's key: it never paired there, or it was revoked. Sent
+    /// only inside the encrypted channel ([`not_paired`]), so it is the one sign a browser forgets
+    /// its key on.
+    NotPaired,
     /// A code from a newer peer. Minor versions may add codes; an older client still reads the frame.
     #[serde(other)]
     Unknown,
@@ -129,6 +133,22 @@ impl WireError {
     pub fn into_envelope(self, request_id: Option<String>, epoch: Option<String>) -> Envelope {
         Envelope { v: VERSION, epoch, request_id, message: Message::Error { code: self.code, message: self.message } }
     }
+}
+
+/// The host's refusal of a device whose key is not on its allowlist: a session's first frame
+/// from that device, or a revocation during its session. The host seals it into the encrypted
+/// channel and then closes the channel with `tunnel::close::NOT_PAIRED`. Only the host can seal
+/// it, so a browser forgets its key on this frame alone; the bare close code arrives through the
+/// broker unauthenticated, and a client keeps its key on it. An older client reads the code as
+/// `unknown` and goes by the close code, as before.
+pub fn not_paired() -> Envelope {
+    WireError::new(ErrorCode::NotPaired, "this device is not paired with this host; pair it again from the host")
+        .into_envelope(None, None)
+}
+
+/// Whether `envelope` is the host's [`not_paired`] refusal.
+pub fn is_not_paired(envelope: &Envelope) -> bool {
+    matches!(envelope.message, Message::Error { code: ErrorCode::NotPaired, .. })
 }
 
 impl fmt::Display for WireError {

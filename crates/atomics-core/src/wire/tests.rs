@@ -393,6 +393,18 @@ fn an_error_code_from_a_newer_peer_decodes_as_unknown() {
 }
 
 #[test]
+fn the_hosts_refusal_is_an_error_frame_of_this_major() {
+    let frame = encode(&not_paired()).unwrap();
+    assert!(frame.starts_with(r#"{"v":{"major":1,"minor":0},"kind":"error","code":"not_paired""#), "{frame}");
+    let envelope = decode(&frame).unwrap();
+    assert!(is_not_paired(&envelope));
+    assert_eq!((envelope.epoch, envelope.request_id), (None, None), "it answers no request and needs no hello");
+    // Another error, or the code a client before this one reads it as, is no refusal.
+    assert!(!is_not_paired(&Envelope::new(Message::Error { code: ErrorCode::Unknown, message: "x".into() })));
+    assert!(!is_not_paired(&Envelope::new(Message::Error { code: ErrorCode::Unauthorised, message: "x".into() })));
+}
+
+#[test]
 fn an_unknown_kind_fails_explicitly() {
     let frame = r#"{"v":{"major":1,"minor":0},"kind":"file_put","path":"a.rs"}"#;
     let error = decode(frame).unwrap_err();

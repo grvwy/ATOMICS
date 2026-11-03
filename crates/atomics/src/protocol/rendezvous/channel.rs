@@ -2,8 +2,12 @@
 //! (`atomics_core::noise`), then one `atomics.v1` session inside the encrypted channel, with the
 //! role the device's allowlist entry gives it (`devices.rs`).
 //!
-//! - **Sessions** (`Noise_IK`): the device's key must be on the allowlist, or the channel is closed
-//!   with `not_paired` (4003) before the host answers. A view-only device is a viewer, any other a
+//! - **Sessions** (`Noise_IK`): the host answers the handshake and waits for the device's first
+//!   transport message. Only once that decrypts (so the peer holds the device's key, and a replayed
+//!   handshake gets no further) is the key looked up, the device marked connected and its last-seen
+//!   time written. A key that is not on the allowlist gets the host's refusal sealed into the channel
+//!   (`wire::not_paired`), then `not_paired` (4003): only that sealed frame tells a browser to forget
+//!   its key. A view-only device is a viewer, any other a
 //!   controller, so H4's grants (`welcome.may`) follow from what the user chose when pairing. Its
 //!   paired name, not the `client_id` its `hello` chose, is the lease holder others see and the
 //!   sender the operation journal records (`protocol::Peer`).
@@ -14,7 +18,8 @@
 //! - Before the handshake the host reads one bounded frame and parses nothing else. A message
 //!   that fails to decrypt ends the channel with `refused` (4000); so does a first frame that is no
 //!   handshake, and one that does not arrive in time ends it with `idle` (4001).
-//! - Revoking the device from the desktop ends its sessions with `not_paired`.
+//! - Revoking the device from the desktop ends its sessions with the same sealed refusal and
+//!   `not_paired`.
 //! - The host rekeys what it sends every hour (`Settings::rekey_every`); both ends also rekey
 //!   every 1 GiB (`noise::Channel`).
 
@@ -24,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use atomics_core::noise::{self, Established, Kind, NoiseError, PairAnswer, PairRequest, Responder};
 use atomics_core::tunnel::{self, close};
+use atomics_core::wire;
 
 use super::super::Sessions;
 use super::super::link::{Link, LinkError, Wait, Waker};
@@ -38,7 +44,7 @@ pub struct Gate {
     pub keys: Arc<DeviceKeys>,
     pub devices: Arc<Devices>,
     pub sessions: Sessions,
-    /// From `joined` to the first frame.
+    /// From `joined` to the first frame, and from a session's answer to its first transport message.
     pub handshake_timeout: Duration,
     /// From the host's answer to a pairing device's first message.
     pub pairing_timeout: Duration,
@@ -97,7 +103,17 @@ impl Inbox {
         }
     }
 
-    fn has_left(&self) -> bool {
+    /// The host closed the channel: what waits is dropped and nothing more is taken, so the
+    /// tunnel frees its slot without waiting for the service's `left`.
+    fn shut(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.left = true;
+        state.frames.clear();
+        state.bytes = 0;
+    }
+
+    /// The channel ended: it left, or the host closed it.
+    pub fn has_left(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).left
     }
 }
@@ -130,9 +146,12 @@ impl Raw {
     }
 
     /// Ask the service to close the channel, after what was queued for it. A channel that already
-    /// left needs nothing: the service has forgotten it.
+    /// left needs nothing: the service has forgotten it. Its slot in the tunnel is free from now
+    /// on, before the close goes out, so a `joined` that follows the close finds it free.
     fn close(&mut self, code: u16) {
-        if !self.closed && !self.inbox.has_left() {
+        let open = !self.closed && !self.inbox.has_left();
+        self.inbox.shut();
+        if open {
             let code = if close::host_may_send(code) { code } else { close::NORMAL };
             self.outbound.control(tunnel::close_channel(self.channel, code));
         }
@@ -183,23 +202,26 @@ fn read_raw(raw: &mut Raw, timeout: Duration) -> Result<Vec<u8>, u16> {
     }
 }
 
-/// A known device's session.
+/// A paired device's session. Message 1 names a key but proves nothing fresh (it may be a recording),
+/// so the allowlist is consulted only once the first transport message decrypts.
 fn session(mut raw: Raw, gate: &Gate, first: &[u8]) {
     let Ok(responder) = Responder::read(first, &gate.host_id, gate.keys.noise_secret(), None) else {
         return raw.close(close::REFUSED);
     };
     let key = responder.device();
-    let Some((device, live)) = gate.devices.attach(&key, raw.waker()) else {
-        return raw.close(close::NOT_PAIRED);
-    };
-    match responder.answer() {
-        Ok((answer, Established { channel, .. })) if raw.send(&answer).is_ok() => {
-            let mut link = SecureLink::new(raw, channel, gate.rekey_every);
-            link.live = Some(live);
-            gate.sessions.run(&mut link, &device.peer());
-        }
-        _ => raw.close(close::REFUSED),
+    let Ok((answer, Established { channel, .. })) = responder.answer() else { return raw.close(close::REFUSED) };
+    if raw.send(&answer).is_err() {
+        return raw.close(close::NORMAL);
     }
+    let mut link = SecureLink::new(raw, channel, gate.rekey_every);
+    let hello = match link.frame(gate.handshake_timeout) {
+        Ok(frame) => frame,
+        Err(code) => return link.raw.close(code),
+    };
+    let Some((device, live)) = gate.devices.attach(&key, link.raw.waker()) else { return link.refuse() };
+    link.live = Some(live);
+    link.ahead = Some(hello);
+    gate.sessions.run(&mut link, &device.peer());
     gate.devices.detach(&key);
 }
 
@@ -261,7 +283,7 @@ fn pair(mut raw: Raw, gate: &Gate, first: &[u8]) {
             gate.sessions.run(&mut link, &device.peer());
             gate.devices.detach(&key);
         }
-        None => link.raw.close(close::NOT_PAIRED),
+        None => link.refuse(),
     }
 }
 
@@ -288,6 +310,8 @@ pub struct SecureLink {
     channel: noise::Channel,
     /// The paired device's session: revoking it ends this link.
     live: Option<Arc<Live>>,
+    /// A frame read before the session started (a session's `hello`): the session's first.
+    ahead: Option<Vec<u8>>,
     rekey_every: Duration,
     rekey_at: Instant,
     /// Why the link ended, when the session did not choose it: the close code then.
@@ -296,7 +320,22 @@ pub struct SecureLink {
 
 impl SecureLink {
     fn new(raw: Raw, channel: noise::Channel, rekey_every: Duration) -> Self {
-        Self { raw, channel, live: None, rekey_every, rekey_at: Instant::now() + rekey_every, end: None }
+        Self { raw, channel, live: None, ahead: None, rekey_every, rekey_at: Instant::now() + rekey_every, end: None }
+    }
+
+    /// Refuse the device inside the channel ([`wire::not_paired`]), then close it with
+    /// `not_paired`. The sealed frame, which only this host can make, is what tells the browser
+    /// to forget its key.
+    fn refuse(&mut self) {
+        let frame = wire::encode(&wire::not_paired()).expect("a small frame");
+        if let Ok(messages) = self.channel.seal(frame.as_bytes()) {
+            for message in &messages {
+                if self.raw.send(message).is_err() {
+                    break;
+                }
+            }
+        }
+        self.raw.close(close::NOT_PAIRED);
     }
 
     fn check(&mut self) -> Result<(), LinkError> {
@@ -336,6 +375,10 @@ impl Link for SecureLink {
     }
 
     fn recv(&mut self, wait: Duration) -> Result<Option<String>, LinkError> {
+        self.check()?;
+        if let Some(frame) = self.ahead.take() {
+            return String::from_utf8(frame).map(Some).map_err(|_| LinkError::Binary);
+        }
         let deadline = Instant::now() + wait;
         loop {
             self.check()?;
@@ -360,7 +403,11 @@ impl Link for SecureLink {
     }
 
     fn close_with(&mut self, code: u16, _reason: &str) {
-        self.raw.close(self.end.unwrap_or(code));
+        match self.end.unwrap_or(code) {
+            // Revoked during the session.
+            close::NOT_PAIRED => self.refuse(),
+            code => self.raw.close(code),
+        }
     }
 
     fn waker(&self) -> Option<Arc<Waker>> {
