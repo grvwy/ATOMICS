@@ -456,6 +456,17 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   refused `too_many` rather than an unexpired outcome forgotten). Clients are told `op_ttl_secs` (15 minutes) and
   resend an unanswered operation only while it is younger (`Pending::resend`): an older one needs the user's fresh
   intent. With `[remote]` off the journal is in memory and there is no file.
+  An incomplete final line is truncated on open. If opening or writing the journal fails,
+  new client mutations are refused; a failed reopen after compaction disables further writes.
+  Desktop actions use fresh operation IDs, bypass the client capacity limit, and still run
+  without journaling when the journal is unwritable. Outcome records are appended under the
+  State lock, then synced after releasing it, before client replies are sent. The beginning
+  remains synced before side effects. Compaction also syncs its replacement and directory.
+
+- **Ownership.** Only one host per ATOMICS home owns remote access: it holds an exclusive advisory lock on
+  `remote.lock` for its lifetime. A second desktop keeps running without remote access and
+  reports that another ATOMICS owns it. It does not open the journal, device keys or advertisement.
+  The command journal opens only after the protocol server has started successfully.
 - **Approvals.** An approval's ID is minted for that one request, and `approval_decide` names it. The first valid
   decision answers it and is recorded; a later one for the same ID, from any client or the desktop, is refused
   `already_resolved` with how it ended, and every client gets `approval_resolved` with the disposition. A decision

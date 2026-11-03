@@ -187,6 +187,28 @@ fn outcomes_answer_the_request_that_sent_the_operation_and_a_repeat_is_not_sent_
 }
 
 #[test]
+fn a_repeat_with_a_different_body_conflicts_without_replacing_the_waiter() {
+    let (server, recorder) = start(Role::Controller);
+    let (mut client, _) = connect(&server, CAPABILITIES);
+    let original = every_command("o").pop().unwrap();
+    send(&mut client, original, "first");
+    recorder.answer(0, Outcome::Accepted);
+    assert_eq!(result(&mut client).2, Outcome::Accepted);
+    let changed = Command::SessionCommand(SessionCommand {
+        op: "o-s".into(),
+        action: SessionAction::Close { session: "a".into() },
+    });
+    send(&mut client, changed, "conflict");
+    let (request, _, outcome) = result(&mut client);
+    assert_eq!(request.as_deref(), Some("conflict"));
+    assert!(matches!(outcome, Outcome::Refused { code: ErrorCode::Conflict, .. }));
+    let done = Outcome::done(serde_json::Value::Null);
+    recorder.answer(0, done.clone());
+    assert_eq!(result(&mut client), (Some("first".into()), "o-s".into(), done));
+    assert_eq!(recorder.count(), 1);
+}
+
+#[test]
 fn operations_under_way_are_bounded() {
     let (server, recorder) = start(Role::Controller);
     let (mut client, _) = connect(&server, CAPABILITIES);

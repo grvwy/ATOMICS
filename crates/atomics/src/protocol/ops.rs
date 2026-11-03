@@ -31,6 +31,11 @@ pub struct OpReply {
 }
 
 impl OpReply {
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: mpsc::Sender<CommandResult>) -> Self {
+        Self::new(tx, None)
+    }
+
     pub(super) fn new(tx: mpsc::Sender<CommandResult>, waker: Option<Arc<Waker>>) -> Self {
         Self { tx, waker }
     }

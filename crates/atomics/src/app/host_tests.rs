@@ -1282,3 +1282,139 @@ fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_a
         },
     );
 }
+
+#[test]
+fn a_second_host_cannot_touch_the_remote_journal_or_advertisement() {
+    with_state("app::host_tests::a_second_host_cannot_touch_the_remote_journal_or_advertisement", |mut state, ctx| {
+        use atomics_core::ops::Outcome;
+        state.config.remote.enabled = true;
+        let first = state.into_host();
+        let mut client = remote_client(&first);
+        client.send(&decide("remember", "missing", Decision::Allow));
+        assert!(matches!(outcome_of(&mut client, "remember"), Outcome::Refused { .. }));
+        let home = paths::atomics_home();
+        let journal = home.join("protocol-ops.jsonl");
+        let advert = std::fs::read(home.join("protocol.json")).unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(&journal).unwrap().ino();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut second = State::new(&cc, Options::default(), &crate::load_icon());
+        second.config.remote.enabled = true;
+        second.config.remote.rendezvous.enabled = true;
+        let second = second.into_host();
+        assert!(second.protocol_addr().is_none());
+        assert!(second.state().remote_view().devices.is_none());
+        assert!(!home.join("devices.json").exists());
+        assert!(second.protocol_error().unwrap().contains("another ATOMICS owns"));
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert_eq!(std::fs::metadata(&journal).unwrap().ino(), inode);
+        drop(second);
+        assert_eq!(std::fs::read(home.join("protocol.json")).unwrap(), advert);
+        client.send(&decide("after", "missing", Decision::Deny));
+        assert!(matches!(outcome_of(&mut client, "after"), Outcome::Refused { .. }));
+        assert!(std::fs::read(&journal).unwrap().len() > before.len());
+    });
+}
+
+#[test]
+fn desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refused() {
+    with_state(
+        "app::host_tests::desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refused",
+        |mut state, _| {
+            use crate::protocol::journal::{Begun, CAPACITY, Journal, Key};
+            use atomics_core::ops::{ApprovalDecide, Command, Outcome};
+            state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+            for unwritable in [false, true] {
+                if unwritable {
+                    // Opening a directory as the journal fails, and must disable client writes.
+                    state.serve_commands(&paths::atomics_home());
+                } else {
+                    state.ops = Journal::memory();
+                    for i in 0..CAPACITY {
+                        assert_eq!(
+                            state.ops.begin(
+                                &Key::client("fill", &i.to_string()),
+                                None,
+                                "x",
+                                atomics_core::store::now()
+                            ),
+                            Begun::Fresh
+                        );
+                    }
+                }
+                let client_key = Key::client("phone", "blocked");
+                let outcome = state.mutate(
+                    client_key,
+                    None,
+                    Command::ApprovalDecide(ApprovalDecide {
+                        op: "blocked".into(),
+                        approval: "missing".into(),
+                        decision: Decision::Allow,
+                        message: None,
+                    }),
+                    None,
+                );
+                assert!(
+                    matches!(outcome, Outcome::Refused { code, .. } if code == if unwritable { ErrorCode::Internal } else { ErrorCode::TooMany }),
+                    "{outcome:?}"
+                );
+                for decision in [Decision::Allow, Decision::Deny] {
+                    let hook = waiting_approval(&mut state.sessions[0], "ask");
+                    let outcome = state.mutate_desktop(|op| {
+                        Command::ApprovalDecide(ApprovalDecide { op, approval: "ask".into(), decision, message: None })
+                    });
+                    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+                    let answer = hook.wait(Duration::ZERO).stdout.expect("desktop answered the hook");
+                    assert!(answer.contains(if decision == Decision::Deny { "deny" } else { "allow" }));
+                }
+                assert_eq!(state.ops.len(), if unwritable { 0 } else { CAPACITY + 2 });
+            }
+        },
+    );
+}
+
+#[test]
+fn a_failed_server_start_never_opens_the_command_journal() {
+    with_state("app::host_tests::a_failed_server_start_never_opens_the_command_journal", |mut state, _| {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        state.config.remote.enabled = true;
+        state.config.remote.port = listener.local_addr().unwrap().port();
+        let host = state.into_host();
+        assert!(host.protocol_addr().is_none());
+        assert!(host.protocol_error().is_some());
+        assert!(!paths::atomics_home().join("protocol-ops.jsonl").exists());
+    });
+}
+
+#[test]
+fn outcome_flush_releases_state_and_holds_replies_until_the_barrier() {
+    with_state("app::host_tests::outcome_flush_releases_state_and_holds_replies_until_the_barrier", |mut state, _| {
+        use crate::protocol::{Commands, OpReply, OpRequest};
+        use atomics_core::ops::Command;
+        state.serve_commands(&paths::atomics_home().join("ops.jsonl"));
+        let (tx, rx) = channel();
+        // Queue through the real sender, then service the request with State locked.
+        assert!(state.op_sender().submit(OpRequest {
+            client: "phone".into(),
+            device: None,
+            command: match decide("flush", "missing", Decision::Allow).message {
+                atomics_core::wire::Message::ApprovalDecide(command) => Command::ApprovalDecide(command),
+                _ => unreachable!(),
+            },
+            reply: OpReply::for_test(tx),
+        }));
+        let request = state.op_rx.try_recv().unwrap();
+        let state = std::sync::Mutex::new(state);
+        let flush = {
+            let mut guard = state.lock().unwrap();
+            guard.serve_op(request);
+            assert!(rx.try_recv().is_err(), "no reply before durability barrier");
+            guard.take_op_flush()
+        };
+        let guard = state.try_lock().expect("State is available during the disk sync");
+        flush();
+        assert!(rx.try_recv().unwrap().outcome.is_final());
+        drop(guard);
+    });
+}

@@ -386,7 +386,7 @@ struct Follows {
     /// client had already sent behind it meets `out_of_order`, which does not count either.
     slowed: HashMap<String, (u64, u64)>,
     /// Its operations under way, and the request each answers.
-    ops: HashMap<String, Option<String>>,
+    ops: HashMap<String, (String, Option<String>)>,
     /// Their outcomes, from the runtime thread.
     results: mpsc::Receiver<CommandResult>,
     reply: OpReply,
@@ -471,9 +471,9 @@ fn conversation(
         }
         while let Ok(result) = subscriptions.results.try_recv() {
             let request_id = if result.outcome.is_final() {
-                subscriptions.ops.remove(&result.op).flatten()
+                subscriptions.ops.remove(&result.op).and_then(|(_, id)| id)
             } else {
-                subscriptions.ops.get(&result.op).cloned().flatten()
+                subscriptions.ops.get(&result.op).and_then(|(_, id)| id.clone())
             };
             let reply = Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id);
             out.envelope(&reply).map_err(link_ended)?;
@@ -641,7 +641,11 @@ fn mutate(
         let why = if follows.may.is_empty() { "this client is view-only" } else { "this client may not do that" };
         return Err(refuse(ErrorCode::Unauthorised, why));
     }
-    if let Some(answers) = follows.ops.get_mut(&op) {
+    let fingerprint = super::journal::fingerprint(&command);
+    if let Some((previous, answers)) = follows.ops.get_mut(&op) {
+        if *previous != fingerprint {
+            return Err(refuse(ErrorCode::Conflict, "this operation ID was used for another command"));
+        }
         *answers = request_id.clone();
         let result = CommandResult { op, outcome: Outcome::Accepted };
         return Ok(out.envelope(&Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id))?);
@@ -658,7 +662,7 @@ fn mutate(
     if !shared.commands.submit(request) {
         return Err(refuse(ErrorCode::Internal, "the host is stopping"));
     }
-    follows.ops.insert(op, request_id);
+    follows.ops.insert(op, (fingerprint, request_id));
     Ok(())
 }
 

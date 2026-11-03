@@ -28,6 +28,7 @@ pub struct Host {
     projections: Arc<Projections>,
     /// Only when `[remote] enabled`; otherwise there is no thread and no socket.
     protocol: Option<protocol::Server>,
+    remote_lock: Option<std::fs::File>,
     /// Why the server is not running although `[remote] enabled` asks for it.
     protocol_error: Option<String>,
     /// The terminals the protocol may stream; absent (and never published) without the server.
@@ -55,7 +56,17 @@ impl Host {
         let projections = Arc::new(Projections::default());
         let bodies = Arc::new(DiffBodies::default());
         let remote = state.remote_access();
-        let (protocol, terminals, protocol_error) = match start_protocol(&mut state, &remote, &projections, &bodies) {
+        let ownership =
+            if remote.enabled { remote_lock(&atomics_core::paths::atomics_home()).map(Some) } else { Ok(None) };
+        let (remote_lock, ownership_error) = match ownership {
+            Ok(lock) => (lock, None),
+            Err(error) => (None, Some(error)),
+        };
+        let started = match ownership_error {
+            Some(error) => Err(error),
+            None => start_protocol(&mut state, &remote, &projections, &bodies),
+        };
+        let (protocol, terminals, protocol_error) = match started {
             Ok(Some((server, terminals))) => (Some(server), Some(terminals), None),
             Ok(None) => (None, None, None),
             Err(error) => {
@@ -84,7 +95,7 @@ impl Host {
             .spawn(move || {
                 let mut summaries = DiffSummaries::default();
                 while !stop.load(Ordering::Acquire) {
-                    let deadline = {
+                    let (deadline, flush) = {
                         let mut state = runtime.lock().unwrap();
                         let window = state.window().clone();
                         if state.runtime_tick() {
@@ -106,8 +117,9 @@ impl Host {
                             profile.set(state.rendezvous_profile());
                         }
                         state.publish_projections(&published, &mut summaries, &bodies);
-                        state.runtime_deadline()
+                        (state.runtime_deadline(), state.take_op_flush())
                     };
+                    flush();
                     signal.wait_until(deadline);
                 }
             })
@@ -120,6 +132,7 @@ impl Host {
             commands,
             projections,
             protocol,
+            remote_lock,
             protocol_error,
             terminals: published_terminals,
             rendezvous,
@@ -190,6 +203,7 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.stop();
         self.state.lock().unwrap().shutdown();
+        self.remote_lock.take();
     }
 }
 
@@ -212,10 +226,26 @@ fn start_protocol(
         advertise: Some(home.join("protocol.json")),
         ..protocol::ServerConfig::default()
     };
-    let commands = state.serve_commands(&home.join("protocol-ops.jsonl"));
+    let commands = Arc::new(state.op_sender());
     let server =
         protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone(), commands)?;
+    state.serve_commands(&home.join("protocol-ops.jsonl"));
     Ok(Some((server, terminals)))
+}
+
+/// Kept open for the lifetime of all remote services; never remove the lock file.
+fn remote_lock(home: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(home)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(home.join("remote.lock"))?;
+    file.try_lock()
+        .map_err(|error| std::io::Error::other(format!("another ATOMICS owns remote access for this home: {error}")))?;
+    Ok(file)
 }
 
 type Started =
