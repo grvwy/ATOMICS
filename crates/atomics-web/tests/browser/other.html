@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Another origin</title>
+</head>
+<body>
+  <script>
+    // A frame of another origin on the same page: it tries to boot the client's frame with its own
+    // ticket. The client must never take it.
+    const boot = EVIL_BOOT;
+    let told = false;
+    setInterval(() => {
+      try {
+        parent.frames[0].postMessage(boot, '*');
+        if (!told) fetch('/report', { method: 'POST', body: 'other posted' });
+        told = true;
+      } catch {}
+    }, 50);
+  </script>
+</body>
+</html>

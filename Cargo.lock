@@ -565,6 +565,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomics-web"
+version = "0.1.0"
+dependencies = [
+ "atomics-core",
+ "atomics-ui",
+ "eframe",
+ "egui",
+ "getrandom 0.3.4",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tungstenite",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "zeroize",
+]
+
+[[package]]
 name = "atspi"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1245,6 +1266,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",

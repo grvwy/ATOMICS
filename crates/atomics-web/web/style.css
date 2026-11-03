@@ -1,0 +1,32 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #1f1e1d;
+  color: #d8d4cc;
+}
+
+@media (prefers-color-scheme: light) {
+  html,
+  body {
+    background: #f5f3ee;
+    color: #2b2a28;
+  }
+}
+
+/* eframe sizes the canvas's pixels from its CSS size. */
+#atomics {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  outline: none;
+  touch-action: none;
+}
+
+#atomics-error {
+  margin: 0;
+  padding: 16px;
+  font: 15px system-ui, sans-serif;
+}

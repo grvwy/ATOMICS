@@ -1,0 +1,16 @@
+# The browser bundle (docs/daemon.md, "The browser client and its embedding").
+# scripts/build-web.sh runs trunk with this.
+[build]
+target = "index.html"
+dist = "dist"
+# Every URL is relative, so the bundle works from whatever folder a hosting product serves it in.
+public_url = "./"
+filehash = true
+# The client's origin allows no inline script, so the loader is a file: boot.js imports the hashed
+# module these attributes name, and the module starts the wasm.
+pattern_script = '<script type="module" src="{base}boot.js" data-atomics-module="{base}{js}" data-atomics-wasm="{base}{wasm}"></script>'
+pattern_preload = ''
+
+[tools]
+# Must equal the wasm-bindgen crate version in Cargo.lock.
+wasm_bindgen = "0.2.129"

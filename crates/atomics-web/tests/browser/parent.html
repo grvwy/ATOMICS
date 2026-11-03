@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hosting page</title>
+</head>
+<body>
+  <!-- Another origin's frame, which keeps posting a boot of its own to the client's frame. -->
+  <iframe src="OTHER_ORIGIN/other" width="10" height="10"></iframe>
+  <script>
+    // A hosting page as docs/daemon.md describes it: it boots its frame when the frame says it is
+    // ready, answers a request for a fresh ticket, and reports what the frame said to the test's server.
+    // The test switches it to a session boot, which loads a new frame.
+    const client = 'CLIENT_ORIGIN';
+    const boots = { pair: PAIR_BOOT, session: SESSION_BOOT };
+    let phase = 'pair';
+    let frame;
+    let tickets = 0;
+    const report = text => fetch('/report', { method: 'POST', body: text });
+    function mount() {
+      frame?.remove();
+      frame = document.createElement('iframe');
+      frame.src = `${client}/index.html`;
+      frame.width = 390;
+      frame.height = 700;
+      document.body.prepend(frame); // the client's frame is frames[0]
+    }
+    addEventListener('message', event => {
+      if (event.origin !== client || event.source !== frame.contentWindow) return;
+      const type = event.data?.type;
+      report(String(type));
+      if (type === 'atomics.ready') frame.contentWindow.postMessage(boots[phase], client);
+      if (type === 'atomics.ticket') {
+        const ticket = `ticket-${++tickets}`;
+        frame.contentWindow.postMessage({ type: 'atomics.embed.ticket', v: 1, host_id: boots[phase].host_id, ticket }, client);
+      }
+    });
+    setInterval(async () => {
+      const next = await (await fetch('/phase')).text();
+      if (next !== phase) {
+        phase = next;
+        mount();
+      }
+    }, 200);
+    mount();
+  </script>
+</body>
+</html>

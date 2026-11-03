@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>ATOMICS</title>
+  <!-- No inline script or style: the client's origin has a strict CSP (docs/daemon.md, "The browser
+       client and its embedding"). -->
+  <link data-trunk rel="css" href="web/style.css">
+  <link data-trunk rel="copy-file" href="web/boot.js">
+  <!-- The hosting page's config, served beside this page and not part of the bundle: it sets
+       window.ATOMICS_PARENT_ORIGIN to the one origin that may boot this frame. -->
+  <script src="config.js"></script>
+  <link data-trunk rel="rust" data-bin="atomics-web" data-wasm-opt="0">
+</head>
+<body>
+  <canvas id="atomics"></canvas>
+  <p id="atomics-error" hidden></p>
+  <noscript>ATOMICS needs JavaScript and WebAssembly.</noscript>
+</body>
+</html>

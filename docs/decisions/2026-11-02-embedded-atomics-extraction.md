@@ -94,7 +94,7 @@ are agent-days of focused work, review wait excluded. "C1"/"C2" are the design's
 | **S6** | **Done** (4.5). Move the files that read nothing from `runtime`: `diff_view.rs`, `panel_nav.rs`, `markdown.rs`, `topbar` helpers into `atomics-ui` (adds `egui` with default features off). Needs S5 for `Palette` | 1 PR | 1.5 | C1 |
 | S7 | Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus | 8–10 PRs | 5 | C1 |
 | **S8** | **Done** (4.7). Writes: `Command` enum and `Backend::send`, domain by domain, replacing `post` closures (50 sites) and the direct `runtime.*` view-hint writes | 5 PRs | 3 | H4 / C1 |
-| S9 | `atomics-ui` builds for `wasm32-unknown-unknown` in CI (`cargo check --target`), eframe web entry point `atomics-web` | 1 PR | 1.5 | C5 |
+| **S9** | **Done** (4.8). `atomics-ui` builds for `wasm32-unknown-unknown` in CI (`cargo check --target`), eframe web entry point `atomics-web` | 1 PR | 1.5 | C5 |
 
 **Sum:** C1 (S0, S1, S5, S6, S7) ≈ 11.5 days, inside the design's 10–15. C2 reads (S2–S4) ≈ 5.5, inside 5–8. S8 and S9 belong
 to H4 and C5. The terminal painter (C3) is independent of this list: it needs only the cell type in `atomics-core`.
@@ -329,14 +329,30 @@ Eight commits, one per domain, then the mapping. The tests ran unchanged but one
   `task_action`). A call left behind would compile and run at once instead of being posted; making the wrapper
   private does not help, since method lookup then goes on to `State`'s. Every call site sends a command now.
 
+### 4.8 S9
+
+- `crates/atomics-web` (C5) runs the moved draw functions in a browser: `board::draw`, `approvals::banner` and
+  `diff_panel::draw` over `RemoteBackend`, a `Backend` on `atomics_core::mirror` fed by `atomics.v1`. Its writes are
+  `Command::remote`'s mutations, sent only where `welcome`'s `may` grants them; the browser offers `Decide` and
+  `ApprovePlan` in this release and says so for the rest. A view command stays in the frame (`views.rs`), as
+  `Desktop::send` keeps it in the desktop.
+- What `RemoteBackend` cannot know reads as empty or default: the host's config (`ui_config` is the defaults),
+  projects, worktrees, recent sessions, the sandbox and the ticket config. Positions are the mirror's order (by
+  id). A board's `Plan` is built from `PlanInfo`, so briefs and acceptance are not on the cards; `plan_digest` is
+  the host's `PlanInfo.digest`, never recomputed in the browser.
+- The diff panel reads each worktree's `DiffSummary` and fills in hunks as `diff_get` brings them; no spans travel,
+  so the browser draws diffs without syntax colours (section 6).
+- CI checks `atomics-ui` and `atomics-web` for `wasm32-unknown-unknown` and lints `atomics-web` there, since its
+  browser glue (`src/web.rs`) does not build natively. Section 5's test covers both crates.
+
 ## 5. The dependency test
 
-`crates/atomics-ui/tests/dependencies.rs` runs `cargo tree --locked -p atomics-ui` for the host target and for
+`crates/atomics-ui/tests/dependencies.rs` runs `cargo tree --locked` for `atomics-ui` and `atomics-web`, for the host target and for
 `wasm32-unknown-unknown` (metadata only, so no wasm toolchain is needed) and fails if the tree contains `atomics`,
 `syntect`, `onig`, `two-face`, `alacritty_terminal`, `cpal`, `rfd`, `notify`, `ureq`, `fontique`, `ring`, `tempfile`,
 `dirs` or `libc`, or if `atomics-core` is present with its `native` feature. One exception, on the host target
-only: egui's locks (`parking_lot_core`) use `libc` on Unix, so the host tree may reach `libc` through them and
-nothing else; the wasm32 tree may not contain it at all. A second test checks the list against
+only: egui's locks (`parking_lot_core`) and the Noise channel's randomness (`getrandom`) use `libc` on Unix, so
+the host tree may reach `libc` through them and nothing else; the wasm32 tree may not contain it at all. A second test checks the list against
 `atomics`'s own tree so a rename of a crate cannot make the first test vacuous. Add a crate to the list when the web
 crate's reviewers find another one the browser cannot use.
 

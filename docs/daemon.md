@@ -673,7 +673,7 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   the pairing's stage and the devices (no keys, links or secrets).
 - **The browser's half** is `atomics_core::noise` (wasm32-safe, `getrandom`'s `wasm_js` backend): `Pairing::read`,
   `Initiator::pair` or `Initiator::connect`, `finish`, then `Channel::seal` and `Channel::open`. The device's static
-  key is the browser's to keep.
+  key is the browser's to keep; the web client (below) keeps it sealed in IndexedDB.
 
 **Roles.** Host (this program, off by default), broker (untrusted relay of bytes), client (browser).
 
@@ -725,7 +725,99 @@ numbers, frame sizes and timing, and public keys. It cannot read terminal conten
 or which device holds a lease, and cannot forge, replay or reorder frames; it can drop, delay or cut them.
 
 **Out of scope here.** Serving the client code (its integrity is the deployment's trust boundary), a fallback
-pairing without an authenticated connection, non-extractable browser keys, and routing between broker replicas.
+pairing without an authenticated connection, a browser key that script on the client's origin cannot use (the web
+client seals it at rest, below), and routing between broker replicas.
+
+### The browser client and its embedding (C5)
+
+`crates/atomics-web` is the egui UI in a browser: eframe's web runner with glow (WebGL2), atomics-ui's draw
+functions over a remote `Backend` built on `atomics_core::mirror`, and the Noise channel above. Everything but
+the browser glue (`src/web.rs`) builds natively, and the tests run it against an in-process host.
+
+**The bundle.** `scripts/build-web.sh` runs trunk (`crates/atomics-web/Trunk.toml`, profile `web`) into
+`crates/atomics-web/dist`: `index.html`, `boot.js`, the content-hashed `atomics-web-<hash>.js`, `_bg.wasm` and
+`style-<hash>.css`, `snippets/` (the device store) and `manifest.json` (`atomics_version`, `protocol_major`,
+`protocol_minor_max`, `wasm_sha256`, `built_from`, and every file's SHA-256). It then packs
+`target/web/atomics-web-<version>.tar.gz` with a `.sha256` beside it; the `Web bundle` workflow publishes both
+on tags. Every URL in the bundle is relative: serve the folder as it is, one per protocol major. There is no
+inline script or style, so the client's origin can send `Content-Security-Policy: default-src 'none';
+script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' wss://<broker host>;
+frame-ancestors <parent origin>` (`connect-src 'self'` is for the wasm's fetch), `index.html` with
+`Cache-Control: no-store` and the hashed files immutable.
+
+**The parent origin.** The hosting product serves `config.js` beside `index.html` (it is not part of the bundle):
+
+```js
+window.ATOMICS_PARENT_ORIGIN = 'https://app.example';
+```
+
+That exact origin, as `MessageEvent.origin` writes it (`https`, or `http` to loopback; lower case; no default port,
+path or trailing slash), is the only one the frame listens to, and only from the window that framed it. A message
+from any other origin or window is dropped before its data is read. Without the setting, or opened outside a
+frame, the client says to open it from its hosting page and does nothing else.
+
+**Frame to parent.** `postMessage({type, v: 1}, <parent origin>)`, where `type` is one of:
+
+| `type` | When |
+| --- | --- |
+| `atomics.ready` | Once, as soon as the frame listens: send the boot |
+| `atomics.booted` | The boot was taken |
+| `atomics.ticket` | The frame needs a fresh connect ticket, to reconnect. Asked again every 15 s until one comes |
+| `atomics.paired` | The host accepted this device: the codes matched |
+
+**Parent to frame.** Both messages carry `v: 1`; any other version or `type` is ignored.
+
+`atomics.embed.boot`, once per page load (to boot again, load the frame again):
+
+| Field | Required | Rule |
+| --- | --- | --- |
+| `host_id` | yes | The rendezvous service's id for the host: 1-64 of `A-Z a-z 0-9 -` |
+| `ticket` | yes | The single-use connect ticket: 1-4096 RFC 7230 token characters |
+| `broker` | yes | The broker's absolute URL: `wss://`, or `ws://` to loopback; no user part or fragment |
+| `display_name` | no | The signed-in person, as the page names them |
+| `theme` | no | The page's theme. A built-in ATOMICS theme of that name is used, else the first built-in of `scheme` |
+| `scheme` | no | `dark` (the default) or `light` |
+| `locale` | no | The page's locale |
+| `view` | no | Where to open: `board` (the default), `plans`, `approvals` or `diffs`; an unknown name opens the board |
+| `mode` | no | Absent, or `pair` on a pairing page |
+| `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk}`: the pairing link's fields, each key 43 characters of unpadded base64url |
+
+A boot with a malformed required field, an unknown `mode` or a malformed `pair` is ignored. Texts are trimmed,
+stripped of control characters and cut at 200 characters.
+
+`atomics.embed.ticket`, answering `atomics.ticket`: `{type, v: 1, host_id, ticket}`, for the booted host. A ticket
+the frame did not ask for is dropped.
+
+**Dialing.** `new WebSocket(broker, ['atomics.rendezvous.v1', 'atomics.ticket.<ticket>'])`, binary messages, each a
+bare tunnel body; the broker must answer `atomics.rendezvous.v1` or the frame closes the socket. Each ticket is
+used once. Then the Noise channel (H5b): on a pairing boot the frame makes a fresh device key, pairs with
+`Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the six-digit code until the host
+answers, and on `paired` keeps the key and posts `atomics.paired`; the channel goes on as the session. Otherwise it
+loads the key it holds for `host_id` and dials `Noise_IK`; with none it asks to pair from the host's Remote devices.
+
+**The device key** is kept per host in the client origin's IndexedDB (`web/device-store.js`): the host's key and
+the device key sealed with AES-GCM under a WebCrypto key made non-extractable, with `navigator.storage.persist()`
+asked for. A copy of the database is ciphertext, but script on the client's origin can use the sealing key, which
+is why the client gets an origin of its own (design §4.2, §6.2).
+
+**Reconnecting.** A drop waits 1 s, doubling to 30 s with jitter (60 s after `quota`), and starts over once a
+channel stayed up 30 s; each try asks the parent for a fresh ticket, then says `hello` with the epoch and cursor
+the board holds, so the host replays what was missed or sends a snapshot. A gap in the events asks for one
+`resync`. Operations still unanswered are sent again with the same IDs while younger than `op_ttl_secs`; older
+ones say to check the board. It stops for good on `not_paired` (and forgets the key), `no_pairing`, `revoked`, a
+refused or failed pairing, a drop while the codes are being compared, or a host key that no longer matches.
+
+**What it offers.** The board, the plans, the approvals and the diffs, read-only, with `board`, `plans`,
+`approvals`, `diffs` and `mutations` asked for in `hello`. It answers approvals (`approval_decide`) and approves
+plans (`plan_command` `approve`, with the plan's digest) when `welcome`'s `may` grants it; any other command says
+it is not available in the browser yet. A diff on screen is fetched file by file with `diff_get`, four files at a
+time, up to 16 pages each; the browser draws it without syntax colours. Terminals come with C3 and C4.
+
+**Tests.** `cargo test -p atomics-web`: the boot's origin, window and field rules; the channel, pairing, the
+board, commands and grants, reconnecting and every stop against an in-process host built from `atomics_core`
+(`src/fake_host.rs`); the views drawn headless; the manifest; and that the crate names no hosting product.
+`crates/atomics-ui/tests/dependencies.rs` keeps desktop-only crates out of `atomics-ui` and `atomics-web` on both
+targets, and CI checks both for `wasm32-unknown-unknown`.
 
 ## Container state and credentials
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/atomics-core", "crates/atomics-ui", "crates/atomics"]
+members = ["crates/atomics-core", "crates/atomics-ui", "crates/atomics-web", "crates/atomics"]
 
 [workspace.package]
 edition = "2024"
@@ -17,3 +17,10 @@ strip = true
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# The browser bundle (crates/atomics-web, built by trunk): small over fast, as the P0 spike measured it.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = true
+panic = "abort"

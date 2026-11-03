@@ -1,0 +1,460 @@
+//! The frame's life with one host, sans I/O: the boot, the encrypted channel through the broker, pairing,
+//! `atomics.v1` into the [`RemoteBackend`], and reconnecting with a fresh ticket from the hosting page.
+//! The browser glue (`web.rs`) carries out its [`Output`]s and feeds back what happened; the tests drive
+//! it against a host built from `atomics_core`, with no browser.
+//!
+//! Reconnecting: when the channel drops, the driver waits (jittered, 1 s doubling to 30 s), asks the
+//! hosting page for a fresh ticket ([`boot::WANTS_TICKET`]), dials again, and resumes with `hello`'s
+//! prior epoch and cursor, so the host replays what was missed or sends a snapshot.
+
+use std::fmt;
+
+use atomics_core::noise::{NoiseError, Pairing, Secret};
+use atomics_core::tunnel::{self, close};
+use atomics_core::wire;
+use serde_json::Value;
+use zeroize::Zeroizing;
+
+use crate::boot::{self, Boot, FromParent, ParentOrigin, Refused, Ticket};
+use crate::connection::{Connection, Event, Failure};
+use crate::device::Device;
+use crate::remote::RemoteBackend;
+
+/// The `client_id` this client says `hello` with.
+pub const CLIENT_ID: &str = "atomics-web";
+/// The first wait before dialing again; it doubles up to [`MAX_RETRY_MS`].
+const FIRST_RETRY_MS: u64 = 1_000;
+const MAX_RETRY_MS: u64 = 30_000;
+/// How long the broker's `quota` close keeps the client away.
+const QUOTA_RETRY_MS: u64 = 60_000;
+/// How long a channel must stay up for the next drop to start the waits over.
+const STEADY_MS: u64 = 30_000;
+/// How long to wait for a fresh ticket before asking again.
+const TICKET_WAIT_MS: u64 = 15_000;
+
+/// What the frame shows about its connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// Waiting for the hosting page's boot.
+    Waiting,
+    Connecting,
+    /// Pairing this browser with the host; the code shows once the handshake is done.
+    Pairing {
+        code: Option<String>,
+    },
+    Live,
+    Reconnecting {
+        attempt: u32,
+    },
+    Stopped(Stop),
+}
+
+/// Why the frame stopped trying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// No parent origin is configured, so nothing may boot the frame.
+    NoParent,
+    /// This browser has no key for the host: it never paired here.
+    NotHere,
+    /// The host no longer knows this browser's key.
+    NotPaired,
+    /// No pairing is open on the host.
+    NoPairing,
+    /// The host's user refused this browser: the codes differed.
+    PairRefused,
+    /// The pairing's handshake failed: a used or wrong link.
+    PairFailed,
+    /// The channel dropped while the codes were being compared.
+    PairInterrupted,
+    /// The rendezvous service revoked the host.
+    Revoked,
+    /// The host's key is not the one this browser paired with.
+    KeyMismatch,
+    /// This browser could not start: no randomness, or a malformed key.
+    Failed,
+}
+
+impl Stop {
+    pub fn message(self) -> &'static str {
+        match self {
+            Stop::NoParent => "Open ATOMICS from the page that hosts it.",
+            Stop::NotHere => {
+                "This browser is not paired with this computer yet. In ATOMICS on the computer, open Remote devices and pair it."
+            }
+            Stop::NotPaired => {
+                "The computer no longer knows this browser. Pair it again from Remote devices in ATOMICS on the computer."
+            }
+            Stop::NoPairing => {
+                "No pairing is open on the computer: it expired, was used, or another device is pairing. Start a new one from Remote devices."
+            }
+            Stop::PairRefused => "The computer refused this browser: the codes did not match.",
+            Stop::PairFailed => "The pairing link was not accepted. Start a new pairing from Remote devices.",
+            Stop::PairInterrupted => "The connection dropped while pairing. Start a new pairing from Remote devices.",
+            Stop::Revoked => "This computer's registration with the rendezvous service was revoked.",
+            Stop::KeyMismatch => "The computer's key does not match the one this browser paired with. Pair again.",
+            Stop::Failed => "This browser could not start the connection. Reload the page to try again.",
+        }
+    }
+}
+
+/// What the browser glue does for the driver.
+pub enum Output {
+    /// Post `{type, v}` to the parent window, at the parent origin exactly.
+    Post(&'static str),
+    /// Open a WebSocket to `url` offering `protocols` (the second carries the ticket: never log it).
+    Dial {
+        socket: u64,
+        url: String,
+        protocols: Vec<Zeroizing<String>>,
+    },
+    /// One binary message.
+    Send {
+        socket: u64,
+        message: Vec<u8>,
+    },
+    Close {
+        socket: u64,
+        code: u16,
+    },
+    /// Read the stored device for this host, and answer with [`Driver::device_loaded`].
+    LoadDevice(String),
+    SaveDevice(Device),
+    ForgetDevice(String),
+}
+
+impl fmt::Debug for Output {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Output::Post(kind) => write!(f, "Post({kind})"),
+            Output::Dial { socket, url, .. } => write!(f, "Dial({socket}, {url})"),
+            Output::Send { socket, message } => write!(f, "Send({socket}, {} bytes)", message.len()),
+            Output::Close { socket, code } => write!(f, "Close({socket}, {code})"),
+            Output::LoadDevice(host) => write!(f, "LoadDevice({host})"),
+            Output::SaveDevice(device) => write!(f, "SaveDevice({})", device.host_id),
+            Output::ForgetDevice(host) => write!(f, "ForgetDevice({host})"),
+        }
+    }
+}
+
+struct Socket {
+    id: u64,
+    connection: Connection,
+    open: bool,
+}
+
+#[derive(Default)]
+struct Retry {
+    attempt: u32,
+    /// When to ask for a ticket and dial again.
+    due_ms: Option<u64>,
+    /// When a fresh ticket was asked for, while it has not come.
+    asked_ms: Option<u64>,
+    /// When the channel last opened.
+    open_ms: Option<u64>,
+}
+
+pub struct Driver {
+    parent: Option<ParentOrigin>,
+    boot: Option<Box<Boot>>,
+    pub remote: RemoteBackend,
+    device_name: String,
+    device: Option<Device>,
+    /// A pairing boot's link and the key this browser pairs with, until the host accepts it.
+    pairing: Option<(Pairing, Secret)>,
+    ticket: Option<Ticket>,
+    socket: Option<Socket>,
+    sockets: u64,
+    status: Status,
+    retry: Retry,
+    now_ms: u64,
+    outputs: Vec<Output>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum End {
+    Code(u16),
+    Failure(Failure),
+}
+
+impl Driver {
+    /// A frame whose parent origin is `parent` (none configured: nothing may boot it). `op_prefix` starts
+    /// its operation IDs; `device_name` is how a host's pairing prompt names this browser.
+    pub fn new(parent: Option<ParentOrigin>, op_prefix: &str, device_name: &str) -> Self {
+        let status = if parent.is_some() { Status::Waiting } else { Status::Stopped(Stop::NoParent) };
+        let outputs = if parent.is_some() { vec![Output::Post(boot::READY)] } else { Vec::new() };
+        Self {
+            parent,
+            boot: None,
+            remote: RemoteBackend::new(op_prefix),
+            device_name: device_name.to_string(),
+            device: None,
+            pairing: None,
+            ticket: None,
+            socket: None,
+            sockets: 0,
+            status,
+            retry: Retry::default(),
+            now_ms: 0,
+            outputs,
+        }
+    }
+
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+
+    pub fn boot(&self) -> Option<&Boot> {
+        self.boot.as_deref()
+    }
+
+    pub fn take_outputs(&mut self) -> Vec<Output> {
+        std::mem::take(&mut self.outputs)
+    }
+
+    /// A message event on the window. Anything but the parent's boot or ticket is refused unread.
+    pub fn message(&mut self, origin: &str, from_parent: bool, data: &Value) -> Result<(), Refused> {
+        let Some(parent) = &self.parent else { return Err(Refused::Origin) };
+        match boot::read(parent, origin, from_parent, data)? {
+            // One boot per frame; the hosting page makes a new frame to boot again.
+            FromParent::Boot(_) if self.boot.is_some() => {}
+            FromParent::Boot(boot) => {
+                self.outputs.push(Output::Post(boot::BOOTED));
+                self.ticket = Some(boot.ticket.clone());
+                let host_id = boot.host_id.clone();
+                let pairing = boot.pairing.clone();
+                self.boot = Some(boot);
+                match pairing {
+                    Some(pairing) => match Secret::generate() {
+                        Ok(secret) => {
+                            self.pairing = Some((pairing, secret));
+                            self.status = Status::Pairing { code: None };
+                            self.dial();
+                        }
+                        Err(_) => self.status = Status::Stopped(Stop::Failed),
+                    },
+                    None => {
+                        self.status = Status::Connecting;
+                        self.outputs.push(Output::LoadDevice(host_id));
+                    }
+                }
+            }
+            FromParent::Ticket { host_id, ticket } => {
+                let ours = self.boot.as_ref().is_some_and(|b| b.host_id == host_id);
+                if ours && self.retry.asked_ms.take().is_some() && self.socket.is_none() {
+                    self.ticket = Some(ticket);
+                    self.dial();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored device for the booted host, as [`Output::LoadDevice`] asked.
+    pub fn device_loaded(&mut self, device: Option<Device>) {
+        if self.device.is_some() || self.pairing.is_some() || self.status != Status::Connecting {
+            return;
+        }
+        let host = self.boot.as_ref().map(|b| b.host_id.clone());
+        match device {
+            Some(device) if Some(&device.host_id) == host.as_ref() => {
+                self.device = Some(device);
+                self.dial();
+            }
+            _ => self.status = Status::Stopped(Stop::NotHere),
+        }
+    }
+
+    fn dial(&mut self) {
+        let Some(boot) = &self.boot else { return };
+        let Some(ticket) = self.ticket.take() else { return self.ask_ticket() };
+        let connection = match (&self.pairing, &self.device) {
+            (Some((pairing, secret)), _) => Connection::pair(pairing, secret, &self.device_name),
+            (None, Some(device)) => Connection::session(&device.host_id, &device.host_key, &device.secret),
+            (None, None) => return,
+        };
+        let Ok(connection) = connection else {
+            self.status = Status::Stopped(Stop::Failed);
+            return;
+        };
+        self.sockets += 1;
+        let id = self.sockets;
+        let protocols = vec![Zeroizing::new(tunnel::SUBPROTOCOL.to_string()), ticket.subprotocol()];
+        self.outputs.push(Output::Dial { socket: id, url: boot.broker.clone(), protocols });
+        self.socket = Some(Socket { id, connection, open: false });
+        self.retry.due_ms = None;
+        if !matches!(self.status, Status::Pairing { .. } | Status::Reconnecting { .. }) {
+            self.status = Status::Connecting;
+        }
+    }
+
+    fn ask_ticket(&mut self) {
+        self.outputs.push(Output::Post(boot::WANTS_TICKET));
+        self.retry.asked_ms = Some(self.now_ms);
+    }
+
+    fn current(&mut self, socket: u64) -> Option<&mut Socket> {
+        self.socket.as_mut().filter(|s| s.id == socket)
+    }
+
+    /// The WebSocket opened, with the subprotocol the broker chose.
+    pub fn socket_open(&mut self, socket: u64, protocol: &str) {
+        let Some(current) = self.current(socket) else { return };
+        if protocol != tunnel::SUBPROTOCOL {
+            return self.fail(socket, End::Code(close::REFUSED));
+        }
+        current.open = true;
+        self.flush();
+    }
+
+    /// One binary message on the WebSocket.
+    pub fn socket_message(&mut self, socket: u64, message: &[u8]) {
+        let Some(current) = self.current(socket).filter(|s| s.open) else { return };
+        let events = match current.connection.receive(message) {
+            Ok(events) => events,
+            Err(failure) => return self.fail(socket, End::Failure(failure)),
+        };
+        for event in events {
+            match event {
+                Event::Code(code) => self.status = Status::Pairing { code: Some(code) },
+                Event::Paired(_) => {
+                    let Some((pairing, secret)) = self.pairing.take() else { continue };
+                    let device = Device { host_id: pairing.host_id.clone(), host_key: pairing.host_key, secret };
+                    self.outputs.push(Output::SaveDevice(device.clone()));
+                    self.outputs.push(Output::Post(boot::PAIRED));
+                    self.device = Some(device);
+                }
+                Event::Open => {
+                    let hello = self.remote.hello(CLIENT_ID);
+                    self.queue(&hello);
+                    self.status = Status::Live;
+                    self.retry.open_ms = Some(self.now_ms);
+                }
+                // A frame this client cannot read (a kind from a newer minor) is skipped.
+                Event::Frame(text) => {
+                    if let Ok(envelope) = wire::decode(&text) {
+                        self.remote.receive(envelope);
+                    }
+                }
+            }
+        }
+        self.flush();
+    }
+
+    /// The WebSocket closed with `code` (1006 when it dropped without one).
+    pub fn socket_closed(&mut self, socket: u64, code: u16) {
+        if self.current(socket).is_none() {
+            return;
+        }
+        self.socket = None;
+        self.remote.disconnected();
+        self.ended(End::Code(code));
+    }
+
+    /// The clock moved: milliseconds on any clock that only goes forward.
+    pub fn tick(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.remote.set_now(now_ms);
+        if let Some(open) = self.retry.open_ms
+            && self.socket.is_some()
+            && now_ms.saturating_sub(open) >= STEADY_MS
+        {
+            self.retry.attempt = 0;
+        }
+        if self.retry.due_ms.is_some_and(|due| now_ms >= due) {
+            self.retry.due_ms = None;
+            self.dial();
+        } else if self.retry.asked_ms.is_some_and(|asked| now_ms.saturating_sub(asked) >= TICKET_WAIT_MS) {
+            self.ask_ticket();
+        }
+    }
+
+    /// Milliseconds until the driver wants [`tick`](Driver::tick) again, if it waits for anything.
+    pub fn wake_in(&self) -> Option<u64> {
+        let due = self.retry.due_ms.map(|due| due.saturating_sub(self.now_ms));
+        let ask = self.retry.asked_ms.map(|asked| (asked + TICKET_WAIT_MS).saturating_sub(self.now_ms));
+        due.into_iter().chain(ask).min()
+    }
+
+    /// Send what the backend queued (the UI's commands, a resync, diff requests).
+    pub fn flush(&mut self) {
+        let Some(socket) = &mut self.socket else { return };
+        if !socket.open {
+            return;
+        }
+        let id = socket.id;
+        let mut failed = None;
+        if socket.connection.is_open() {
+            for envelope in self.remote.take_outgoing() {
+                let Ok(frame) = wire::encode(&envelope) else { continue };
+                if let Err(failure) = socket.connection.send(&frame) {
+                    failed = Some(failure);
+                    break;
+                }
+            }
+        }
+        for message in socket.connection.take_outgoing() {
+            self.outputs.push(Output::Send { socket: id, message });
+        }
+        if let Some(failure) = failed {
+            self.fail(id, End::Failure(failure));
+        }
+    }
+
+    fn queue(&mut self, envelope: &wire::Envelope) {
+        if let (Some(socket), Ok(frame)) = (&mut self.socket, wire::encode(envelope)) {
+            let _ = socket.connection.send(&frame);
+        }
+    }
+
+    /// The channel failed on this side: close the socket and decide what next.
+    fn fail(&mut self, socket: u64, end: End) {
+        self.outputs.push(Output::Close { socket, code: close::REFUSED });
+        self.socket = None;
+        self.remote.disconnected();
+        self.ended(end);
+    }
+
+    fn ended(&mut self, end: End) {
+        let pairing = self.pairing.is_some();
+        let compared = matches!(self.status, Status::Pairing { code: Some(_) });
+        let stop = match end {
+            End::Code(close::NOT_PAIRED) if pairing => Some(Stop::PairRefused),
+            End::Code(close::NOT_PAIRED) => {
+                if let Some(device) = self.device.take() {
+                    self.outputs.push(Output::ForgetDevice(device.host_id));
+                }
+                Some(Stop::NotPaired)
+            }
+            End::Code(close::NO_PAIRING) => Some(Stop::NoPairing),
+            End::Code(close::REVOKED) => Some(Stop::Revoked),
+            End::Failure(Failure::Refused) => Some(Stop::PairRefused),
+            End::Failure(Failure::Noise(NoiseError::Refused)) if pairing => Some(Stop::PairFailed),
+            End::Failure(Failure::Noise(NoiseError::Refused)) => Some(Stop::KeyMismatch),
+            _ if pairing && compared => Some(Stop::PairInterrupted),
+            _ => None,
+        };
+        if let Some(stop) = stop {
+            self.pairing = None;
+            self.retry = Retry::default();
+            self.status = Status::Stopped(stop);
+            return;
+        }
+        let wait = match end {
+            End::Code(close::QUOTA) => QUOTA_RETRY_MS,
+            _ => (FIRST_RETRY_MS << self.retry.attempt.min(5)).min(MAX_RETRY_MS),
+        };
+        // Between half and all of the wait, so clients that dropped together do not return together.
+        let mut byte = [0u8; 1];
+        let jitter = getrandom::fill(&mut byte).map_or(255, |()| byte[0]);
+        let wait = wait / 2 + wait / 2 * u64::from(jitter) / 255;
+        self.retry.attempt += 1;
+        self.retry.due_ms = Some(self.now_ms + wait);
+        self.retry.open_ms = None;
+        if !matches!(self.status, Status::Pairing { .. }) {
+            self.status = Status::Reconnecting { attempt: self.retry.attempt };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

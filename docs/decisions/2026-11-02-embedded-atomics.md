@@ -189,7 +189,8 @@ to match, `Cache-Control no-store` on the loader, and a CSP that allows `wasm-un
 broker. No threads, so no COOP/COEP.
 
 The hosting app gives the iframe a boot object by `postMessage` after load (mode, host list, theme, locale, connect
-ticket), never the session cookie.
+ticket), never the session cookie. The exact contract (message types, fields, the parent-origin config) is
+`docs/daemon.md`, "The browser client and its embedding".
 
 ### 4.3 Asset hosting and versioning
 
