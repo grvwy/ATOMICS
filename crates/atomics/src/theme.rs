@@ -233,6 +233,31 @@ mod tests {
         found
     }
 
+    /// Colors that must not follow the theme, each with its reason. An exception names its file and the
+    /// exact code of its line, so it covers that one site and nothing else; one that no longer matches
+    /// fails the scan, so it cannot outlive the code it excuses.
+    const EXCEPTIONS: &[(&str, &str, &str)] = &[
+        (
+            "atomics/src/app/pairing.rs",
+            "painter.rect_filled(rect, 0.0, Color32::WHITE);",
+            "a QR code must be black on white to scan: the pairing code's light modules and quiet zone",
+        ),
+        (
+            "atomics/src/app/pairing.rs",
+            "painter.rect_filled(Rect::from_min_size(at, Vec2::splat(scale)), 0.0, Color32::BLACK);",
+            "a QR code must be black on white to scan: the pairing code's dark modules",
+        ),
+    ];
+
+    /// The exception that excuses a scan result (`file:line: code`), by its position in [`EXCEPTIONS`].
+    fn exception(found: &str) -> Option<usize> {
+        EXCEPTIONS.iter().position(|(file, code, _)| {
+            let rest = found.strip_prefix(file).and_then(|rest| rest.strip_prefix(':'));
+            rest.and_then(|rest| rest.split_once(": "))
+                .is_some_and(|(line, text)| line.bytes().all(|b| b.is_ascii_digit()) && text == *code)
+        })
+    }
+
     #[test]
     fn ui_code_takes_every_color_from_the_theme() {
         fn rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
@@ -264,7 +289,37 @@ mod tests {
                 color_literals(file.strip_prefix(crates).unwrap(), &std::fs::read_to_string(file).unwrap())
             })
             .collect();
+        let mut used = vec![false; EXCEPTIONS.len()];
+        let found: Vec<String> = found
+            .into_iter()
+            .filter(|found| match exception(found) {
+                Some(at) => {
+                    used[at] = true;
+                    false
+                }
+                None => true,
+            })
+            .collect();
         assert!(found.is_empty(), "use a theme token from the theme instead of:\n{}", found.join("\n"));
+        let stale: Vec<String> = EXCEPTIONS
+            .iter()
+            .zip(&used)
+            .filter(|(_, used)| !**used)
+            .map(|((file, code, _), _)| format!("{file}: {code}"))
+            .collect();
+        assert!(stale.is_empty(), "these exceptions no longer match their code; remove them:\n{}", stale.join("\n"));
+        // An exception covers its own site only: the same color elsewhere, or other code there, is still found.
+        assert_eq!(
+            exception("atomics/src/app/pairing.rs:189: painter.rect_filled(rect, 0.0, Color32::WHITE);"),
+            Some(0)
+        );
+        for other in [
+            "atomics/src/app/other.rs:189: painter.rect_filled(rect, 0.0, Color32::WHITE);",
+            "atomics/src/app/pairing.rs:12: let c = Color32::WHITE;",
+            "atomics/src/app/pairing.rs:x: painter.rect_filled(rect, 0.0, Color32::WHITE);",
+        ] {
+            assert_eq!(exception(other), None, "{other}");
+        }
 
         // The scan itself catches each way of writing a color.
         let file = Path::new("x.rs");
