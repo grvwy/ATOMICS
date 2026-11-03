@@ -10,6 +10,7 @@ use crate::app::State;
 use crate::app::projection::{DiffBodies, DiffSummaries};
 use crate::ipc::{ControlMessage, ControlOutcome};
 use crate::protocol;
+use crate::protocol::rendezvous::devices::Devices;
 use crate::protocol::rendezvous::{self, Rendezvous, StatusCell, issuer::Published};
 use atomics_core::control::ControlRequest;
 use atomics_core::projection::Projections;
@@ -43,6 +44,10 @@ pub(crate) struct RemoteView {
     pub error: Option<String>,
     /// With `[remote.rendezvous] enabled`, whether or not it could start.
     pub rendezvous: Option<Arc<StatusCell>>,
+    /// The paired devices and the pairing the desktop may offer, while the rendezvous runs.
+    pub devices: Option<Arc<Devices>>,
+    /// `[remote.rendezvous] pair_url`, the template of the pairing link.
+    pub pair_url: String,
 }
 
 impl Host {
@@ -59,13 +64,15 @@ impl Host {
                 (None, None, Some(error.to_string()))
             }
         };
-        let (rendezvous, profile, status) =
+        let (rendezvous, profile, status, devices) =
             start_rendezvous(&remote, protocol.as_ref(), state.window().clone(), state.rendezvous_profile());
         state.set_remote_view(RemoteView {
             enabled: remote.enabled,
             addr: protocol.as_ref().map(protocol::Server::addr),
             error: protocol_error.clone(),
             rendezvous: status,
+            devices,
+            pair_url: remote.rendezvous.pair_url.clone(),
         });
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -211,7 +218,8 @@ fn start_protocol(
     Ok(Some((server, terminals)))
 }
 
-type Started = (Option<Rendezvous>, Option<Arc<Published<TicketConfig>>>, Option<Arc<StatusCell>>);
+type Started =
+    (Option<Rendezvous>, Option<Arc<Published<TicketConfig>>>, Option<Arc<StatusCell>>, Option<Arc<Devices>>);
 
 /// The rendezvous, when `[remote.rendezvous] enabled`. Without the protocol server it cannot
 /// serve a channel, so it does not start, and its status says why. Its keys are read, and made if
@@ -225,8 +233,9 @@ fn start_rendezvous(
 ) -> Started {
     let settings = &config.rendezvous;
     if !settings.enabled {
-        return (None, None, None);
+        return (None, None, None, None);
     }
+    let repaint = window.clone();
     let status = StatusCell::new(move || window.request_repaint());
     let stopped = |note: &str| {
         status.update(|s| {
@@ -240,8 +249,10 @@ fn start_rendezvous(
         } else {
             "the rendezvous needs [remote] enabled = true"
         });
-        return (None, None, Some(status));
+        return (None, None, Some(status), None);
     };
+    let home = atomics_core::paths::atomics_home();
+    let devices = Devices::open(home.join("devices.json"), move || repaint.request_repaint());
     let published = Arc::new(Published::default());
     published.set(profile);
     let issuer = rendezvous::issuer::ProfileIssuer::new(published.clone(), crate::mcp_client::OAuth::current());
@@ -252,15 +263,16 @@ fn start_rendezvous(
     let started = Rendezvous::start(
         rendezvous::Settings::new(&settings.url, &settings.name),
         server.sessions(),
+        devices.clone(),
         Box::new(issuer),
         keys,
         status.clone(),
     );
     match started {
-        Ok(rendezvous) => (Some(rendezvous), Some(published), Some(status)),
+        Ok(rendezvous) => (Some(rendezvous), Some(published), Some(status), Some(devices)),
         Err(error) => {
             stopped(&format!("could not start the rendezvous thread: {error}"));
-            (None, None, Some(status))
+            (None, None, Some(status), None)
         }
     }
 }

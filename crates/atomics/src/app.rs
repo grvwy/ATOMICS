@@ -56,6 +56,7 @@ mod input;
 mod integrations;
 mod mutations;
 mod open_link;
+mod pairing;
 mod plan_cleanup;
 mod plan_view;
 mod plans;
@@ -687,6 +688,9 @@ struct Client {
     connection_url: String,
     /// Open or close the Settings menu on the next frame.
     show_settings: Option<bool>,
+    /// The Remote devices window (pairing and revoking), and the device whose Revoke asks.
+    remote_devices: bool,
+    revoke_confirm: Option<atomics_core::noise::PublicKey>,
     voice_tx: Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
@@ -744,6 +748,8 @@ impl Client {
             connection_name: String::new(),
             connection_url: String::new(),
             show_settings: None,
+            remote_devices: false,
+            revoke_confirm: None,
             voice_tx,
             voice_rx,
             screenshot: options.screenshot.take().map(|path| Screenshot {

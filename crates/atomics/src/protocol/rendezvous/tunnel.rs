@@ -15,7 +15,7 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Message, WebSocket};
 
 use super::super::link::{LinkError, Waker};
-use super::channel::{ChannelLink, Inbox};
+use super::channel::{self, Gate, Inbox};
 use super::issuer::{Ask, Desk, IssueKind, Reply};
 use super::socket::Conn;
 use super::{Backoff, Context, Phase};
@@ -124,7 +124,8 @@ struct Pump<'a> {
     channels: HashMap<u32, Arc<Inbox>>,
     ctx: &'a Context,
     desk: &'a mut Desk,
-    host_id: &'a str,
+    /// What each channel's thread needs, with this tunnel's host id.
+    gate: Arc<Gate>,
     renew_at: Option<Instant>,
     last_heard: Instant,
     since: Instant,
@@ -132,7 +133,13 @@ struct Pump<'a> {
 }
 
 /// Pump `socket` until it ends. Every channel ends with it.
-pub fn run(mut socket: WebSocket<Conn>, ctx: &Context, desk: &mut Desk, host_id: &str, backoff: &mut Backoff) -> Ended {
+pub fn run(
+    mut socket: WebSocket<Conn>,
+    ctx: &Context,
+    desk: &mut Desk,
+    gate: Arc<Gate>,
+    backoff: &mut Backoff,
+) -> Ended {
     let waker = socket.get_mut().stream().waker();
     ctx.signal.set_tunnel(Some(waker.clone()));
     let outbound = Arc::new(Outbound::new(waker, ctx.settings.channel_buffer));
@@ -143,7 +150,7 @@ pub fn run(mut socket: WebSocket<Conn>, ctx: &Context, desk: &mut Desk, host_id:
         channels: HashMap::new(),
         ctx,
         desk,
-        host_id,
+        gate,
         renew_at: None,
         last_heard: now,
         since: now,
@@ -263,8 +270,8 @@ impl Pump<'_> {
         }
     }
 
-    /// A new channel: one `atomics.v1` session on a thread of its own. A `joined` is only a hint
-    /// (in H5b, a channel that cannot complete the handshake ends there).
+    /// A new channel: its handshake and then its session, on a thread of its own. A `joined` is
+    /// only a hint: a channel that cannot complete the handshake ends there.
     fn join(&mut self, channel: u32) {
         if self.channels.contains_key(&channel) {
             return;
@@ -274,12 +281,7 @@ impl Pump<'_> {
             self.outbound.control(tunnel::close_channel(channel, close::QUOTA));
             return;
         }
-        let served =
-            ChannelLink::new(channel, self.outbound.clone(), settings.send_timeout).and_then(|(link, inbox)| {
-                self.ctx.sessions.serve(Box::new(link), super::channel::ROLE)?;
-                Ok(inbox)
-            });
-        match served {
+        match channel::open(channel, self.outbound.clone(), self.gate.clone()) {
             Ok(inbox) => {
                 self.channels.insert(channel, inbox);
                 self.count();
@@ -305,7 +307,7 @@ impl Pump<'_> {
     fn renewal(&mut self) -> Option<Ended> {
         if !self.desk.waiting() && self.renew_at.is_some_and(|at| Instant::now() >= at) {
             self.renew_at = None;
-            self.desk.send(Ask::Pass { host_id: self.host_id.to_string() });
+            self.desk.send(Ask::Pass { host_id: self.gate.host_id.clone() });
         }
         match self.desk.poll()? {
             Ok(Reply::Pass(pass)) => {

@@ -14,8 +14,11 @@ use super::link::Waker;
 
 /// One mutation on its way to be carried out.
 pub struct OpRequest {
-    /// The client's own ID, from its `hello`; with `command.op()` it names the operation.
+    /// The client's own ID, from its `hello`; with `command.op()` (and `device`) it names the
+    /// operation.
     pub client: String,
+    /// The paired device it came from, if any.
+    pub device: Option<super::session::PeerDevice>,
     pub command: Command,
     pub reply: OpReply,
 }

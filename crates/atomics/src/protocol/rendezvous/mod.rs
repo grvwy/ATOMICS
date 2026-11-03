@@ -7,16 +7,14 @@
 //!   again, wait, or stop. It never takes the `State` lock, and no lock of its is held across I/O.
 //! - `atomics-rendezvous-issuer` makes the ticket profile's MCP calls (`issuer.rs`), which may take
 //!   seconds, so a renewal never stalls the frames.
-//! - Each channel the service opens is one `atomics.v1` client session on a thread of its own,
-//!   served like a loopback client (`protocol::Sessions`).
-//!
-//! **The H5b seam is `channel.rs`.** In H5a a channel carries `atomics.v1` in plaintext, so it is
-//! always a viewer (`channel::ROLE`), whatever the service says: nothing a plaintext channel sends
-//! can take a lease, type or decide. H5b puts a Noise session inside `ChannelLink` (handshake on
-//! the first frames, then decrypt in `recv` and encrypt in `send`) and takes the role from the
-//! paired device's allowlist entry; nothing outside `channel.rs` changes.
+//! - Each channel the service opens has a thread of its own (`channel.rs`): a Noise handshake
+//!   with a paired device, or a pairing, then one `atomics.v1` client session inside the
+//!   encrypted channel, served like a loopback client (`protocol::Sessions`) with the role the
+//!   device's allowlist entry gives it. The service sees only ciphertext.
+//! - `devices.rs` keeps the allowlist and the one pairing the desktop may offer.
 
 mod channel;
+pub mod devices;
 pub mod issuer;
 pub mod keys;
 mod socket;
@@ -33,6 +31,8 @@ use atomics_core::tunnel::close;
 use ring::rand::SecureRandom;
 use serde::Serialize;
 
+use self::channel::Gate;
+use self::devices::Devices;
 use self::issuer::{Ask, Desk, IssueError, IssueKind, Issuer, Reply};
 use self::keys::DeviceKeys;
 use self::socket::{DialError, Target};
@@ -73,6 +73,12 @@ pub struct Settings {
     pub quota_wait: Duration,
     /// How long after registering an unknown host id means "not applied yet" rather than "gone".
     pub registration_grace: Duration,
+    /// How long a channel has, from `joined`, to send its handshake.
+    pub handshake_timeout: Duration,
+    /// How long a pairing device has, after the host's answer, to prove the psk and name itself.
+    pub pairing_timeout: Duration,
+    /// How often the host rekeys what it sends on a channel.
+    pub rekey_every: Duration,
 }
 
 impl Settings {
@@ -95,6 +101,9 @@ impl Settings {
             throttle_wait: Duration::from_secs(60),
             quota_wait: Duration::from_secs(300),
             registration_grace: Duration::from_secs(60),
+            handshake_timeout: Duration::from_secs(10),
+            pairing_timeout: devices::HANDSHAKE_WINDOW,
+            rekey_every: Duration::from_secs(3600),
         }
     }
 }
@@ -251,6 +260,7 @@ impl Backoff {
 pub struct Context {
     pub settings: Settings,
     pub sessions: Sessions,
+    pub devices: Arc<Devices>,
     pub status: Arc<StatusCell>,
     pub signal: Arc<Signal>,
 }
@@ -274,12 +284,13 @@ impl Rendezvous {
     pub fn start(
         settings: Settings,
         sessions: Sessions,
+        devices: Arc<Devices>,
         issuer: Box<dyn Issuer>,
         keys: KeySource,
         status: Arc<StatusCell>,
     ) -> std::io::Result<Self> {
         let signal = Arc::new(Signal::default());
-        let context = Context { settings, sessions, status: status.clone(), signal: signal.clone() };
+        let context = Context { settings, sessions, devices, status: status.clone(), signal: signal.clone() };
         let (finished, done) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new().name("atomics-rendezvous".into()).spawn(move || {
             run(context, issuer, keys);
@@ -357,6 +368,8 @@ fn after(ended: Ended, settings: &Settings) -> Option<Next> {
 fn run(ctx: Context, issuer: Box<dyn Issuer>, keys: KeySource) {
     let status = ctx.status.clone();
     let stopped = |note: String| {
+        // A host that stopped (revoked, replaced, misconfigured) offers no pairing.
+        ctx.devices.set_host(None);
         status.update(|s| {
             s.phase = Phase::Stopped;
             s.online = false;
@@ -372,7 +385,8 @@ fn run(ctx: Context, issuer: Box<dyn Issuer>, keys: KeySource) {
         Ok(keys) => Arc::new(keys),
         Err(error) => return stopped(format!("the device keys could not be read or stored: {error}")),
     };
-    let mut desk = match Desk::spawn(issuer, keys, ctx.signal.clone(), status.clone()) {
+    ctx.devices.set_key(keys.noise_key());
+    let mut desk = match Desk::spawn(issuer, keys.clone(), ctx.signal.clone(), status.clone()) {
         Ok(desk) => desk,
         Err(error) => return stopped(format!("could not start the issuer thread: {error}")),
     };
@@ -387,6 +401,7 @@ fn run(ctx: Context, issuer: Box<dyn Issuer>, keys: KeySource) {
                 match desk.ask(ask, &ctx.signal) {
                     None => break,
                     Some(Ok(Reply::Registered(id))) => {
+                        ctx.devices.set_host(Some(&id));
                         status.update(|s| {
                             s.registered = true;
                             s.host_id = Some(id.clone());
@@ -415,6 +430,7 @@ fn run(ctx: Context, issuer: Box<dyn Issuer>, keys: KeySource) {
                 // host is gone there, and registering again brings it back.
                 if error.kind == IssueKind::Unknown && registered.elapsed() > ctx.settings.registration_grace {
                     host = None;
+                    ctx.devices.set_host(None);
                     status.update(|s| s.registered = false);
                 }
                 if !pause(&ctx, &error, &mut backoff) {
@@ -428,7 +444,17 @@ fn run(ctx: Context, issuer: Box<dyn Issuer>, keys: KeySource) {
             Err(DialError::Failed(why)) => Next::Again(why),
             Ok(socket) => {
                 drop(pass);
-                match after(tunnel::run(socket, &ctx, &mut desk, &host_id, &mut backoff), &ctx.settings) {
+                let gate = Arc::new(Gate {
+                    host_id: host_id.clone(),
+                    keys: keys.clone(),
+                    devices: ctx.devices.clone(),
+                    sessions: ctx.sessions.clone(),
+                    handshake_timeout: ctx.settings.handshake_timeout,
+                    pairing_timeout: ctx.settings.pairing_timeout,
+                    send_timeout: ctx.settings.send_timeout,
+                    rekey_every: ctx.settings.rekey_every,
+                });
+                match after(tunnel::run(socket, &ctx, &mut desk, gate, &mut backoff), &ctx.settings) {
                     Some(next) => next,
                     None => break,
                 }
@@ -473,6 +499,7 @@ fn pause(ctx: &Context, error: &IssueError, backoff: &mut Backoff) -> bool {
     let settings = &ctx.settings;
     match error.kind {
         IssueKind::Revoked => {
+            ctx.devices.set_host(None);
             ctx.status.update(|s| {
                 s.phase = Phase::Stopped;
                 s.note = Some(format!("the service revoked this host: {}", error.message));

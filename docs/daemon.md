@@ -395,8 +395,9 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   held. `terminal::tests` drives `TerminalView` to show that desktop typing still reaches the PTY and takes the lease
   back. The headless gate (`tests/headless_host.rs`) types into a shell that ctl started. `protocol/link.rs` races
   wakes against the wake pipe's drain and checks that a later wake still ends a wait at once.
-- **Not yet.** `holder` is the `client_id` the client chose; device names arrive with pairing (H5). Encoding mouse
-  reports and the clipboard opt-in is client work (C3, C4).
+- **Who holds it.** `holder` is a paired device's name, the one it was paired under (so a client can say
+  "typing from iPhone"); a loopback client's is the `client_id` it chose.
+- **Not yet.** Encoding mouse reports and the clipboard opt-in is client work (C3, C4).
 
 Keystroke echo on loopback (2026-11-02, `protocol::echo_bench`, ignored by default; release build, shared 18-core
 machine). A real PTY runs `cat` in cooked mode, so the kernel echoes each key. A client on a loopback socket with
@@ -427,8 +428,9 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
 
 - **Who may.** `welcome` lists what the client may change in `may`: `type` (with `input`), and `approve`, `session`,
   `plan` and `review` (with `mutations`). It comes from the client's `Role`: a controller gets all of them, a viewer
-  none. Loopback clients hold the bearer token, so until pairing (H5) they are controllers; a paired device's entry
-  in the allowlist will be a role, "view only" or "may type and approve". A mutation without the capability or the
+  none. Loopback clients hold the bearer token, so they are controllers; a rendezvous client's role is its paired
+  device's access in the allowlist, "view only" (viewer) or "may type and approve" (controller; see Rendezvous,
+  "Pairing and the encrypted channel"). A mutation without the capability or the
   grant is refused `unauthorised` in a `command_result`, never forwarded, and counts towards disconnecting.
 - **One at a time, on the runtime thread.** The protocol thread never runs a mutation: it hands it over a channel
   that wakes the runtime thread, which carries mutations out under the `State` lock in turn with the desktop's
@@ -473,8 +475,10 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   and both see how it ended; the desktop racing a client likewise; a decision for an answered request does not answer
   the next; a retried steer is delivered once; an operation an earlier host died during is `uncertain`; and a plan
   approval with an outdated digest is refused.
-- **Not yet.** Opening an editor (its terminal is not streamed yet), and attributing a decision to a device name
-  (the journal names the `client_id` until pairing).
+- **Who sent it.** The journal keys a paired device's operations by a digest of its key and its client's ID
+  (`device:<digest>:<client_id>`), so two devices never share one, and records the device's name (`by`). A loopback
+  client's are `client:<client_id>`, the desktop's `desktop`.
+- **Not yet.** Opening an editor (its terminal is not streamed yet).
 
 ### Terminal painter
 
@@ -561,9 +565,9 @@ desktop exactly as before.
 
 ## Rendezvous
 
-Stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-7. The host side of registration, passes
-and the tunnel is built (H5a, `crates/atomics/src/protocol/rendezvous/`); Noise, pairing and the device allowlist
-are H5b, so for now a channel carries `atomics.v1` in plaintext and is view-only.
+Stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-8. The host side is built
+(`crates/atomics/src/protocol/rendezvous/`): registration, passes and the tunnel (H5a), and the end-to-end Noise
+channel, pairing and the device allowlist (H5b), whose browser half is `atomics_core::noise`.
 The rendezvous lets a browser reach a host that cannot accept inbound connections. The host dials out to a
 broker; a browser dials the same broker; the broker pairs the sockets and relays opaque frames. The protocol
 above (`atomics.v1`) runs unchanged inside an end-to-end encrypted channel, so the broker is never a protocol peer.
@@ -597,15 +601,16 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   subprotocol `atomics.rendezvous.v1`, `Authorization: Bearer <pass>` and no `Origin`. The pass is never in a URL,
   a log, a status line or `atomics ctl`.
 - **Frames.** Every binary message is `[kind u8][channel u32 BE][body]` (`atomics_core::tunnel`). Data (0) on a
-  channel of 1 or more carries one `atomics.v1` text frame; control (1) is an operation byte: `joined` (1), `left` (2,
+  channel of 1 or more carries one Noise message (below); control (1) is an operation byte: `joined` (1), `left` (2,
   then the close code), `close` (3, host to service, 1000 or 4000-4999 only), `renew` (4, the new pass as ASCII, on
   channel 0) and `expiry` (5, the admission's end in Unix ms, on channel 0). Unknown kinds and operations from the
   service are ignored, data for a channel that never joined is dropped, and malformed frames are skipped.
-- **Channels.** Each `joined` becomes one `atomics.v1` session on a thread of its own, served by the protocol
-  server's session code with its queues and limits (`protocol::Sessions`), as a viewer: its `welcome` grants nothing
-  (`may` is empty), so it neither types nor mutates until H5b pairs devices (`channel.rs`). At most four at once; one
-  more is closed with `quota` (4429). A session ends its channel with 1000, `refused` (4000) for a protocol error,
-  `idle` (4001) or `slow` (4408); one the host cannot start gets `unavailable` (4002). Each channel may queue 1 MiB
+- **Channels.** Each `joined` gets a thread of its own (`channel.rs`): a Noise handshake, then one `atomics.v1`
+  session inside the encrypted channel, served by the protocol server's session code with its queues and limits
+  (`protocol::Sessions`), with the role of the paired device (below). At most four at once; one more is closed with
+  `quota` (4429). A channel ends with 1000, `refused` (4000) for a protocol error or a message that fails to
+  decrypt, `idle` (4001), `not_paired` (4003), `no_pairing` (4004) or `slow` (4408); one the host cannot start gets
+  `unavailable` (4002). Each channel may queue 1 MiB
   toward the service (a session waits up to 5 s for room, then ends as slow), and a channel whose session stops
   reading 1 MiB of what arrives is closed as slow.
 - **Renewal.** After each `expiry` the host renews at half the remaining admission, between 15 s and 150 s, so a
@@ -621,10 +626,54 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   the protocol server's URL and the rendezvous's `phase`, `service`, `host`, `registered`, `host_id`, `online`,
   `channels` and `note`. The headless host logs whether it started.
 - **Tests.** `protocol::rendezvous::tests` runs the host against an in-process service that admits only unused
-  passes from a fake issuer: registration, the upgrade's headers, a channel's `hello` and `welcome`, renewal at
-  half-life, every close code, a dropped socket and a silent service, refused upgrades, the channel limit and
-  refused clients, issuer refusals, and a stop. The profile issuer is tested against an in-process MCP server
-  (whoami, signatures, refusal codes, no secret in messages); `atomics_core::tunnel` tests the framing.
+  passes from a fake issuer, with browsers speaking `atomics_core::noise` on its channels: registration, the
+  upgrade's headers, pairing (controller and view-only, a wrong psk, a device racing the link, no pairing open),
+  sessions of paired devices, an unknown device, plaintext and forged channels, replays, revoking, renewal at
+  half-life, every close code, a dropped socket and a silent service, refused upgrades, the channel limit, issuer
+  refusals, and a stop. The profile issuer is tested against an in-process MCP server (whoami, signatures, refusal
+  codes, no secret in messages); `atomics_core::tunnel` tests the framing; `atomics_core::noise` checks both
+  protocols against the standard Noise vectors and its own framing against vectors from an independent
+  implementation; `rendezvous::devices` tests the pairing stages, expiry, the allowlist file and revocation.
+
+### Pairing and the encrypted channel (H5b)
+
+```toml
+[remote.rendezvous]
+pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's pairing page; empty = no pairing
+```
+
+- **Pairing.** Clicking the top bar's "Remote" opens Remote devices. "Pair a device" (once the host is registered
+  and `pair_url` is set) shows a QR code and the link `pair_url` with `{pairing}` replaced by
+  `<v>.<host_id>.<host_noise_pubkey>.<psk>`: `v` is 1, `host_id` the service's id, and the key and a fresh psk 43
+  characters of unpadded base64url. `pair_url` must be `https://` (or `http://` to this machine) and end in
+  `#{pairing}`, so the psk travels only in the fragment, which browsers never send. The link works once, for five
+  minutes, and only one is open. A device answers it with `Noise_IKpsk2_25519_ChaChaPoly_SHA256`; one at a time
+  (another gets `no_pairing`), and one that fails or takes over 30 s gives the link back. Its first message
+  (`PairRequest`, its name) proves the psk; then the desktop asks "Pair “name”?" beside the six-digit code from the
+  handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
+  it; "Codes differ: refuse" does not. Either answer, the device leaving, or expiry uses the link up. The device gets
+  `PairAnswer` (`paired`, `may`); a paired device's channel goes on as its session, a refused one is closed with
+  `not_paired`.
+- **Sessions.** A paired device dials `Noise_IK_25519_ChaChaPoly_SHA256` with its stored static key. The host looks
+  the key up in the allowlist and closes the channel with `not_paired` (4003) before answering if it is not there.
+  Its access is its role: view only is a viewer (`may` empty), may type and approve a controller. Its name is
+  its lease holder label and its name in the operation journal.
+- **Frames.** The first data body is `[kind u8: 1 pair, 2 session][Noise message 1]`, exactly 97 bytes; the
+  host's answer is message 2 (48 bytes); before it, the host reads that one bounded frame and parses nothing. Then
+  each body is one Noise transport message (at most 65535 bytes) whose plaintext is `[flags u8][part of a frame]`:
+  flag 1 says the `atomics.v1` frame goes on in the next message (so a 256 KiB frame takes five), flag 2 that the
+  sender rekeys after this message and the reader after reading it. Each direction rekeys every 1 GiB, and the host
+  every hour too. Noise's counter nonces make a replayed, reordered, cut or forged message fail, which ends the
+  channel with `refused`. The prologue is `atomics-noise-v1`, `atomics.v1`, the protocol major and the host id, one
+  per line.
+- **The allowlist** is `devices.json` in the ATOMICS home (0600, written atomically): each device's public key,
+  name, access, and when it paired and was last seen. Remote devices lists them, with "connected" while a session
+  is open; "Revoke…" asks once, removes the device and ends its sessions at once with `not_paired`. A host the
+  service revoked (4403) stops, and withdraws an open pairing link. `atomics ctl '{"cmd":"remote"}'` adds `paired`:
+  the pairing's stage and the devices (no keys, links or secrets).
+- **The browser's half** is `atomics_core::noise` (wasm32-safe, `getrandom`'s `wasm_js` backend): `Pairing::read`,
+  `Initiator::pair` or `Initiator::connect`, `finish`, then `Channel::seal` and `Channel::open`. The device's static
+  key is the browser's to keep.
 
 **Roles.** Host (this program, off by default), broker (untrusted relay of bytes), client (browser).
 
@@ -655,15 +704,17 @@ match on the host before the device is added to the allowlist. A device may be a
 **Handshake.** First pairing: `Noise_IKpsk2_25519_ChaChaPoly_SHA256`, the browser as initiator. Known devices:
 `Noise_IK_25519_ChaChaPoly_SHA256`, with the browser key looked up in the host allowlist. The prologue binds
 `atomics.v1`, the protocol major and `host_id`. Before authentication the host parses only a bounded Noise message,
-never JSON. Rekey every 1 GiB or hour. After the handshake the first plaintext frame is `hello` (see Client
-protocol), and `welcome` decides replay or reset from the epoch and cursor as in Reconnect.
+never JSON. Rekey every 1 GiB or hour. After the handshake (and, when pairing, the host's `PairAnswer`) the first
+`atomics.v1` frame is `hello` (see Client protocol), and `welcome` decides replay or reset from the epoch and cursor
+as in Reconnect.
 
 **Limits (broker enforces bytes and time; the host enforces meaning).**
 Frame at most 256 KiB (`wire::MAX_FRAME_BYTES`), a per-channel send buffer of 1 MiB closed after 10 s full,
 sustained 2 MiB/s per host with an 8 MiB burst, ping every 25 s with a 60 s idle close, and per-user quotas on hosts
 and channels. The broker cannot read frames, so it cannot supersede screen deltas: the host applies the queue
 policy from Terminal streaming before encrypting, and a closed slow channel reconnects to a fresh snapshot.
-Close codes are typed: `unauthorised`, `revoked`, `slow`, `replaced`, `quota`.
+Close codes are typed: `unauthorised`, `revoked`, `slow`, `replaced`, `quota`; the host's own, on a channel, are
+`refused`, `idle`, `unavailable`, `not_paired` and `no_pairing`.
 
 **Reconnect.** Jittered backoff. A dropped broker socket detaches channels without touching sessions. The host
 redials with a fresh pass; each browser reconnects, handshakes again and sends `hello` with its prior epoch and

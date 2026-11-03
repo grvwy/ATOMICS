@@ -74,10 +74,15 @@ impl State {
     /// A mutation from a protocol client: what is known now goes back at once, and the final
     /// outcome of work that ends later when it does.
     pub(super) fn serve_op(&mut self, request: OpRequest) {
-        let OpRequest { client, command, reply } = request;
-        let key = journal::Key::client(&client, command.op());
+        let OpRequest { client, device, command, reply } = request;
+        // A paired device's operations are its own, and the journal names it.
+        let key = match &device {
+            Some(device) => journal::Key::device(&device.id, &client, command.op()),
+            None => journal::Key::client(&client, command.op()),
+        };
         let op = command.op().to_string();
-        let first = self.mutate(key, command, Some(reply.clone()));
+        let by = device.map(|device| device.name);
+        let first = self.mutate(key, by.as_deref(), command, Some(reply.clone()));
         reply.send(&op, first);
     }
 
@@ -85,13 +90,14 @@ impl State {
     /// the first outcome; a later one only lands in the journal.
     pub(super) fn mutate_desktop(&mut self, command: impl FnOnce(String) -> Command) -> Outcome {
         let op = uuid::Uuid::new_v4().to_string();
-        self.mutate(journal::Key::desktop(op.clone()), command(op), None)
+        self.mutate(journal::Key::desktop(op.clone()), None, command(op), None)
     }
 
-    /// Carry out `command` once under `key`. Returns its outcome, or `accepted` for work that
-    /// ends later, whose outcome then goes to `reply`.
-    fn mutate(&mut self, key: journal::Key, command: Command, reply: Option<OpReply>) -> Outcome {
-        match self.ops.begin(&key, &journal::fingerprint(&command), atomics_core::store::now()) {
+    /// Carry out `command` once under `key` (sent by the paired device named `by`, if any).
+    /// Returns its outcome, or `accepted` for work that ends later, whose outcome then goes to
+    /// `reply`.
+    fn mutate(&mut self, key: journal::Key, by: Option<&str>, command: Command, reply: Option<OpReply>) -> Outcome {
+        match self.ops.begin(&key, by, &journal::fingerprint(&command), atomics_core::store::now()) {
             Begun::Fresh => {}
             Begun::Known(outcome) => return outcome,
             Begun::Running => {

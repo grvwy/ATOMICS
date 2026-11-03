@@ -86,8 +86,9 @@ impl Desktop<'_> {
 
     /// Phone and browser access through a rendezvous service, when `[remote.rendezvous]` is
     /// enabled: "Remote" in the success colour while online, with a dot in the warning colour while
-    /// it waits or has stopped, muted while it connects. The hover says why.
-    fn rendezvous_indicator(&mut self, ui: &mut egui::Ui) {
+    /// it waits or has stopped, muted while it connects. The hover says why; a click opens Remote
+    /// devices (pairing and revoking).
+    fn rendezvous_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         use crate::protocol::rendezvous::Phase;
         let Some(status) = self.runtime.rendezvous_status() else { return };
         let palette = self.palette();
@@ -121,8 +122,17 @@ impl Desktop<'_> {
             hover.push('\n');
             hover.push_str(note);
         }
-        let response = ui.label(RichText::new(text).color(color)).on_hover_text(hover);
+        if self.runtime.remote_devices().is_some() {
+            hover.push_str("\nClick to pair a phone or browser, or to revoke one.");
+        }
+        let response = ui.selectable_label(self.client.remote_devices, RichText::new(text).color(color));
         record_item(ui, "Remote", &response);
+        if response.on_hover_text(hover).clicked() && self.runtime.remote_devices().is_some() {
+            self.client.remote_devices = !self.client.remote_devices;
+            if in_menu {
+                ui.close();
+            }
+        }
     }
 
     fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool, in_menu: bool) {
@@ -148,7 +158,7 @@ impl Desktop<'_> {
             }
         }
         self.github_counter(ui, in_menu);
-        self.rendezvous_indicator(ui);
+        self.rendezvous_indicator(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
             let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)

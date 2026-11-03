@@ -309,6 +309,7 @@ impl Desktop<'_> {
 
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         self.quick_open_dialog(ctx);
+        self.remote_devices_dialog(ctx);
         self.cleanup_dialog(ctx);
         self.config_proposal_dialog(ctx);
         if let Some((id, _)) = self.client.confirm_plan_close.clone() {

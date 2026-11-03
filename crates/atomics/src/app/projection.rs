@@ -113,9 +113,37 @@ impl State {
         self.remote.rendezvous.as_ref().map(|cell| cell.get())
     }
 
-    /// `atomics ctl '{"cmd":"remote"}'`: the protocol server and the rendezvous. Never a token or pass.
+    /// The paired devices and the pairing, while the rendezvous runs.
+    pub(crate) fn remote_devices(&self) -> Option<std::sync::Arc<crate::protocol::rendezvous::devices::Devices>> {
+        self.remote.devices.clone()
+    }
+
+    /// `atomics ctl '{"cmd":"remote"}'`: the protocol server, the rendezvous and the paired
+    /// devices. Never a token, pass, psk or pairing link.
     pub(crate) fn remote_json(&self) -> serde_json::Value {
+        use crate::protocol::rendezvous::devices::PairingView;
         let view = &self.remote;
+        let devices = view.devices.as_ref().map(|devices| {
+            let pairing = match devices.view() {
+                PairingView::Idle { .. } => "none",
+                PairingView::Open { .. } => "open",
+                PairingView::Confirm { .. } => "confirm",
+            };
+            let list: Vec<_> = devices
+                .list()
+                .into_iter()
+                .map(|(device, connected)| {
+                    serde_json::json!({
+                        "name": device.name,
+                        "access": device.access,
+                        "paired_ms": device.paired_ms,
+                        "seen_ms": device.seen_ms,
+                        "connected": connected,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "pairing": pairing, "devices": list, "problem": devices.problem() })
+        });
         serde_json::json!({
             "protocol": {
                 "enabled": view.enabled,
@@ -123,6 +151,7 @@ impl State {
                 "error": view.error,
             },
             "rendezvous": self.rendezvous_status(),
+            "paired": devices,
         })
     }
 
