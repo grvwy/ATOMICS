@@ -245,7 +245,12 @@ impl HttpClient {
         }
         let text = response.body_mut().with_config().limit(MAX_REFUSAL_BYTES).read_to_string().unwrap_or_default();
         let shown: String = cleaner.error(&text).trim().chars().take(MAX_REFUSAL_CHARS).collect();
-        let hint = if matches!(status, 401 | 403) { " (check server.token_env)" } else { "" };
+        // A sign-in's 401 never gets here. With no token sent, there is none to check.
+        let hint = match (status, self.oauth.is_some(), self.token.is_some()) {
+            (403, true, _) => " (the sign-in lacks the right to this)",
+            (401 | 403, false, true) => " (check server.token_env)",
+            _ => "",
+        };
         let separator = if shown.is_empty() { "" } else { ": " };
         let message = format!("{label} answered HTTP {status}{hint}{separator}{shown}");
         if status == 429 || (500..600).contains(&status) {

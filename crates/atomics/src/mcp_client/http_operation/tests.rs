@@ -443,7 +443,7 @@ fn a_refusal_is_cleaned_cut_and_says_whether_it_may_pass() {
     let script = Script::start(vec![reply(403, "", &coded)]);
     let error = request(&script.url, &get, &vars()).unwrap_err();
     let McpError::Tool { message, details } = &error else { panic!("{error:?}") };
-    assert!(message.contains("check server.token_env"), "{message}");
+    assert!(message.contains("HTTP 403"), "{message}");
     assert_eq!(details, &coded);
 
     for (status, retryable) in [(429, true), (500, true), (503, true), (400, false), (404, false), (410, false)] {
@@ -455,14 +455,21 @@ fn a_refusal_is_cleaned_cut_and_says_whether_it_may_pass() {
 }
 
 #[test]
-fn a_401_without_a_sign_in_says_what_would_fix_it() {
+fn a_refusal_without_a_sign_in_says_what_would_fix_it() {
     let get = operation(json!({"http":{"method":"GET", "path":"/items"}}));
-    // A static token cannot sign in: the person checks the token.
-    let script = Script::start(vec![reply(401, "", "no")]);
-    let error = request_with(&script.url, Some("own-token-123456"), &Cleaner::default(), &get, &vars()).unwrap_err();
-    assert!(matches!(error, McpError::Tool { .. }), "{error:?}");
-    assert!(error.to_string().contains("check server.token_env"), "{error}");
-    assert_eq!(script.seen().len(), 1, "no second try");
+    for status in [401, 403] {
+        // A static token cannot sign in: the person checks the token.
+        let script = Script::start(vec![reply(status, "", "no")]);
+        let error =
+            request_with(&script.url, Some("own-token-123456"), &Cleaner::default(), &get, &vars()).unwrap_err();
+        assert!(matches!(error, McpError::Tool { .. }), "{error:?}");
+        assert!(error.to_string().contains("check server.token_env"), "{error}");
+        assert_eq!(script.seen().len(), 1, "no second try");
+        // No token was sent, so there is none to check.
+        let script = Script::start(vec![reply(status, "", "no")]);
+        let error = request(&script.url, &get, &vars()).unwrap_err();
+        assert!(!error.to_string().contains("token_env"), "{error}");
+    }
     // No token, and the API asks for OAuth.
     let challenge = "WWW-Authenticate: Bearer resource_metadata=\"https://x/.well-known/y\"\r\n";
     let script = Script::start(vec![reply(401, challenge, "no")]);
