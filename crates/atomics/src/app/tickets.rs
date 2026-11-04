@@ -2540,6 +2540,47 @@ mod tests {
         )
     }
 
+    /// The REST example's `children` takes a UUID, which a link made with a key does not have.
+    #[test]
+    fn a_plan_linked_by_its_key_reads_its_board_where_children_needs_a_uuid() {
+        with_app(
+            "app::tickets::tests::a_plan_linked_by_its_key_reads_its_board_where_children_needs_a_uuid",
+            |app, _ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                let (config, _api) = crate::mcp_client::tests::rest_example(&state);
+                app.runtime.config.tickets = config;
+                app.runtime.apply_ticket_config();
+                let plan =
+                    request(app, json!({"cmd":"plan_set", "goal":"A board", "ticket":{"id":"DEMO-1"}, "tasks":[]}))
+                        .result["plan"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                settle(app);
+                let index = app.runtime.plans.iter().position(|p| p.id == plan).unwrap();
+                // The heartbeat's read as well as the first: both only list.
+                for _ in 0..2 {
+                    assert_eq!(app.runtime.plans[index].ticket_mode, Some(TicketMode::Board));
+                    assert_eq!(app.runtime.tickets.boards[&plan].len(), 4);
+                    let board = app.runtime.plans[index].ticket.as_ref().unwrap();
+                    assert!(board.error.is_none(), "{:?}", board.error);
+                    let requests = fake(&state)["http_requests"].as_array().unwrap().clone();
+                    let targets: Vec<&str> =
+                        requests.iter().rev().take(2).rev().map(|r| r["target"].as_str().unwrap()).collect();
+                    assert_eq!(
+                        targets,
+                        [
+                            "/v1/api/v1/tickets/by-key/DEMO-1",
+                            "/v1/api/v1/tickets/00000000-0000-4000-8000-000000000001/children"
+                        ]
+                    );
+                    assert!(ticket_request(app, json!({"cmd":"ticket_sync", "plan":plan})).ok);
+                }
+            },
+        );
+    }
+
     #[test]
     fn board_mode_keeps_tickets_and_tasks_in_step_in_both_directions() {
         with_app("app::tickets::tests::board_mode_keeps_tickets_and_tasks_in_step_in_both_directions", |app, ctx| {

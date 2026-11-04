@@ -420,7 +420,8 @@ fails the operation with a message naming it; other text in braces is left alone
 `{query}` is the search text exactly as supplied, including quotes and whitespace. Substitution makes one
 pass: `{id}` or `{query}` inside a query stays literal, and values become JSON strings without concatenation.
 `{key_number}` is the trailing numeric component (`EX-11967` → `11967`). `{uuid}` is the link's `id` only
-when it is a UUID; a link containing only a key fails with an error naming `{uuid}`. The three placeholders
+when it is a UUID; a link containing only a key fails with an error naming `{uuid}`, except that `read`,
+`children` and a board's `list` first find the UUID with a `get` that takes a key. The three placeholders
 work in every operation. Numeric arguments such as `take = 10` stay numeric; a placeholder inside a TOML
 string stays a string except for the four conversation placeholders below. Use `{key_number}` for servers accepting a bare ticket number as text.
 
@@ -1571,7 +1572,7 @@ were read from the backend's source on 2026-11-04, not from a live call.
 - **The tabs** are the API's views: **Active**, **All** and **Mine**. Searches look through all work, closed tickets included.
 - **A key** is looked up with `get`, at `by-key/{key}`, which must be live for a prefixed key to go first. A bare number
   needs no lookup: the API's search answers it itself. `read`, `children` and comments take the ticket's UUID, so a link
-  known only by its key is first read with `get`.
+  known only by its key is first read with `get`. So is a plan's board, which costs one more request each time it is read.
 - **Links** come from `link_url`, since the API's tickets carry no address.
 - **What it leaves out.** More does not appear: the API pages by `skip` and `take` and ATOMICS by cursor, so a list stops
   at the first 50. `related` stays on MCP, as the API has no route for it.
