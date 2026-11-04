@@ -184,8 +184,8 @@ volume that already held most of the closure:
 | Build | Time | Note |
 | --- | --- | --- |
 | Image and bundle, first run on this checkout | 32 min 41 s | 49 derivations built, 14 fetched; the image step (systemd-repart populating btrfs) alone 18 min 53 s |
-| Again after a change to ATOMICS's sources | 10-13 min | the package and the image again |
-| Again with nothing changed | about 1 min | evaluation; nothing copied |
+| Again after a change to ATOMICS's sources | 8-13 min | the package and the image again |
+| Again with nothing changed | 6 s | evaluation only; nothing copied |
 
 The image is a 100 GiB sparse disk with 7.5 GiB in use; copying it out of the container keeps it
 sparse. The bundle is a few dozen KiB of `sh` scripts and text.
