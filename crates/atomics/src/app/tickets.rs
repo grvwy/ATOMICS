@@ -1623,28 +1623,30 @@ mod tests {
     }
 
     fn configure_chief_tools(app: &mut Desktop<'_>, path: &Path) {
-        configure(app, CARDS, path, |config| {
-            let operation = |tool: &str, arguments: Value| {
-                serde_json::from_value(json!({
-                    "tool":tool, "arguments":arguments, "items":"cards",
-                    "result":{"id":"ref", "key":"code", "title":"name", "state":"column.title", "url":"href",
-                        "score":"rank", "snippet":"excerpt", "assignee":"owner", "parent":"parent", "kind":"type"}
-                }))
-                .unwrap()
-            };
-            config.server.env.insert("API_KEY".into(), "chief-secret-7c2d".into());
-            config.operations.search = Some(operation("card_search", json!({"query":"{query}"})));
-            config.operations.semantic_search = Some(operation("card_semantic_search", json!({"query":"{query}"})));
-            config.operations.children = Some(operation("card_children", json!({"card":"{id}"})));
-            config.operations.related = Some(operation("card_related", json!({"card":"{id}"})));
-            config.operations.read = Some(serde_json::from_value(json!({
+        configure(app, CARDS, path, chief_tools);
+    }
+
+    fn chief_tools(config: &mut TicketConfig) {
+        let operation = |tool: &str, arguments: Value| {
+            serde_json::from_value(json!({
+                "tool":tool, "arguments":arguments, "items":"cards",
+                "result":{"id":"ref", "key":"code", "title":"name", "state":"column.title", "url":"href",
+                    "score":"rank", "snippet":"excerpt", "assignee":"owner", "parent":"parent", "kind":"type"}
+            }))
+            .unwrap()
+        };
+        config.server.env.insert("API_KEY".into(), "chief-secret-7c2d".into());
+        config.operations.search = Some(operation("card_search", json!({"query":"{query}"})));
+        config.operations.semantic_search = Some(operation("card_semantic_search", json!({"query":"{query}"})));
+        config.operations.children = Some(operation("card_children", json!({"card":"{id}"})));
+        config.operations.related = Some(operation("card_related", json!({"card":"{id}"})));
+        config.operations.read = Some(serde_json::from_value(json!({
                 "tool":"card_get", "arguments":{"card":"{id}"},
                 "result":{"id":"card.ref", "key":"card.code", "title":"card.name", "state":"card.column.title", "url":"card.href"},
                 "body":"card.body",
                 "comments":{"items":"card.notes", "author":"authorDisplayName", "text":"body", "kind":"authorIdentityKind"},
                 "links":{"items":"card.development", "label":"title", "url":"pullRequestUrl", "ci":"continuousIntegrationStatus"}
             })).unwrap());
-        });
     }
 
     fn chief_tool(app: &mut Desktop<'_>, name: &str, args: Value) -> ControlResponse {
@@ -1658,46 +1660,66 @@ mod tests {
             let dir = crate::test_support::tempdir().unwrap();
             let path = dir.path().join("demo.json");
             configure_chief_tools(app, &path);
-            app.runtime.tickets.panel.query = "my own query".into();
-            let plans = serde_json::to_value(&app.runtime.plans).unwrap();
-            for semantic in [false, true] {
-                let response = chief_tool(
-                    app,
-                    "atomics_ticket_search",
-                    json!({"query":"browser OAuth", "semantic":semantic, "take":1}),
-                );
-                assert!(response.ok, "{response:?}");
-                assert_eq!(response.result["cards"].as_array().unwrap().len(), 1);
-                assert_eq!(response.result["cards"][0]["key"], "DEMO-2");
-                assert!(response.result["cards"][0]["score"].as_f64().unwrap() > 0.7);
-                assert!(app.runtime.tickets.panel.find.from_chief);
-                assert_eq!(app.runtime.tickets.panel.find.ran, Some(("browser OAuth".into(), semantic)));
-                assert_eq!(app.runtime.tickets.panel.query, "my own query");
-            }
-            let read = chief_tool(app, "atomics_ticket_read", json!({"ticket":"DEMO-2"}));
-            assert!(read.ok, "{read:?}");
-            assert!(read.result["card"]["body"].as_str().unwrap().contains("## Goal"));
-            assert_eq!(read.result["card"]["comments"][0]["kind"], "Agent");
-            assert_eq!(read.result["card"]["links"][0]["ci"], "Passed");
-            let children = chief_tool(app, "atomics_ticket_children", json!({"ticket":"DEMO-1"}));
-            assert!(children.ok, "{children:?}");
-            assert_eq!(children.result["cards"].as_array().unwrap().len(), 4);
-            let related = chief_tool(
-                app,
-                "atomics_ticket_related",
-                json!({"ticket":{
-                    "id":read.result["card"]["id"], "key":read.result["card"]["key"], "system":"cards"
-                }}),
-            );
-            assert!(related.ok, "{related:?}");
-            assert_eq!(related.result["cards"].as_array().unwrap().len(), 3);
-            app.runtime.config.tickets.operations.read = None;
-            app.runtime.apply_ticket_config();
-            let fallback = chief_tool(app, "atomics_ticket_read", json!({"ticket":"DEMO-1"}));
-            assert!(fallback.ok, "{fallback:?}");
-            assert!(fallback.result["card"]["body"].as_str().unwrap().contains("## Acceptance"));
-            assert_eq!(serde_json::to_value(&app.runtime.plans).unwrap(), plans, "discovery never changes plans");
+            chief_reads(app);
         });
+    }
+
+    #[test]
+    fn ticket_tools_read_search_children_and_related_over_http() {
+        with_app("app::tickets::tests::ticket_tools_read_search_children_and_related_over_http", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = dir.path().join("demo.json");
+            let mut api = None;
+            configure(app, CARDS, &path, |config| {
+                chief_tools(config);
+                api = Some(crate::mcp_client::tests::over_http(config, &path));
+            });
+            chief_reads(app);
+            let requests = fake(&path)["http_requests"].as_array().unwrap().len();
+            assert!(requests >= 6, "{requests}");
+        });
+    }
+
+    fn chief_reads(app: &mut Desktop<'_>) {
+        app.runtime.tickets.panel.query = "my own query".into();
+        let plans = serde_json::to_value(&app.runtime.plans).unwrap();
+        for semantic in [false, true] {
+            let response = chief_tool(
+                app,
+                "atomics_ticket_search",
+                json!({"query":"browser OAuth", "semantic":semantic, "take":1}),
+            );
+            assert!(response.ok, "{response:?}");
+            assert_eq!(response.result["cards"].as_array().unwrap().len(), 1);
+            assert_eq!(response.result["cards"][0]["key"], "DEMO-2");
+            assert!(response.result["cards"][0]["score"].as_f64().unwrap() > 0.7);
+            assert!(app.runtime.tickets.panel.find.from_chief);
+            assert_eq!(app.runtime.tickets.panel.find.ran, Some(("browser OAuth".into(), semantic)));
+            assert_eq!(app.runtime.tickets.panel.query, "my own query");
+        }
+        let read = chief_tool(app, "atomics_ticket_read", json!({"ticket":"DEMO-2"}));
+        assert!(read.ok, "{read:?}");
+        assert!(read.result["card"]["body"].as_str().unwrap().contains("## Goal"));
+        assert_eq!(read.result["card"]["comments"][0]["kind"], "Agent");
+        assert_eq!(read.result["card"]["links"][0]["ci"], "Passed");
+        let children = chief_tool(app, "atomics_ticket_children", json!({"ticket":"DEMO-1"}));
+        assert!(children.ok, "{children:?}");
+        assert_eq!(children.result["cards"].as_array().unwrap().len(), 4);
+        let related = chief_tool(
+            app,
+            "atomics_ticket_related",
+            json!({"ticket":{
+                "id":read.result["card"]["id"], "key":read.result["card"]["key"], "system":"cards"
+            }}),
+        );
+        assert!(related.ok, "{related:?}");
+        assert_eq!(related.result["cards"].as_array().unwrap().len(), 3);
+        app.runtime.config.tickets.operations.read = None;
+        app.runtime.apply_ticket_config();
+        let fallback = chief_tool(app, "atomics_ticket_read", json!({"ticket":"DEMO-1"}));
+        assert!(fallback.ok, "{fallback:?}");
+        assert!(fallback.result["card"]["body"].as_str().unwrap().contains("## Acceptance"));
+        assert_eq!(serde_json::to_value(&app.runtime.plans).unwrap(), plans, "discovery never changes plans");
     }
 
     #[test]

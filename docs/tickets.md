@@ -5,9 +5,9 @@ ATOMICS reads those tickets live and shows them on the board. When write operati
 their states as the work moves and comments as agents report. It tells the chief when someone changes a ticket.
 
 One generic layer serves every system. ATOMICS reaches the ticket system's MCP server itself. A per-workspace
-`[tickets]` config says which MCP tool implements each generic operation and where the tool's result keeps
-each field. Nothing in ATOMICS knows any particular system: swapping Relay for Linear, or for anything else
-with an MCP server, changes only the config.
+`[tickets]` config says which MCP tool implements each generic operation, or for reads which
+[HTTP request](#http-operations), and where the result keeps each field. Nothing in ATOMICS knows any particular
+system: swapping Relay for Linear, or for anything else with an MCP server, changes only the config.
 
 ## Demo
 
@@ -22,6 +22,9 @@ From a checkout, build the fixture once (outside the two-minute walkthrough):
 ```sh
 CARGO_BUILD_JOBS=2 cargo build -p atomics --example fake_ticket_server
 ```
+
+`fake_ticket_server --http <state.json>` serves the same tools over HTTP on a free loopback port, for
+[HTTP operations](#http-operations); its source says how.
 
 On macOS/Linux, paste this into a terminal at the checkout root. It creates an isolated config and state;
 use your installed `atomics` desktop binary, or `target/debug/atomics` if already built:
@@ -170,8 +173,9 @@ chief starts, so restart the chief after changing ticket settings or the declara
 | `branch` | Optional branch template: `{key}`, `{key_lower}`, `{key_number}` (numeric suffix of the key), `{slug}` (ticket title), `{branch}` (system suggestion). |
 | `link_url` | Optional URL template used when a card has no URL, e.g. `https://tickets.example/?selected={uuid}`. Uses the ticket placeholders below. |
 | `workflow` | Free text added to the chief's prompt: how your team works with tickets. |
-| `timeout_secs` | Longest wait for one MCP request (default 30). |
+| `timeout_secs` | Longest wait for one MCP or HTTP request (default 30). |
 | `server` | The MCP server; see below. |
+| `http` | The REST API that reads may use instead; see [HTTP operations](#http-operations). |
 | `states` | The system's state names for `planned`, `running`, `review`, `done`, `blocked` and any lifecycle stage. Unmapped statuses are never pushed. |
 | `operations` | Which tool implements each operation; see below. |
 
@@ -353,6 +357,8 @@ result = { id = "id", key = "id", url = "url", title = "title", state = "status.
 | `rendezvous_challenge` (optional) | A fresh challenge for a tunnel pass. `result` must map `challenge`. | `{host_id}` |
 | `rendezvous_pass` (optional) | The pass the signed challenge buys. `result` must map `pass`. | `{host_id}`, `{challenge}`, `{signature}` |
 
+An operation names a `tool`, or for reads an [`http`](#http-operations) request instead.
+
 `{system}` works everywhere. `{key}` is the ticket's key when known, otherwise its id. `{board}` is the
 plan's link: the board in board mode, the plan's ticket in ticket mode. Placeholders work anywhere in an argument
 string, and arguments may be numbers, booleans, arrays and tables. A placeholder whose value is unknown
@@ -470,6 +476,63 @@ A path that is not set reads the field of the same name (`id`, `key`, `url`, `ti
 `updated_at`). Numbers and booleans become text. A path that stops at an object shows that object on the
 card, so it is easy to spot and fix. When none of the paths match, the error quotes the start of the
 result, which tells you where the fields really are. `atomics_ticket_sync` is a quick way to see it.
+
+### HTTP operations
+
+The Tickets panel and the chief's reads are not agents, so a system with a REST API can answer them without MCP. A read
+maps an `http` request in place of a `tool`; everything else about the operation (`arguments`, `items`, `result`,
+`body`, `comments`, `paging`, `accepts`) reads as it does for a tool, so a profile can move reads one at a time and keep
+the rest on MCP:
+
+```toml
+[tickets.http]
+url = "https://api.example.com/v1"
+
+[tickets.operations.read]
+http = { method = "GET", path = "/items/{id}" }
+arguments = { expand = "comments" }   # GET: the query string. POST: the JSON body.
+result = { id = "id", key = "key", title = "title" }
+
+[tickets.operations.search]
+http = { method = "POST", path = "/items/search", query = ["tenant"] }
+arguments = { text = "{query}", tenant = "docs", states = ["open", "review"] }
+items = "items"
+result = { id = "id", key = "key", title = "title" }
+paging = { cursor = "cursor", next = "next" }
+```
+
+| `http` key | Meaning |
+| --- | --- |
+| `method` | `"GET"` or `"POST"`. |
+| `path` | Below `[tickets.http] url`. It starts with `/` and has no `//`, `..`, `?`, `#` or scheme. Placeholders fill whole or partial segments. |
+| `query` (optional) | For a POST: the arguments that go in the query string instead of the body. |
+| `response_headers` (optional) | Response headers to read, as `{ name = "x-header" }`. With any, result paths read from `{"body": <the answer>, "headers": {"name": "…"}}`. |
+
+Only `browse`, `search`, `semantic_search`, `read`, `read_comments`, `get`, `children`, `related` and `list` can use
+`http`. Writes, `whoami`, conversations and rendezvous stay on MCP, and `[tickets.server]` stays required for them and
+for agents. An operation with both `tool` and `http` does not load. In a query string an array repeats its key, null is
+left out, and an object is an error. `atomics doctor` reports these operations on a line of their own, without calling
+them, since their paths need ticket values.
+
+What a request can do is fixed, whatever a config or a server says:
+
+- **One address.** A request goes to the base URL plus the path, and that address is checked again right before each
+  send: https, or http to this machine; no user name or password; the base's origin, under its path. Nothing from an
+  answer becomes an address. A paging cursor is an opaque value, sent as the `paging.cursor` argument.
+- **Values stay in their segment.** A value is percent-encoded into its path segment. An empty value, `.`, `..`, or one
+  holding a slash, backslash or semicolon is refused, also when percent-encoded, and nothing is sent.
+- **No redirects.** A 3xx is an error; `Location` is never read.
+- **A token stays with its resource.** It goes only in the `Authorization` header, only to its own origin. `token_env`
+  goes only when `[tickets.http] url` has the origin of `server.url`; otherwise requests carry no token. A request that
+  holds a token ATOMICS is using, in its address or body, is not sent. There are no configurable request headers.
+  With `server.oauth = true` the API has a sign-in of its own, because a token belongs to one resource: an MCP token is
+  never sent to a REST API. The sign-in does not ask for that resource yet, so until it does such a read answers
+  "sign-in required".
+- **Bounded answers.** The answer must be JSON, at most 8 MiB. Of a refusal, 300 characters show, cleaned of credentials.
+
+A 401 with a sign-in refreshes once and tries again; a second 401 asks for a sign-in. With a `token_env` token it says to
+check the token. Only a lost connection, a timeout, a 429 or a 5xx backs off, and the API's backoff is separate from the
+MCP server's. A 404 is one missing ticket.
 
 ### Display result paths
 

@@ -163,7 +163,7 @@ diff:
 | Label | Settings |
 | --- | --- |
 | runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
-| sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
+| sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
 A theme change also shows the theme itself above the diff: bars, agent rows, a terminal with its ANSI colors, a
@@ -207,7 +207,7 @@ file. Waiting proposals block `atomics_restart` and do not survive a restart.
   without asking.
 - **Secrets stay out of the tools' answers.** `atomics_config_get` and `atomics_doctor` mask the values of
   secret-looking names (names containing `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `AUTH` or `CREDENTIAL`) in
-  `tickets.server.env`, operation arguments and `NAME=value` assignments; the argument after a flag such as
+  `tickets.server.env`, `tickets.http`, operation arguments and `http` keys, and `NAME=value` assignments; the argument after a flag such as
   `--api-key`, or `--token=…`; URL user info and credential query parameters; bearer and basic credentials;
   and `voice.api_key`, which reads `***` when set. Every string is also cleaned of the values those settings
   hold and of the tokens `token_env` and `api_key_env` name, as far as ATOMICS knows them. `token_env` and

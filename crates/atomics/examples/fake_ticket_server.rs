@@ -2,6 +2,13 @@
 //!
 //! `fake_ticket_server <state.json>`
 //! `fake_ticket_server --no-read` or `--stop-reading-after-initialize` stalls stdin for transport tests.
+//! `fake_ticket_server --http <state.json>` serves the same tools over HTTP on a free loopback port,
+//! and prints the port. `GET` or `POST /v1/tools/<tool>[/<argument>/<value>…]` calls the tool: the
+//! query string (a repeated key is an array, `status` always is), the JSON body and the path's pairs
+//! are its arguments, and the answer is its result as plain JSON. A tool that fails answers
+//! `fail_status` (default 400). `http_token` in the state makes every request need that bearer
+//! token, and `http_requests` records each request's method, target and `Authorization`. Every
+//! answer carries the header `X-Fake-Request: 1`.
 //!
 //! It speaks three unrelated tool dialects, so tests can swap ticket systems by config
 //! alone: "card_*" tools with nested, structured results, and "issue_*" tools with
@@ -15,7 +22,7 @@
 //! filters (`status` as an array, where `active` means in progress, `assignee`, where `owner` is the state's `me`
 //! or Demo User, `type`, `parent`) and `cursor` paging work with or without `about`.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde_json::{Value, json};
 
@@ -25,6 +32,10 @@ fn main() {
         loop {
             std::thread::park();
         }
+    }
+    if path == "--http" {
+        serve_http(&std::env::args().nth(2).expect("usage: fake_ticket_server --http <state.json>"));
+        return;
     }
     if !std::path::Path::new(&path).exists() && path != "--stop-reading-after-initialize" {
         save(&path, &demo());
@@ -57,6 +68,121 @@ fn main() {
             }
         }
     }
+}
+
+/// One request at a time, as the state file wants, on a port the caller reads from stdout.
+fn serve_http(path: &str) {
+    if !std::path::Path::new(path).exists() {
+        save(path, &demo());
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    println!("{}", listener.local_addr().unwrap().port());
+    std::io::stdout().flush().unwrap();
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let Ok((status, body)) = answer_http(path, &mut stream) else { continue };
+        let reply = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Fake-Request: 1\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(reply.as_bytes());
+    }
+}
+
+fn answer_http(path: &str, stream: &mut std::net::TcpStream) -> std::io::Result<(u16, String)> {
+    let mut reader = std::io::BufReader::new(stream);
+    let mut first = String::new();
+    reader.read_line(&mut first)?;
+    let mut parts = first.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+    let (mut length, mut authorization) = (0, None);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else { continue };
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => length = value.trim().parse().unwrap_or(0),
+            "authorization" => authorization = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+
+    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    if !state["http_requests"].is_array() {
+        state["http_requests"] = json!([]);
+    }
+    let log = json!({"method":method, "target":target, "authorization":authorization});
+    state["http_requests"].as_array_mut().unwrap().push(log);
+    save(path, &state);
+    if let Some(token) = state["http_token"].as_str()
+        && authorization.as_deref() != Some(format!("Bearer {token}").as_str())
+    {
+        return Ok((401, json!({"message":"sign in"}).to_string()));
+    }
+    let (route, query) = target.split_once('?').unwrap_or((target, ""));
+    let segments: Vec<String> = route.split('/').map(decode).collect();
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    let ["", "v1", "tools", tool, pairs @ ..] = segments.as_slice() else {
+        return Ok((404, json!({"message":"no such route"}).to_string()));
+    };
+    let mut arguments = if body.is_empty() { json!({}) } else { serde_json::from_slice(&body)? };
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let (name, value) = (decode(&name.replace('+', " ")), decode(&value.replace('+', " ")));
+        let value = match name.as_str() {
+            "take" => json!(value.parse::<u64>().unwrap_or(0)),
+            _ => json!(value),
+        };
+        let slot = &mut arguments[&name];
+        *slot = match slot.take() {
+            Value::Null if name == "status" => json!([value]),
+            Value::Null => value,
+            Value::Array(mut values) => {
+                values.push(value);
+                Value::Array(values)
+            }
+            other => json!([other, value]),
+        };
+    }
+    for pair in pairs.chunks(2) {
+        if let [name, value] = pair {
+            arguments[*name] = json!(value);
+        }
+    }
+    Ok(match call(path, &json!({"name":tool, "arguments":arguments})) {
+        Ok(result) if result["isError"] == true => {
+            let refused =
+                result.get("structuredContent").cloned().unwrap_or(json!({"message":result["content"][0]["text"]}));
+            let state: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+            (state["fail_status"].as_u64().unwrap_or(400) as u16, refused.to_string())
+        }
+        Ok(result) => (200, atomics_core::tickets::tool_output(&result).to_string()),
+        Err(message) => (400, json!({"message":message}).to_string()),
+    })
+}
+
+fn decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = (bytes[at] == b'%').then(|| text.get(at + 1..at + 3)).flatten();
+        match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 const TOOLS: &[&str] = &[

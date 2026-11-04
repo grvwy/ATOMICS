@@ -104,6 +104,8 @@ pub(crate) struct State {
     pub(crate) revoke_status: Option<u16>,
     /// How long the token endpoint takes to answer.
     pub(crate) token_delay: Duration,
+    /// The resource refuses every token, even one just issued.
+    pub(crate) refuse_access: bool,
 }
 
 pub(crate) struct Fake {
@@ -260,7 +262,7 @@ impl Fake {
             };
         }
         let token = r.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or_default();
-        if !st.access.contains(token) {
+        if !st.access.contains(token) || st.refuse_access {
             let mut headers = vec![];
             if !st.no_challenge {
                 let metadata = self.mcp_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp");
@@ -477,6 +479,72 @@ fn a_token_near_expiry_refreshes_with_rotation_and_a_401_refreshes_once() {
     let st = fake.state.lock().unwrap();
     assert_eq!(st.token_requests.iter().filter(|r| r["grant_type"] == "refresh_token").count(), 2);
     assert_eq!(st.list_auth, [format!("Bearer {}", client.oauth_token().unwrap())]);
+}
+
+/// The fake protects `/mcp` with POSTs: the REST client's path below it stands in for an API.
+#[test]
+fn a_rest_read_refreshes_once_on_a_401_and_then_needs_a_sign_in() {
+    use atomics_core::tickets::{Cleaner, HttpCall, HttpMethod, HttpRequest};
+
+    let fake = Fake::start();
+    let (_dir, oauth) = machine();
+    let server = fake.server();
+    sign_in(&oauth, &server).unwrap();
+    let call = HttpCall {
+        method: HttpMethod::Post,
+        path: String::new(),
+        query: Vec::new(),
+        response_headers: Default::default(),
+    };
+    let request = HttpRequest {
+        path: "/".into(),
+        query: Vec::new(),
+        body: Some(json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"})),
+    };
+    let cleaner = Cleaner::default();
+    let refreshes = |fake: &Fake| {
+        let state = fake.state.lock().unwrap();
+        state.token_requests.iter().filter(|r| r["grant_type"] == "refresh_token").count()
+    };
+    let mut client = super::super::HttpClient::connect(&server, None, Duration::from_secs(5), Some(&oauth)).unwrap();
+    client.call(&call, "POST /", &request, &cleaner, &cleaner).unwrap();
+    assert_eq!(refreshes(&fake), 0);
+
+    // The API stops accepting the token: one refresh, and the same request goes through.
+    let first = client.oauth_token().unwrap().to_string();
+    fake.state.lock().unwrap().access.clear();
+    client.call(&call, "POST /", &request, &cleaner, &cleaner).unwrap();
+    assert_eq!(refreshes(&fake), 1);
+    assert_ne!(client.oauth_token().unwrap(), first);
+
+    // A refresh that does not help: the next 401 asks for a person, with no second refresh.
+    fake.state.lock().unwrap().refuse_access = true;
+    let error = client.call(&call, "POST /", &request, &cleaner, &cleaner).unwrap_err();
+    assert!(matches!(error, McpError::SignInRequired(_)), "{error:?}");
+    assert!(is_sign_in_required(&error.to_string()), "{error}");
+    assert_eq!(refreshes(&fake), 2);
+
+    // A refresh the server refuses asks for a person too.
+    let revoked = Fake::start();
+    let (_other, other_oauth) = machine();
+    let other = revoked.server();
+    sign_in(&other_oauth, &other).unwrap();
+    let mut client =
+        super::super::HttpClient::connect(&other, None, Duration::from_secs(5), Some(&other_oauth)).unwrap();
+    {
+        let mut state = revoked.state.lock().unwrap();
+        state.access.clear();
+        state.refresh.clear();
+    }
+    let error = client.call(&call, "POST /", &request, &cleaner, &cleaner).unwrap_err();
+    assert!(matches!(error, McpError::SignInRequired(_)), "{error:?}");
+    assert_eq!(refreshes(&revoked), 1);
+
+    // No saved sign-in for this resource: a person has to act, and nothing is sent.
+    let (_third, signed_out) = machine();
+    let error =
+        super::super::HttpClient::connect(&server, None, Duration::from_secs(5), Some(&signed_out)).err().unwrap();
+    assert!(matches!(error, McpError::SignInRequired(_)), "{error:?}");
 }
 
 #[test]
