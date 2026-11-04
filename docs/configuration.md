@@ -27,7 +27,9 @@ one open and opens another from the saved ones (the Project menu lists them too,
 one). ATOMICS remembers the workspace open last (`workspace` in `state/store.json`). A start that names neither a
 project nor a workspace, such as from the Dock or `atomics` in a folder outside any repository, opens it again with
 the projects that were open, so its `[tickets]`, `[workflow]` and chief settings apply as before. Naming a project
-(`atomics ~/repos/app`) opens just that project, with no workspace, as it always has. A workspace whose file is gone
+(`atomics ~/repos/app`), or starting `atomics` in a repository or a folder below its root, opens just that project,
+with no workspace, as it always has: another repository's workspace settings never apply to it, and the next bare
+start opens that project again rather than the earlier workspace. A workspace whose file is gone
 is not opened again. `atomics_restart` relaunches with the workspace open at that moment in place of any
 `--workspace` the first start had, so a workspace picked after the start survives the restart.
 

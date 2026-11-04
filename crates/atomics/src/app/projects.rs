@@ -2,11 +2,14 @@ use super::*;
 
 impl State {
     /// `atomics <path>` or `--workspace`, else the repository ATOMICS was started in, else
-    /// the projects from last time. A start that names neither a project nor a workspace (from the
-    /// Dock, say) opens the workspace that was open last time again, if it is still saved, so its
-    /// `[tickets]`, workflow and chief settings apply as they did.
+    /// the projects from last time. A bare start, which names neither a project nor a workspace and
+    /// is not in a repository (from the Dock, say), opens the workspace that was open last time again,
+    /// if it is still saved, so its `[tickets]`, workflow and chief settings apply as they did. A start
+    /// in a repository opens just that one, as it always has: another repository's workspace settings
+    /// never apply to it.
     pub(super) fn open_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
-        let reopened = workspace.is_none() && requested.is_empty();
+        let bare = requested.is_empty() && workspace::project_root(&self.launch_dir).is_err();
+        let reopened = workspace.is_none() && bare;
         let workspace = workspace.or_else(|| {
             let last = self.store.workspace.clone().filter(|_| reopened)?;
             Workspace::list().contains(&last).then_some(last)
@@ -238,6 +241,35 @@ mod tests {
                 let root = workspace::project_root(&repo).unwrap();
                 assert_eq!((state.workspace.as_deref(), state.open_projects.clone()), (None, vec![root]));
                 assert_eq!(Store::load(&paths::store_file()).workspace, None);
+
+                // A start in a repository (`atomics` in a terminal there, or in a folder below its
+                // root) opens just that one, with no workspace: the last one's settings stay with it,
+                // and nothing is saved back that would bring them to this repository later.
+                state.open_workspace("team").unwrap();
+                let (_other_dir, other) = crate::app::tests::repository();
+                let other_root = workspace::project_root(&other).unwrap();
+                let below = other.join("src");
+                std::fs::create_dir_all(&below).unwrap();
+                for launch in [other.clone(), below] {
+                    state.launch_dir = launch.clone();
+                    fresh(&mut state, vec![], None);
+                    let opened = (state.workspace.as_deref(), state.open_projects.clone());
+                    assert_eq!(opened, (None, vec![other_root.clone()]), "{}", launch.display());
+                    assert!(state.ticket_config().is_none(), "team's [tickets] stay with team");
+                    let store = Store::load(&paths::store_file());
+                    assert_eq!((store.workspace, store.projects), (None, vec![other_root.clone()]));
+                    state.open_workspace("team").unwrap();
+                }
+                // Naming a project from a folder outside any repository does not reopen it either.
+                let outside = paths::home().join("notes");
+                std::fs::create_dir_all(&outside).unwrap();
+                state.launch_dir = outside;
+                fresh(&mut state, vec![other.clone()], None);
+                assert_eq!((state.workspace.as_deref(), state.open_projects.clone()), (None, vec![other_root.clone()]));
+                // From the Dock again, outside any repository, the workspace open last comes back.
+                state.open_workspace("team").unwrap();
+                fresh(&mut state, vec![], None);
+                assert_eq!((state.workspace.as_deref(), state.open_projects.clone()), (Some("team"), open.clone()));
 
                 // A workspace that is no longer saved is not opened again.
                 state.open_workspace("team").unwrap();
