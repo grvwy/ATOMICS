@@ -399,3 +399,47 @@ fn with_remote_on_a_taken_port_the_host_fails_loudly_and_cleans_up() {
     let output = host.wait_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+/// The NixOS VM's service: `atomics host --remote-port` serves `atomics.v1` on that loopback port with
+/// `[remote]` off in the config, and a client paired through ctl gets in with its own token, which the
+/// host keeps only as a digest, until it is unpaired.
+#[test]
+fn a_service_port_and_a_paired_client_reach_the_headless_host() {
+    let instance = Instance::new(None);
+    let free = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free);
+    let mut command = instance.command(["host", "--remote-port", &port.to_string()]);
+    command.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").stdin(Stdio::null());
+    let mut host = TestChild::spawn(&mut command, CHILD_TIMEOUT).unwrap();
+    instance.ready(&mut host);
+    assert_eq!(instance.ctl(json!({"cmd":"remote"}))["protocol"]["url"], format!("ws://127.0.0.1:{port}"));
+
+    let paired = instance.ctl(json!({"cmd":"pair_client","name":"ATOMICS on a Mac"}));
+    let token = paired["token"].as_str().unwrap().to_string();
+    let upgrade = |token: &str| {
+        // As through a forward on another port: the Host names the loopback, any port.
+        let mut request = format!("ws://127.0.0.1:{port}").into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert("Host", "127.0.0.1:1".parse().unwrap());
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers.insert("Sec-WebSocket-Protocol", wire::SUBPROTOCOL.parse().unwrap());
+        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tungstenite::client(request, stream).is_ok()
+    };
+    assert!(upgrade(&token), "the paired token gets in");
+    assert!(!upgrade(&token[1..]), "a wrong one does not");
+    let clients = instance.ctl(json!({"cmd":"remote"}))["clients"].clone();
+    assert_eq!(clients[0]["name"], "ATOMICS on a Mac");
+    let kept = std::fs::read_to_string(instance.home().join("paired-clients.json")).unwrap();
+    assert!(!kept.contains(&token), "only a digest is kept");
+    instance.ctl(json!({"cmd":"unpair_client","name":"ATOMICS on a Mac"}));
+    assert!(!upgrade(&token), "an unpaired token stops working");
+
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains(&token), "the token reached the log");
+}
