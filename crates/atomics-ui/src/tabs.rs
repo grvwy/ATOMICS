@@ -41,6 +41,20 @@ pub fn view_tabs(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     Nav::new(backend, client).view_tabs(ui);
 }
 
+/// The session filters where there is no top-bar tab strip, such as a phone's Agents pane.
+pub fn filters(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let mut nav = Nav::new(backend, client);
+    ui.horizontal_wrapped(|ui| {
+        if backend.available(&Command::SetView(None)) {
+            nav.view_tab(ui, &ViewTab::All, None, None);
+            nav.view_tab(ui, &ViewTab::Repos, None, None);
+        }
+        if backend.available(&Command::ShowUngrouped) {
+            nav.view_tab(ui, &ViewTab::Ungrouped, None, None);
+        }
+    });
+}
+
 /// The overflow menu's label when every plan tab is in it, and its color: how many plans need the user, or
 /// how many agents run.
 pub fn urgent_tabs_label(backend: &dyn Backend, client: &mut Client) -> (String, Color32) {

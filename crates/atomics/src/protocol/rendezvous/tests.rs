@@ -405,8 +405,9 @@ impl Fixture {
     fn paired(&self, socket: &mut Admitted, channel: u32, device: &Secret, access: Access) -> noise::Channel {
         let link = self.offer();
         let (mut secure, code) = socket.pair(channel, &link, device, "Test phone").unwrap();
-        assert_eq!(self.prompt(), ("Test phone".to_string(), code), "the desktop shows the device's own code");
-        self.devices.decide(Some(access));
+        assert_eq!(self.prompt(), ("Test phone".to_string(), code.clone()), "the desktop shows the device's own code");
+        assert!(!self.devices.decide_code("stale-code", Some(access)));
+        assert!(self.devices.decide_code(&code, Some(access)));
         assert_eq!(socket.pair_answer(channel, &mut secure), PairAnswer { paired: true, may: Some(access) });
         secure
     }
@@ -1134,7 +1135,7 @@ fn the_rendezvous_modules_name_no_product() {
         ("atomics-core tunnel.rs", include_str!("../../../../atomics-core/src/tunnel.rs")),
         ("atomics-core noise.rs", include_str!("../../../../atomics-core/src/noise.rs")),
         ("atomics-core noise tests", include_str!("../../../../atomics-core/src/noise/tests.rs")),
-        ("pairing window", include_str!("../../app/pairing.rs")),
+        ("pairing window", include_str!("../../../../atomics-ui/src/management/remote.rs")),
         ("journal", include_str!("../journal.rs")),
         ("ops", include_str!("../ops.rs")),
         ("advert", include_str!("../../../../atomics-core/src/advert.rs")),

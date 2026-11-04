@@ -46,6 +46,18 @@ impl State {
             }
         }
         self.mirror_pending_permission();
+        // A later live reply must never keep an abandoned hook at the head, even between screen polls.
+        for index in 0..self.sessions.len() {
+            if self.sessions[index].approvals.iter().any(|pending| {
+                pending.request.tool != "Azure REST"
+                    && pending.native.is_none()
+                    && pending.reply.as_ref().is_none_or(|reply| reply.expired())
+            }) {
+                let screen =
+                    self.sessions[index].terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
+                self.prune_dead_approvals(index, &screen, now);
+            }
+        }
         if now.duration_since(self.approvals_checked) < APPROVAL_CHECK_INTERVAL {
             return;
         }
@@ -58,8 +70,14 @@ impl State {
             let session = &mut self.sessions[index];
             if session.sandbox.is_some() {
                 let had_approvals = !session.approvals.is_empty();
+                let mut expired = Vec::new();
                 session.approvals.retain(|pending| {
-                    pending.request.tool == "Azure REST" && pending.reply.as_ref().is_some_and(|reply| !reply.expired())
+                    let keep = pending.request.tool == "Azure REST"
+                        && pending.reply.as_ref().is_some_and(|reply| !reply.expired());
+                    if !keep {
+                        expired.push(pending.id.clone());
+                    }
+                    keep
                 });
                 if had_approvals && session.approvals.is_empty() {
                     session.status = if session.terminal.as_ref().is_some_and(Terminal::exited) {
@@ -69,6 +87,12 @@ impl State {
                     };
                 }
                 session.approval_hold = false;
+                if !expired.is_empty() {
+                    self.last_status.remove(&session.id);
+                }
+                for id in expired {
+                    self.record_resolution(id, Disposition::Expired);
+                }
                 continue;
             }
             let pending = session.approval_hold || !session.approvals.is_empty();
@@ -81,12 +105,8 @@ impl State {
             let pending = session.approval_hold || !session.approvals.is_empty();
             let menu = atomics_core::approvals::menu_visible(&screen);
             if menu {
-                // A native menu means Codex has already stopped waiting for the hook.
-                for approval in &mut session.approvals {
-                    if let Some(reply) = approval.reply.take() {
-                        reply.answer(HookReply::default());
-                    }
-                }
+                // A menu holds input, but never consumes a waiting hook, even for the same command.
+                // The IPC waiter expires disconnected hooks before their fallback menu takes over.
                 session.approval_hold = true;
                 session.menu_absent_since = None;
                 continue;
@@ -109,7 +129,7 @@ impl State {
             if now.duration_since(*missing_since) < APPROVAL_MENU_GRACE {
                 continue;
             }
-            session.approvals.clear();
+            let expired = std::mem::take(&mut session.approvals);
             session.approval_hold = false;
             session.menu_absent_since = None;
             if session.status == AgentStatus::NeedsInput {
@@ -119,7 +139,55 @@ impl State {
                     AgentStatus::Working
                 };
             }
+            for pending in expired {
+                self.record_resolution(pending.id, Disposition::Expired);
+            }
             self.release_held(index);
+        }
+    }
+
+    /// Drop hooks that cannot be answered and have no corresponding menu when a live reply waits
+    /// behind them or another menu is visible. With no menu, keep the quiet period for the fallback
+    /// prompt to draw; Azure requests keep the relay's expiry handling above. One menu can stand
+    /// for only one expired request, or for the answer still lingering on screen.
+    fn prune_dead_approvals(&mut self, index: usize, screen: &str, now: Instant) {
+        let session = &mut self.sessions[index];
+        let menu = session.sandbox.is_none() && atomics_core::approvals::menu_visible(screen);
+        let command_menu = if menu { atomics_core::approvals::native_menu(screen) } else { None };
+        let mut represented = command_menu.as_ref().is_some_and(|visible| {
+            session.answered_menu.as_ref().is_some_and(|(answered, at)| {
+                now.saturating_duration_since(*at) < ANSWERED_MENU_LINGER && visible.same(answered)
+            }) || session.approvals.iter().any(|pending| pending.native.as_ref().is_some_and(|menu| visible.same(menu)))
+        });
+        let live_reply =
+            session.approvals.iter().any(|pending| pending.reply.as_ref().is_some_and(|reply| !reply.expired()));
+        let mut expired = Vec::new();
+        session.approvals.retain(|pending| {
+            let live = pending.request.tool == "Azure REST"
+                || pending.native.is_some()
+                || pending.reply.as_ref().is_some_and(|reply| !reply.expired());
+            if live {
+                return true;
+            }
+            let on_screen = !represented
+                && command_menu.is_some()
+                && [Decision::Allow, Decision::Deny].into_iter().any(|decision| {
+                    atomics_core::approvals::menu_key(screen, pending.request.command.as_deref(), decision).is_some()
+                });
+            represented |= on_screen;
+            if on_screen || (!menu && !live_reply) {
+                return true;
+            }
+            expired.push(pending.id.clone());
+            false
+        });
+        if expired.is_empty() {
+            return;
+        }
+        // Wake the chief even if the session still needs input: the first live request is now shown.
+        self.last_status.remove(&session.id);
+        for id in expired {
+            self.record_resolution(id, Disposition::Expired);
         }
     }
 
@@ -153,8 +221,13 @@ impl State {
             (None, None) => return,
             _ => {}
         }
-        // Withdrawn: a decision still naming it finds it no longer pending.
-        session.approvals.clear();
+        // Withdrawn: a decision still naming it finds it no longer pending. Hooks behind it
+        // keep waiting for their own replies when the menu changes.
+        session.approvals.retain(|pending| pending.native.is_none());
+        if !session.approvals.is_empty() {
+            self.last_status.remove(&session.id);
+            return;
+        }
         let asked = visible
             .filter(|visible| !session.answered_menu.as_ref().is_some_and(|(answered, _)| answered.same(visible)));
         if let Some(menu) = asked {
@@ -190,7 +263,9 @@ impl State {
     pub(super) fn approvable(&mut self, index: usize) -> bool {
         let screen =
             self.sessions[index].terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
-        self.sync_native(index, &screen, Instant::now());
+        let now = Instant::now();
+        self.prune_dead_approvals(index, &screen, now);
+        self.sync_native(index, &screen, now);
         let Some(pending) = self.sessions[index].approvals.first() else { return false };
         if pending.reply.as_ref().is_some_and(|reply| !reply.expired()) {
             return true;
@@ -367,6 +442,7 @@ impl State {
     ) -> Result<Answered, WireError> {
         let rejected = |message: &str| WireError::new(ErrorCode::Rejected, message);
         self.expire_approvals(Instant::now());
+        self.approvable(index);
         // A drop is let through only while it takes the entries its warning named; a denial drops nothing.
         if decision != Decision::Deny {
             self.recheck_stash(index, approval)?;
@@ -418,8 +494,8 @@ impl State {
             if key == "\x01" {
                 return Err(rejected("expanded the permission command; retry approval once it is visible"));
             }
-            if let Some(menu) = &pending.native {
-                session.answered_menu = Some((menu.clone(), Instant::now()));
+            if let Some(menu) = atomics_core::approvals::native_menu(&screen) {
+                session.answered_menu = Some((menu, Instant::now()));
             }
         }
         let pending = session.approvals.remove(0);
@@ -526,6 +602,482 @@ mod tests {
             app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
             app.runtime.expire_approvals(Instant::now());
         }
+    }
+
+    fn hook_request(app: &mut Desktop<'_>, id: &str) -> Arc<ipc::ApprovalReply> {
+        let reply = Arc::new(ipc::ApprovalReply::default());
+        app.runtime.sessions[0].approvals.push(PendingApproval {
+            id: id.into(),
+            request: ApprovalRequest {
+                tool: "Bash".into(),
+                command: Some(format!("touch {id}")),
+                cwd: app.runtime.launch_dir.clone(),
+                reason: None,
+                input: json!({}),
+                warning: None,
+            },
+            reply: Some(reply.clone()),
+            native: None,
+            stash: Default::default(),
+        });
+        reply
+    }
+
+    #[test]
+    fn review_an_unrelated_choice_menu_must_not_keep_a_dead_hook_ahead_of_a_live_hook() {
+        with_app(
+            "app::approvals::tests::review_an_unrelated_choice_menu_must_not_keep_a_dead_hook_ahead_of_a_live_hook",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let screen = dir.path().join("edit-menu.txt");
+                std::fs::write(
+                    &screen,
+                    "Allow these file edits?\n› 1. Yes, proceed\n  2. No\nPress enter to confirm or esc to cancel\n",
+                )
+                .unwrap();
+                let terminal = menu_agent(app, &[&screen]);
+                let mut worker =
+                    session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                worker.terminal = Some(terminal);
+                worker.approval_hold = true;
+                app.runtime.sessions = vec![worker];
+                hook_request(app, "dead").wait(Duration::ZERO);
+                let live = hook_request(app, "live");
+                assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                let result = app.runtime.decide("live", Decision::Allow, None);
+                assert!(result.is_ok(), "a dead request blocked a live reply: {result:?}");
+                assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                assert_eq!(app.runtime.resolution("dead"), Some(Disposition::Expired));
+                assert!(app.runtime.sessions[0].approval_hold);
+                assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+            },
+        );
+    }
+
+    #[test]
+    fn a_command_menu_keeps_live_hooks_until_their_own_decisions() {
+        with_app("app::approvals::tests::a_command_menu_keeps_live_hooks_until_their_own_decisions", |app, _| {
+            for (fixture, command, keys) in [
+                ("codex-0.165-approval-screen.txt", "atomics queue --class test -- ./check.sh", "Keys: 31 0d"),
+                ("claude-2.1-approval-screen.txt", "touch fixture", "Keys: 0d"),
+            ] {
+                let dir = crate::test_support::tempdir().unwrap();
+                let screen = dir.path().join("command-menu.txt");
+                std::fs::write(
+                    &screen,
+                    std::fs::read_to_string(recorded(fixture)).unwrap().replace(command, "touch shown"),
+                )
+                .unwrap();
+                let mut worker =
+                    session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                worker.terminal = Some(menu_agent(app, &[&screen]));
+                app.runtime.sessions = vec![worker];
+                let shown = hook_request(app, "shown");
+                let live = hook_request(app, "live");
+                let commandless = hook_request(app, "commandless");
+                app.runtime.sessions[0].approvals.last_mut().unwrap().request.command = None;
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.runtime.expire_approvals(Instant::now());
+                assert!(app.runtime.sessions[0].approvals[0].reply.is_some(), "{fixture}");
+                assert!(!shown.expired(), "even the shown command's hook must stay live: {fixture}");
+                assert!(!live.expired(), "a different command's hook must stay live: {fixture}");
+                assert!(!commandless.expired(), "a hook without a command cannot match: {fixture}");
+                assert!(app.runtime.sessions[0].approval_hold);
+                assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
+                // A disconnected hook expires before the agent falls back to the menu.
+                assert!(shown.wait(Duration::ZERO).stdout.is_none());
+                assert_eq!(app.runtime.decide("shown", Decision::Allow, None).unwrap(), Disposition::Allowed);
+                shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), keys);
+                assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+                assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                assert_eq!(app.runtime.decide("commandless", Decision::Deny, None).unwrap(), Disposition::Denied);
+                assert!(commandless.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
+                assert!(app.runtime.sessions[0].approval_hold);
+                assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+            }
+        });
+    }
+
+    #[test]
+    fn review_a_fallback_menu_must_not_abandon_a_later_live_duplicate_command() {
+        with_app(
+            "app::approvals::tests::review_a_fallback_menu_must_not_abandon_a_later_live_duplicate_command",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let screen = dir.path().join("duplicate-command-menu.txt");
+                let menu = std::fs::read_to_string(recorded("codex-0.165-approval-screen.txt"))
+                    .unwrap()
+                    .replace("atomics queue --class test -- ./check.sh", "touch shown");
+                std::fs::write(&screen, menu).unwrap();
+                let mut worker =
+                    session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                worker.terminal = Some(menu_agent(app, &[&screen]));
+                worker.approval_hold = true;
+                app.runtime.sessions = vec![worker];
+                hook_request(app, "shown").wait(Duration::ZERO);
+                let live = hook_request(app, "live");
+                app.runtime.sessions[0].approvals[1].request.command = Some("touch shown".into());
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.runtime.expire_approvals(Instant::now());
+                assert!(
+                    app.runtime.sessions[0].approvals[1].reply.is_some(),
+                    "the first hook's fallback menu consumed the later live duplicate's reply"
+                );
+                assert!(
+                    live.answer(HookReply { stdout: Some(Decision::Allow.output(None)) }),
+                    "the later duplicate still needs its own hook decision"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn one_menu_represents_only_one_expired_duplicate_command() {
+        with_app("app::approvals::tests::one_menu_represents_only_one_expired_duplicate_command", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let screen = dir.path().join("duplicate-command-menu.txt");
+            let menu = std::fs::read_to_string(recorded("codex-0.165-approval-screen.txt"))
+                .unwrap()
+                .replace("atomics queue --class test -- ./check.sh", "touch shown");
+            std::fs::write(&screen, menu).unwrap();
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            worker.terminal = Some(menu_agent(app, &[&screen]));
+            worker.approval_hold = true;
+            app.runtime.sessions = vec![worker];
+            for id in ["shown", "expired-one", "expired-two"] {
+                hook_request(app, id).wait(Duration::ZERO);
+                app.runtime.sessions[0].approvals.last_mut().unwrap().request.command = Some("touch shown".into());
+            }
+            let live = hook_request(app, "live");
+            app.runtime.sessions[0].approvals.last_mut().unwrap().request.command = Some("touch shown".into());
+            for _ in 0..2 {
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.runtime.expire_approvals(Instant::now());
+                assert!(app.runtime.approvable(0));
+                assert_eq!(
+                    app.runtime.sessions[0].approvals.iter().map(|pending| pending.id.as_str()).collect::<Vec<_>>(),
+                    ["shown", "live"]
+                );
+                assert!(!live.expired());
+            }
+            assert_eq!(app.runtime.resolution("shown"), None);
+            for id in ["expired-one", "expired-two"] {
+                assert_eq!(app.runtime.resolution(id), Some(Disposition::Expired));
+            }
+            assert_eq!(app.runtime.decide("shown", Decision::Deny, None).unwrap(), Disposition::Denied);
+            shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 1b");
+            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+            assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        });
+    }
+
+    #[test]
+    fn an_answered_menu_lingering_beside_a_live_identical_command_keeps_its_reply() {
+        with_app(
+            "app::approvals::tests::an_answered_menu_lingering_beside_a_live_identical_command_keeps_its_reply",
+            |app, _| {
+                for fallback in [false, true] {
+                    let dir = crate::test_support::tempdir().unwrap();
+                    let screen = dir.path().join("lingering-command-menu.txt");
+                    let menu = std::fs::read_to_string(recorded("codex-0.165-approval-screen.txt"))
+                        .unwrap()
+                        .replace("atomics queue --class test -- ./check.sh", "touch shown");
+                    std::fs::write(&screen, &menu).unwrap();
+                    let mut worker =
+                        session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                    worker.terminal = Some(menu_agent(app, &[&screen]));
+                    app.runtime.sessions = vec![worker];
+                    if fallback {
+                        hook_request(app, "shown").wait(Duration::ZERO);
+                    }
+                    assert!(app.runtime.approvable(0));
+                    let shown = app.runtime.sessions[0].approvals[0].id.clone();
+                    assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
+                    assert_eq!(app.runtime.decide(&shown, Decision::Allow, None).unwrap(), Disposition::Allowed);
+                    shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 31 0d");
+                    assert!(app.runtime.sessions[0].answered_menu.is_some());
+
+                    // Redraw the old screen to make the agent's delayed repaint deterministic.
+                    app.runtime.sessions[0].terminal = Some(menu_agent(app, &[&screen]));
+                    app.runtime.sessions[0].answered_menu.as_mut().unwrap().1 = Instant::now();
+                    let live = hook_request(app, "live");
+                    app.runtime.sessions[0].approvals.last_mut().unwrap().request.command = Some("touch shown".into());
+                    hook_request(app, "expired").wait(Duration::ZERO);
+                    app.runtime.sessions[0].approvals.last_mut().unwrap().request.command = Some("touch shown".into());
+                    for _ in 0..2 {
+                        app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                        app.runtime.expire_approvals(Instant::now());
+                        assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+                        assert_eq!(app.runtime.sessions[0].approvals[0].id, "live");
+                        assert!(app.runtime.sessions[0].approvals[0].reply.is_some());
+                        assert!(!live.expired());
+                    }
+                    assert_eq!(app.runtime.resolution("expired"), Some(Disposition::Expired));
+                    assert_eq!(app.runtime.resolution(&shown), Some(Disposition::Allowed));
+                    assert_eq!(app.runtime.decide("live", Decision::Deny, None).unwrap(), Disposition::Denied);
+                    assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
+                    assert!(app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("1. Yes"));
+                    assert!(app.runtime.sessions[0].approval_hold);
+                    assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn replacing_a_native_menu_keeps_the_live_hook_behind_it() {
+        with_app("app::approvals::tests::replacing_a_native_menu_keeps_the_live_hook_behind_it", |app, _| {
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            worker.terminal = Some(menu_agent(app, &[&recorded("codex-0.165-approval-screen.txt")]));
+            app.runtime.sessions = vec![worker];
+            assert!(app.runtime.approvable(0));
+            assert!(app.runtime.sessions[0].approvals[0].native.is_some());
+            let live = hook_request(app, "live");
+            app.runtime.sessions[0].terminal = Some(menu_agent(app, &[&recorded("claude-2.1-approval-screen.txt")]));
+            app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.runtime.expire_approvals(Instant::now());
+            assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+            assert_eq!(app.runtime.sessions[0].approvals[0].id, "live");
+            assert!(!live.expired());
+            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+            assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+            assert!(app.runtime.sessions[0].approval_hold);
+        });
+    }
+
+    #[test]
+    fn a_hidden_command_menu_keeps_live_hook_replies() {
+        with_app("app::approvals::tests::a_hidden_command_menu_keeps_live_hook_replies", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let screen = dir.path().join("hidden-command-menu.txt");
+            let menu = std::fs::read_to_string(recorded("codex-0.165-approval-screen.txt"))
+                .unwrap()
+                .replace("$ atomics queue --class test -- ./check.sh", "[… 9 lines] ⌃a view all");
+            std::fs::write(&screen, menu).unwrap();
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            worker.terminal = Some(menu_agent(app, &[&screen]));
+            app.runtime.sessions = vec![worker];
+            let live = hook_request(app, "live");
+            app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.runtime.expire_approvals(Instant::now());
+            assert!(!live.expired(), "a hidden command cannot identify an abandoned hook");
+            assert!(app.runtime.sessions[0].approval_hold);
+            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+            assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        });
+    }
+
+    #[test]
+    fn review_expired_hook_keeps_input_held_until_the_fallback_menu_can_draw() {
+        with_app(
+            "app::approvals::tests::review_expired_hook_keeps_input_held_until_the_fallback_menu_can_draw",
+            |app, _| {
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    "/bin/cat".into(),
+                    vec![],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let mut worker =
+                    session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                worker.terminal = Some(terminal);
+                worker.approval_hold = true;
+                app.runtime.sessions = vec![worker];
+                let reply = hook_request(app, "fallback");
+                assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
+                reply.wait(Duration::ZERO);
+                app.runtime.approvals_checked = Instant::now();
+                app.runtime.expire_approvals(Instant::now());
+                assert!(app.runtime.sessions[0].approval_hold, "the hook timed out before its native menu could draw");
+                assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+                assert!(!app.runtime.approvable(0), "checking approvability must preserve the grace period too");
+                assert_eq!(app.runtime.sessions[0].approvals[0].id, "fallback");
+                assert_eq!(app.runtime.resolution("fallback"), None);
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.runtime.expire_approvals(Instant::now());
+                assert!(app.runtime.sessions[0].menu_absent_since.is_some());
+                assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+
+                // The fallback arrives during the quiet period and still answers the hook's own ID.
+                let dir = crate::test_support::tempdir().unwrap();
+                let screen = dir.path().join("fallback.txt");
+                let menu = std::fs::read_to_string(recorded("codex-0.165-approval-screen.txt"))
+                    .unwrap()
+                    .replace("atomics queue --class test -- ./check.sh", "touch fallback");
+                std::fs::write(&screen, menu).unwrap();
+                app.runtime.sessions[0].terminal = Some(menu_agent(app, &[&screen]));
+                assert!(app.runtime.approvable(0));
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.runtime.expire_approvals(Instant::now());
+                assert_eq!(app.runtime.sessions[0].approvals[0].id, "fallback");
+                assert!(app.runtime.sessions[0].menu_absent_since.is_none());
+                assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+                assert_eq!(app.runtime.decide("fallback", Decision::Allow, None).unwrap(), Disposition::Allowed);
+                shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 31 0d");
+                poll_after_quiet(app);
+                assert!(app.runtime.sessions[0].held.is_empty());
+                assert!(!app.runtime.sessions[0].approval_hold);
+            },
+        );
+    }
+
+    #[test]
+    fn dead_hook_heads_expire_and_the_first_live_request_can_be_approved() {
+        with_app(
+            "app::approvals::tests::dead_hook_heads_expire_and_the_first_live_request_can_be_approved",
+            |app, _| {
+                for reader in ["poll", "approvable", "approve", "decide", "control"] {
+                    app.runtime.sessions =
+                        vec![session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];
+                    app.runtime.sessions[0].approval_hold = true;
+                    hook_request(app, "dead").wait(Duration::ZERO);
+                    let live = hook_request(app, "live");
+                    // The fast paths must prune even when the periodic screen check is not due yet.
+                    app.runtime.approvals_checked = Instant::now();
+                    app.runtime.record_events();
+                    let cursor = app.runtime.event_seq;
+                    match reader {
+                        "poll" => app.runtime.expire_approvals(Instant::now()),
+                        "approvable" => assert!(app.runtime.approvable(0)),
+                        "approve" => {
+                            app.runtime.approve(0, "live", Decision::Allow, None).unwrap();
+                        }
+                        "decide" => {
+                            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed)
+                        }
+                        "control" => {
+                            let answer = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                            assert!(answer.ok, "{answer:?}");
+                            assert_eq!(answer.result["command"], "touch live");
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(app.runtime.resolution("dead"), Some(Disposition::Expired), "{reader}");
+                    if matches!(reader, "poll" | "approvable") {
+                        assert_eq!(app.runtime.sessions[0].approvals[0].id, "live");
+                        app.runtime.record_events();
+                        let event = app
+                            .runtime
+                            .events
+                            .iter()
+                            .find(|event| event.seq > cursor)
+                            .expect("the chief hears the new head");
+                        assert_eq!(event.approval.as_ref().unwrap().command.as_deref(), Some("touch live"));
+                        app.runtime.approve(0, "live", Decision::Allow, None).unwrap();
+                    }
+                    assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"), "{reader}");
+                    assert!(app.runtime.sessions[0].approvals.is_empty());
+                    assert_eq!(app.runtime.resolution("live"), Some(Disposition::Allowed));
+                    let projections = atomics_core::projection::Projections::default();
+                    app.runtime.publish_projections(
+                        &projections,
+                        &mut super::super::projection::DiffSummaries::default(),
+                        &super::super::projection::DiffBodies::default(),
+                    );
+                    assert_eq!(projections.resolution("dead"), Some(Disposition::Expired));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn approving_only_dead_hooks_clears_the_queue_and_reports_no_pending_request() {
+        with_app(
+            "app::approvals::tests::approving_only_dead_hooks_clears_the_queue_and_reports_no_pending_request",
+            |app, _| {
+                for control in [false, true] {
+                    app.runtime.sessions =
+                        vec![session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];
+                    app.runtime.sessions[0].approval_hold = true;
+                    for id in ["dead-one", "dead-two"] {
+                        hook_request(app, id).wait(Duration::ZERO);
+                    }
+                    let now = Instant::now();
+                    app.runtime.sessions[0].menu_absent_since = Some(now - APPROVAL_MENU_GRACE);
+                    app.runtime.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
+                    let error = if control {
+                        request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).error.unwrap()
+                    } else {
+                        app.runtime.approve(0, "dead-one", Decision::Allow, None).unwrap_err().message
+                    };
+                    assert_eq!(error, "no pending permission request");
+                    assert!(app.runtime.sessions[0].approvals.is_empty());
+                    assert!(!app.runtime.sessions[0].approval_hold);
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                    for id in ["dead-one", "dead-two"] {
+                        assert_eq!(app.runtime.resolution(id), Some(Disposition::Expired));
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn a_failed_approval_button_displays_the_decision_error() {
+        with_app("app::approvals::tests::a_failed_approval_button_displays_the_decision_error", |app, ctx| {
+            app.runtime.sessions =
+                vec![session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];
+            let reply = hook_request(app, "reviewed");
+            let mut time = 0.0;
+            let mut frame = |app: &mut Desktop<'_>, events| {
+                time += 0.05;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            app.draw(|backend, client| atomics_ui::topbar::notice(ui, backend, client));
+                            let layout = layout::compute(1400.0, 900.0, 1, 0, false, 0.0, &app.runtime.config.layout);
+                            app.tiles(ui, ui.max_rect(), &layout, &[0]);
+                        });
+                    },
+                );
+                let text: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(t) => {
+                            Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                output.drop_without_applying_deltas();
+                text
+            };
+            let pos = frame(app, vec![]).into_iter().find(|(text, _)| text == "Allow").unwrap().1;
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(!app.client.approval_decisions.is_empty(), "the button posted a decision");
+            reply.wait(Duration::ZERO);
+            app.runtime.drain_actions();
+            let error = "the permission hook has returned; answer in the agent terminal";
+            assert_eq!(app.runtime.toast.as_ref().unwrap().0, error);
+            app.apply_client_events(ctx);
+            assert!(app.client.approval_decisions.is_empty());
+            assert!(frame(app, vec![]).iter().any(|(text, _)| text.contains(error)), "the error must be drawn");
+        });
     }
 
     #[test]
@@ -1094,6 +1646,8 @@ mod tests {
                     native: None,
                     stash: Default::default(),
                 });
+                // The hook has returned before its hidden fallback menu can be answered.
+                assert!(reply.wait(Duration::ZERO).stdout.is_none());
                 assert!(
                     app.runtime
                         .approve(
@@ -1110,7 +1664,6 @@ mod tests {
                         .message
                         .contains("expanded")
                 );
-                assert!(reply.expired() || reply.wait(Duration::ZERO).stdout.is_none());
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("$ touch fixture") {
                     assert!(Instant::now() < deadline);
@@ -1170,8 +1723,8 @@ mod tests {
     }
 
     #[test]
-    fn expired_approvals_wait_for_menu_quiet_or_lifecycle() {
-        with_app("app::approvals::tests::expired_approvals_wait_for_menu_quiet_or_lifecycle", |app, _ctx| {
+    fn expired_hooks_wait_for_menu_quiet_or_lifecycle() {
+        with_app("app::approvals::tests::expired_hooks_wait_for_menu_quiet_or_lifecycle", |app, _ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             app.runtime.sessions = vec![session("stale", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
             let permission = atomics_core::hook::HookEvent::from_payload(&json!({
@@ -1243,7 +1796,7 @@ mod tests {
             let before = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
             app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
             app.runtime.expire_approvals(Instant::now());
-            assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+            assert!(app.runtime.sessions[0].approvals.is_empty(), "an edit menu cannot keep a dead command request");
             assert!(app.runtime.sessions[0].menu_absent_since.is_none(), "a menu drawn late resets the quiet period");
             assert_eq!(app.runtime.sessions[0].held, ["held while editing"]);
             let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"stale", "cwd":dir.path(), "tool_name":"Bash", "tool_input":{"command":"cat fixture"}})).unwrap();
@@ -1254,12 +1807,8 @@ mod tests {
                 delivered: 0,
                 approval_reply: None,
             });
-            assert_eq!(
-                app.runtime.sessions[0].approvals.len(),
-                1,
-                "an unrelated tool must leave the permission pending"
-            );
-            assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+            assert!(app.runtime.sessions[0].approvals.is_empty());
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
             assert!(app.runtime.sessions[0].approval_hold, "PreToolUse alone must not release input into a menu");
             assert_eq!(app.runtime.deliver(0, "still held"), Delivery::Held);
             app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;

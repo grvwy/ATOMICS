@@ -29,9 +29,9 @@ const DESKTOP_ONLY: &[&str] = &[
 /// Desktop-only crates the host target may still reach, and the only crates allowed to depend on them there.
 /// The wasm32 tree may not contain them at all.
 const HOST_ONLY_THROUGH: &[(&str, &[&str])] = &[
-    // egui's locks (parking_lot) and the Noise channel's randomness (getrandom) use libc on Unix; in a
-    // browser getrandom is crypto.getRandomValues and there is no libc.
-    ("libc", &["parking_lot_core", "getrandom"]),
+    // egui's locks (parking_lot), the Noise channel's randomness (getrandom) and ARM CPU detection
+    // (cpufeatures) use libc on Unix; the browser tree must still contain no libc.
+    ("libc", &["parking_lot_core", "getrandom", "cpufeatures"]),
 ];
 
 /// The crates that run in the browser.

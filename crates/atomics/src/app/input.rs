@@ -18,18 +18,21 @@ impl Desktop<'_> {
             && client.new_dialog.is_none()
             && client.rename.is_none()
             && client.quick_open.is_none()
-            && !client.remote_devices
-            && client.revoke_confirm.is_none()
+            && !client.ui.management.remote
+            && !client.ui.management.project
+            && !client.ui.management.settings
             && client.ui.confirm_close.is_none()
             && client.ui.confirm_plan_close.is_none()
             && !self.runtime.github.modal
             && self.runtime.tickets.panel.dialog.is_none()
+            && !client.ui.tickets.dialog
             && matches!(client.voice, Voice::Idle)
             && client.ui.history.can_go(-1);
         idle && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
     }
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
+        atomics_ui::trace_lane::shortcuts(ctx, &mut self.client.ui, &self.runtime.trace_data());
         let keys = self.runtime.config.keys.clone();
         let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s)));
         if pressed(&keys.voice) {
@@ -51,7 +54,7 @@ impl Desktop<'_> {
             self.client.focus_steer = true;
         }
         let editor_pressed = pressed(&keys.toggle_editor);
-        if editor_pressed && self.runtime.panel == PanelMode::Diff && self.runtime.github_pr_diff().is_some() {
+        if editor_pressed && self.runtime.panel == PanelMode::Diff && self.client.ui.pr_view.is_some() {
             // A pull request's files are in no worktree here: its diff stays read-only.
             self.runtime.toast(super::github::READ_ONLY);
         } else if editor_pressed && let Some(root) = self.runtime.diff_target() {
@@ -77,7 +80,7 @@ impl Desktop<'_> {
         self.github_focus(ctx);
         self.github_keys(ctx);
         // Shift+↓/↑ walk changed files; PageDown/PageUp walk hunks in the focused diff.
-        let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
+        let editor_focused = self.client.ui.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
         if !ctx.text_edit_focused() && !editor_focused {
             let diff_focused = self.runtime.diff_open
                 && self.runtime.panel == PanelMode::Diff
@@ -99,14 +102,11 @@ impl Desktop<'_> {
                     (0, false)
                 }
             });
-            if step != 0 && ctx.memory(|m| m.has_focus(trace_lane::focus_id())) {
-                // The trace lane has the focus: Shift+↓/↑ step its cards.
-                self.runtime.lane_step(step);
-            } else if step != 0
+            if step != 0
                 // A pull request diff on screen takes the same keys.
                 && self.runtime.panel == PanelMode::Diff
-                && self.runtime.github_pr_diff().is_some()
-                && let Some((_, state)) = self.client.github.pr_view.as_mut()
+                && self.client.ui.pr_view.is_some()
+                && let Some((_, state)) = self.client.ui.pr_view.as_mut()
             {
                 if hunk {
                     state.step_hunk(step);
@@ -115,21 +115,26 @@ impl Desktop<'_> {
                 }
                 self.send(Command::OpenDiff);
                 self.client.focus_terminal = None;
-                self.client.focus_editor = false;
+                self.client.ui.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
             } else if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
                 // The Tickets panel takes Shift+↓/↑; it pages with PageUp/PageDown itself.
                 self.client.focus_terminal = None;
-                self.client.focus_editor = false;
+                self.client.ui.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                self.runtime.tickets_step(step);
+                if self.client.ui.tickets.active() {
+                    let ui = &mut self.client.ui;
+                    ui.tickets.step(step, ctx.input(|i| i.time), &mut ui.commands);
+                } else {
+                    self.runtime.tickets_step(step);
+                }
             } else if step != 0
                 && let Some(root) = self.runtime.diff_target()
             {
                 self.send(Command::OpenDiff);
                 self.send(Command::SetPanel(PanelMode::Diff));
                 self.client.focus_terminal = None;
-                self.client.focus_editor = false;
+                self.client.ui.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 let state = self.client.diff_views.entry(root.clone()).or_default();
                 let target = if hunk { state.step_hunk(step) } else { state.step(step) };
@@ -150,9 +155,17 @@ impl Desktop<'_> {
         if pressed(&keys.forward) {
             self.draw(atomics_ui::nav::forward);
         }
+        if self.runtime.panel == PanelMode::Tickets
+            && self.runtime.diff_open
+            && self.client.ui.tickets.read.is_some()
+            && pressed(&keys.plan_with_chief)
+        {
+            self.client.ui.tickets.dialog = true;
+        }
         // Plan with chief, from a ticket the panel is reading.
         if self.runtime.panel == PanelMode::Tickets
             && self.runtime.diff_open
+            && !self.client.ui.tickets.active()
             && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read
             && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
             && pressed(&keys.plan_with_chief)
@@ -163,7 +176,7 @@ impl Desktop<'_> {
             self.runtime.toggle_tickets();
             if self.runtime.panel == PanelMode::Tickets {
                 self.client.focus_terminal = None;
-                self.client.focus_editor = false;
+                self.client.ui.focus_editor = false;
                 if self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read {
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 }
@@ -174,6 +187,7 @@ impl Desktop<'_> {
         // Alt+← goes back along the tickets read, only while the panel holds the keys.
         if self.runtime.panel == PanelMode::Tickets
             && self.runtime.diff_open
+            && !self.client.ui.tickets.active()
             && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read
             && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, Key::ArrowLeft))
@@ -183,6 +197,7 @@ impl Desktop<'_> {
         // Escape in a ticket goes back to the list; the panel keeps the keys.
         if self.runtime.panel == PanelMode::Tickets
             && self.runtime.diff_open
+            && !self.client.ui.tickets.active()
             && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read
             && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
@@ -193,6 +208,7 @@ impl Desktop<'_> {
         if self.runtime.tickets.config.as_ref().is_some_and(|config| config.has_views())
             && self.runtime.panel == PanelMode::Tickets
             && self.runtime.diff_open
+            && !self.client.ui.tickets.active()
             && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Find
             && ctx.memory(|m| m.has_focus(diff_view::focus_id()) || m.has_focus(tickets_panel::query_id()))
         {
@@ -255,7 +271,7 @@ impl Desktop<'_> {
                 self.send(Command::Activate { session: id.clone(), open_diff: true });
                 self.client.focus_terminal = None;
                 if self.runtime.panel == PanelMode::Editor {
-                    self.client.focus_editor = true;
+                    self.client.ui.focus_editor = true;
                     // A worktree's editor is started lazily. Selecting it in editor mode
                     // must not leave the previous agent's terminal holding the keys.
                     ctx.memory_mut(|m| {
@@ -280,24 +296,15 @@ impl Desktop<'_> {
                     }
                 } else if self.runtime.panel == PanelMode::Tickets {
                     // Find stays in Find; Read shows the agent's ticket.
-                    self.client.focus_editor = false;
+                    self.client.ui.focus_editor = false;
                     self.runtime.tickets_retarget(&id);
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 } else {
-                    self.client.focus_editor = false;
+                    self.client.ui.focus_editor = false;
                     self.send(Command::SetPanel(PanelMode::Diff));
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 }
             }
-        }
-        // Escape from the trace lane returns to the terminal. egui may already have dropped the
-        // focus on that Escape, so the lane remembers that it had it last frame.
-        if (self.runtime.lane.had_focus || ctx.memory(|m| m.has_focus(trace_lane::focus_id())))
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
-        {
-            self.runtime.lane.had_focus = false;
-            ctx.memory_mut(|m| m.surrender_focus(trace_lane::focus_id()));
-            self.client.focus_terminal = self.runtime.chief_session_id().map(str::to_string);
         }
         if ctx.memory(|m| m.has_focus(diff_view::focus_id())) {
             let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
@@ -306,7 +313,7 @@ impl Desktop<'_> {
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(text) | egui::Event::Paste(text) if !text.is_empty()))
             });
-            if self.client.focus_editor {
+            if self.client.ui.focus_editor {
                 ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
             } else if escape
                 || typing
@@ -341,9 +348,12 @@ impl Desktop<'_> {
 
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         self.quick_open_dialog(ctx);
-        self.remote_devices_dialog(ctx);
+        if let Some(open) = self.client.show_settings.take() {
+            self.client.ui.management.settings = open;
+        }
+        self.draw(|backend, client| atomics_ui::management::dialogs(ctx, backend, client));
         self.cleanup_dialog(ctx);
-        self.config_proposal_dialog(ctx);
+
         if let Some((id, _)) = self.client.confirm_plan_close.clone() {
             if let Some(index) =
                 self.runtime.plans.iter().position(|plan| plan.id == id && plan.status == PlanStatus::Open)
@@ -704,7 +714,7 @@ mod tests {
                 assert_eq!(app.runtime.diff_target(), Some(project.join(format!("task-{}", n + 1))));
                 assert!(app.runtime.diff_open);
                 if n % 3 == 1 {
-                    assert!(app.runtime.panel == PanelMode::Editor && app.client.focus_editor);
+                    assert!(app.runtime.panel == PanelMode::Editor && app.client.ui.focus_editor);
                 } else {
                     assert!(app.runtime.panel == PanelMode::Diff);
                     assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
@@ -754,7 +764,7 @@ mod tests {
             app.sync_diffs();
             let terminal = egui::Id::NULL.with("agent-terminal");
             let editor = egui::Id::NULL.with("editor-terminal");
-            app.client.editor_id = Some(editor);
+            app.client.ui.editor_id = Some(editor);
             for (arrow, path) in
                 [(Key::ArrowDown, "first.rs"), (Key::ArrowDown, "second.rs"), (Key::ArrowUp, "first.rs")]
             {
@@ -1197,7 +1207,7 @@ mod tests {
             );
             assert_eq!(app.runtime.active.as_deref(), Some("second"));
             assert!(app.runtime.panel == PanelMode::Editor);
-            assert!(ctx.memory(|m| m.has_focus(app.client.editor_id.unwrap())));
+            assert!(ctx.memory(|m| m.has_focus(app.client.ui.editor_id.unwrap())));
             for code in [Key::ArrowDown, Key::ArrowUp, Key::PageUp, Key::Home, Key::End, Key::Escape] {
                 diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::NONE)]);
             }
@@ -1235,7 +1245,7 @@ mod tests {
             let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
             let started = Instant::now();
             diff_frame(app, ctx, vec![key(Key::Num2, Key::Num2, modifiers)]);
-            assert!(ctx.memory(|m| m.has_focus(app.client.editor_id.unwrap())));
+            assert!(ctx.memory(|m| m.has_focus(app.client.ui.editor_id.unwrap())));
             assert!(app.runtime.editors.contains_key(&second));
             let deadline = started + crate::test_support::scaled_timeout(Duration::from_secs(4));
             while started.elapsed() < Duration::from_millis(1500) || !second.join("editor.bin").exists() {

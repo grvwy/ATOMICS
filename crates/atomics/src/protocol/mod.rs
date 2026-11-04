@@ -165,6 +165,7 @@ impl Server {
         let pending = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(session::Shared {
             hub: hub.clone(),
+            projections: projections.clone(),
             diffs,
             screens: screens.clone(),
             commands,

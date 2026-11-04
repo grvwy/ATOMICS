@@ -3,59 +3,6 @@ use super::*;
 pub(super) use atomics_ui::topbar::record_item;
 
 impl Desktop<'_> {
-    /// Phone and browser access through a rendezvous service, when `[remote.rendezvous]` is
-    /// enabled: "Remote" in the success colour while online, with a dot in the warning colour while
-    /// it waits or has stopped, or while the operation journal cannot be written; muted while it
-    /// connects. The hover says why; a click opens Remote devices (pairing and revoking).
-    fn rendezvous_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
-        use crate::protocol::rendezvous::Phase;
-        let Some(status) = self.runtime.rendezvous_status() else { return };
-        let palette = self.palette();
-        let journal = self.runtime.journal_problem();
-        let (text, color) = match status.phase {
-            _ if journal.is_some() => ("Remote ●".to_string(), palette.warning),
-            Phase::Online => ("Remote".to_string(), palette.success),
-            Phase::Waiting | Phase::Stopped => ("Remote ●".to_string(), palette.warning),
-            Phase::Starting | Phase::Registering | Phase::Connecting => ("Remote …".to_string(), palette.muted),
-        };
-        let service = if status.host.is_empty() {
-            status.service.clone()
-        } else {
-            format!("{} ({})", status.service, status.host)
-        };
-        let state = match status.phase {
-            Phase::Online => match status.channels {
-                0 => "online, no browser connected".to_string(),
-                1 => "online, 1 browser connected".to_string(),
-                n => format!("online, {n} browsers connected"),
-            },
-            Phase::Starting => "starting".into(),
-            Phase::Registering => "registering this host".into(),
-            Phase::Connecting => "connecting".into(),
-            Phase::Waiting => "waiting to try again".into(),
-            Phase::Stopped => "stopped".into(),
-        };
-        let mut hover = format!("Phone and browser access through {service}: {state}");
-        if !status.registered && status.phase != Phase::Online {
-            hover.push_str("\nThis host is not registered yet.");
-        }
-        for note in status.note.iter().chain(&journal) {
-            hover.push('\n');
-            hover.push_str(note);
-        }
-        if self.runtime.remote_devices().is_some() {
-            hover.push_str("\nClick to pair a phone or browser, or to revoke one.");
-        }
-        let response = ui.selectable_label(self.client.remote_devices, RichText::new(text).color(color));
-        record_item(ui, "Remote", &response);
-        if response.on_hover_text(hover).clicked() && self.runtime.remote_devices().is_some() {
-            self.client.remote_devices = !self.client.remote_devices;
-            if in_menu {
-                ui.close();
-            }
-        }
-    }
-
     /// The ATOMICS VM on a Mac with its bundle installed (docs/nixos-vm.md): "VM" with its state, and a
     /// menu that starts or stops it. Agents of this window run on this Mac unless the config's agents
     /// are the bundle's wrappers; `atomics --connect vm` runs the window on the VM's host instead.
@@ -117,7 +64,7 @@ impl Desktop<'_> {
         self.draw(|backend, client| atomics_ui::signin::top_bar_item(ui, backend, client));
         self.draw(|backend, client| atomics_ui::topbar::workspace_menu(ui, backend, client));
         self.github_counter(ui, in_menu);
-        self.rendezvous_indicator(ui, in_menu);
+
         self.vm_indicator(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
@@ -136,28 +83,6 @@ impl Desktop<'_> {
                 self.runtime.connect_ticket_server();
                 ui.close();
             }
-        }
-    }
-
-    /// The Settings menu, last in the top bar; ctl's `show_settings` opens or closes it.
-    pub(super) fn settings_button(&mut self, ui: &mut egui::Ui) {
-        // Trying themes and toggling where they are saved keep the menu open.
-        let config =
-            egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-        let (response, _) = if egui::containers::menu::is_in_menu(ui) {
-            egui::containers::menu::SubMenuButton::new("Settings").config(config).ui(ui, |ui| self.settings_menu(ui))
-        } else {
-            egui::containers::menu::MenuButton::new("Settings").config(config).ui(ui, |ui| self.settings_menu(ui))
-        };
-        record_item(ui, "Settings", &response);
-        if let Some(open) = self.client.show_settings.take() {
-            let id = egui::Popup::default_response_id(&response);
-            if open {
-                egui::Popup::open_id(ui.ctx(), id);
-            } else {
-                egui::Popup::close_id(ui.ctx(), id);
-            }
-            ui.ctx().request_repaint();
         }
     }
 }
@@ -185,6 +110,7 @@ mod tests {
                     .exact_size(34.0)
                     .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 4)))
                     .show(ui, |ui| app.top_bar(ui));
+                app.draw(|backend, client| atomics_ui::management::dialogs(ui.ctx(), backend, client));
             },
         );
         app.runtime.drain_actions();
@@ -253,7 +179,7 @@ mod tests {
         app.runtime.config_error = Some("Invalid config fixture".into());
         app.runtime.hook_error = Some("Offline hook fixture".into());
         app.runtime.heartbeat.last = Some((atomics_core::store::now(), vec![]));
-        app.client.load = (Instant::now(), Some(123.4));
+        app.runtime.resources.load = Some(123.4);
     }
 
     #[test]
@@ -745,7 +671,7 @@ mod tests {
                 }
                 click(app, ctx, width, "+ New");
                 assert!(app.client.new_dialog.is_some(), "width={width}: new action");
-                for (action, entry) in [("Project", "Open project…"), ("Settings", "Edit config")] {
+                for (action, entry) in [("Project", "Open project…"), ("Settings", "Effective configuration")] {
                     if collapsed {
                         click(app, ctx, width, "Actions");
                     }
@@ -761,6 +687,7 @@ mod tests {
                         "width={width}: {action} menu did not open"
                     );
                     output.drop_without_applying_deltas();
+                    app.client.ui.management.settings = false;
                     render(
                         app,
                         ctx,

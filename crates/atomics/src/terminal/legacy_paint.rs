@@ -179,5 +179,5 @@ fn named(palette: &Palette, name: NamedColor) -> Color32 {
 
 /// The old `Palette::dim`, independent of the shared painter's.
 fn dim(palette: &Palette, color: Color32) -> Color32 {
-    crate::theme::lerp(palette.terminal, color, 0.62)
+    atomics_ui::theme::lerp(palette.terminal, color, 0.62)
 }

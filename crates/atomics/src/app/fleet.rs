@@ -117,6 +117,7 @@ pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Op
 /// one per egui id.
 pub(super) struct Terminals<'a> {
     pub(super) sessions: &'a [Session],
+    pub(super) editors: &'a HashMap<PathBuf, Terminal>,
     pub(super) views: &'a mut HashMap<egui::Id, TerminalView>,
 }
 
@@ -131,7 +132,14 @@ impl TerminalSurface for Terminals<'_> {
         metrics: &Metrics,
         palette: &Palette,
     ) -> egui::Response {
-        match self.sessions.get(index).filter(|s| s.id == session).and_then(|s| s.terminal.as_ref()) {
+        let terminal =
+            self.sessions.get(index).filter(|s| s.id == session).and_then(|s| s.terminal.as_ref()).or_else(|| {
+                self.editors
+                    .iter()
+                    .find(|(root, _)| atomics_core::projection::editor_terminal(&root.to_string_lossy()) == session)
+                    .map(|(_, t)| t)
+            });
+        match terminal {
             Some(terminal) => self.views.entry(id).or_default().show(terminal, ui, rect, id, metrics, palette),
             // Not reached: views ask only for sessions with a terminal, from the same model.
             None => ui.interact(rect, id, Sense::click()),

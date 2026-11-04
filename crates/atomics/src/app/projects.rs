@@ -145,6 +145,12 @@ impl State {
     }
 
     pub(super) fn save_workspace(&mut self, name: &str) {
+        if let Err(error) = self.save_workspace_checked(name) {
+            self.toast(error);
+        }
+    }
+
+    pub(super) fn save_workspace_checked(&mut self, name: &str) -> Result<(), String> {
         let mut ws = match Workspace::load(name) {
             Ok(ws) => ws,
             Err(err)
@@ -152,21 +158,16 @@ impl State {
             {
                 Workspace::default()
             }
-            Err(err) => {
-                self.toast(format!("{err:#}"));
-                return;
-            }
+            Err(err) => return Err(format!("{err:#}")),
         };
         ws.name = name.trim().to_string();
         ws.projects = self.open_projects.clone();
-        match ws.save() {
-            Ok(file) => {
-                self.workspace = Some(ws.name);
-                self.remember_projects();
-                self.toast(format!("Saved {}", paths::display(&file)));
-            }
-            Err(err) => self.toast(format!("{err:#}")),
-        }
+        let file = ws.save().map_err(|err| format!("{err:#}"))?;
+        self.workspace = Some(ws.name);
+        self.remember_projects();
+        self.apply_config();
+        self.toast(format!("Saved {}", paths::display(&file)));
+        Ok(())
     }
 
     /// The open project a folder belongs to.

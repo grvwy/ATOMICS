@@ -37,6 +37,7 @@ pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo
 
 fn plan(id: &str, goal: &str) -> PlanInfo {
     PlanInfo {
+        ticket_tree: None,
         id: id.into(),
         status: PlanStatus::Open,
         goal: goal.into(),
@@ -107,6 +108,22 @@ fn file_diff() -> FileDiff {
 struct FakeDiffs(Mutex<HashMap<String, (u64, FileDiff)>>);
 
 impl DiffSource for FakeDiffs {
+    fn folder_revision(&self, worktree: &str) -> Option<u64> {
+        self.0.lock().unwrap().get(worktree).map(|(revision, _)| *revision)
+    }
+
+    fn folder(
+        &self,
+        worktree: &str,
+        path: &str,
+        offset: u32,
+        budget: usize,
+    ) -> Result<atomics_core::folder::Page, wire::WireError> {
+        let revision =
+            self.folder_revision(worktree).ok_or_else(|| wire::WireError::new(ErrorCode::NotFound, "no listing"))?;
+        let paths: Vec<_> = (0..300).map(|i| format!("src/file{i:03}.rs")).collect();
+        atomics_core::folder::page(paths.iter().map(String::as_str), worktree, path, revision, offset, budget)
+    }
     fn file(&self, worktree: &str, path: &str) -> Option<(u64, FileDiff)> {
         let files = self.0.lock().unwrap();
         let (revision, file) = files.get(worktree)?;
@@ -160,6 +177,71 @@ fn start() -> Fixture {
     fixture
 }
 
+#[test]
+fn folder_subscriptions_page_follow_changes_and_stop_on_unsubscribe() {
+    use wire::Topic;
+    let f = start();
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.sync_until(|m| !m.diffs.is_empty());
+    let topic = Topic::Folder { worktree: "/w/a".into(), path: "src".into() };
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![topic.clone()] }));
+    let page = loop {
+        if let Message::FolderPage(page) = client.next().unwrap().message {
+            break page;
+        }
+    };
+    assert_eq!(page.entries.len(), atomics_core::folder::PAGE_ENTRIES);
+    assert_eq!((page.offset, page.next_offset), (0, Some(128)));
+    client.send(&Envelope::new(Message::FolderGet {
+        worktree: "/w/a".into(),
+        path: "src".into(),
+        revision: page.revision,
+        offset: 128,
+    }));
+    let second = loop {
+        if let Message::FolderPage(page) = client.next().unwrap().message {
+            break page;
+        }
+    };
+    assert_eq!(second.offset, 128);
+    assert!(page.entries.last().unwrap().path < second.entries[0].path);
+    f.diffs.0.lock().unwrap().get_mut("/w/a").unwrap().0 = 2;
+    let changed = loop {
+        if let Message::FolderPage(page) = client.next().unwrap().message {
+            break page;
+        }
+    };
+    assert_eq!((changed.revision, changed.offset), (Seq(2), 0));
+    client.send(&Envelope::new(Message::FolderGet {
+        worktree: "/w/a".into(),
+        path: "src".into(),
+        revision: Seq(1),
+        offset: 128,
+    }));
+    assert!(matches!(client.next().unwrap().message, Message::Error { code: ErrorCode::StaleRevision, .. }));
+    client.send(&Envelope::new(Message::Unsubscribe { topics: vec![topic] }));
+    client.send(&Envelope::new(Message::Ping { nonce: Some("unsubscribed".into()) }));
+    while !matches!(client.next().unwrap().message, Message::Pong { .. }) {}
+    f.diffs.0.lock().unwrap().get_mut("/w/a").unwrap().0 = 3;
+    client.send(&Envelope::new(Message::Ping { nonce: Some("after-change".into()) }));
+    assert!(matches!(client.next().unwrap().message, Message::Pong { .. }));
+
+    let mut old = TestClient::connect(f.server.addr(), f.server.token());
+    old.send(&Envelope::new(Message::Hello {
+        client_id: "old-explorer".into(),
+        versions: vec![VERSION],
+        capabilities: vec!["board".into(), "diffs".into()],
+        prior_epoch: None,
+        prior_cursor: None,
+    }));
+    old.sync_until(|m| !m.diffs.is_empty());
+    old.send(&Envelope::new(Message::Subscribe {
+        topics: vec![Topic::Folder { worktree: "/w/a".into(), path: String::new() }],
+    }));
+    assert!(matches!(old.next().unwrap().message, Message::Error { code: ErrorCode::Unauthorised, .. }));
+}
+
 fn board_matches(m: &Mirror, p: &Projections) -> bool {
     fn sorted<T: Clone>(v: &[T], key: impl Fn(&T) -> String) -> Vec<T> {
         let mut v = v.to_vec();
@@ -178,6 +260,7 @@ pub(crate) struct TestClient {
     pub(crate) ws: WebSocket<TcpStream>,
     pub mirror: Mirror,
     pub welcome: Option<Envelope>,
+    pub resolutions: HashMap<String, wire::Disposition>,
 }
 
 impl TestClient {
@@ -205,7 +288,7 @@ impl TestClient {
             headers.insert("Sec-WebSocket-Protocol", wire::SUBPROTOCOL.parse().unwrap());
         }
         match tungstenite::client(request, stream) {
-            Ok((ws, _)) => Ok(Self { ws, mirror: Mirror::default(), welcome: None }),
+            Ok((ws, _)) => Ok(Self { ws, mirror: Mirror::default(), welcome: None, resolutions: HashMap::new() }),
             Err(HandshakeError::Failure(e)) => Err(e),
             Err(HandshakeError::Interrupted(_)) => panic!("the upgrade timed out"),
         }
@@ -246,6 +329,9 @@ impl TestClient {
     /// Read one frame and apply it to the mirror.
     pub(crate) fn step(&mut self) -> Option<Envelope> {
         let envelope = self.next()?;
+        if let Message::ApprovalResolved { id, disposition, .. } = &envelope.message {
+            self.resolutions.insert(id.clone(), *disposition);
+        }
         if matches!(envelope.message, Message::Welcome { .. }) {
             self.welcome = Some(envelope.clone());
         }
@@ -766,7 +852,10 @@ fn the_hosts_own_state_reaches_a_client_that_asked_for_it_and_is_skipped_for_one
     assert!(!may.contains(&atomics_core::ops::Grant::Host), "host_command needs the host capability: {may:?}");
 
     let expired = HostInfo {
+        projects: Vec::new(),
+        resources: Some(atomics_core::projection::ResourceInfo { load: Some(4.2), cores: 8, ..Default::default() }),
         workspace: Some("team".into()),
+        tickets: None,
         workspaces: vec!["team".into()],
         sign_in: Some(SignInInfo {
             system: "tracker".into(),
@@ -777,6 +866,7 @@ fn the_hosts_own_state_reaches_a_client_that_asked_for_it_and_is_skipped_for_one
             rejected: None,
             browser_failed: false,
         }),
+        ..HostInfo::default()
     };
     f.projections.publish_host(expired.clone());
     new.sync_until(|m| m.host == expired);
@@ -1151,4 +1241,96 @@ fn the_advertisement_a_stopped_server_removes_is_only_its_own() {
     std::fs::write(&path, serde_json::to_vec(&theirs).unwrap()).unwrap();
     f.server.stop();
     assert!(path.exists(), "a file that is not this server's stays");
+}
+
+#[test]
+fn trace_is_paged_live_and_only_sent_under_its_capability() {
+    use atomics_core::trace::{TraceLog, TraceState};
+    use atomics_core::trace_feed::TraceData;
+    use atomics_core::{hook::HookEvent, tickets::Cleaner};
+    use serde_json::json;
+    let f = start_with(ServerConfig { frame_budget: 4096, ..config() });
+    let mut log = TraceLog::default();
+    for n in 0..100 {
+        let hook = HookEvent::from_payload(&json!({
+            "session_id": "chief", "hook_event_name": "PreToolUse", "tool_name": "mcp__example__lookup",
+            "tool_use_id": format!("call-{n}"), "tool_input": {"query": "hello", "api_key": "do-not-send"}
+        }))
+        .unwrap();
+        log.ingest(&hook, None, &Cleaner::default(), n).unwrap();
+    }
+    let data =
+        TraceData { session: Some("chief".into()), entries: log.entries.into_iter().collect(), ..Default::default() };
+    f.projections.trace.publish(data.clone());
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    assert!(matches!(client.next().unwrap().message, Message::Welcome { .. }));
+    assert!(matches!(client.next().unwrap().message, Message::StateSnapshot { .. }));
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Trace] }));
+    assert_eq!(client.next().unwrap().message, Message::TraceChanged { revision: Seq(1) });
+    let mut offset = 0;
+    let mut entries = Vec::new();
+    loop {
+        client.send(
+            &Envelope::new(Message::TraceGet { revision: Seq(1), offset, limit: u32::MAX })
+                .reply_to(Some("page".into())),
+        );
+        let envelope = loop {
+            let envelope = client.next().unwrap();
+            if !matches!(envelope.message, Message::TraceChanged { .. }) {
+                break envelope;
+            }
+        };
+        assert_eq!(envelope.request_id.as_deref(), Some("page"));
+        assert!(wire::encode(&envelope).unwrap().len() <= 4096);
+        let Message::TracePage(page) = envelope.message else { panic!("expected page") };
+        if page.offset == 0 {
+            let mut newer = data.clone();
+            newer.entries[0].state = TraceState::Ok;
+            f.projections.trace.publish(newer);
+        }
+        entries.extend(page.data.entries);
+        match page.next_offset {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(entries, data.entries);
+    assert!(!serde_json::to_string(&entries).unwrap().contains("do-not-send"));
+    // A completion replaces a running call even though its sequence number did not change.
+    let mut completed = data;
+    completed.entries[1].state = TraceState::Ok;
+    f.projections.trace.publish(completed);
+    assert_eq!(client.next().unwrap().message, Message::TraceChanged { revision: Seq(3) });
+    client.send(&Envelope::new(Message::TraceGet { revision: Seq(1), offset: 0, limit: 1 }));
+    assert!(matches!(client.next().unwrap().message, Message::Error { code: ErrorCode::StaleRevision, .. }));
+    client.send(&Envelope::new(Message::Unsubscribe { topics: vec![wire::Topic::Trace] }));
+    client.send(&Envelope::new(Message::Ping { nonce: Some("unsubscribed".into()) }));
+    assert!(matches!(client.next().unwrap().message, Message::Pong { .. }));
+    f.projections.trace.publish(Default::default());
+    client.send(&Envelope::new(Message::Ping { nonce: Some("quiet".into()) }));
+    assert!(matches!(client.next().unwrap().message, Message::Pong { .. }));
+    // Reconnect/resubscribe tells the latest revision even when the board cursor never moved.
+    client.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Trace] }));
+    assert_eq!(client.next().unwrap().message, Message::TraceChanged { revision: Seq(4) });
+
+    let mut old = TestClient::connect(f.server.addr(), f.server.token());
+    old.send(&Envelope::new(Message::Hello {
+        client_id: "old".into(),
+        versions: vec![VERSION],
+        capabilities: vec!["board".into()],
+        prior_epoch: None,
+        prior_cursor: None,
+    }));
+    assert!(matches!(old.next().unwrap().message, Message::Welcome { .. }));
+    assert!(matches!(old.next().unwrap().message, Message::StateSnapshot { .. }));
+    old.send(&Envelope::new(Message::TraceGet { revision: Seq(4), offset: 0, limit: 1 }));
+    assert!(matches!(old.next().unwrap().message, Message::Error { code: ErrorCode::Unauthorised, .. }));
+    old.send(&Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Trace] }));
+    assert!(matches!(old.next().unwrap().message, Message::Error { code: ErrorCode::Unauthorised, .. }));
+    old.send(&Envelope::new(Message::Ping { nonce: None }));
+    assert!(matches!(old.next().unwrap().message, Message::Pong { .. }), "old clients receive no new message kinds");
 }

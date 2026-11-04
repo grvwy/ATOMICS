@@ -18,6 +18,11 @@ use crate::touch::Touch;
 /// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
 /// the desktop's client as the draw code that uses them moves into this crate.
 pub struct Client {
+    pub tickets: crate::tickets::Tickets,
+    pub pr_target: Option<(Option<String>, Option<PathBuf>)>,
+    pub pr_view: Option<(String, DiffState)>,
+    pub editor_id: Option<egui::Id>,
+    pub focus_editor: bool,
     /// The colors and fonts to draw with, made by the platform from the host's theme.
     pub palette: Arc<Palette>,
     /// What the user asked for while this UI drew, oldest first. The platform takes them after each
@@ -47,6 +52,7 @@ pub struct Client {
     pub icon: Option<egui::TextureHandle>,
     /// The name typed for saving the open projects as a workspace.
     pub workspace_input: String,
+    pub management: crate::management::State,
     /// The address being pasted back for the ticket system's sign-in.
     pub sign_in_paste: String,
     /// The sign-in's manual steps (the link and the paste box) show although the host opened a browser.
@@ -61,6 +67,8 @@ pub struct Client {
     pub touch: Option<Touch>,
     /// The places this window showed before and after the one on screen ([`crate::nav`]).
     pub history: History,
+    /// The trace lane's navigation and layout in this client.
+    pub lane: crate::trace_lane::Lane,
 }
 
 impl Default for Client {
@@ -68,8 +76,13 @@ impl Default for Client {
     fn default() -> Self {
         let tokens = atomics_core::theme::builtin(atomics_core::theme::DEFAULT).expect("the default theme is built in");
         Self {
+            pr_target: None,
+            pr_view: None,
+            editor_id: None,
+            focus_editor: false,
             palette: Arc::new(Palette::new(&tokens, Fonts::default())),
             commands: Vec::new(),
+            tickets: crate::tickets::Tickets::default(),
             expanded_tasks: HashSet::new(),
             confirm_plan_close: None,
             approval_decisions: HashSet::new(),
@@ -82,6 +95,7 @@ impl Default for Client {
             focus_terminal: None,
             icon: None,
             workspace_input: String::new(),
+            management: crate::management::State::default(),
             sign_in_paste: String::new(),
             sign_in_manual: false,
             steer_text: String::new(),
@@ -89,6 +103,7 @@ impl Default for Client {
             focus_steer: false,
             touch: None,
             history: History::default(),
+            lane: Default::default(),
         }
     }
 }

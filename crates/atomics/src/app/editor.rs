@@ -29,15 +29,24 @@ impl State {
         self.panel = PanelMode::Editor;
         self.diff_open = true;
         self.client_events.push(ClientEvent::Edit { root: root.to_path_buf(), path: path.map(str::to_string) });
+        if let Err(error) = self.edit_terminal(root, path, line) {
+            self.toast(error);
+        }
+    }
+
+    /// Host operation: starts or types into the PTY without changing any client's view.
+    pub(super) fn edit_terminal(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
+        if let Some(path) = path {
+            self.editor_files.insert(root.to_path_buf(), path.to_string());
+        }
         if let Some(editor) = self.editors.get(root).filter(|e| !e.exited()) {
             if let Some(path) = path {
                 editor.type_steps(self.config.editor.open_steps(path, line, false), Duration::ZERO);
             }
-            return;
+            return Ok(());
         }
         let Some((program, rest)) = self.config.editor.command.split_first() else {
-            self.toast("No editor configured ([editor] command)");
-            return;
+            return Err("No editor configured ([editor] command)".into());
         };
         let mut args = rest.to_vec();
         args.push(path.unwrap_or(".").to_string());
@@ -67,8 +76,9 @@ impl State {
                     Duration::from_millis(900),
                 );
                 self.editors.insert(root.to_path_buf(), editor);
+                Ok(())
             }
-            Err(err) => self.toast(format!("Could not start the editor: {err:#}")),
+            Err(err) => Err(format!("Could not start the editor: {err:#}")),
         }
     }
 }
@@ -85,76 +95,11 @@ pub(super) fn save_png(path: &Path, image: &egui::ColorImage) -> anyhow::Result<
 }
 
 impl Desktop<'_> {
+    #[cfg(test)]
     pub(super) fn editor_panel(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {
-        let p = self.palette();
-        ui.painter().rect_filled(rect, 0.0, p.terminal);
-        let header = rect.with_max_y(rect.top() + 30.0);
-        let body = rect.with_min_y(header.bottom());
-        ui.painter().rect_filled(header, 0.0, p.raised);
-        ui.painter().line_segment([header.left_bottom(), header.right_bottom()], Stroke::new(1.0, p.border));
-        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("editor-header")
-                .max_rect(header.shrink2(vec2(10.0, 3.0)))
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-        child.label(RichText::new("EDITOR").color(p.accent).strong().size(12.0));
-        child.label(RichText::new(&name).color(p.muted).size(12.0));
-        let editor_running = self.runtime.editors.get(root).is_some_and(|e| !e.exited());
-        let mut action = None;
-        child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("×").on_hover_text("Close the panel").clicked() {
-                action = Some("close");
-            }
-            if ui
-                .small_button("diff")
-                .on_hover_text(format!(
-                    "Back to the diff ({})",
-                    shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_editor)
-                ))
-                .clicked()
-            {
-                action = Some("diff");
-            }
-            if editor_running
-                && !self.runtime.config.editor.inlay_hints_keys.is_empty()
-                && ui.small_button("inlay hints").on_hover_text("Toggle the language server's inlay hints").clicked()
-            {
-                action = Some("hints");
-            }
+        self.draw_terminals(|backend, client, terminals| {
+            atomics_ui::editor::draw(ui, rect, root, backend, client, terminals)
         });
-        match action {
-            Some("close") => self.send(Command::CloseDiff),
-            Some("diff") => self.send(Command::SetPanel(PanelMode::Diff)),
-            Some("hints") => {
-                if let Some(editor) = self.runtime.editors.get(root) {
-                    editor.type_steps(self.runtime.config.editor.inlay_hints_keys.clone(), Duration::ZERO);
-                }
-            }
-            _ => {}
-        }
-
-        let metrics = self.metrics(ui);
-        let id = ui.scope_id().with(("editor", root));
-        self.client.editor_id = Some(id);
-        match self.runtime.editors.get_mut(root).filter(|e| !e.exited()) {
-            Some(editor) => {
-                if std::mem::take(&mut self.client.focus_editor) {
-                    ui.memory_mut(|m| m.request_focus(id));
-                }
-                self.client.terminal_views.entry(id).or_default().show(editor, ui, body, id, &metrics, &p);
-            }
-            None => {
-                self.runtime.editors.remove(root);
-                let mut child =
-                    ui.new_child(egui::UiBuilder::new().id_salt("editor-empty").max_rect(body.shrink(20.0)));
-                child.label(RichText::new("The editor is not running.").color(p.muted));
-                if child.button("Open editor").clicked() {
-                    self.send(Command::Edit { root: root.to_path_buf(), path: None, line: None });
-                }
-            }
-        }
     }
 
     pub(super) fn quick_open_dialog(&mut self, ctx: &egui::Context) {

@@ -44,6 +44,23 @@ use super::screens::Screens;
 
 /// Where `diff_get` finds hunks. Implemented over data the runtime thread published, never `State`.
 pub trait DiffSource: Send + Sync {
+    /// Reference-counted by folder subscription, including disconnects. Runtime work stays on the host.
+    fn watch_folder(&self, _worktree: &str, _watching: bool) {}
+    fn folder_revision(&self, _worktree: &str) -> Option<u64> {
+        None
+    }
+    fn folder(
+        &self,
+        _worktree: &str,
+        _path: &str,
+        _offset: u32,
+        _budget: usize,
+    ) -> Result<atomics_core::folder::Page, WireError> {
+        Err(WireError::new(ErrorCode::NotFound, "file listing is not ready"))
+    }
+    fn content(&self, _worktree: &str, _path: &str, _budget: usize) -> Result<(String, bool), WireError> {
+        Err(WireError::new(ErrorCode::NotFound, "no such worktree file"))
+    }
     /// The diff revision and the file whose new or old path is `path`.
     fn file(&self, worktree: &str, path: &str) -> Option<(u64, FileDiff)>;
     /// Whether `worktree`'s diff is no longer at `revision`, or went away lately: a file a client
@@ -105,6 +122,7 @@ impl Default for SessionConfig {
 
 pub struct Shared {
     pub hub: Arc<Mutex<Hub>>,
+    pub projections: Arc<atomics_core::projection::Projections>,
     pub diffs: Arc<dyn DiffSource>,
     pub screens: Arc<Screens>,
     /// Where mutations are carried out.
@@ -163,11 +181,21 @@ struct Out<'a> {
     link: &'a mut dyn Link,
     epoch: String,
     last_sent: Instant,
+    manages_host: bool,
 }
 
 impl Out<'_> {
     fn raw(&mut self, frame: &str) -> Result<(), LinkError> {
         self.last_sent = Instant::now();
+        if !self.manages_host && frame.contains("\"host\"") {
+            let mut value: serde_json::Value = serde_json::from_str(frame).map_err(|_| LinkError::Closed)?;
+            if let Some(pairing) =
+                value.pointer_mut("/host/management/remote/pairing").and_then(serde_json::Value::as_object_mut)
+            {
+                pairing.remove("link");
+            }
+            return self.link.send(&value.to_string());
+        }
         self.link.send(frame)
     }
 
@@ -194,7 +222,7 @@ fn link_ended(error: LinkError) -> Ended {
 
 pub fn serve(link: &mut dyn Link, peer: &Peer, shared: &Shared) -> Ended {
     let epoch = lock(&shared.hub).epoch().to_string();
-    let mut out = Out { link, epoch, last_sent: Instant::now() };
+    let mut out = Out { link, epoch, last_sent: Instant::now(), manages_host: false };
     let ended = run(&mut out, peer, shared);
     use atomics_core::tunnel::close;
     let (code, reason) = match &ended {
@@ -265,7 +293,11 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     if !terminals {
         capabilities.retain(|c| c != INPUT);
     }
+    if !capabilities.iter().any(|c| c == wire::HOST) {
+        capabilities.retain(|c| c != wire::EXPLORER);
+    }
     let may = role.may(&capabilities);
+    out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
     let (results_tx, results) = mpsc::channel();
     let mut follows = Follows {
         board: Narrowed::default(),
@@ -274,6 +306,14 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         input: terminals && capabilities.iter().any(|c| c == INPUT),
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
         host: capabilities.iter().any(|c| c == wire::HOST),
+        panels: capabilities.iter().any(|c| c == wire::PANELS),
+        explorer: capabilities.iter().any(|c| c == wire::EXPLORER),
+        complete: capabilities.iter().any(|c| c == wire::PLAN_COMPLETE),
+        folders: HashMap::new(),
+        trace: capabilities.iter().any(|c| c == wire::TRACE),
+        follows_trace: false,
+        trace_revision: None,
+        trace_page: None,
         may: may.clone(),
         client_id: client_id.clone(),
         device: peer.device.clone(),
@@ -305,6 +345,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         conversation(out, shared, &outbox, &mut follows)
     })();
     outbox.close();
+    for (worktree, _) in follows.folders.keys() {
+        shared.diffs.watch_folder(worktree, false);
+    }
     // Whatever lease this connection held ends with it: input sent on it can no longer land, and
     // a later connection starts without one.
     for session in &follows.screens {
@@ -343,7 +386,7 @@ impl Narrowed {
         match topic {
             Topic::Diff { worktree } => Some((&mut self.diffs, worktree.as_str())),
             Topic::Plan { id } => Some((&mut self.plans, id.as_str())),
-            Topic::Screen { .. } => None,
+            Topic::Screen { .. } | Topic::Folder { .. } | Topic::Trace => None,
         }
     }
 
@@ -379,6 +422,15 @@ struct Follows {
     mutations: bool,
     /// It negotiated `host`: it is sent `host_upsert`.
     host: bool,
+    panels: bool,
+    explorer: bool,
+    complete: bool,
+    folders: HashMap<(String, String), Option<u64>>,
+    trace: bool,
+    follows_trace: bool,
+    trace_revision: Option<u64>,
+    /// One immutable page chain per connection; newer live events cannot invalidate it.
+    trace_page: Option<Arc<atomics_core::projection::Snapshot<atomics_core::trace_feed::TraceData>>>,
     /// What its role and capabilities let it change, as its `welcome` said.
     may: Vec<Grant>,
     /// The ID it said hello with, which names its operations in the journal.
@@ -401,11 +453,17 @@ struct Follows {
 impl Follows {
     /// Topics of every kind, which `MAX_SUBSCRIPTIONS` bounds together.
     fn count(&self) -> usize {
-        self.board.diffs.len() + self.board.plans.len() + self.screens.len()
+        self.board.diffs.len()
+            + self.board.plans.len()
+            + self.screens.len()
+            + self.folders.len()
+            + usize::from(self.follows_trace)
     }
 
     fn has(&self, topic: &Topic) -> bool {
         match topic {
+            Topic::Folder { worktree, path } => self.folders.contains_key(&(worktree.clone(), path.clone())),
+            Topic::Trace => self.follows_trace,
             Topic::Diff { worktree } => self.board.diffs.contains(worktree),
             Topic::Plan { id } => self.board.plans.contains(id),
             Topic::Screen { session, .. } => self.screens.contains(session),
@@ -484,8 +542,33 @@ fn conversation(
             let reply = Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id);
             out.envelope(&reply).map_err(link_ended)?;
         }
+        if subscriptions.follows_trace {
+            let revision = shared.projections.trace.load().revision;
+            if subscriptions.trace_revision != Some(revision) {
+                out.envelope(&Envelope::host(&out.epoch, Message::TraceChanged { revision: Seq(revision) }))
+                    .map_err(link_ended)?;
+                subscriptions.trace_revision = Some(revision);
+            }
+        }
         if subscriptions.input {
             tell_leases(out, shared, subscriptions).map_err(link_ended)?;
+        }
+        // Folder feeds run on the host connection, independently of any UI frame. A replacement
+        // starts at offset zero, so clients discard pages from an older listing.
+        for ((worktree, path), sent) in &mut subscriptions.folders {
+            let revision = shared.diffs.folder_revision(worktree);
+            if revision.is_some() && revision != *sent {
+                match shared.diffs.folder(worktree, path, 0, shared.frame_budget.saturating_sub(2048)) {
+                    Ok(page) => {
+                        *sent = Some(page.revision.0);
+                        out.envelope(&Envelope::host(&out.epoch, Message::FolderPage(page))).map_err(link_ended)?;
+                    }
+                    Err(error) => {
+                        *sent = revision;
+                        out.error(error, None).map_err(link_ended)?;
+                    }
+                }
+            }
         }
         match out.link.recv(config.tick) {
             Ok(Some(frame)) => {
@@ -643,6 +726,13 @@ fn mutate(
     if !follows.mutations {
         return Err(refuse(ErrorCode::Unauthorised, "the mutations capability was not negotiated"));
     }
+    if matches!(&command, Command::HostCommand(c) if matches!(c.action,
+        atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
+        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief))
+        && (!follows.host || !follows.panels)
+    {
+        return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
+    }
     if !follows.may.contains(&command.grant()) {
         let why = if follows.may.is_empty() { "this client is view-only" } else { "this client may not do that" };
         return Err(refuse(ErrorCode::Unauthorised, why));
@@ -696,6 +786,17 @@ fn handle(
             // The whole list is checked first, so a refused request subscribes to nothing.
             let mut fresh = HashSet::new();
             for topic in &topics {
+                if let Topic::Folder { worktree, .. } = topic {
+                    if !subscriptions.explorer {
+                        return Err(refuse(ErrorCode::Unauthorised, "the explorer capability was not negotiated"));
+                    }
+                    if !lock(&shared.hub).has_worktree(worktree) {
+                        return Err(gone(WireError::new(ErrorCode::NotFound, "that worktree is no longer open")));
+                    }
+                }
+                if matches!(topic, Topic::Trace) && !subscriptions.trace {
+                    return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
+                }
                 if let Topic::Screen { session, .. } = topic {
                     if !subscriptions.terminals {
                         return Err(no_terminals());
@@ -733,9 +834,18 @@ fn handle(
                     }
                 }
             }
+            if topics.contains(&Topic::Trace) {
+                subscriptions.follows_trace = true;
+                subscriptions.trace_revision = None;
+            }
             // Board topics cannot fail, so they go in once every screen has.
             let before = subscriptions.board.clone();
             for topic in &topics {
+                if let Topic::Folder { worktree, path } = topic
+                    && subscriptions.folders.insert((worktree.clone(), path.clone()), None).is_none()
+                {
+                    shared.diffs.watch_folder(worktree, true);
+                }
                 if let Some((set, name)) = subscriptions.board.entry(topic) {
                     set.insert(name.to_string());
                 }
@@ -748,6 +858,16 @@ fn handle(
         Message::Unsubscribe { topics } => {
             let before = subscriptions.board.clone();
             for topic in topics {
+                if let Topic::Folder { worktree, path } = &topic
+                    && subscriptions.folders.remove(&(worktree.clone(), path.clone())).is_some()
+                {
+                    shared.diffs.watch_folder(worktree, false);
+                }
+                if topic == Topic::Trace {
+                    subscriptions.follows_trace = false;
+                    subscriptions.trace_page = None;
+                    subscriptions.trace_revision = None;
+                }
                 if let Topic::Screen { session, .. } = &topic
                     && subscriptions.screens.remove(session)
                 {
@@ -782,6 +902,31 @@ fn handle(
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
         }
+        Message::TraceGet { revision, offset, limit } => {
+            if !subscriptions.trace {
+                return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
+            }
+            let current = subscriptions
+                .trace_page
+                .as_ref()
+                .filter(|page| page.revision == revision.0)
+                .cloned()
+                .unwrap_or_else(|| shared.projections.trace.load());
+            if current.revision != revision.0 {
+                return Err(gone(WireError::new(
+                    ErrorCode::StaleRevision,
+                    "trace changed; request its latest revision",
+                )));
+            }
+            let room = shared
+                .frame_budget
+                .min(wire::MAX_FRAME_BYTES)
+                .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
+            let page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
+            subscriptions.trace_page = page.next_offset.is_some().then_some(current);
+            let reply = Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id);
+            Ok(out.envelope(&reply)?)
+        }
         Message::DiffGet { worktree, path, revision, offset } => {
             let Some((current, file)) = shared.diffs.file(&worktree, &path) else {
                 // The diff may have changed since the revision the client was told of the file in.
@@ -805,7 +950,38 @@ fn handle(
                 Err(e) => Err(Handled::Refused(e.into(), reply.request_id)),
             }
         }
-        Message::FileGet { .. } => Err(refuse(ErrorCode::NotFound, "this host does not serve file contents yet")),
+        Message::FolderGet { worktree, path, revision, offset } => {
+            if !subscriptions.explorer {
+                return Err(refuse(ErrorCode::Unauthorised, "the explorer capability was not negotiated"));
+            }
+            if !subscriptions.folders.contains_key(&(worktree.clone(), path.clone())) {
+                return Err(refuse(ErrorCode::NotFound, "subscribe to that folder first"));
+            }
+            let budget = shared
+                .frame_budget
+                .saturating_sub(256 + wire::json_len(&out.epoch) + id.as_deref().map_or(0, wire::json_len));
+            let page = shared.diffs.folder(&worktree, &path, offset, budget).map_err(gone)?;
+            if page.revision != revision {
+                return Err(gone(WireError::new(ErrorCode::StaleRevision, "folder listing changed; start again")));
+            }
+            Ok(out.envelope(&Envelope::host(&out.epoch, Message::FolderPage(page)).reply_to(id))?)
+        }
+        Message::FileGet { worktree, path } => {
+            if !subscriptions.explorer {
+                return Err(refuse(ErrorCode::Unauthorised, "the explorer capability was not negotiated"));
+            }
+            // JSON escaping takes at most six bytes for each byte of text.
+            let overhead = 256
+                + wire::json_len(&out.epoch)
+                + wire::json_len(&worktree)
+                + wire::json_len(&path)
+                + id.as_deref().map_or(0, wire::json_len);
+            let budget = shared.frame_budget.saturating_sub(overhead) / 6;
+            let (content, truncated) = shared.diffs.content(&worktree, &path, budget).map_err(gone)?;
+            Ok(out.envelope(
+                &Envelope::host(&out.epoch, Message::FileContent { worktree, path, content, truncated }).reply_to(id),
+            )?)
+        }
         Message::LeaseAcquire { session, takeover } => {
             let terminal = controllable(shared, subscriptions, &session).map_err(refusal)?;
             terminal.1.acquire(&subscriptions.me, takeover, Instant::now(), &shared.lease).map_err(refused)?;
@@ -871,6 +1047,16 @@ fn handle(
         | Message::ReviewCommand(_)
         | Message::SessionCommand(_)
         | Message::HostCommand(_)) => {
+            if matches!(&message, Message::PlanCommand(c) if c.action == atomics_core::ops::PlanAction::Complete)
+                && !subscriptions.complete
+            {
+                let Message::PlanCommand(c) = message else { unreachable!() };
+                return Err(Handled::Result(
+                    c.op,
+                    WireError::new(ErrorCode::Unauthorised, "the plan_complete capability was not negotiated").into(),
+                    id,
+                ));
+            }
             let command = Command::from_message(message).expect("a mutation");
             mutate(out, shared, subscriptions, command, id)
         }

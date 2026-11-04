@@ -1,5 +1,13 @@
 # Tickets
 
+The TICKETS sidebar and Tickets reader are shared by the desktop, native connected client and browser,
+including the phone layout. Hosts with the `host` capability publish the reader's safe profile and
+bounded replies, and accept ticket requests through `host_command`. Search text, selected results,
+breadcrumbs, recent reads and Plan with chief drafts belong to each client. Configured operation
+arguments and credentials stay on the host. Plan ticket trees travel with their plan projections so
+they can be chunked with the board. Older hosts keep their existing UI. The phone opens Tickets from
+its ⋯ menu; ticket chips open the same reader in every layout.
+
 ATOMICS plans can follow an external ticket system. A plan and each of its tasks can carry a ticket link.
 ATOMICS reads those tickets live and shows them on the board. When write operations are mapped, it moves
 their states as the work moves and comments as agents report. It tells the chief when someone changes a ticket.

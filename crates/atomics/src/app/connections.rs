@@ -73,6 +73,21 @@ impl Connections {
         self.definitions.iter().find(|definition| definition.name == name)
     }
 
+    pub(super) fn management_info(&self) -> serde_json::Value {
+        let rows: Vec<_> = self
+            .rows()
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "name": row.name, "status": row.status.as_ref().map(Status::label),
+                    "detail": row.detail, "env": row.env, "skipped": row.skipped,
+                    "busy": self.busy.contains(&row.name), "error": self.errors.get(&row.name),
+                })
+            })
+            .collect();
+        json!({ "rows": rows, "notes": self.notes, "error": self.registered.as_ref().and_then(|r| r.as_ref().err()), "refreshing": self.refreshing, "importing": self.importing })
+    }
+
     fn rows(&self) -> Vec<Row> {
         let registered = self.registered.as_ref().and_then(|listed| listed.as_ref().ok());
         let mut rows: Vec<Row> = registered
@@ -351,6 +366,7 @@ impl State {
 }
 
 /// What the Connections panel asks for.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Action {
     Refresh,
@@ -360,15 +376,8 @@ pub(super) enum Action {
     Add,
 }
 
+#[cfg(test)]
 impl Desktop<'_> {
-    pub(super) fn connections_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Connections", |ui| {
-            if let Some(action) = self.connections_panel(ui) {
-                self.connection_action(action);
-            }
-        });
-    }
-
     pub(super) fn connection_action(&mut self, action: Action) {
         let command = match action {
             Action::Refresh => Command::RefreshConnections,

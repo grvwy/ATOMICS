@@ -220,9 +220,52 @@ impl State {
     /// The ticket system's sign-in and the open workspace, for a client. A client's sign-in never opens a
     /// browser here: the client shows the address and pastes back where its browser ended. What becomes of
     /// the sign-in shows in the host's state, not in this outcome.
-    fn host_command(&mut self, command: HostCommand) -> Result<serde_json::Value, WireError> {
+    pub(super) fn host_command(&mut self, command: HostCommand) -> Result<serde_json::Value, WireError> {
         let rejected = |message: String| WireError::new(ErrorCode::Rejected, message);
         match command.action {
+            HostAction::Tickets { request, ticket } => {
+                self.ticket_ui_command(request, *ticket).map_err(rejected)?;
+                Ok(json!({ "queued": true }))
+            }
+            HostAction::Edit { root, path, line } => {
+                let root = PathBuf::from(root);
+                if !self.diffs.contains_key(&root) && !self.sessions.iter().any(|s| s.root() == root) {
+                    return Err(not_found("no worktree at that root"));
+                }
+                if path.as_ref().is_some_and(|p| {
+                    std::path::Path::new(p).is_absolute()
+                        || std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir))
+                }) {
+                    return Err(rejected("name a file inside the worktree".into()));
+                }
+                self.edit_terminal(&root, path.as_deref(), line).map_err(rejected)?;
+                if !self.editors.get(&root).is_some_and(|t| !t.exited()) {
+                    return Err(rejected("the editor could not be started".into()));
+                }
+                Ok(json!({ "terminal": atomics_core::projection::editor_terminal(&root.to_string_lossy()) }))
+            }
+            HostAction::EditorHints { root } => {
+                let editor = self
+                    .editors
+                    .get(std::path::Path::new(&root))
+                    .filter(|t| !t.exited())
+                    .ok_or_else(|| not_found("no running editor at that root"))?;
+                editor.type_steps(self.config.editor.inlay_hints_keys.clone(), std::time::Duration::ZERO);
+                Ok(json!({ "typed": true }))
+            }
+            HostAction::PullRequestDiff { key } => {
+                if !self.load_pull_request(&key) {
+                    return Err(not_found("no pull request with that key"));
+                }
+                Ok(json!({ "loading": key }))
+            }
+            HostAction::StartChief => {
+                if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
+                    self.sessions.retain(|s| !s.chief);
+                    self.start_chief(None).map_err(rejected)?;
+                }
+                Ok(json!({ "started": true }))
+            }
             HostAction::SignIn => {
                 self.start_client_sign_in().map_err(rejected)?;
                 Ok(json!({ "signing_in": true }))
@@ -242,6 +285,7 @@ impl State {
                 let projects = self.open_workspace(&name).map_err(rejected)?;
                 Ok(json!({ "workspace": name, "projects": projects }))
             }
+            action => self.manage(action),
         }
     }
 
@@ -295,6 +339,9 @@ impl State {
             }
             PlanAction::Archive => {
                 ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Archived }
+            }
+            PlanAction::Complete => {
+                ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Completed }
             }
         })
     }

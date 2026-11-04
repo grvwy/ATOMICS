@@ -77,6 +77,13 @@ impl Local<'_> {
 }
 
 impl Backend for Local<'_> {
+    fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
+        self.0.editor_infos()
+    }
+
+    fn pull_requests(&self) -> Vec<atomics_core::projection::PullRequestInfo> {
+        self.0.pull_request_infos()
+    }
     fn send(&self, command: atomics_ui::Command) {
         self.run(command);
     }
@@ -88,6 +95,14 @@ impl Backend for Local<'_> {
 
     fn launch_dir(&self) -> Option<PathBuf> {
         Some(self.0.launch_dir.clone())
+    }
+
+    fn ticket_tree(&self, plan: usize) -> Option<atomics_core::ticket_ui::TicketTree> {
+        self.0.plans.get(plan).and_then(|plan| self.0.ticket_tree(plan))
+    }
+
+    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
+        self.0.ticket_ui_info()
     }
 
     fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
@@ -230,6 +245,10 @@ impl Backend for Local<'_> {
     }
 
     fn diff(&self, root: &Path) -> Option<DiffSnapshot> {
+        if let Some((_, revision, prepared)) = self.0.pull_request_bodies().find(|(key, _, _)| Path::new(key) == root) {
+            return Some(DiffSnapshot { revision, prepared: Some(prepared), ..DiffSnapshot::default() });
+        }
+
         let data = self.0.diffs.get(root)?;
         Some(DiffSnapshot {
             revision: data.revision,
@@ -241,6 +260,18 @@ impl Backend for Local<'_> {
             file: data.file.clone(),
             file_error: data.file_error.clone(),
         })
+    }
+
+    fn trace_now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn trace(&self) -> atomics_core::trace_feed::TraceData {
+        self.0.trace_data()
     }
 
     fn chief(&self) -> ChiefView {
@@ -372,6 +403,10 @@ impl Backend for Local<'_> {
         }
     }
 
+    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
+        Some(self.0.management_info())
+    }
+
     fn project_menu(&self) -> ProjectMenu {
         let state = self.0;
         ProjectMenu {
@@ -391,6 +426,10 @@ impl Backend for Local<'_> {
 
     fn sign_in(&self) -> Option<atomics_ui::signin::SignInView> {
         self.0.sign_in_view()
+    }
+
+    fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
+        Some(self.0.resources.clone())
     }
 }
 
@@ -482,7 +521,6 @@ mod tests {
             let status = Command::SetTaskStatus { plan: 0, task: "c".into(), status: TaskStatus::Blocked };
             let update = PlanAction::Update { task: "c".into(), status: Some(TaskStatus::Blocked), note: None };
             assert_eq!(map(status), Remote::Send(vec![plan("op-4", update)]));
-            assert_eq!(map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed }), Remote::Unsupported);
             assert_eq!(map(Command::ApprovePlan(1)), Remote::Send(Vec::new()));
             let decide = Command::Decide { session: 0, approval: "ask".into(), decision: Decision::Deny };
             let answer =
@@ -512,9 +550,19 @@ mod tests {
             assert_eq!(map(Command::CloseSession("agent".into())), Remote::Send(vec![session("op-10", close)]));
             assert_eq!(map(Command::ToggleDiff), Remote::Client);
             assert_eq!(map(Command::ShowPlan(0)), Remote::Client);
-            assert_eq!(map(Command::OpenProject(root.clone())), Remote::Unsupported);
+            assert_eq!(
+                map(Command::OpenProject(root.clone())),
+                Remote::Send(vec![ops::Command::HostCommand(ops::HostCommand {
+                    op: "op-11".into(),
+                    action: ops::HostAction::OpenProject { path: worktree.clone() }
+                })])
+            );
             assert_eq!(map(Command::OpenTicket(Default::default())), Remote::Client);
             assert_eq!(map(Command::SyncTickets(0)), Remote::Unsupported);
+            assert_eq!(
+                map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed }),
+                Remote::Send(vec![plan("op-12", PlanAction::Complete)])
+            );
 
             // The host takes what the mapping sends: approving through the journal, as a protocol client does.
             let Remote::Send(mut sent) = Command::ApprovePlan(0).remote(&app.runtime.backend(), &mut String::new)

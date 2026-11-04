@@ -2,6 +2,8 @@
 //! the chief's ticket tools. ATOMICS's own task status stays authoritative: it pushes a
 //! state when its status changes, and reports changes made in the ticket system to
 //! the chief as `ticket` events instead of acting on them.
+mod client;
+
 use super::*;
 use crate::tickets::{TicketJob, TicketOp, TicketOutput};
 use atomics_core::tickets::{self as ticket, Author, TicketConfig, TicketDraft, TicketLink, TicketMode};
@@ -22,6 +24,7 @@ pub(super) struct Tag {
 
 #[derive(Clone, PartialEq)]
 enum Kind {
+    Client(String, Arc<TicketConfig>),
     Trace(u64),
     Whoami(Arc<TicketConfig>, u64),
     Outbox,
@@ -82,6 +85,7 @@ pub(super) struct Tickets {
     generations: HashMap<LinkKey, u64>,
     /// What the Tickets panel shows.
     pub(super) panel: super::tickets_panel::TicketsPanel,
+    pub(super) client_replies: Vec<atomics_core::ticket_ui::TicketReply>,
     /// Sign-in state and jobs of the ticket server.
     pub(super) sign: super::tickets_signin::SignUi,
     pub(super) trace_jobs: HashMap<u64, (Arc<TicketConfig>, super::trace::TraceAction)>,
@@ -131,6 +135,7 @@ impl Tickets {
             batches: HashMap::new(),
             next_batch: 0,
             generations: HashMap::new(),
+            client_replies: Vec::new(),
             panel: Default::default(),
             sign: super::tickets_signin::SignUi::new(wake),
             trace_jobs: HashMap::new(),
@@ -218,6 +223,7 @@ impl State {
         if effective != self.tickets.config {
             let previous = self.tickets.config.clone();
             self.tickets.config = effective;
+            self.tickets.client_replies.clear();
             // Keep one serial worker: replacing it during an in-flight write could race
             // another worker saving the same sidecar. Reset its registrations in order.
             if self.tickets.jobs.is_some()
@@ -544,6 +550,11 @@ impl State {
     }
 
     fn finish_ticket(&mut self, tag: Tag, result: Result<TicketOutput, String>) {
+        if let Kind::Client(_, config) = &tag.kind
+            && self.tickets.config.as_ref() != Some(config)
+        {
+            return;
+        }
         // A refused sign-in shows wherever the tickets do, with the button that signs in again. Only a
         // job that called the server proves a sign-in works: a trace capture or an empty outbox does not.
         let called_the_server = !matches!(tag.kind, Kind::Trace(_) | Kind::Outbox);
@@ -553,6 +564,12 @@ impl State {
                 self.ticket_job_succeeded()
             }
             Ok(_) => {}
+        }
+        if let Kind::Client(request, config) = &tag.kind {
+            if self.tickets.config.as_ref() == Some(config) {
+                self.ticket_ui_result(request.clone(), result);
+            }
+            return;
         }
         if let Kind::Whoami(config, epoch) = &tag.kind {
             if self.tickets.config.as_ref() == Some(config) && self.tickets.identity_epoch == *epoch {
@@ -632,7 +649,8 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Whoami(..)
+            Kind::Client(..)
+            | Kind::Whoami(..)
             | Kind::Outbox
             | Kind::Remote(..)
             | Kind::Trace(_)
@@ -704,7 +722,8 @@ impl State {
             }
             (kind, Err(err)) => {
                 let what = match &kind {
-                    Kind::Whoami(..)
+                    Kind::Client(..)
+                    | Kind::Whoami(..)
                     | Kind::Outbox
                     | Kind::Remote(..)
                     | Kind::Trace(_)

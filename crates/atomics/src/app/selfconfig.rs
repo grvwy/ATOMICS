@@ -3,7 +3,7 @@
 //! cleaned of secrets, and only the user's click on Apply writes a file: no control
 //! request can apply a proposal.
 use super::*;
-use atomics_core::selfconfig::{self, Layer, Proposal, Risk, Scope, Source};
+use atomics_core::selfconfig::{self, Layer, Proposal, Scope, Source};
 use atomics_core::tickets::Cleaner;
 
 /// Proposals waiting at once; more are refused until the user decides.
@@ -11,6 +11,7 @@ const MAX_PROPOSALS: usize = 5;
 
 /// How long Apply stays disabled after a proposal appears, so a click meant for whatever
 /// was under the pointer never applies it.
+#[cfg(test)]
 pub(super) const APPLY_DELAY: Duration = Duration::from_millis(800);
 
 /// A proposed change waiting for the user.
@@ -18,12 +19,12 @@ pub(super) struct Pending {
     pub(super) id: String,
     /// The file to write, as found when the change was proposed.
     file: PathBuf,
-    proposal: Proposal,
-    reason: Option<String>,
+    pub(super) proposal: Proposal,
+    pub(super) reason: Option<String>,
     /// Who proposed it, as far as ATOMICS can tell. The user judges the diff, not the name.
-    from: String,
+    pub(super) from: String,
     /// A theme change's theme, drawn above its diff.
-    preview: Option<Arc<Theme>>,
+    pub(super) preview: Option<Arc<Theme>>,
 }
 
 /// What `atomics_config_propose` asks to change.
@@ -309,121 +310,6 @@ impl State {
     }
 }
 
-impl Desktop<'_> {
-    /// The oldest proposed change, as a diff with Apply and Reject. Settings that run
-    /// commands, send credentials or instruct agents are labeled above the diff.
-    pub(super) fn config_proposal_dialog(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.runtime.proposals.first() else {
-            self.client.config_seen = None;
-            return;
-        };
-        let p = self.palette();
-        let seen = match &self.client.config_seen {
-            Some((id, at)) if *id == pending.id => *at,
-            _ => {
-                self.client.config_note.clear();
-                let now = Instant::now();
-                self.client.config_seen = Some((pending.id.clone(), now));
-                now
-            }
-        };
-        let ready = seen.elapsed() >= APPLY_DELAY;
-        if !ready {
-            ctx.request_repaint_after(APPLY_DELAY - seen.elapsed());
-        }
-        let count = self.runtime.proposals.len();
-        let mut decision = None;
-        let note = &mut self.client.config_note;
-        let screen = ctx.content_rect();
-        egui::Window::new("Proposed config change")
-            .id(egui::Id::NULL.with("config-proposal"))
-            .collapsible(true)
-            .resizable(true)
-            .default_size(vec2(screen.width().min(820.0), (screen.height() * 0.7).min(760.0)))
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let proposal = &pending.proposal;
-                // Who, what and its risks above, the decision below; the diff scrolls between them.
-                egui::Panel::top("config-proposal-head").frame(egui::Frame::new()).show(ui, |ui| {
-                    let of = if count > 1 { format!(" · 1 of {count}") } else { String::new() };
-                    ui.label(
-                        RichText::new(format!("{} · {} scope{of}", proposal.file, proposal.scope.name())).strong(),
-                    );
-                    ui.label(match &pending.reason {
-                        Some(reason) => format!("From {}: {reason}", pending.from),
-                        None => format!("From {}", pending.from),
-                    });
-                    if proposal.before.is_none() {
-                        ui.label(RichText::new("Creates this file.").color(p.muted));
-                    }
-                    for (risk, keys) in proposal.risks() {
-                        let color = if risk == Risk::RunsCommands { p.error } else { p.warning };
-                        let text = format!("⚠ {}: {}", risk.label(), keys.join(", "));
-                        ui.label(RichText::new(text).color(color).strong());
-                    }
-                    for warning in &proposal.warnings {
-                        ui.label(RichText::new(warning).color(p.warning).size(12.0));
-                    }
-                    if let Some(preview) = &pending.preview {
-                        let preview = preview.palette();
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Preview").color(p.muted).size(12.0));
-                        preview.show_preview(ui);
-                        if preview.fonts != p.fonts {
-                            ui.label(RichText::new("Its fonts and sizes show once applied.").color(p.quiet).size(11.5));
-                        }
-                    }
-                    ui.add_space(4.0);
-                });
-                egui::Panel::bottom("config-proposal-actions").frame(egui::Frame::new()).show(ui, |ui| {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let apply = egui::Button::new(RichText::new("Apply").color(p.on_accent)).fill(p.accent);
-                        if ui
-                            .add_enabled(ready, apply)
-                            .on_hover_text("Back up the file, write the change and reload")
-                            .clicked()
-                        {
-                            decision = Some(true);
-                        }
-                        if ui.button("Reject").clicked() {
-                            decision = Some(false);
-                        }
-                        ui.add(
-                            egui::TextEdit::singleline(note)
-                                .desired_width(ui.available_width())
-                                .hint_text("Note for the chief (optional)"),
-                        );
-                    });
-                });
-                egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
-                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                        for line in proposal.diff.lines() {
-                            let text = RichText::new(line).monospace().size(12.0);
-                            let text = if line.starts_with("+++") || line.starts_with("---") {
-                                text.color(p.muted)
-                            } else if line.starts_with('+') {
-                                text.color(p.foreground).background_color(p.added)
-                            } else if line.starts_with('-') {
-                                text.color(p.foreground).background_color(p.removed)
-                            } else if line.starts_with('@') {
-                                text.color(p.info)
-                            } else {
-                                text.color(p.muted)
-                            };
-                            ui.label(text);
-                        }
-                    });
-                });
-            });
-        if let Some(apply) = decision {
-            let id = pending.id.clone();
-            let note = std::mem::take(&mut self.client.config_note);
-            self.send(Command::DecideProposal { id, apply, note });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::tests::{request, with_app};
@@ -677,15 +563,15 @@ mod tests {
                 let shown: Vec<&str> = shown.iter().map(|(text, _)| text.as_str()).collect();
                 assert!(shown.contains(&"⚠ runs commands: agents"), "{shown:?}");
                 assert!(shown.contains(&"From the chief: Narrower tiles and an aider agent"), "{shown:?}");
-                assert!(shown.iter().any(|line| line.starts_with("+min_tile_width = 400.0")), "{shown:?}");
-                assert!(shown.iter().any(|line| line.starts_with("-min_tile_width = 520.0")), "{shown:?}");
+                assert!(shown.iter().any(|line| line.starts_with("+layout.min_tile_width = 400.0")), "{shown:?}");
+                assert!(shown.iter().any(|line| line.starts_with("-layout.min_tile_width = 520.0")), "{shown:?}");
 
                 // Apply waits a moment after the proposal appears, so a stray click does nothing.
                 click(app, ctx, "Apply");
                 assert_eq!(app.runtime.proposals.len(), 1);
                 assert_eq!(std::fs::read_to_string(&main).unwrap(), atomics_core::config::DEFAULT_CONFIG);
-                app.client.config_seen.as_mut().unwrap().1 -= APPLY_DELAY;
-                app.client.config_note = "Looks right".into();
+                app.client.ui.management.proposal_seen.as_mut().unwrap().1 -= APPLY_DELAY.as_secs_f64();
+                app.client.ui.management.proposal_note = "Looks right".into();
                 click(app, ctx, "Apply");
                 assert!(app.runtime.proposals.is_empty());
                 let applied = event(&events);
@@ -713,10 +599,10 @@ mod tests {
                 let host = Config::source_paths(&main)[1].clone();
                 assert!(request(app, json!({"cmd":"config_propose", "scope":"host", "toml":"[font]\nsize = 15.0"})).ok);
                 // A note belongs to the proposal on screen: a new one starts without it.
-                app.client.config_note = "Typed for the last one".into();
+                app.client.ui.management.proposal_note = "Typed for the last one".into();
                 render(app, ctx, vec![]);
-                assert!(app.client.config_note.is_empty());
-                app.client.config_note = "Not on this machine".into();
+                assert!(app.client.ui.management.proposal_note.is_empty());
+                app.client.ui.management.proposal_note = "Not on this machine".into();
                 click(app, ctx, "Reject");
                 let rejected = event(&events);
                 assert_eq!(
@@ -817,11 +703,11 @@ mod tests {
                 output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(r) if r.fill == amber));
             output.drop_without_applying_deltas();
             assert!(texts.iter().any(|t| t == "Preview"), "{texts:?}");
-            assert!(texts.iter().any(|t| t.starts_with("+accent = '#e0a458'")), "{texts:?}");
+            assert!(texts.iter().any(|t| t.starts_with("+accent = \"#e0a458\"")), "{texts:?}");
             assert!(amber_fill, "the preview paints the proposed accent");
             assert_ne!(app.palette().accent, amber, "the theme itself waits for Apply");
 
-            app.client.config_seen.as_mut().unwrap().1 -= APPLY_DELAY;
+            app.client.ui.management.proposal_seen.as_mut().unwrap().1 -= APPLY_DELAY.as_secs_f64();
             click(app, ctx, "Apply");
             let applied = event(&events);
             assert_eq!((applied["outcome"].as_str(), applied["scope"].as_str()), (Some("applied"), Some("theme")));

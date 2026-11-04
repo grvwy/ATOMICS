@@ -37,6 +37,7 @@ pub struct Desk {
     pub plan_view: bool,
     /// The Ungrouped tab is on screen.
     pub ungrouped: bool,
+    pub project: Option<PathBuf>,
     /// The plan of the plan tab and the board, by id; `None` while no plan is open and none was picked.
     pub plan: Option<String>,
     /// Its status when it was last seen: one that closes since then gives way.
@@ -65,6 +66,7 @@ impl Default for Desk {
             panel: PanelMode::Plan,
             plan_view: true,
             ungrouped: false,
+            project: None,
             plan: None,
             status: None,
             selected: 0,
@@ -114,11 +116,12 @@ pub fn carries_out(command: &Command, wide: bool) -> bool {
         | Command::OpenDiff
         | Command::ToggleDiff
         | Command::CloseDiff
-        | Command::SetPanel(PanelMode::Diff | PanelMode::Plan)
+        | Command::SetPanel(PanelMode::Diff | PanelMode::Plan | PanelMode::Editor | PanelMode::Tickets)
         | Command::TogglePlan
-        | Command::ToggleView(PanelMode::Diff | PanelMode::Plan)
+        | Command::ToggleView(PanelMode::Diff | PanelMode::Plan | PanelMode::Editor | PanelMode::Tickets)
         | Command::ShowPlan(_)
         | Command::ShowUngrouped
+        | Command::SetView(_)
         | Command::ViewPlanHistory(_)
         | Command::EditingPlan
         | Command::Toast(_) => true,
@@ -144,7 +147,7 @@ impl Desk {
             diff_target: self.diff_target(backend),
             plan_view: self.plan_view && plan,
             ungrouped: self.ungrouped,
-            project: None,
+            project: self.project.clone(),
             selected_plan: self.selected,
             diff_open: self.diff_open,
             panel: if plan || self.panel != PanelMode::Plan { self.panel } else { PanelMode::Diff },
@@ -182,7 +185,9 @@ impl Desk {
             }
         };
         let sessions = backend.session_list();
-        if self.typing_in.as_deref().is_some_and(|id| !sessions.iter().any(|s| s.id == id)) {
+        if self.typing_in.as_deref().is_some_and(|id| {
+            !sessions.iter().any(|s| s.id == id) && !backend.editors().iter().any(|e| e.terminal == id && e.running)
+        }) {
             self.typing_in = None;
         }
         let shown = visible(&self.hints(backend));
@@ -195,7 +200,7 @@ impl Desk {
         };
         if !keep {
             self.active = shown.first().map(|&i| sessions[i].id.clone());
-            self.diff_root = None;
+            self.diff_root = self.project.clone().filter(|_| self.active.is_none());
         }
         // A tab with no session yet picks its first once one comes.
         self.pick = pick && shown.is_empty();
@@ -223,6 +228,13 @@ impl Desk {
                 }
             }
             Command::ShowRoot(worktree) => self.show_root(worktree),
+            Command::SetView(project) => {
+                self.plan_view = false;
+                self.ungrouped = false;
+                self.project = project.clone();
+                self.diff_root = project;
+                self.pick = true;
+            }
             Command::OpenDiff => self.diff_open = true,
             Command::CloseDiff => self.diff_open = false,
             Command::ToggleDiff => self.diff_open = !self.diff_open,
@@ -249,6 +261,7 @@ impl Desk {
             Command::ShowUngrouped => {
                 self.plan_view = false;
                 self.ungrouped = true;
+                self.project = None;
                 self.pick = true;
             }
             Command::ToggleChief => self.chief.open = !self.chief.open,
@@ -280,6 +293,7 @@ impl Desk {
             self.selected = index;
             self.plan_view = true;
             self.ungrouped = false;
+            self.project = None;
         }
     }
 

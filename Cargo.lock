@@ -563,6 +563,8 @@ version = "0.1.5"
 dependencies = [
  "atomics-core",
  "egui",
+ "qrcodegen",
+ "serde_json",
 ]
 
 [[package]]

@@ -35,6 +35,7 @@ impl State {
         changed |= self.poll_cleanup();
         changed |= self.poll_plan_cleanup();
         changed |= self.usage.drain();
+        changed |= self.poll_resources();
         for session in &mut self.sessions {
             if let Some(ready) = &session.worktree_ready
                 && let Ok(worktree) = ready.try_recv()
@@ -455,6 +456,7 @@ impl State {
 
     /// Reads the config files again when they changed, and the workspace's sections.
     pub(super) fn reload_config(&mut self) {
+        self.management_config.take();
         self.config_checked = Instant::now();
         let stamp = config_fingerprints(&self.config_path);
         self.apply_ticket_config();
@@ -512,12 +514,40 @@ impl State {
         self.output_delay.take()
     }
 
+    /// Runtime sampling continues with no desktop or remote client attached.
+    fn poll_resources(&mut self) -> bool {
+        use atomics_core::projection::{ResourceInfo, SlotInfo};
+        let before = self.resources.clone();
+        if self.resources_checked.elapsed() >= Duration::from_secs(2) {
+            self.resources.load = crate::governor::load_average();
+            self.resources.sampled_at = crate::usage::now();
+            self.resources_checked = Instant::now();
+        }
+        let (running, waiting) = self.governor.snapshot();
+        let pool = |class| SlotInfo {
+            slots: self.governor.slots(class),
+            running: running.iter().filter(|ticket| ticket.class == class).count(),
+            waiting: waiting.iter().filter(|ticket| ticket.class == class).count(),
+        };
+        self.resources = ResourceInfo {
+            claude: self.usage.claude.clone(),
+            codex: self.usage.codex.clone(),
+            cores: self.governor.cores,
+            compiler_jobs: self.jobserver.as_ref().map(|pool| pool.tokens()),
+            test: pool(SlotClass::Test),
+            qa: pool(SlotClass::Qa),
+            ..self.resources.clone()
+        };
+        self.resources != before
+    }
+
     pub(crate) fn runtime_deadline(&self) -> Instant {
         let now = Instant::now();
         if self.restarting {
             return now + Duration::from_secs(1);
         }
         let mut next = self.config_checked + Duration::from_secs(1);
+        next = next.min(self.resources_checked + Duration::from_secs(2));
         next = next.min(self.heartbeat.deadline(Duration::from_secs(self.config.chief.heartbeat_secs.max(1))));
         for waiter in &self.waiters {
             next = next.min(waiter.deadline);

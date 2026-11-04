@@ -207,7 +207,6 @@ fn what_atomics_v1_has_no_action_for_says_so() {
     let before = world.host.received.len();
     for command in [
         Command::ReopenPlan(0),
-        Command::ClosePlan { plan: 0, status: atomics_core::plan::PlanStatus::Completed },
         Command::ResumeSession("s1".into()),
         Command::VoiceToSession { session: 1, text: "go on".into() },
     ] {

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use atomics_core::diff::FileDiff;
 use atomics_core::diff_data::Prepared;
@@ -25,28 +25,131 @@ pub(crate) struct DiffSummaries(HashMap<PathBuf, (u64, DiffSummary)>);
 /// without the `State` lock. Holds `Arc`s of what the diff worker already built, and remembers
 /// worktrees whose diff went away lately.
 #[derive(Default)]
-pub(crate) struct DiffBodies(RwLock<HashMap<String, (u64, Arc<Prepared>)>>, Departed);
+pub(crate) struct DiffBodies {
+    contents: RwLock<HashMap<String, (u64, Arc<Prepared>)>>,
+    departed: Departed,
+    folders: Mutex<HashMap<String, usize>>,
+    wake: crate::host::Wake,
+}
 
 impl DiffBodies {
+    pub(crate) fn with_wake(wake: crate::host::Wake) -> Self {
+        Self { wake, ..Default::default() }
+    }
+
+    /// A remote explorer can open an otherwise idle worktree. Its subscription wakes the host,
+    /// which schedules the existing worker and keeps that file tree fresh only while followed.
+    pub(crate) fn refresh_folders(&self, state: &mut State) {
+        let roots: Vec<_> = self.folders.lock().unwrap_or_else(|e| e.into_inner()).keys().map(PathBuf::from).collect();
+        for root in roots {
+            if !state.repos.contains(&root)
+                && !state.worktree_project.contains_key(&root)
+                && !state.sessions.iter().any(|s| s.root() == root)
+            {
+                continue;
+            }
+            let diff = state.diffs.entry(root).or_default();
+            if !diff.loading
+                && diff.last_request.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(3))
+                && diff.dirty_since.is_none()
+            {
+                diff.mark_dirty();
+            }
+        }
+    }
+
     fn replace(&self, entries: HashMap<String, (u64, Arc<Prepared>)>) {
         let same = {
-            let current = self.0.read().unwrap_or_else(|e| e.into_inner());
+            let current = self.contents.read().unwrap_or_else(|e| e.into_inner());
             current.len() == entries.len()
                 && entries
                     .iter()
                     .all(|(k, (r, p))| current.get(k).is_some_and(|(cr, cp)| cr == r && Arc::ptr_eq(cp, p)))
         };
         if !same {
-            let before = std::mem::replace(&mut *self.0.write().unwrap_or_else(|e| e.into_inner()), entries);
-            let now = self.0.read().unwrap_or_else(|e| e.into_inner());
-            self.1.record(before.keys().map(String::as_str), |w| now.contains_key(w));
+            let before = std::mem::replace(&mut *self.contents.write().unwrap_or_else(|e| e.into_inner()), entries);
+            let now = self.contents.read().unwrap_or_else(|e| e.into_inner());
+            self.departed.record(before.keys().map(String::as_str), |w| now.contains_key(w));
         }
     }
 }
 
 impl crate::protocol::DiffSource for DiffBodies {
+    fn watch_folder(&self, worktree: &str, watching: bool) {
+        let mut folders = self.folders.lock().unwrap_or_else(|e| e.into_inner());
+        if watching {
+            *folders.entry(worktree.into()).or_default() += 1;
+        } else if let Some(count) = folders.get_mut(worktree) {
+            *count -= 1;
+            if *count == 0 {
+                folders.remove(worktree);
+            }
+        }
+        drop(folders);
+        self.wake.notify();
+    }
+    fn folder_revision(&self, worktree: &str) -> Option<u64> {
+        self.contents.read().unwrap_or_else(|e| e.into_inner()).get(worktree).map(|(revision, _)| *revision)
+    }
+
+    fn folder(
+        &self,
+        worktree: &str,
+        path: &str,
+        offset: u32,
+        budget: usize,
+    ) -> Result<atomics_core::folder::Page, atomics_core::wire::WireError> {
+        let (revision, prepared) =
+            self.contents.read().unwrap_or_else(|e| e.into_inner()).get(worktree).cloned().ok_or_else(|| {
+                atomics_core::wire::WireError::new(atomics_core::wire::ErrorCode::NotFound, "file listing is not ready")
+            })?;
+        atomics_core::folder::page(
+            prepared.all_files.iter().map(|p| p.as_ref()).chain(prepared.diff.files.iter().map(|f| f.path())),
+            worktree,
+            path,
+            revision,
+            offset,
+            budget,
+        )
+    }
+
+    fn content(
+        &self,
+        worktree: &str,
+        path: &str,
+        budget: usize,
+    ) -> Result<(String, bool), atomics_core::wire::WireError> {
+        use atomics_core::wire::{ErrorCode, WireError};
+        let missing = || WireError::new(ErrorCode::NotFound, "no such worktree file");
+        if path.is_empty() || !atomics_core::folder::valid_path(path) {
+            return Err(missing());
+        }
+        let known =
+            self.contents.read().unwrap_or_else(|e| e.into_inner()).get(worktree).is_some_and(|(_, prepared)| {
+                prepared.all_files.iter().any(|p| p.as_ref() == path)
+                    || prepared.diff.files.iter().any(|f| f.path() == path)
+            });
+        if !known {
+            return Err(missing());
+        }
+        let (bytes, truncated) =
+            match atomics_core::git::read_worktree_file(std::path::Path::new(worktree), path, budget as u64) {
+                Some(atomics_core::git::WorktreeFile::File { bytes: Some(bytes), .. }) => (bytes, false),
+                Some(atomics_core::git::WorktreeFile::File { bytes: None, .. }) => (Vec::new(), true),
+                Some(atomics_core::git::WorktreeFile::Link(_)) => {
+                    return Err(WireError::new(ErrorCode::Rejected, "symbolic link; file contents are not followed"));
+                }
+                None => return Err(missing()),
+            };
+        if bytes.contains(&0) {
+            return Err(WireError::new(ErrorCode::Rejected, "binary file"));
+        }
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        Ok((content, truncated))
+    }
+
     fn file(&self, worktree: &str, path: &str) -> Option<(u64, FileDiff)> {
-        let (revision, prepared) = self.0.read().unwrap_or_else(|e| e.into_inner()).get(worktree)?.clone();
+        let (revision, prepared) = self.contents.read().unwrap_or_else(|e| e.into_inner()).get(worktree)?.clone();
         let file = prepared
             .diff
             .files
@@ -56,9 +159,9 @@ impl crate::protocol::DiffSource for DiffBodies {
     }
 
     fn moved_on(&self, worktree: &str, revision: u64) -> bool {
-        match self.0.read().unwrap_or_else(|e| e.into_inner()).get(worktree) {
+        match self.contents.read().unwrap_or_else(|e| e.into_inner()).get(worktree) {
             Some((current, _)) => *current != revision,
-            None => self.1.contains(worktree),
+            None => self.departed.contains(worktree),
         }
     }
 }
@@ -68,19 +171,47 @@ fn text(path: &std::path::Path) -> String {
 }
 
 impl State {
+    pub(super) fn editor_infos(&self) -> Vec<atomics_core::projection::EditorInfo> {
+        let mut editors: Vec<_> = self
+            .editors
+            .iter()
+            .map(|(root, terminal)| {
+                let path = text(root);
+                atomics_core::projection::EditorInfo {
+                    terminal: atomics_core::projection::editor_terminal(&path),
+                    root: path,
+                    running: !terminal.exited(),
+                    file: self.editor_files.get(root).cloned(),
+                    inlay_hints: !self.config.editor.inlay_hints_keys.is_empty(),
+                }
+            })
+            .collect();
+        editors.sort_by(|a, b| a.root.cmp(&b.root));
+        editors
+    }
     /// Publish which terminals exist, by session, for the protocol thread to stream. Called only
     /// while the protocol server runs; builds handles only when the set of terminals changed.
     pub(crate) fn publish_terminals(&self, out: &Terminals) {
-        let live = || self.sessions.iter().filter_map(|s| Some((s, s.terminal.as_ref()?)));
-        if out.matches(live().map(|(s, t)| (s.id.as_str(), t.screen_identity()))) {
+        let live: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|s| Some((s.id.clone(), s.terminal.as_ref()?)))
+            .chain(
+                self.editors
+                    .iter()
+                    .filter(|(_, t)| !t.exited())
+                    .map(|(root, t)| (atomics_core::projection::editor_terminal(&text(root)), t)),
+            )
+            .collect();
+        if out.matches(live.iter().map(|(id, t)| (id.as_str(), t.screen_identity()))) {
             return;
         }
         out.publish(
-            live()
-                .map(|(s, t)| {
+            live.into_iter()
+                .map(|(id, t)| {
                     let handle = Arc::new(t.screen_handle());
                     TerminalEntry {
-                        session: s.id.clone(),
+                        session: id,
                         identity: t.screen_identity(),
                         source: handle.clone(),
                         control: handle,
@@ -209,14 +340,36 @@ impl State {
         out.publish_approvals(self.approval_infos());
         self.publish_diffs(out, cache, bodies);
         out.publish_host(self.host_info());
+        out.trace.publish(self.trace_data());
     }
 
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
     pub(crate) fn host_info(&self) -> HostInfo {
         HostInfo {
+            editors: self.editor_infos(),
+            pull_requests: self.pull_request_infos(),
+            projects: self
+                .repos
+                .iter()
+                .map(|root| atomics_core::projection::ProjectInfo {
+                    root: text(root),
+                    worktrees: self
+                        .worktrees
+                        .iter()
+                        .filter(|w| w.path != *root && self.worktree_project.get(&w.path) == Some(root))
+                        .map(|w| atomics_core::projection::WorktreeInfo {
+                            path: text(&w.path),
+                            branch: w.branch.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
             workspace: self.workspace.clone(),
             workspaces: self.workspace_names.clone(),
             sign_in: self.sign_in_info(),
+            tickets: self.ticket_ui_info(),
+            management: Some(self.management_info()),
+            resources: Some(self.resources.clone()),
         }
     }
 
@@ -253,6 +406,7 @@ impl State {
         self.plans
             .iter()
             .map(|p| PlanInfo {
+                ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,
                 goal: p.goal.clone(),
@@ -310,7 +464,10 @@ impl State {
     }
 
     fn publish_diffs(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
-        cache.0.retain(|root, _| self.diffs.contains_key(root));
+        let pull_bodies: Vec<_> = self.pull_request_bodies().collect();
+        cache.0.retain(|root, _| {
+            self.diffs.contains_key(root) || pull_bodies.iter().any(|(key, _, _)| std::path::Path::new(key) == root)
+        });
         let mut diffs = Vec::new();
         let mut contents = HashMap::new();
         for (root, data) in &self.diffs {
@@ -325,6 +482,19 @@ impl State {
                 }
             };
             diffs.push(DiffSummary { comments: data.comments.clone(), ..entry });
+        }
+        for (key, revision, prepared) in pull_bodies {
+            let root = PathBuf::from(&key);
+            let summary = match cache.0.get(&root) {
+                Some((r, summary)) if *r == revision => summary.clone(),
+                _ => {
+                    let summary = DiffSummary::new(&key, revision, &prepared.diff);
+                    cache.0.insert(root, (revision, summary.clone()));
+                    summary
+                }
+            };
+            diffs.push(summary);
+            contents.insert(key, (revision, prepared));
         }
         diffs.sort_by(|a, b| a.worktree.cmp(&b.worktree));
         // Bodies first: a client told about a revision can always fetch it.

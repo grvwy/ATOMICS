@@ -66,6 +66,14 @@ impl Local<'_> {
     pub(super) fn run(&self, command: Command) {
         let state = self.0;
         match command {
+            Command::EditorHints(root) => state.post(move |state| {
+                if let Some(editor) = state.editors.get(&root) {
+                    editor.type_steps(state.config.editor.inlay_hints_keys.clone(), Duration::ZERO);
+                }
+            }),
+            Command::LoadPullRequest(key) => state.post(move |state| {
+                state.load_pull_request(&key);
+            }),
             // The desktop's decision goes through the journal and `State::decide` like a protocol
             // client's, so the two can race and exactly one wins.
             Command::Decide { session, approval, decision } => {
@@ -203,10 +211,23 @@ impl Local<'_> {
                     }
                 });
             }
+            Command::Manage(action) => state.post(move |state| {
+                let outcome = state.mutate_desktop(|op| {
+                    atomics_core::ops::Command::HostCommand(atomics_core::ops::HostCommand { op, action })
+                });
+                if let atomics_core::ops::Outcome::Refused { message, .. } = outcome {
+                    state.toast(message);
+                }
+            }),
             Command::OpenProject(root) => state.post(move |state| state.open_project(&root)),
             Command::CloseProject(root) => state.post(move |state| state.close_project(&root)),
             Command::OpenWorkspace(name) => state.post(move |state| {
                 let _ = state.open_workspace(&name);
+            }),
+            Command::Ticket { request, action } => state.post(move |state| {
+                if let Err(error) = state.ticket_ui_command(request, action) {
+                    state.toast(error);
+                }
             }),
             Command::SignInTickets => state.post(State::start_sign_in),
             Command::PasteSignIn(text) => state.post(move |state| {
@@ -292,8 +313,15 @@ impl Desktop<'_> {
         &mut self,
         draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client, &mut dyn TerminalSurface) -> R,
     ) -> R {
+        if self.runtime.github.pr_diff.is_some() && self.runtime.github_pr_diff().is_none() {
+            self.client.ui.pr_view = None;
+        }
         self.client.ui.palette = self.palette();
-        let mut terminals = Terminals { sessions: &self.runtime.sessions, views: &mut self.client.terminal_views };
+        let mut terminals = Terminals {
+            sessions: &self.runtime.sessions,
+            editors: &self.runtime.editors,
+            views: &mut self.client.terminal_views,
+        };
         let result = draw(&self.runtime.backend(), &mut self.client.ui, &mut terminals);
         for command in std::mem::take(&mut self.client.ui.commands) {
             self.send(command);
@@ -337,7 +365,7 @@ impl Desktop<'_> {
                 if view == PanelMode::Tickets {
                     if self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
                         self.client.focus_terminal = None;
-                        self.client.focus_editor = false;
+                        self.client.ui.focus_editor = false;
                     } else {
                         self.client.focus_terminal = self.runtime.active.clone();
                     }
@@ -358,7 +386,13 @@ impl Desktop<'_> {
                 }
             }
             Command::Rename(session) => self.begin_rename(&session),
-            Command::PickProject => self.pick_project(),
+            Command::PickProject => {
+                self.client.ui.management.project = true;
+                self.client.ui.management.folder_page = 0;
+                let start = paths::home().to_string_lossy().into_owned();
+                self.client.ui.management.folder = Some(start.clone());
+                self.send(Command::Manage(atomics_core::ops::HostAction::BrowseFolder { path: start }));
+            }
             Command::HideChief => self.runtime.chief_open = false,
             Command::ResizeChief(width) => self.runtime.store.chief_width = width,
             Command::Toast(text) => self.runtime.toast(text),
@@ -384,6 +418,7 @@ impl Desktop<'_> {
         self.send(Command::SeeSession(id.to_string()));
     }
 
+    #[cfg(test)]
     pub(super) fn pick_project(&mut self) {
         self.client.project_picker = Some(
             self.runtime.repos.first().and_then(|r| r.parent()).map(Path::to_path_buf).unwrap_or_else(paths::home),

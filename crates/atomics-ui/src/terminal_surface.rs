@@ -7,11 +7,12 @@ use egui::Rect;
 use crate::terminal::Metrics;
 use crate::theme::Palette;
 
-/// Draws a session's terminal where a view puts it.
+/// Draws a host terminal where a view puts it, including editor PTYs.
 pub trait TerminalSurface {
     /// Draws the terminal of the session at `index` of [`Backend::session_list`](crate::Backend::session_list),
     /// whose id is `session`, into `rect` under `id`, with `metrics` and `palette`, and feeds it the
-    /// keyboard and the pointer while it has focus. Views call it only for sessions running inside ATOMICS
+    /// keyboard and the pointer while it has focus. An editor uses its `EditorInfo::terminal` ID and
+    /// `usize::MAX` for `index`; it is never added to the agent session list. Views call it only for sessions running inside ATOMICS
     /// ([`SessionRow::outside`](crate::SessionRow::outside) is false).
     #[allow(clippy::too_many_arguments)]
     fn show(

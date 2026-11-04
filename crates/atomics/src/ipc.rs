@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -62,15 +63,15 @@ impl ApprovalReply {
     }
 
     pub fn wait(&self, timeout: Duration) -> HookReply {
-        self.wait_with_timeout(|| timeout)
+        self.wait_until(|| timeout, || false)
     }
 
-    fn wait_with_timeout(&self, timeout: impl Fn() -> Duration) -> HookReply {
+    fn wait_until(&self, timeout: impl Fn() -> Duration, disconnected: impl Fn() -> bool) -> HookReply {
         let started = Instant::now();
         let mut state = self.state.lock().unwrap();
         while matches!(*state, ApprovalState::Waiting) {
             let remaining = timeout().saturating_sub(started.elapsed());
-            if remaining.is_zero() {
+            if remaining.is_zero() || disconnected() {
                 break;
             }
             let (next, _) = self.ready.wait_timeout(state, remaining.min(Duration::from_millis(250))).unwrap();
@@ -222,20 +223,38 @@ fn handle_with_wait_duration(
     window.request_repaint();
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
-        reply = if hub.lock().unwrap().chief_running {
-            approval_reply.wait_with_timeout(|| {
-                let seconds =
-                    if hub.lock().unwrap().chief_running { atomics_core::hook::PERMISSION_WAIT_SECONDS } else { 10 };
+        let chief_running = hub.lock().unwrap().chief_running;
+        reply = approval_reply.wait_until(
+            || {
+                let seconds = if chief_running && hub.lock().unwrap().chief_running {
+                    atomics_core::hook::PERMISSION_WAIT_SECONDS
+                } else {
+                    10
+                };
                 wait_duration(seconds)
-            })
-        } else {
-            approval_reply.wait(wait_duration(10))
-        };
+            },
+            || disconnected(&stream),
+        );
     }
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(&reply)?.as_bytes())?;
     writer.write_all(b"\n")?;
     Ok(())
+}
+
+/// Hooks send one line, then only read. Peeking does not consume their request or block the waiter.
+fn disconnected(stream: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: `byte` is writable for one byte and the stream owns this live descriptor.
+    let read = unsafe {
+        libc::recv(stream.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+    };
+    read == 0
+        || (read < 0
+            && !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ))
 }
 
 fn control(request: ControlRequest, channels: &Channels, window: &Window, stream: &UnixStream) -> ControlResponse {
@@ -485,6 +504,43 @@ mod tests {
         assert!(!reply.answer(HookReply { stdout: Some("duplicate".into()) }));
         assert_eq!(thread.join().unwrap().stdout.as_deref(), Some("allowed"));
         assert!(!reply.answer(HookReply::default()));
+    }
+
+    #[test]
+    fn permission_reply_expires_when_the_hook_disconnects_before_its_timeout() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (hooks, received) = std::sync::mpsc::channel();
+        let handler = std::thread::spawn(move || {
+            handle(
+                server,
+                &Mutex::new(Hub { chief_running: true, ..Hub::default() }),
+                &Channels {
+                    hooks: hooks.into(),
+                    control: std::sync::mpsc::channel().0.into(),
+                    usage: std::sync::mpsc::channel().0,
+                    governor: Arc::new(crate::governor::Governor::new(Default::default(), Default::default())),
+                },
+                &Window::default(),
+            )
+        });
+        writeln!(
+            client,
+            "{}",
+            json!({"payload":{
+                "hook_event_name":"PermissionRequest", "session_id":"worker"
+            }})
+        )
+        .unwrap();
+        let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().approval_reply.unwrap();
+        assert!(!pending.expired());
+        drop(client);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(2));
+        while !pending.expired() {
+            assert!(Instant::now() < deadline, "the closed hook kept its reply alive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pending.answer(HookReply { stdout: Some("late".into()) }));
+        assert!(handler.join().unwrap().is_err(), "writing to the closed hook must fail");
     }
 
     #[test]

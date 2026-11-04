@@ -36,15 +36,13 @@ fn demo_call(app: &mut Desktop<'_>, tool: &str, input: serde_json::Value) -> ser
 
     app.runtime.on_hook(demo_hook("PreToolUse", tool, input.clone(), Value::Null));
     demo_wait(app, |r| r.tickets.trace_jobs.is_empty());
-    assert_eq!(app.runtime.lane_entries().last().unwrap().state, TraceState::Running);
+    assert_eq!(app.lane_entries().last().unwrap().state, TraceState::Running);
     if tool == "atomics_plan_set" {
-        assert_eq!(app.runtime.lane_entries().last().unwrap().plan.as_ref().unwrap().tasks.len(), 6);
+        assert_eq!(app.lane_entries().last().unwrap().plan.as_ref().unwrap().tasks.len(), 6);
     }
     let request = crate::mcp::request_for_tool(tool, input.clone()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    app.runtime.control(serde_json::to_value(request).and_then(serde_json::from_value).unwrap(),
-        tx,
-    );
+    app.runtime.control(serde_json::to_value(request).and_then(serde_json::from_value).unwrap(), tx);
     settle(app);
     let crate::ipc::ControlOutcome::Done(reply) =
         rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap()
@@ -54,7 +52,7 @@ fn demo_call(app: &mut Desktop<'_>, tool: &str, input: serde_json::Value) -> ser
     assert!(reply.ok, "{reply:?}");
     app.runtime.on_hook(demo_hook("PostToolUse", tool, input, json!({"structuredContent": reply.result})));
     demo_wait(app, |r| r.tickets.trace_jobs.is_empty());
-    assert_eq!(app.runtime.lane_entries().last().unwrap().state, TraceState::Ok);
+    assert_eq!(app.lane_entries().last().unwrap().state, TraceState::Ok);
     reply.result
 }
 
@@ -196,7 +194,7 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         let reply =
             demo_call(app, "atomics_plan_set", json!({"plan":plan.id, "goal":"Ticket workspace demo", "tasks":tasks}));
         assert_eq!(reply["plan"], plan.id);
-        let entries = app.runtime.lane_entries();
+        let entries = app.lane_entries();
         assert_eq!(
             entries.iter().map(|e| e.op).collect::<Vec<_>>(),
             [TraceOp::SemanticSearch, TraceOp::Read, TraceOp::Children, TraceOp::Related, TraceOp::Plan,]
@@ -208,7 +206,7 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         assert_eq!(entries[3].cards.len(), 4);
         assert_eq!(entries[4].plan.as_ref().unwrap().tasks.len(), 6);
         app.runtime.store.chief_dock = Some(ChiefDock::Docked);
-        app.runtime.lane.height = Some(300.0);
+        app.client.ui.lane.height = Some(300.0);
         let mut lane_text = String::new();
         for _ in 0..2 {
             let mut lane = ctx.run_ui(

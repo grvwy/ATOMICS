@@ -142,7 +142,9 @@ fn new_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client,
         Some(folder) => remote.display(folder),
         None => "Scratch folder".to_string(),
     };
-    let open = dialog(ctx, "New session", false, |ui| {
+    let touch = client.touch;
+    let width = (ctx.content_rect().width() - 120.0).clamp(100.0, 320.0);
+    let open = dialog(ctx, "New session", touch.is_some(), |ui| {
         egui::Grid::new("new-session").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label("Agent");
             egui::ComboBox::from_id_salt("agent").selected_text(&agent).show_ui(ui, |ui| {
@@ -152,19 +154,22 @@ fn new_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client,
             });
             ui.end_row();
             ui.label("Where");
-            egui::ComboBox::from_id_salt("where").selected_text(place(&picked.folder)).width(320.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut picked.folder, None, place(&None));
-                for folder in &folders {
-                    let folder = Some(folder.clone());
-                    ui.selectable_value(&mut picked.folder, folder.clone(), place(&folder));
-                }
-            });
+            egui::ComboBox::from_id_salt("where").selected_text(place(&picked.folder)).width(width).truncate().show_ui(
+                ui,
+                |ui| {
+                    ui.selectable_value(&mut picked.folder, None, place(&None));
+                    for folder in &folders {
+                        let folder = Some(folder.clone());
+                        ui.selectable_value(&mut picked.folder, folder.clone(), place(&folder));
+                    }
+                },
+            );
             ui.end_row();
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            start = ui.button("Start").clicked();
-            cancel = ui.button("Cancel").clicked();
+            start = ui.add(touch::sized(egui::Button::new("Start"), touch)).clicked();
+            cancel = ui.add(touch::sized(egui::Button::new("Cancel"), touch)).clicked();
         });
     });
     let folder = picked.folder.clone();

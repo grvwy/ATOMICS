@@ -47,6 +47,8 @@ pub(super) struct Github {
     /// The outcome of the last action, shown in the modal.
     pub(super) notice: Option<String>,
     pub(super) pr_diff: Option<PrDiff>,
+    pr_diffs: BTreeMap<String, PrDiff>,
+    diff_revision: u64,
     /// The head commit each pull request's diff was loaded at. Merge sends it, so GitHub refuses
     /// (409) a merge whose branch moved after the diff was reviewed.
     reviewed: BTreeMap<(RepoId, u64), String>,
@@ -87,7 +89,9 @@ pub(super) enum Connect {
 }
 
 /// A pull request's diff, shown read-only in the diff viewer.
+#[derive(Clone)]
 pub(super) struct PrDiff {
+    pub revision: u64,
     pub repo: RepoId,
     pub number: u64,
     pub title: String,
@@ -135,6 +139,7 @@ enum Done {
     Diff {
         repo: RepoId,
         number: u64,
+        revision: u64,
         result: Result<(Arc<diff_view::Prepared>, String), String>,
     },
 }
@@ -464,20 +469,19 @@ impl State {
                 self.github.notice = Some(notice);
             }
             Done::Runs(runs) => self.github.runs.extend(runs),
-            Done::Diff { repo, number, result } => {
-                if let Some(view) =
-                    self.github.pr_diff.as_mut().filter(|view| view.repo == repo && view.number == number)
-                {
+            Done::Diff { repo, number, revision, result } => {
+                let key = pr_key(&repo, number);
+                if let Some(view) = self.github.pr_diffs.get_mut(&key).filter(|v| v.revision == revision) {
                     match result {
                         Ok((prepared, sha)) => {
                             view.head_sha = Some(sha.clone());
                             view.prepared = Some(Ok(prepared));
-                            self.github.reviewed.insert((repo, number), sha);
+                            self.github.reviewed.insert((repo.clone(), number), sha);
                         }
-                        Err(error) => {
-                            view.prepared = Some(Err(error));
-                            self.github_poll_now();
-                        }
+                        Err(error) => view.prepared = Some(Err(error)),
+                    }
+                    if self.github.pr_diff.as_ref().is_some_and(|v| v.repo == repo && v.number == number) {
+                        self.github.pr_diff = Some(view.clone());
                     }
                 }
             }
@@ -729,7 +733,14 @@ impl State {
     /// Loads a pull request's diff from GitHub or Azure DevOps into the diff viewer, read-only. No
     /// fetch, ref or worktree is touched.
     pub(super) fn github_view_diff(&mut self, repo: RepoId, pull: &Pull) {
-        self.github.pr_diff = Some(PrDiff {
+        self.fetch_pull_request(repo, pull, true);
+    }
+
+    fn fetch_pull_request(&mut self, repo: RepoId, pull: &Pull, select: bool) {
+        self.github.diff_revision += 1;
+        let revision = self.github.diff_revision;
+        let view = PrDiff {
+            revision,
             repo: repo.clone(),
             number: pull.number,
             title: pull.title.clone(),
@@ -738,9 +749,30 @@ impl State {
             head_sha: None,
             prepared: None,
             over: (self.active.clone(), self.diff_root.clone()),
-        });
-        self.diff_open = true;
-        self.panel = PanelMode::Diff;
+        };
+        let key = pr_key(&repo, pull.number);
+        if select {
+            self.github.pr_diff = Some(view.clone());
+        }
+        self.github.pr_diffs.insert(key.clone(), view);
+        // Keep the host cache bounded. Selection and scroll remain on each client.
+        if self.github.pr_diffs.len() > 16 {
+            let oldest = self
+                .github
+                .pr_diffs
+                .iter()
+                .filter(|(k, _)| **k != key)
+                .min_by_key(|(_, v)| v.revision)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                self.github.pr_diffs.remove(&oldest);
+            }
+        }
+        if select {
+            self.client_events.push(ClientEvent::PullRequest(key));
+            self.diff_open = true;
+            self.panel = PanelMode::Diff;
+        }
         let (api, highlighter, number) = (self.github_api(&repo.host), self.highlighter.clone(), pull.number);
         self.github_job(move |tx| {
             let result = api().and_then(|mut client| {
@@ -758,7 +790,7 @@ impl State {
                 };
                 Ok((crate::diff_worker::prepare_diff(diff, &highlighter), sha))
             });
-            let _ = tx.send(Done::Diff { repo, number, result });
+            let _ = tx.send(Done::Diff { repo, number, revision, result });
         });
     }
 
@@ -808,7 +840,6 @@ pub(super) struct GithubUi {
     pub selected: Option<(RepoId, u64)>,
     pub methods: BTreeMap<RepoId, MergeMethod>,
     pub confirm: Option<Confirm>,
-    pub pr_view: Option<((RepoId, u64), DiffState)>,
     /// Scroll the selected row into view on the next frame.
     pub scroll_to_selected: bool,
     /// The host whose chip was clicked: "Disconnect GitHub?" shows until answered.
@@ -961,7 +992,7 @@ impl Desktop<'_> {
             if self.client.github.return_focus.is_none() {
                 self.client.github.return_focus = Some(ctx.memory(|memory| memory.focused()));
                 self.client.focus_terminal = None;
-                self.client.focus_editor = false;
+                self.client.ui.focus_editor = false;
                 self.client.focus_steer = false;
             }
             if !self.client.github.input_focus.is_some_and(|id| ctx.memory(|memory| memory.has_focus(id))) {
@@ -1660,92 +1691,87 @@ impl Desktop<'_> {
             }
         }
     }
+}
 
-    /// Shows the pull request diff in place of the worktree's diff; returns false when none is open.
-    pub(super) fn github_pr_panel(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
-        let Some(view) = self.runtime.github_pr_diff() else {
-            self.client.github.pr_view = None;
-            return false;
-        };
-        let key = (view.repo.clone(), view.number);
-        let title = format!("{}#{} {}", view.repo, view.number, view.title);
-        let branch = match &view.head_sha {
-            Some(sha) => format!("{} → {} · {}", view.head, view.base, short_sha(sha)),
-            None => format!("{} → {}", view.head, view.base),
-        };
-        let prepared = view.prepared.clone();
-        if self.client.github.pr_view.as_ref().is_none_or(|(shown, _)| *shown != key) {
-            self.client.github.pr_view = Some((key.clone(), DiffState::default()));
-        }
-        let palette = self.palette();
-        let font = palette.mono(palette.fonts.diff_size.unwrap_or(self.runtime.config.font.diff_size));
-        let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
-        let editor_shortcut = self.runtime.config.keys.toggle_editor.clone();
-        let Some((_, state)) = self.client.github.pr_view.as_mut() else { return false };
-        match prepared {
-            Some(Ok(prepared)) => {
-                state.prepared = Some(prepared);
-                state.error = None;
-                state.loading = false;
-            }
-            Some(Err(error)) => {
-                state.prepared = None;
-                state.error = Some(error);
-                state.loading = false;
-            }
-            None => state.loading = true,
-        }
-        let rect = if rect.width() >= 760.0 {
-            let column = rect.with_max_x(rect.left() + 250.0);
-            let current = state.focused.clone();
-            if let Some((path, _)) = diff_view::changed_files(ui, column, state, current.as_deref(), &palette) {
-                state.open(&path);
-            }
-            rect.with_min_x(column.right())
-        } else {
-            rect
-        };
-        let header = Header {
-            title: &title,
-            branch: Some(&branch),
-            can_send: false,
-            split,
-            editor_shortcut: &editor_shortcut,
-            touch: None,
-            review: true,
-            edit: true,
-        };
-        let action = diff_view::show(ui, rect, state, header, &palette, &font);
-        // Read-only: nothing receives review comments on a pull request diff.
-        state.comments.clear();
-        match action {
-            DiffAction::None | DiffAction::SendReview => {}
-            DiffAction::Close => {
-                self.runtime.github.pr_diff = None;
-                self.client.github.pr_view = None;
-            }
-            DiffAction::Refresh => {
-                if let Some(view) = self.runtime.github.pr_diff.take() {
-                    let pull = Pull {
-                        number: view.number,
-                        title: view.title,
-                        head: view.head,
-                        base: view.base,
-                        ..Pull::default()
-                    };
-                    let over = view.over;
-                    self.runtime.github_view_diff(view.repo, &pull);
-                    if let Some(view) = self.runtime.github.pr_diff.as_mut() {
-                        view.over = over;
-                    }
-                }
-            }
-            DiffAction::Edit { .. } => self.runtime.toast(READ_ONLY),
-            DiffAction::Split(on) => {
-                self.client.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never })
+pub(super) fn pr_key(repo: &RepoId, number: u64) -> String {
+    format!("pull:{repo}#{number}")
+}
+
+impl State {
+    pub(super) fn pull_request_infos(&self) -> Vec<atomics_core::projection::PullRequestInfo> {
+        let mut rows = BTreeMap::new();
+        for (repo, listing) in &self.github.lists {
+            for pull in &listing.pulls {
+                let key = pr_key(repo, pull.number);
+                rows.insert(
+                    key.clone(),
+                    atomics_core::projection::PullRequestInfo {
+                        key,
+                        repo: repo.to_string(),
+                        number: pull.number,
+                        title: pull.title.clone(),
+                        head: pull.head.clone(),
+                        base: pull.base.clone(),
+                        url: pull.url.clone(),
+                        head_sha: None,
+                        loading: false,
+                        error: None,
+                    },
+                );
             }
         }
+        for (key, view) in &self.github.pr_diffs {
+            let url = rows.get(key).map(|v| v.url.clone()).unwrap_or_default();
+            rows.insert(
+                key.clone(),
+                atomics_core::projection::PullRequestInfo {
+                    key: key.clone(),
+                    repo: view.repo.to_string(),
+                    number: view.number,
+                    title: view.title.clone(),
+                    head: view.head.clone(),
+                    base: view.base.clone(),
+                    url,
+                    head_sha: view.head_sha.clone(),
+                    loading: view.prepared.is_none(),
+                    error: view.prepared.as_ref().and_then(|p| p.as_ref().err().cloned()),
+                },
+            );
+        }
+        rows.into_values().collect()
+    }
+
+    pub(super) fn load_pull_request(&mut self, key: &str) -> bool {
+        let found = self
+            .github
+            .lists
+            .iter()
+            .find_map(|(repo, list)| {
+                list.pulls.iter().find(|p| pr_key(repo, p.number) == key).map(|p| (repo.clone(), p.clone()))
+            })
+            .or_else(|| {
+                self.github.pr_diffs.get(key).map(|v| {
+                    (
+                        v.repo.clone(),
+                        Pull {
+                            number: v.number,
+                            title: v.title.clone(),
+                            head: v.head.clone(),
+                            base: v.base.clone(),
+                            ..Pull::default()
+                        },
+                    )
+                })
+            });
+        let Some((repo, pull)) = found else { return false };
+        self.fetch_pull_request(repo, &pull, false);
         true
+    }
+
+    pub(super) fn pull_request_bodies(&self) -> impl Iterator<Item = (String, u64, Arc<diff_view::Prepared>)> + '_ {
+        self.github.pr_diffs.iter().filter_map(|(key, view)| {
+            Some((key.clone(), view.revision, view.prepared.as_ref()?.as_ref().ok()?.clone()))
+        })
     }
 }
 
