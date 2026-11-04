@@ -952,6 +952,22 @@ pub(crate) mod tests {
         assert!(!dir.path().join("keychain-catalog").exists());
     }
 
+    // The relay records each request after writing its response. Keep the folder alive until
+    // every complete log line is on disk, as in the relay's log test.
+    fn wait_for_relay_log(home: &std::path::Path, requests: usize) -> String {
+        use std::time::{Duration, Instant};
+        let log = home.join("relay.log");
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.bytes().filter(|byte| *byte == b'\n').count() == requests {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "relay did not log {requests} requests: {text}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn credentials_linear_uses_raw_api_key_authorization_and_accepts_a_raw_placeholder() {
         use crate::relay::{Service, fake};
@@ -982,7 +998,7 @@ pub(crate) mod tests {
         }
         assert!(body.contains("message_start") && body.contains("message_stop"));
         assert_eq!(upstream.seen.lock().unwrap()[0].header("authorization"), ["lin_api_PRIVATE-linear"]);
-        let output = std::fs::read_to_string(dir.path().join("home/relay.log")).unwrap_or_default();
+        let output = wait_for_relay_log(&dir.path().join("home"), 1);
         assert!(!output.contains("lin_api_PRIVATE-linear") && !output.contains(&grant.placeholder));
     }
 
@@ -1022,7 +1038,7 @@ pub(crate) mod tests {
             assert!(service.usage("GitHub").1.is_empty());
             let output = format!(
                 "{}\n{}\n{:?}",
-                std::fs::read_to_string(home.join("relay.log")).unwrap(),
+                wait_for_relay_log(&home, 4),
                 std::fs::read_to_string(home.join("credential-usage.json")).unwrap(),
                 grant
             );
