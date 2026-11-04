@@ -98,13 +98,54 @@ the guest helper with an ssh stand-in (`checks.aarch64-linux.atomics-vm-mac`,
 [`nix/tests/mac-desktop.sh`](../nix/tests/mac-desktop.sh)).
 
 On shared development machines, run builds through `atomics queue --class test -- <build command>`.
-An isolated Docker Nix builder can reuse the `atomics-nix-store` volume; mount the source read-only,
-exclude `target` from the flake source, and use `--no-link --print-out-paths`. The image step runs
-systemd-repart under `unshare --map-root-user`, which Docker's default seccomp profile refuses
-(`unshare failed: Operation not permitted`). Without that namespace the build user, not root, owns
-the image's `/`, and the guest fails at boot (systemd reports unsafe path transitions; nsncd, sshd
-and DHCP do not start). Build the image where user namespaces are allowed, or as the container's root
-with that `unshare` prefix removed (`--option build-users-group ''`). The other outputs build anywhere.
+
+### Build on a Mac with Docker
+
+A Mac needs no Nix: [`scripts/macos-vm-build.sh`](../scripts/macos-vm-build.sh) runs the
+`aarch64-linux` build in a `nixos/nix` container (pinned by digest) and prints the image's and the
+bundle's paths:
+
+```sh
+scripts/macos-vm-build.sh --instance atomics-vm [--out DIR] [--mac-user NAME] \
+  [--cpus 4] [--memory-gib 8] [--disk-gib 100]
+```
+
+- It waits for a test slot through `atomics queue --class test` when ATOMICS runs.
+- The Nix store is a named Docker volume (`ATOMICS_NIX_VOLUME`, default `atomics-nix-store`), so a
+  second run builds only what changed, and a run with nothing changed copies nothing.
+- The checkout is mounted read-only, and only git's files (tracked ones, and new ones git does not
+  ignore) are copied into the container: `target/` never reaches the store. The ATOMICS package is
+  built from the Cargo files, `crates/`, `assets/` and the guest check alone, so an edit to the docs
+  or the Nix files does not rebuild it.
+- `--mac-user` (default: you) and the sizes are the [settings](#settings); `--instance` names the
+  Lima instance the bundle's scripts reach (default `atomics`; pick another when one of that name
+  exists).
+- `DIR` (default `target/atomics-vm`) gets `atomics-vm.raw`, a sparse disk, `bundle/`, the Mac side
+  (checked for `/nix/store` references, which a Mac does not have), and `build.json`.
+
+**The image step and Docker's seccomp profile.** NixOS's image builder runs systemd-repart under
+`unshare --map-root-user`, which Docker's default seccomp profile refuses (`unshare failed: Operation
+not permitted`). Without that namespace the build user, not root, owns the image's `/`, and the guest
+fails at boot (systemd reports unsafe path transitions; nsncd, sshd and DHCP do not start). The
+container therefore runs with [`scripts/macos-vm-build.seccomp.json`](../scripts/macos-vm-build.seccomp.json):
+every system call Docker's default profile refuses a container without added capabilities stays
+refused (mount, ptrace, kexec, bpf, keyrings, io_uring and the rest), except creating a user namespace.
+The container gets no added capability and is not privileged, the builds still run as Nix's build
+users, and the image is the same derivation, store path for store path, that any Linux builder makes.
+The other route, building as the container's root with that `unshare` removed, needs a patched image
+builder whose output no other builder shares, and builds as root.
+
+Measured on an 18-core Apple Silicon Mac (Docker Desktop, 18 CPUs and 24 GB for its VM), with a store
+volume that already held most of the closure:
+
+| Build | Time | Note |
+| --- | --- | --- |
+| Image and bundle, first run on this checkout | 32 min 41 s | 49 derivations built, 14 fetched; the image step (systemd-repart populating btrfs) alone 18 min 53 s |
+| Again after a change to ATOMICS's sources | 10-13 min | the package and the image again |
+| Again with nothing changed | about 1 min | evaluation; nothing copied |
+
+The image is a 100 GiB sparse disk with 7.5 GiB in use; copying it out of the container keeps it
+sparse. The bundle is a few dozen KiB of `sh` scripts and text.
 
 ## Install the Mac side and create the VM with Lima
 
