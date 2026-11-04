@@ -17,9 +17,9 @@ pub mod link;
 pub mod target;
 pub mod vm;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atomics_ui::Client;
@@ -54,8 +54,6 @@ pub struct ClientApp {
     link: Option<(u64, Link)>,
     wake: Arc<dyn Fn() + Send + Sync>,
     started: Instant,
-    /// Why the last dial could not find the host, for the status line's hover and the log.
-    unreachable: Arc<Mutex<Option<String>>>,
     /// The VM's host: what the window does before it can dial (`vm.rs`).
     vm: Option<vm::Gate>,
     /// Why forgetting the VM's refused token failed, for the dialog that asks to pair again.
@@ -144,7 +142,6 @@ impl ClientApp {
             link: None,
             wake,
             started: Instant::now(),
-            unreachable: Arc::default(),
             pair_error: None,
             #[cfg(test)]
             fixed: None,
@@ -175,6 +172,12 @@ impl ClientApp {
         let mut app = Self::fixed(ctx, resolve);
         app.vm = Some(gate);
         app
+    }
+
+    /// Why the last dial did not reach the host, as the window shows it.
+    #[cfg(test)]
+    pub(crate) fn unreachable(&self) -> Option<&str> {
+        self.view.unreachable.as_deref()
     }
 
     #[cfg(test)]
@@ -260,6 +263,8 @@ impl ClientApp {
         match gate.forget_token() {
             Ok(()) => {
                 self.pair_error = None;
+                // The refusal is answered: what the next dial finds is the news.
+                self.view.unreachable = None;
                 self.driver.retry_now();
             }
             Err(error) => self.pair_error = Some(format!("The keychain item could not be removed: {error:#}")),
@@ -421,14 +426,7 @@ impl ClientApp {
             for output in outputs {
                 match output {
                     Output::DialDirect { socket } => {
-                        let resolve = self.resolver();
-                        let unreachable = self.unreachable.clone();
-                        let resolve: Resolve = Box::new(move || {
-                            let found = resolve();
-                            *unreachable.lock().unwrap() = found.as_ref().err().map(|e| format!("{e:#}"));
-                            found
-                        });
-                        let link = Link::open(socket, resolve, self.events_tx.clone(), self.wake.clone());
+                        let link = Link::open(socket, self.resolver(), self.events_tx.clone(), self.wake.clone());
                         self.link = Some((socket, link));
                     }
                     Output::Send { socket, message } => {
@@ -453,11 +451,20 @@ impl ClientApp {
     fn take_events(&mut self) {
         for event in self.events.try_iter().collect::<Vec<_>>() {
             match event {
-                Event::Open { socket, protocol } => self.driver.socket_open(socket, &protocol),
+                Event::Open { socket, protocol } => {
+                    self.view.unreachable = None;
+                    self.driver.socket_open(socket, &protocol);
+                }
                 Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),
-                Event::Closed { socket, code } => {
+                Event::Closed { socket, code, unreachable } => {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket) {
                         self.link = None;
+                    }
+                    // Why the host could not be reached: on screen while the window waits for it, and in
+                    // the log each time it changes.
+                    if let Some(why) = unreachable.filter(|why| self.view.unreachable.as_ref() != Some(why)) {
+                        eprintln!("atomics: the host cannot be reached: {why}");
+                        self.view.unreachable = Some(why);
                     }
                     // A refused token stops the driver (`Stop::Unauthorised`); for the VM's host the window
                     // then asks before it pairs again (`pair_dialog`).

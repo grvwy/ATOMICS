@@ -739,6 +739,42 @@ fn a_wide_window_says_when_the_board_may_be_out_of_date_and_why_it_stopped() {
     assert!(has(&shown, Stop::Revoked.message()) && has(&shown, "Stopped"), "{shown:?}");
 }
 
+/// A native client's word on why its dial failed shows while it waits for the host: on the status screen
+/// before there is a board, under the reconnecting note over one, and never once the host is back.
+#[test]
+fn why_a_native_client_cannot_reach_its_host_shows_while_it_waits() {
+    use atomics_core::tunnel::close;
+
+    let why = "cannot connect to 127.0.0.1:47800: Connection refused (os error 61)";
+    let mut world = World::new(fake_host::host());
+    world.driver = crate::driver::Driver::direct("op");
+    world.pump();
+    assert!(matches!(world.driver.status(), Status::Reconnecting { .. }));
+    let (ctx, mut client, mut view) = (egui::Context::default(), Client::default(), View::default());
+    view.unreachable = Some(why.into());
+    for size in [WIDE, PHONE] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Connecting to your computer") && has(&shown, why), "{size:?}: {shown:?}");
+    }
+
+    let (ctx, mut world, mut client, mut view) = live();
+    view.unreachable = Some(why.into());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, why), "connected: {shown:?}");
+    world.drop_socket(close::ABNORMAL);
+    for size in [WIDE, PHONE] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Reconnecting. The board may be out of date") && has(&shown, why), "{size:?}: {shown:?}");
+    }
+
+    let (ctx, mut world, mut client, mut view) = live();
+    view.unreachable = Some(why.into());
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    world.drop_socket(close::REVOKED);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, why), "stopped, which says why itself: {shown:?}");
+}
+
 /// A secondary click at `at`.
 fn right_click(at: egui::Pos2) -> Vec<egui::Event> {
     let button = |pressed| egui::Event::PointerButton {

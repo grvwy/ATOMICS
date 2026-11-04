@@ -137,6 +137,8 @@ pub struct View {
     pub place: Option<Place>,
     /// The place's action was clicked this frame; the native client takes it.
     pub place_clicked: bool,
+    /// A native client's word on why its last dial did not reach the host, shown while it waits for it.
+    pub unreachable: Option<String>,
     /// The terminal the page's input goes to, by session id, as the pane on screen says.
     target: Option<String>,
     /// The note on the notice line and when it first showed there.
@@ -487,7 +489,10 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace());
                     let (text, good) = status_line(driver);
-                    ui.label(RichText::new(text).color(status_color(good, &p)).size(11.5));
+                    let status = ui.label(RichText::new(text).color(status_color(good, &p)).size(11.5));
+                    if let Some(why) = unreachable(driver, view) {
+                        status.on_hover_text(why);
+                    }
                     // Nothing beside the brand but the connection: where agents run goes right.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         layout_menu(ui, view, |_| {});
@@ -498,18 +503,22 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(8)))
             .show(ui, |ui| {
-                status_screen(ui, driver, client);
+                status_screen(ui, driver, client, unreachable(driver, view));
             });
         return;
     }
     // Under the frame, where its coming and going moves nothing the user may be about to click.
     if let Some((text, color)) = connection_note(driver, &client.palette) {
         let fill = client.palette.panel;
+        let why = unreachable(driver, view);
         egui::Panel::bottom("atomics-connection")
             .resizable(false)
             .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(10, 4)))
             .show(ui, |ui| {
                 ui.label(RichText::new(text).color(color));
+                if let Some(why) = why {
+                    ui.label(RichText::new(why).color(client.palette.muted).small());
+                }
             });
     }
     shell::frame(ui, &mut Web { driver, client, view });
@@ -785,6 +794,15 @@ fn status_color(good: Option<bool>, p: &Palette) -> Color32 {
     }
 }
 
+/// Why a native client's last dial did not reach the host, while it is still trying: not once it is through or
+/// has stopped (the stop says why itself).
+fn unreachable<'a>(driver: &Driver, view: &'a View) -> Option<&'a str> {
+    match driver.status() {
+        Status::Connecting | Status::Reconnecting { .. } => view.unreachable.as_deref(),
+        _ => None,
+    }
+}
+
 /// What the connection's state says of the board on screen, and in what colour: why this page stopped, or that
 /// the board may be out of date.
 fn connection_note(driver: &Driver, p: &Palette) -> Option<(&'static str, Color32)> {
@@ -872,7 +890,7 @@ fn centred(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// The connection's state while there is no board to show, filling the body; false when there is a board.
-fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client) -> bool {
+fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreachable: Option<&str>) -> bool {
     let p = client.palette.clone();
     let gutter = gutter(client);
     if !waiting_room(driver) {
@@ -928,6 +946,10 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client) -> boo
         _ => padded(ui, gutter, |ui| {
             centred(ui, |ui| {
                 ui.label(RichText::new("Connecting to your computer…").color(p.muted));
+                if let Some(why) = unreachable {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(why).color(p.warning).small());
+                }
             })
         }),
     }
@@ -937,7 +959,7 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client) -> boo
 /// The phone's body: the connection's state while there is no board, else the pane, under what the
 /// connection and the host have to say.
 fn phone_body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
-    if status_screen(ui, driver, client) {
+    if status_screen(ui, driver, client, unreachable(driver, view)) {
         return;
     }
     let p = client.palette.clone();
@@ -945,6 +967,9 @@ fn phone_body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view:
     let gutter = gutter(client);
     if let Some((text, color)) = connection_note(driver, &p) {
         padded(ui, gutter, |ui| ui.label(RichText::new(text).color(color)));
+        if let Some(why) = unreachable(driver, view) {
+            padded(ui, gutter, |ui| ui.label(RichText::new(why).color(p.muted).small()));
+        }
     }
     padded(ui, gutter, |ui| notice(ui, driver, client.touch));
     match view.tab {

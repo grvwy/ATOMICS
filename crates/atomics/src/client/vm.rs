@@ -403,7 +403,7 @@ mod tests {
         assert!(!folder.starts_with(dir.path()), "a folder of the forward's own");
         assert_eq!(endpoint.host, format!("127.0.0.1:{port}"));
         let refused = super::super::link::connect(&endpoint).map(|_| ()).unwrap_err();
-        assert_eq!(refused, atomics_core::tunnel::close::UNAUTHORISED);
+        assert_eq!(refused.code, atomics_core::tunnel::close::UNAUTHORISED);
         assert_eq!(&host.join().unwrap(), socket);
         assert_eq!(*tokens.lock().unwrap(), [TOKEN], "the token went to the forward's socket");
         assert!(foreign.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock), "the port was dialled");

@@ -123,12 +123,23 @@ fn a_refused_token_stops_the_client() {
 }
 
 #[test]
-fn a_host_that_is_not_there_is_tried_again() {
+fn a_host_that_is_not_there_is_tried_again_and_the_window_says_why() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let mut app = client(addr);
     until(&mut app, "a reconnect", |status| matches!(status, Status::Reconnecting { .. }));
+    let why = app.unreachable().unwrap_or_default();
+    assert!(why.starts_with(&format!("cannot connect to {addr}: ")), "{why}");
+}
+
+/// What finding the host failed on (the VM's forward, say) is what the window shows.
+#[test]
+fn a_host_that_cannot_be_found_says_why() {
+    let ctx = egui::Context::default();
+    let mut app = ClientApp::fixed(&ctx, || anyhow::bail!("the VM atomics is stopped"));
+    until(&mut app, "a reconnect", |status| matches!(status, Status::Reconnecting { .. }));
+    assert_eq!(app.unreachable(), Some("the VM atomics is stopped"));
 }
 
 /// The VM's host refusing this Mac's token stops the window and asks: the token stays in the keychain,
@@ -185,6 +196,7 @@ fn a_token_the_vms_host_refuses_is_kept_until_the_user_pairs_again() {
     app.pair_again();
     assert_eq!(kept(), None);
     assert!(!app.asks_to_pair_again());
+    assert_eq!(app.unreachable(), None, "the refusal is not news while it pairs again");
     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
     while dials.load(Ordering::SeqCst) < 2 {
         assert!(Instant::now() < deadline, "no dial after Pair again");
