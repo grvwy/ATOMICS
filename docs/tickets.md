@@ -584,7 +584,8 @@ What a request can do is fixed, whatever a config or a server says:
 - **Bounded answers.** The answer must be JSON, at most 8 MiB. Of a refusal, 300 characters show, cleaned of credentials.
 
 A 401 with a sign-in refreshes once and tries again; a second 401 [offers one more sign-in, once](#one-sign-in-a-token-per-resource).
-With a `token_env` token it says to check the token. Only a lost connection, a timeout, a 429 or a 5xx backs off, and the API's backoff is separate from the
+A 403 with a sign-in says it lacks the right, which another sign-in would not change. With a `token_env` token, a 401 or a 403
+says to check the token. Only a lost connection, a timeout, a 429 or a 5xx backs off, and the API's backoff is separate from the
 MCP server's. A 404 is one missing ticket.
 
 ### Display result paths

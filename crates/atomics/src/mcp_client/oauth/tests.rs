@@ -130,6 +130,8 @@ pub(crate) struct State {
     pub(crate) refuse_api_tokens: bool,
     /// The API answers 401 to its own valid tokens, as an endpoint not open to them does.
     pub(crate) api_refuses: bool,
+    /// The API answers 403 to its own valid tokens, as to a person without the right.
+    pub(crate) api_forbids: bool,
     /// What the API's protected-resource metadata says, when not the truth.
     pub(crate) api_metadata_issuer: Option<String>,
     pub(crate) api_metadata_resource: Option<String>,
@@ -434,6 +436,9 @@ impl Fake {
             let challenge = "Bearer resource_metadata=\"http://127.0.0.1:1/.well-known/oauth-protected-resource\"";
             return Resp(401, vec![("WWW-Authenticate", challenge.into())], "unauthorized".into());
         }
+        if st.api_forbids {
+            return Resp(403, vec![], "forbidden".into());
+        }
         json_resp(200, json!({ "id": "DEMO-1", "key": "DEMO-1", "title": "Read over the API", "state": "open" }))
     }
 }
@@ -671,6 +676,26 @@ fn a_rest_read_refreshes_once_on_a_401_and_then_says_what_to_do() {
     let error = api_client(&fake, &signed_out, &server).err().unwrap();
     assert!(matches!(error, McpError::SignInRequired(_)), "{error:?}");
     assert_eq!(refresh_requests(&fake).len(), 3);
+}
+
+#[test]
+fn a_rest_read_refused_with_a_403_says_the_sign_in_lacks_the_right() {
+    let fake = Fake::start();
+    let (_dir, oauth) = machine();
+    let server = fake.server_with_api();
+    sign_in(&oauth, &server).unwrap();
+    let mut client = api_client(&fake, &oauth, &server).unwrap();
+    assert_eq!(read_over_the_api(&mut client).unwrap()["id"], "DEMO-1");
+    let refreshes = refresh_requests(&fake).len();
+
+    fake.state.lock().unwrap().api_forbids = true;
+    let error = read_over_the_api(&mut client).unwrap_err();
+    assert!(matches!(error, McpError::Tool { .. }), "another sign-in would not help: {error:?}");
+    let text = error.to_string();
+    assert!(text.contains("HTTP 403") && text.contains("sign-in lacks the right"), "{text}");
+    assert!(!text.contains("token_env"), "{text}");
+    assert!(!is_sign_in_required(&text), "{text}");
+    assert_eq!(refresh_requests(&fake).len(), refreshes, "a new token would not help");
 }
 
 #[test]
