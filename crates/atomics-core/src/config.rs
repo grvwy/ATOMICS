@@ -423,7 +423,7 @@ close_done_agents = true
 #
 # [[tickets.views]]
 # label = "Mine"
-# arguments = { baseViewKey = "work-my", baseViewValueKey = "assigned-to-me" }
+# arguments = { baseViewKey = "work-active", baseViewValueKey = "assigned-to-me" }
 # END RELAY REST PROFILE
 
 [resources]

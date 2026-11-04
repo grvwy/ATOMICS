@@ -1569,7 +1569,7 @@ were read from the backend's source on 2026-11-04, not from a live call.
 - **Both searches** are the same `POST`; the `semantic` query argument chooses. The panel starts by meaning and the
   chief by keyword. When meaning search is not set up or not reachable, the API answers by keyword and says so in
   `X-Semantic-State`; `fallback` reads that, and the panel and the chief pass it on.
-- **The tabs** are the API's views: **Active**, **All** and **Mine**. Searches look through all work, closed tickets included.
+- **The tabs** are the API's views: **Active**, **All** and **Mine**, which is the open work assigned to you. Searches look through all work, closed tickets included.
 - **A key** is looked up with `get`, at `by-key/{key}`, which must be live for a prefixed key to go first. A bare number
   needs no lookup: the API's search answers it itself. `read`, `children` and comments take the ticket's UUID, so a link
   known only by its key is first read with `get`. So is a plan's board, which costs one more request each time it is read.
@@ -1664,7 +1664,7 @@ arguments = { baseViewKey = "work-all" }
 
 [[tickets.views]]
 label = "Mine"
-arguments = { baseViewKey = "work-my", baseViewValueKey = "assigned-to-me" }
+arguments = { baseViewKey = "work-active", baseViewValueKey = "assigned-to-me" }
 ```
 
 ### Let PR automation own review and done

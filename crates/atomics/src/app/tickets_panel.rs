@@ -2728,9 +2728,10 @@ mod tests {
                 let tickets = state["tickets"].as_array_mut().unwrap();
                 tickets[4]["state"] = "Done".into();
                 tickets[1]["assignee"] = "Someone Else".into();
+                tickets[4]["assignee"] = "Someone Else".into();
             });
             for (tab, view, value, count) in
-                [(0, "work-active", None, 4), (1, "work-all", None, 5), (2, "work-my", Some("assigned-to-me"), 1)]
+                [(0, "work-active", None, 4), (1, "work-all", None, 5), (2, "work-active", Some("assigned-to-me"), 1)]
             {
                 app.runtime.tickets_tab(tab);
                 settle(app);
