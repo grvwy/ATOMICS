@@ -547,8 +547,8 @@ ID with the warning as it reads now, and the decision is refused (`stale_revisio
 command would drop now. A denial needs no second look. Every brief tells agents
 to stash with `git stash push -m <task id>`, to find their entry by that message and restore it with
 `git stash apply <commit>`, and to drop, pop or clear nothing without approval. Claude agents ATOMICS starts on this
-machine ask in their own terminal before these commands (`permissions.ask` in their session settings), even where
-their settings allow git; sandboxed agents run unattended and have only the brief. `atomics doctor` lists every
+machine ask in their own terminal before these commands (`permissions.ask` in their session settings), also with
+git options before `stash` such as `git -C ../app stash drop`, even where their settings allow git; sandboxed agents run unattended and have only the brief. `atomics doctor` lists every
 repository's stash.
 
 ## The chief agent
