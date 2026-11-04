@@ -473,4 +473,9 @@ pub trait Backend {
     /// The folder the host was started in, where the welcome starts agents outside the Ungrouped tab;
     /// `None` when the host does not say.
     fn launch_dir(&self) -> Option<PathBuf>;
+
+    /// The ticket system's sign-in, when the host's ticket system signs in with OAuth and says how it stands.
+    fn sign_in(&self) -> Option<crate::signin::SignInView> {
+        None
+    }
 }

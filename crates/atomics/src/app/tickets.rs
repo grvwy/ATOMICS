@@ -70,7 +70,7 @@ pub(super) struct Tickets {
     /// The state each link is being moved to right now.
     pushing: HashMap<LinkKey, String>,
     /// State pushes that failed, retried on the next heartbeat or sync.
-    failed: HashMap<LinkKey, String>,
+    pub(super) failed: HashMap<LinkKey, String>,
     /// Caller-chosen nonce retained until a state push succeeds or is superseded.
     state_nonces: HashMap<LinkKey, (String, String, String)>,
     /// The tickets each board-mode plan's board lists.
@@ -544,6 +544,16 @@ impl State {
     }
 
     fn finish_ticket(&mut self, tag: Tag, result: Result<TicketOutput, String>) {
+        // A refused sign-in shows wherever the tickets do, with the button that signs in again. Only a
+        // job that called the server proves a sign-in works: a trace capture or an empty outbox does not.
+        let called_the_server = !matches!(tag.kind, Kind::Trace(_) | Kind::Outbox);
+        match &result {
+            Err(error) => self.ticket_job_failed(error),
+            Ok(_) if called_the_server && self.tickets.config.as_ref().is_some_and(|c| c.system == tag.system) => {
+                self.ticket_job_succeeded()
+            }
+            Ok(_) => {}
+        }
         if let Kind::Whoami(config, epoch) = &tag.kind {
             if self.tickets.config.as_ref() == Some(config) && self.tickets.identity_epoch == *epoch {
                 match result {
@@ -994,8 +1004,7 @@ impl State {
         task: Option<&str>,
         author: &Author,
     ) -> Result<(Arc<TicketConfig>, LinkKey, TicketLink), String> {
-        let config =
-            self.ticket_config().ok_or("No ticket system is configured ([tickets] in the workspace or config).")?;
+        let config = self.ticket_config().ok_or_else(|| self.no_ticket_system())?;
         if !config.posts(author) {
             return Err(format!(
                 "Ticket comments by {} are off in [tickets] comments.",
@@ -1309,7 +1318,7 @@ impl State {
             let _ = reply.send(ControlOutcome::Done(ControlResponse::error(error)));
         };
         let Some(config) = self.ticket_config() else {
-            reject("tickets are not configured: set tickets.system and tickets.server".into());
+            reject(self.no_ticket_system());
             return;
         };
         let (operation, query) = match &mut op {
@@ -1378,10 +1387,11 @@ impl State {
         };
         self.tickets.failed.retain(|key, _| !plans.contains(&key.0));
         let batch = self.open_batch(reply, Answer::Sync(plans.clone()));
-        if self.ticket_config().is_none()
+        let unconfigured = self.ticket_config().is_none().then(|| self.no_ticket_system());
+        if let Some(reason) = unconfigured
             && let Some(entry) = self.tickets.batches.get_mut(&batch)
         {
-            entry.errors.push("No ticket system is configured ([tickets] in the workspace or config).".into());
+            entry.errors.push(reason);
         }
         for id in &plans {
             self.refresh_tickets(Some(id), Some(batch));
@@ -1428,14 +1438,14 @@ impl State {
         comment: Option<String>,
         reply: Sender<ControlOutcome>,
     ) {
-        let target = (|| {
-            let config = self.ticket_config().ok_or("No ticket system is configured.")?;
+        let target = (|| -> Result<_, String> {
+            let config = self.ticket_config().ok_or_else(|| self.no_ticket_system())?;
             if config.comments != ticket::CommentPolicy::Agents {
-                return Err("Agent ticket access requires [tickets] comments = agents.");
+                return Err("Agent ticket access requires [tickets] comments = agents.".into());
             }
             let pane = pane.filter(|id| !id.is_empty()).ok_or("No agent session identity.")?;
             if !self.sessions.iter().any(|s| s.id == pane && !s.chief) {
-                return Err("No task agent matches this session.");
+                return Err("No task agent matches this session.".into());
             }
             let mut tasks =
                 self.plans.iter().filter(|p| p.is_open()).flat_map(|p| {
@@ -1443,16 +1453,16 @@ impl State {
                 });
             let (plan, task) = tasks.next().ok_or("This session has no task in an open plan.")?;
             if tasks.next().is_some() {
-                return Err("This session belongs to more than one task.");
+                return Err("This session belongs to more than one task.".into());
             }
             let link = if plan_link { plan.ticket.as_ref() } else { task.ticket.as_ref() }
                 .ok_or("The requested task or plan has no linked ticket.")?;
             if !link.system.is_empty() && link.system != config.system {
-                return Err("The linked ticket belongs to another ticket system.");
+                return Err("The linked ticket belongs to another ticket system.".into());
             }
             let operation = if comment.is_some() { "comment" } else { "get" };
             if config.operation(operation).is_none() {
-                return Err("The requested ticket operation is not configured.");
+                return Err("The requested ticket operation is not configured.".into());
             }
             let key = (plan.id.clone(), (!plan_link).then(|| task.id.clone()));
             let author = Author::Agent(ticket::model_label(&task.agent, &task.args));
@@ -1836,7 +1846,13 @@ mod tests {
             let original = app.runtime.chief_prompt();
             assert!(!original.contains("atomics_ticket_search"));
             let not_configured = chief_tool(app, "atomics_ticket_search", json!({"query":"q"}));
-            assert!(!not_configured.ok && not_configured.error.unwrap().contains("tickets.server"));
+            // It names the cause: no workspace is open, and the config has no [tickets] either.
+            let why = not_configured.error.unwrap();
+            assert!(
+                !not_configured.ok && why.contains("No ticket system is configured: no workspace is open"),
+                "{why}"
+            );
+            assert!(why.contains("config.toml has no [tickets] either"), "{why}");
             let dir = crate::test_support::tempdir().unwrap();
             let path = dir.path().join("demo.json");
             configure_chief_tools(app, &path);

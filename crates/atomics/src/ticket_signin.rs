@@ -41,6 +41,36 @@ impl SignState {
     }
 }
 
+/// Whether a ticket job's error says the server wants a person to sign in again: ATOMICS's own
+/// `sign-in required`, or a server that answers a call with words that mean its sign-in lapsed
+/// (such as `needs-refresh` or `invalid_grant`) although the keychain still holds one. Signing in
+/// again replaces what the keychain holds, which is what such a server needs.
+pub fn asks_for_sign_in(error: &str) -> bool {
+    const LAPSED: &[&str] = &[
+        "needs-refresh",
+        "needs_refresh",
+        "needs refresh",
+        "invalid_grant",
+        "invalid_token",
+        "token expired",
+        "token has expired",
+        "expired token",
+        "reauthenticate",
+        "re-authenticate",
+        "reauthorize",
+        "re-authorize",
+        "sign in again",
+        "log in again",
+        "login required",
+        "unauthenticated",
+    ];
+    if crate::mcp_client::is_sign_in_required(error) || error.contains(crate::mcp_client::SIGN_IN_REQUIRED) {
+        return true;
+    }
+    let lower = error.to_ascii_lowercase();
+    LAPSED.iter().any(|words| lower.contains(words))
+}
+
 /// Whether this machine has no browser to open: Linux without a display, or a login over SSH.
 pub fn headless() -> bool {
     headless_in(std::env::consts::OS, |name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))

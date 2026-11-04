@@ -4,7 +4,10 @@
 //! headless-browser test (`tests/browser.rs`) serves the real bundle from it too.
 //!
 //! Its terminals ([`FakeTerminal`]) echo what is typed into them, as `cat` in a cooked terminal would,
-//! under leases with fencing tokens and input numbers as the real host keeps them.
+//! under leases with fencing tokens and input numbers as the real host keeps them. Its own state ([`Board::host`]:
+//! the workspace and the ticket sign-in) goes with its snapshots and `host_upsert`, and `host_command` changes it
+//! as the real host's would, without a ticket server: a sign-in waits on [`SIGN_IN_URL`] until any address is
+//! pasted.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -12,9 +15,12 @@ use atomics_core::diff::FileDiff;
 use atomics_core::lease::{GridSize, LeaseReason, LeaseState};
 use atomics_core::noise::{Access, Channel, Kind, PairAnswer, PairRequest, Pairing, PublicKey, Responder, Secret};
 use atomics_core::ops::{
-    CommandResult, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
+    CommandResult, HostAction, HostCommand, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand,
+    SessionAction, SessionCommand,
 };
-use atomics_core::projection::{ApprovalInfo, DiffFileBody, DiffSummary, PlanInfo, SessionInfo, TaskInfo};
+use atomics_core::projection::{
+    ApprovalInfo, DiffFileBody, DiffSummary, HostInfo, PlanInfo, SessionInfo, SignInState, TaskInfo,
+};
 use atomics_core::screen::{HistoryChunk, Line, RowsEncoder, Screen};
 use atomics_core::steer::ReviewComment;
 use atomics_core::tunnel::close;
@@ -24,6 +30,8 @@ use atomics_core::wire::{
 };
 
 pub const HOST_ID: &str = "6f1c2a7e-0b7d-4c55-9f43-3d2a1b0c9e8f";
+/// The address a sign-in this host starts waits on.
+pub const SIGN_IN_URL: &str = "https://auth.example.com/authorize?client_id=atomics&state=s1";
 
 enum Stage {
     /// Nothing read on this channel yet.
@@ -43,6 +51,8 @@ pub struct Board {
     pub plans: Vec<PlanInfo>,
     pub approvals: Vec<ApprovalInfo>,
     pub diffs: Vec<DiffSummary>,
+    /// The host's own state: its workspaces and the ticket sign-in.
+    pub host: HostInfo,
 }
 
 pub struct FakeHost {
@@ -79,14 +89,22 @@ pub struct FakeHost {
     /// The name the browser's leases are shown under: the name it paired with.
     pub device: String,
     tokens: u64,
-    /// The next plan, review or session command is refused with this, as a host that cannot do it says.
+    /// The next plan, review, session or host command is refused with this, as a host that cannot do it says.
     pub refuse_next: Option<WireError>,
     /// What was steered, by session: delivered to the agent, not typed under a lease.
     pub steered: Vec<(String, String)>,
     /// The reviews sent to agents, by worktree.
     pub reviews: Vec<(String, Vec<ReviewComment>)>,
-    /// Plan, review and session commands wait unanswered, as work that takes a while does.
+    /// Plan, review, session and host commands wait unanswered, as work that takes a while does.
     pub hold_results: bool,
+    /// What every `host_command` asked, in order, answered or not.
+    pub host_commands: Vec<HostAction>,
+    /// This host offers `host`. Without it, it is one from before `host`: its snapshots carry none of its own
+    /// state, and that state's events reach the browser as `skipped`, as a newer host sends them to a client
+    /// that did not ask for `host`.
+    pub offers_host: bool,
+    /// The channel open now negotiated `host`.
+    host_negotiated: bool,
 }
 
 /// A terminal that echoes what it is typed, with its lease.
@@ -288,6 +306,9 @@ impl FakeHost {
             steered: Vec::new(),
             reviews: Vec::new(),
             hold_results: false,
+            host_commands: Vec::new(),
+            offers_host: true,
+            host_negotiated: false,
         }
     }
 
@@ -396,13 +417,30 @@ impl FakeHost {
                 self.board.diffs.retain(|d| d.worktree != summary.worktree);
                 self.board.diffs.push(summary.clone());
             }
+            Message::HostUpsert { host, .. } => self.board.host = host.clone(),
             _ => {}
         }
         let envelope = Envelope::host(&self.epoch, message);
         self.events.push(envelope.clone());
+        let sent = self.for_channel(&envelope);
         match &mut self.stage {
-            Some(Stage::Open(channel)) => Self::seal(channel, &[envelope]),
+            Some(Stage::Open(channel)) => Self::seal(channel, &[sent]),
             _ => Vec::new(),
+        }
+    }
+
+    /// The host's own state changes to `host`: the `host_upsert` an open channel is sent.
+    pub fn publish_host(&mut self, host: HostInfo) -> Vec<Vec<u8>> {
+        self.event(|cursor| Message::HostUpsert { cursor, host })
+    }
+
+    /// An event as the open channel is sent it: one of the host's own state as `skipped` without `host`.
+    fn for_channel(&self, event: &Envelope) -> Envelope {
+        match &event.message {
+            Message::HostUpsert { cursor, .. } if !self.host_negotiated => {
+                Envelope::host(&self.epoch, Message::Skipped { cursor: *cursor })
+            }
+            _ => event.clone(),
         }
     }
 
@@ -421,11 +459,12 @@ impl FakeHost {
             &self.epoch,
             Message::StateSnapshot {
                 cursor: Seq(self.head()),
-                revisions: Revisions { sessions: rev, plans: rev, approvals: rev, diffs: rev },
+                revisions: Revisions { sessions: rev, plans: rev, approvals: rev, diffs: rev, host: rev },
                 sessions: self.board.sessions.clone(),
                 plans: self.board.plans.clone(),
                 approvals: self.board.approvals.clone(),
                 diffs: self.board.diffs.clone(),
+                host: if self.offers_host { self.board.host.clone() } else { HostInfo::default() },
                 part: None,
             },
         )
@@ -532,7 +571,10 @@ impl FakeHost {
         let host = move |m| Envelope::host(&epoch, m);
         match envelope.message {
             Message::Hello { capabilities, prior_epoch, prior_cursor, .. } => {
-                let capabilities = wire::common_capabilities(&capabilities, CAPABILITIES);
+                let offered: Vec<&str> =
+                    CAPABILITIES.iter().copied().filter(|c| self.offers_host || *c != wire::HOST).collect();
+                let capabilities = wire::common_capabilities(&capabilities, &offered);
+                self.host_negotiated = capabilities.iter().any(|c| c == wire::HOST);
                 let role = self.access.role();
                 let resume =
                     wire::decide_resume(&self.epoch, Seq(self.head()), Seq(1), prior_epoch.as_deref(), prior_cursor);
@@ -548,7 +590,9 @@ impl FakeHost {
                 let mut out = vec![welcome];
                 match resume {
                     Resume::Reset { .. } => out.push(self.snapshot()),
-                    Resume::Replay { after } => out.extend(self.events.iter().skip(after.0 as usize).cloned()),
+                    Resume::Replay { after } => {
+                        out.extend(self.events.iter().skip(after.0 as usize).map(|e| self.for_channel(e)));
+                    }
                 }
                 out
             }
@@ -617,6 +661,11 @@ impl FakeHost {
             Message::SessionCommand(command) => {
                 let op = command.op.clone();
                 self.mutate(op, |host| host.session_command(command))
+            }
+            Message::HostCommand(command) => {
+                let op = command.op.clone();
+                self.host_commands.push(command.action.clone());
+                self.mutate(op, |host| host.host_command(command))
             }
             _ => Vec::new(),
         }
@@ -760,6 +809,35 @@ impl FakeHost {
                 Outcome::done(serde_json::Value::Null)
             }
         }
+    }
+
+    /// The sign-in and the workspace, as the real host changes them.
+    fn host_command(&mut self, command: HostCommand) -> Outcome {
+        let refused = |code, text: String| Outcome::refused(WireError::new(code, text));
+        let mut host = self.board.host.clone();
+        let now = host.sign_in.as_ref().map(|sign_in| sign_in.state);
+        let (state, url) = match command.action {
+            HostAction::OpenWorkspace { name } if !host.workspaces.contains(&name) => {
+                return refused(ErrorCode::NotFound, format!("no workspace {name}"));
+            }
+            HostAction::OpenWorkspace { name } => {
+                host.workspace = Some(name);
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            _ if now.is_none() => return refused(ErrorCode::Rejected, "the ticket system has no sign-in".into()),
+            HostAction::SignIn => (SignInState::SigningIn, Some(SIGN_IN_URL.to_string())),
+            HostAction::SignInPaste { .. } if now != Some(SignInState::SigningIn) => {
+                return refused(ErrorCode::Rejected, "no sign-in is under way".into());
+            }
+            HostAction::SignInPaste { .. } => (SignInState::SignedIn, None),
+            HostAction::SignInCancel => (SignInState::SignedOut, None),
+        };
+        if let Some(sign_in) = host.sign_in.as_mut() {
+            (sign_in.state, sign_in.url, sign_in.rejected) = (state, url, None);
+        }
+        let _ = self.publish_host(host);
+        Outcome::done(serde_json::Value::Null)
     }
 
     fn terminal_frame(&mut self, message: Message, id: Option<String>) -> Vec<Envelope> {
@@ -981,6 +1059,7 @@ pub fn board() -> Board {
             files: vec![file("src/a.rs"), file("src/b.rs")],
             comments: Vec::new(),
         }],
+        host: HostInfo::default(),
     }
 }
 
@@ -1062,6 +1141,28 @@ pub fn many_plans() -> FakeHost {
         let id = if n < 23 { format!("a-{n:02}") } else { format!("z-{n:02}") };
         host.board.plans.push(closed_plan(&id, PlanStatus::Archived, &format!("Archived plan number {n}")));
     }
+    host
+}
+
+/// [`host`] with the workspace `team` open of the two saved, whose ticket system, `tracker` on
+/// tickets.example.com, signs in from ATOMICS and stands at `state`; a sign-in under way waits on [`SIGN_IN_URL`].
+pub fn tickets(state: SignInState) -> FakeHost {
+    use atomics_core::projection::SignInInfo;
+    let mut host = self::host();
+    let url = (state == SignInState::SigningIn).then(|| SIGN_IN_URL.to_string());
+    host.board.host = HostInfo {
+        workspace: Some("team".into()),
+        workspaces: vec!["daily".into(), "team".into()],
+        sign_in: Some(SignInInfo {
+            system: "tracker".into(),
+            server: "tickets.example.com".into(),
+            state,
+            reason: None,
+            url,
+            rejected: None,
+            browser_failed: false,
+        }),
+    };
     host
 }
 

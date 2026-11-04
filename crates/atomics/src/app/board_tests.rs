@@ -343,3 +343,61 @@ fn approve_plan_fills_with_the_accent_and_writes_on_accent() {
         output.drop_without_applying_deltas();
     });
 }
+
+#[test]
+fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
+    tests::with_app(
+        "app::board_tests::a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again",
+        |app, ctx| {
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+            app.runtime.config.tickets = toml::from_str("system = \"tracker\"").unwrap();
+            app.runtime.config.tickets.server = fake.server();
+            app.runtime.tickets.sign.override_oauth(oauth);
+            app.runtime.tickets.sign.headless = true;
+            app.runtime.apply_ticket_config();
+            app.runtime.poll_signin();
+            app.runtime.plans[0].tasks = vec![Task { id: "a".into(), title: "Work".into(), ..Default::default() }];
+            let labels = |rendered: &BoardFrame| -> Vec<String> {
+                rendered.text.iter().map(|text| text.galley.text().to_string()).collect()
+            };
+            // Never signed in here: the board says so, with the button that signs in.
+            let rendered = frame(app, ctx, 1400.0, 0.0, vec![]);
+            assert!(labels(&rendered).contains(&"Sign in to tracker".to_string()), "{:?}", labels(&rendered));
+
+            // The server refused the saved sign-in: the same place offers Reconnect, and says why.
+            app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+            let rendered = frame(app, ctx, 1400.0, 0.1, vec![]);
+            let texts = labels(&rendered);
+            assert!(texts.contains(&"tracker needs you to sign in again".to_string()), "{texts:?}");
+            assert!(texts.contains(&"the server refused the saved sign-in".to_string()), "{texts:?}");
+            let button = rendered.text.iter().find(|text| text.galley.text() == "Reconnect").expect("Reconnect");
+            let at = button.pos + button.galley.rect.center().to_vec2();
+            let press = |pressed| {
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ]
+            };
+            frame(app, ctx, 1400.0, 0.2, press(true));
+            frame(app, ctx, 1400.0, 0.3, press(false));
+            assert!(app.runtime.tickets.sign.job.is_some(), "the click started the sign-in");
+            // With no browser here, the board shows the steps: the link to open and the paste box.
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+            while app.runtime.sign_in_info().and_then(|info| info.url).is_none() {
+                app.runtime.poll_signin();
+                assert!(Instant::now() < deadline, "no sign-in address");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let texts = labels(&frame(app, ctx, 1400.0, 0.4, vec![]));
+            assert!(texts.contains(&"Waiting for the sign-in…".to_string()), "{texts:?}");
+            assert!(texts.contains(&"Open link".to_string()) && texts.contains(&"Use it".to_string()), "{texts:?}");
+            let _ = app.runtime.cancel_sign_in();
+        },
+    );
+}

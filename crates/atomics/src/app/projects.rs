@@ -2,11 +2,21 @@ use super::*;
 
 impl State {
     /// `atomics <path>` or `--workspace`, else the repository ATOMICS was started in, else
-    /// the projects from last time.
+    /// the projects from last time. A start that names neither a project nor a workspace (from the
+    /// Dock, say) opens the workspace that was open last time again, if it is still saved, so its
+    /// `[tickets]`, workflow and chief settings apply as they did.
     pub(super) fn open_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
+        let reopened = workspace.is_none() && requested.is_empty();
+        let workspace = workspace.or_else(|| {
+            let last = self.store.workspace.clone().filter(|_| reopened)?;
+            Workspace::list().contains(&last).then_some(last)
+        });
+        self.workspace = workspace.clone();
         let mut projects = requested;
+        let mut saved = Vec::new();
         if let Some(name) = &workspace {
             match Workspace::load(name) {
+                Ok(ws) if reopened => saved = ws.projects,
                 Ok(ws) => projects.extend(ws.projects),
                 Err(err) => self.toast(format!("{err:#}")),
             }
@@ -16,6 +26,10 @@ impl State {
         }
         if projects.is_empty() {
             projects = self.store.projects.clone();
+        }
+        // The projects left open last time are the reopened workspace's and what was added to it.
+        if projects.is_empty() {
+            projects = saved;
         }
         for dir in projects {
             if let Ok(root) = workspace::project_root(&dir)
@@ -32,7 +46,50 @@ impl State {
             self.store.touch_project(&root);
         }
         self.store.projects = self.open_projects.clone();
+        self.store.workspace = self.workspace.clone();
         let _ = self.store.save(&paths::store_file());
+        self.refresh_workspace_names();
+    }
+
+    /// The saved workspaces, read again: the host's state lists them for every client.
+    pub(super) fn refresh_workspace_names(&mut self) {
+        self.workspace_names = Workspace::list();
+    }
+
+    /// Why no ticket system is configured, as a ticket tool says it: the open workspace (or that none
+    /// is, and which are saved), and what its `[tickets]` and the config's lack.
+    pub(super) fn no_ticket_system(&self) -> String {
+        let config = if self.config.tickets.system.trim().is_empty() {
+            "config.toml has no [tickets] either".to_string()
+        } else {
+            format!("config.toml's [tickets] ({}) has no server", self.config.tickets.system)
+        };
+        let cause = match self.workspace.as_deref() {
+            None => {
+                let saved = Workspace::list();
+                let names: Vec<String> = saved
+                    .iter()
+                    .map(|name| match Workspace::load(name).map(|ws| ws.extra.contains_key("tickets")) {
+                        Ok(true) => format!("{name} (has [tickets])"),
+                        _ => name.clone(),
+                    })
+                    .collect();
+                let saved =
+                    if names.is_empty() { "none saved".to_string() } else { format!("saved: {}", names.join(", ")) };
+                format!(
+                    "no workspace is open; {saved}. Open one from the Project menu, or start ATOMICS with --workspace NAME; {config}"
+                )
+            }
+            Some(name) => match Workspace::load(name) {
+                Err(error) => format!("the open workspace {name} does not load: {error:#}"),
+                Ok(ws) => match ws.tickets() {
+                    Err(error) => format!("the open workspace {name}'s [tickets] does not parse: {}", error.message()),
+                    Ok(None) => format!("the open workspace {name} has no [tickets]; {config}"),
+                    Ok(Some(_)) => format!("the open workspace {name}'s [tickets] names no system and server"),
+                },
+            },
+        };
+        format!("No ticket system is configured: {cause}.")
     }
 
     pub(super) fn open_project(&mut self, dir: &Path) {
@@ -61,7 +118,9 @@ impl State {
         }
     }
 
-    pub(super) fn open_workspace(&mut self, name: &str) {
+    /// Opens a saved workspace in place of the open projects; it is the one a start without
+    /// `--workspace` and a restart open again. Returns how many projects it opened.
+    pub(super) fn open_workspace(&mut self, name: &str) -> Result<usize, String> {
         match Workspace::load(name) {
             Ok(ws) => {
                 self.open_projects = ws.projects.iter().filter_map(|p| workspace::project_root(p).ok()).collect();
@@ -70,9 +129,15 @@ impl State {
                 self.apply_config();
                 self.active = None;
                 self.diff_root = self.open_projects.first().cloned();
-                self.toast(format!("Workspace {name}: {} projects", self.open_projects.len()));
+                let opened = self.open_projects.len();
+                self.toast(format!("Workspace {name}: {opened} projects"));
+                Ok(opened)
             }
-            Err(err) => self.toast(format!("{err:#}")),
+            Err(err) => {
+                let error = format!("{err:#}");
+                self.toast(error.clone());
+                Err(error)
+            }
         }
     }
 
@@ -94,6 +159,7 @@ impl State {
         match ws.save() {
             Ok(file) => {
                 self.workspace = Some(ws.name);
+                self.remember_projects();
                 self.toast(format!("Saved {}", paths::display(&file)));
             }
             Err(err) => self.toast(format!("{err:#}")),
@@ -117,6 +183,75 @@ impl State {
 mod tests {
     use super::*;
     use crate::app::tests::with_state;
+
+    #[test]
+    fn a_start_that_names_nothing_opens_the_last_workspace_and_errors_name_the_cause() {
+        with_state(
+            "app::projects::tests::a_start_that_names_nothing_opens_the_last_workspace_and_errors_name_the_cause",
+            |mut state, _| {
+                let (_repo_dir, repo) = crate::app::tests::repository();
+                let dir = workspace::workspaces_dir();
+                std::fs::create_dir_all(&dir).unwrap();
+                let team = format!(
+                    "projects = [{:?}]\n[tickets]\nsystem = \"tracker\"\n[tickets.server]\nurl = \"https://tickets.example.com/mcp\"\n",
+                    repo.display().to_string()
+                );
+                std::fs::write(dir.join("team.toml"), team).unwrap();
+                std::fs::write(dir.join("daily.toml"), "projects = []\n").unwrap();
+                state.refresh_workspace_names();
+
+                // Started from the Dock with nothing open: the ticket tools say why there is no system.
+                state.workspace = None;
+                state.apply_config();
+                assert!(state.ticket_config().is_none());
+                let why = state.no_ticket_system();
+                assert!(why.starts_with("No ticket system is configured: no workspace is open"), "{why}");
+                assert!(why.contains("saved: daily, team (has [tickets])"), "{why}");
+                assert!(why.contains("--workspace NAME"), "{why}");
+
+                // Opening one from the picker remembers it for the next start.
+                assert_eq!(state.open_workspace("team"), Ok(1));
+                assert_eq!(Store::load(&paths::store_file()).workspace.as_deref(), Some("team"));
+                assert_eq!(state.ticket_config().map(|c| c.system.clone()).as_deref(), Some("tracker"));
+                let host = state.host_info();
+                assert_eq!(host.workspace.as_deref(), Some("team"));
+                assert_eq!(host.workspaces, ["daily", "team"]);
+
+                // The next start that names neither a project nor a workspace opens it again, with
+                // the projects that were open.
+                let open = state.open_projects.clone();
+                let fresh = |state: &mut State, requested: Vec<PathBuf>, workspace: Option<String>| {
+                    state.store = Store::load(&paths::store_file());
+                    state.workspace = None;
+                    state.open_projects.clear();
+                    state.open_initial_projects(requested, workspace);
+                    state.apply_config();
+                };
+                fresh(&mut state, vec![], None);
+                assert_eq!(state.workspace.as_deref(), Some("team"));
+                assert_eq!(state.open_projects, open);
+                assert!(state.ticket_config().is_some(), "its [tickets] apply again");
+                // Naming one wins; naming a project opens just that, as before.
+                fresh(&mut state, vec![], Some("daily".into()));
+                assert_eq!(state.workspace.as_deref(), Some("daily"));
+                fresh(&mut state, vec![repo.clone()], None);
+                let root = workspace::project_root(&repo).unwrap();
+                assert_eq!((state.workspace.as_deref(), state.open_projects.clone()), (None, vec![root]));
+                assert_eq!(Store::load(&paths::store_file()).workspace, None);
+
+                // A workspace that is no longer saved is not opened again.
+                state.open_workspace("team").unwrap();
+                std::fs::remove_file(dir.join("team.toml")).unwrap();
+                fresh(&mut state, vec![], None);
+                assert_eq!(state.workspace, None);
+
+                // An open workspace without [tickets] is named as the cause.
+                state.workspace = Some("daily".into());
+                let why = state.no_ticket_system();
+                assert!(why.contains("the open workspace daily has no [tickets]"), "{why}");
+            },
+        );
+    }
 
     #[test]
     fn saving_project_changes_keeps_workspace_ticket_settings() {

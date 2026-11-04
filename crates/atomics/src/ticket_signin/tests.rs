@@ -311,3 +311,17 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
     }
     assert!(!joined.contains("SECRET-CODE") && !joined.contains("code_verifier"));
 }
+
+#[test]
+fn a_lapsed_sign_in_is_told_apart_from_other_ticket_failures() {
+    // ATOMICS's own refusal, as the worker reports it inside a job's error.
+    assert!(asks_for_sign_in("sign-in required: https://tickets.example.com/mcp needs a sign-in"));
+    assert!(asks_for_sign_in("reading the ticket failed: sign-in required: the server refused the saved sign-in"));
+    // A server that says so in its own words while the keychain still holds a sign-in.
+    for words in ["tool error: needs-refresh", "{\"error\":\"invalid_grant\"}", "Token has expired; log in again"] {
+        assert!(asks_for_sign_in(&format!("reading the ticket failed: {words}")), "{words}");
+    }
+    for other in ["ENG-123 was not found", "request to https://tickets.example.com/mcp timed out", "HTTP 500"] {
+        assert!(!asks_for_sign_in(other), "{other}");
+    }
+}

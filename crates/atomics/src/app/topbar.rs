@@ -77,23 +77,19 @@ impl Desktop<'_> {
                 }
             }
         }
+        // The shared items: Sign in or Reconnect while the ticket system needs it, and the workspace.
+        self.draw(|backend, client| atomics_ui::signin::top_bar_item(ui, backend, client));
+        self.draw(|backend, client| atomics_ui::topbar::workspace_menu(ui, backend, client));
         self.github_counter(ui, in_menu);
         self.rendezvous_indicator(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
-            let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)
-                && !self.runtime.tickets.panel.signin;
-            let label = if signed_in {
-                format!("Tickets: sign out of {system}")
-            } else {
-                format!("Tickets: sign in to {system}")
-            };
-            if ui.button(label).clicked() {
-                if signed_in {
-                    self.runtime.start_sign_out();
-                } else {
-                    self.runtime.show_signin();
-                }
+            let signed_in = self
+                .runtime
+                .sign_in_info()
+                .is_some_and(|info| info.state == atomics_core::projection::SignInState::SignedIn);
+            if signed_in && ui.button(format!("Tickets: sign out of {system}")).clicked() {
+                self.runtime.start_sign_out();
                 ui.close();
             }
             if signed_in
@@ -221,6 +217,60 @@ mod tests {
         app.runtime.hook_error = Some("Offline hook fixture".into());
         app.runtime.heartbeat.last = Some((atomics_core::store::now(), vec![]));
         app.client.load = (Instant::now(), Some(123.4));
+    }
+
+    #[test]
+    fn the_bar_shows_the_open_workspace_and_reconnect_and_both_work() {
+        with_app("app::topbar::tests::the_bar_shows_the_open_workspace_and_reconnect_and_both_work", |app, ctx| {
+            let dir = atomics_core::workspace::workspaces_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["team", "daily"] {
+                std::fs::write(dir.join(format!("{name}.toml")), "projects = []\n").unwrap();
+            }
+            app.runtime.workspace = Some("team".into());
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (_keys, oauth) = crate::mcp_client::oauth_test_machine();
+            app.runtime.config.tickets = toml::from_str("system = \"tracker\"").unwrap();
+            app.runtime.config.tickets.server = fake.server();
+            app.runtime.tickets.sign.override_oauth(oauth);
+            app.runtime.tickets.sign.headless = true;
+            app.runtime.apply_ticket_config();
+            app.runtime.poll_signin();
+            app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+            app.runtime.toast = None;
+
+            let (items, output) = render(app, ctx, 1500.0, vec![]);
+            output.drop_without_applying_deltas();
+            for name in ["Workspace", "sign-in", "chief"] {
+                assert!(items.iter().any(|(item, _)| item == name), "{name}: {items:?}");
+            }
+            let chief = items.iter().find(|(name, _)| name == "chief").unwrap().1;
+            for (name, rect) in items.iter().filter(|(name, _)| name == "Workspace" || name == "sign-in") {
+                assert!(rect.min.x >= chief.max.x, "{name} is right of the chief's pill: {items:?}");
+            }
+
+            // Reconnect starts the sign-in and opens the panel that shows its steps.
+            click(app, ctx, 1500.0, "sign-in");
+            assert!(app.runtime.tickets.sign.job.is_some());
+            assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
+            let _ = app.runtime.cancel_sign_in();
+
+            // The workspace item names the open one and opens another.
+            click(app, ctx, 1500.0, "Workspace");
+            click(app, ctx, 1500.0, "daily");
+            assert_eq!(app.runtime.workspace.as_deref(), Some("daily"));
+            let (items, output) = render(app, ctx, 1500.0, vec![]);
+            let labels: Vec<String> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            output.drop_without_applying_deltas();
+            assert!(labels.iter().any(|label| label == "Workspace: daily"), "{labels:?}; {items:?}");
+        });
     }
 
     #[test]

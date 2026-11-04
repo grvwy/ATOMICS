@@ -211,7 +211,7 @@ mod tests {
             }
             assert_ne!(std::env::current_exe().unwrap(), executable, "exercise /proc/self/exe's deleted suffix");
             assert_eq!(executable_path().unwrap(), executable);
-            let target = crate::restart::Target::current().unwrap();
+            let target = crate::restart::Target::current(None).unwrap();
             assert_eq!(target.executable, executable);
             target.validate().unwrap();
             return;

@@ -72,6 +72,10 @@ fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, sel
 /// sessions to resume. A click activates a session; its menu selects it for steering, renames or closes it.
 pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
+    // With no open plan there is no board to offer the ticket sign-in, so it goes above the agents.
+    if crate::signin::no_board_shows(backend) {
+        crate::signin::framed(ui, backend, client);
+    }
     section(ui, &p, "AGENTS");
     let mut clicked: Option<String> = None;
     let mut close: Option<String> = None;

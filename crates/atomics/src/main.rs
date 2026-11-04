@@ -505,6 +505,9 @@ mod cli_tests {
             &["atomics", "setup", "--workspace", "daily"],
             &["atomics", "sandbox", "setup", "-w", "daily"],
             &["atomics", "doctor", "-w", "daily"],
+            // What a restart passes: the open workspace as one argument, after the rest.
+            &["atomics", "/repo", "--size", "800x600", "--workspace=daily"],
+            &["atomics", "host", "/repo", "--workspace=daily"],
         ] {
             assert_eq!(Cli::try_parse_from(args).unwrap().workspace.as_deref(), Some("daily"), "{args:?}");
         }

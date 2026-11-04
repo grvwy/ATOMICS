@@ -379,6 +379,10 @@ impl Backend for Local<'_> {
             can_save: !state.open_projects.is_empty(),
         }
     }
+
+    fn sign_in(&self) -> Option<atomics_ui::signin::SignInView> {
+        self.0.sign_in_view()
+    }
 }
 
 /// `at`, in seconds since the epoch, as this machine's local date and time; "unavailable" if it cannot tell.

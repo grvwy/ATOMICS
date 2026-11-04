@@ -257,27 +257,39 @@ not a failure: the worker does not back off from it, and the next job after a si
 
 #### The sign-in in the app
 
-Open the Tickets panel (`cmd+k`; Ctrl+Shift+K on Linux/Windows), the Tickets entry in the Actions menu, or the first search. Until the
-server is signed in the panel shows a banner, "relay is not signed in", with **Sign in with the browser**; a dot on
-the Tickets entry says the same.
+Needing a sign-in shows wherever the tickets do, each time with a button that runs the sign-in: an open plan's
+board (above its tickets), the sidebar above AGENTS while no plan is open, the Tickets panel (`cmd+k`;
+Ctrl+Shift+K on Linux/Windows), and the top bar's **Sign in to <system>** item, whose popup holds the same steps
+(in the Actions menu when the bar is narrow). The Tickets entry carries a dot meanwhile. Never signed in here, the
+button reads **Sign in to <system>**; once the server has refused the saved sign-in, or said in an error that it
+lapsed (such as `needs-refresh` or `invalid_grant`), it reads **Reconnect** and the reason shows under "<system>
+needs you to sign in again". Desktop, browser and phone draw the same banner (`atomics-ui`'s `signin`).
 
-1. **Sign in** opens the default browser (`open` on macOS, `xdg-open` on Linux, `cmd /c start` on Windows). The banner
-   reads "Waiting for the browser…" with **Cancel** and the time left (five minutes). Back in ATOMICS it becomes the
-   chip with **Sign out**, and the query box is focused. When `whoami` is mapped, the chip shows the
-   connection name and kind, plus its owner when supplied. Profiles without `whoami` keep `relay · signed in`.
-2. **No browser here** (SSH, a Linux machine with no `DISPLAY`/`WAYLAND_DISPLAY`, or a browser that failed to open):
-   the banner shows the authorization link with **Copy link** and a paste box at once. Open the link on any machine and
-   sign in. The browser then lands on `http://127.0.0.1:<port>/callback?code=…&state=…`, which does not load there:
-   paste that address (or just its query) and press **Use it**. ATOMICS checks `state` (and the issuer) before it
-   exchanges the code. A wrong address is refused with a short reason and the sign-in keeps waiting. No port
-   forwarding is needed. On a machine with a browser the same box appears under **No browser here?**.
-3. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh and
+1. **Sign in** runs the host's sign-in job. On the desktop it opens the default browser (`open` on macOS, `xdg-open`
+   on Linux, `cmd /c start` on Windows); the banner reads "Waiting for the browser…" with **Cancel** and the time
+   left (five minutes). Back in ATOMICS it becomes the chip with **Sign out**, and the query box is focused. When
+   `whoami` is mapped, the chip shows the connection name and kind, plus its owner when supplied. Profiles without
+   `whoami` keep `<system> · signed in`.
+2. **No browser here** (SSH, a Linux machine with no `DISPLAY`/`WAYLAND_DISPLAY`, a browser that failed to open, or
+   a sign-in started from a browser or phone client): the banner shows the authorization link with **Open link**,
+   **Copy link** and a paste box at once. Open the link on any machine and sign in. The browser then lands on
+   `http://127.0.0.1:<port>/callback?code=…&state=…`, which does not load there: paste that address (or just its
+   query) and press **Use it**. ATOMICS checks `state` (and the issuer) before it exchanges the code. A wrong address
+   is refused with a short reason and the sign-in keeps waiting. No port forwarding is needed. On a machine with a
+   browser the same box appears under **No browser here?**. A client's sign-in never opens a browser on the host:
+   the client sends `host_command` `sign_in`, opens the address the host publishes, and sends back where it ended
+   (`sign_in_paste`; `docs/daemon.md`).
+3. **Reconnect** is the same sign-in. When it finishes, the ticket worker connects again with the new sign-in,
+   whoami and the remote outboxes run again, and every ticket on the boards is read again, so the errors the refused
+   sign-in left on the board go: no restart and no `atomics tickets login`. A later job that gets through (say after
+   `atomics tickets login` in a terminal) clears the state too.
+4. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh and
    access tokens (RFC 7009) when its metadata has a `revocation_endpoint`, then deletes the saved sign-in and drops
    the worker's connection. A revocation that fails is shown; the local sign-out always completes.
-4. **Expiry.** The access token is refreshed 60 seconds before it expires and once after a `401`; the refresh token is
+5. **Expiry.** The access token is refreshed 60 seconds before it expires and once after a `401`; the refresh token is
    stored again whenever the server rotates it. When the server refuses the saved sign-in (`invalid_grant`) or gave no
-   refresh token, the sign-in is cleared and the banner shows again: "sign-in required". A network failure is
-   a transport error with the usual 15-second backoff, not a sign-out.
+   refresh token, the sign-in is cleared and every place above offers **Reconnect**. A network failure is a transport
+   error with the usual 15-second backoff, not a sign-out.
 
 From a terminal:
 
