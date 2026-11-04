@@ -256,7 +256,8 @@ fn masked(path: &[String], value: Value) -> Value {
     let names: Vec<&str> = path.iter().map(String::as_str).collect();
     let named_secret = match names.as_slice() {
         ["tickets", "server", "env", name] => secret_name(name),
-        ["tickets", "operations", _, "arguments", .., name] => secret_name(name) && !placeholder(&value),
+        ["tickets", "http", name] => secret_name(name),
+        ["tickets", "operations", _, "arguments" | "http", .., name] => secret_name(name) && !placeholder(&value),
         _ => false,
     };
     if named_secret {
@@ -381,7 +382,7 @@ impl Risk {
         }
     }
 
-    /// The settings with this risk, as dotted key prefixes.
+    /// The settings with this risk, as dotted key prefixes. A `*` stands for any one part.
     fn keys(self) -> &'static [&'static str] {
         match self {
             Risk::RunsCommands => &[
@@ -404,6 +405,8 @@ impl Risk {
                 "github.azure_devops",
                 "tickets.server.token_env",
                 "tickets.server.oauth",
+                "tickets.http",
+                "tickets.operations.*.http",
                 "voice.provider",
                 "voice.base_url",
                 "voice.api_key_env",
@@ -416,9 +419,10 @@ impl Risk {
     /// The risk of changing the setting at `key`, if any.
     pub fn of(key: &str) -> Option<Risk> {
         Risk::ALL.into_iter().find(|risk| {
-            risk.keys()
-                .iter()
-                .any(|prefix| key == *prefix || key.strip_prefix(prefix).is_some_and(|r| r.starts_with('.')))
+            risk.keys().iter().any(|prefix| {
+                let mut parts = key.split('.');
+                prefix.split('.').all(|want| parts.next().is_some_and(|part| want == "*" || want == part))
+            })
         })
     }
 }
@@ -1058,6 +1062,37 @@ arguments = { ticket = "{id}", apiKey = "argument-secret-333", header = "Authori
     }
 
     #[test]
+    fn http_settings_read_without_their_credentials() {
+        let main = layer(
+            Source::Main,
+            r#"
+[tickets]
+system = "x"
+server = { command = ["x"] }
+[tickets.http]
+url = "https://name:url-password@api.example/v1?api_key=url-key"
+[tickets.operations.read]
+http = { method = "GET", path = "/items/{id}", query = ["a"], response_headers = { session_token = "x-private", state = "x-state" } }
+arguments = { api_key = "argument-secret", key = "{key}" }
+"#,
+        );
+        assert!(main.error.is_none(), "{:?}", main.error);
+        let effective = Config::from_tables([main.table.clone()]).unwrap();
+        let values = values(&effective, &[main], &Cleaner::default(), None);
+        let get = |key: &str| &values[key]["value"];
+        let url = get("tickets.http.url").as_str().unwrap();
+        assert!(url.contains("api.example/v1"), "{url}");
+        assert!(!url.contains("url-password") && !url.contains("url-key"), "{url}");
+        assert_eq!(get("tickets.operations.read.http.path"), "/items/{id}");
+        assert_eq!(get("tickets.operations.read.http.method"), "GET");
+        assert_eq!(get("tickets.operations.read.http.query"), &serde_json::json!(["a"]));
+        assert_eq!(get("tickets.operations.read.http.response_headers.session_token"), MASKED);
+        assert_eq!(get("tickets.operations.read.http.response_headers.state"), "x-state");
+        assert_eq!(get("tickets.operations.read.arguments.api_key"), MASKED);
+        assert_eq!(get("tickets.operations.read.arguments.key"), "{key}");
+    }
+
+    #[test]
     fn values_mask_nested_operation_arguments_without_losing_their_path() {
         let main = layer(
             Source::Main,
@@ -1209,6 +1244,20 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         let risk = |key: &str| proposal.changes.iter().find(|c| c.key == key).unwrap().risk;
         assert_eq!(risk("agents"), Some(Risk::RunsCommands));
         assert_eq!(risk("voice.base_url"), Some(Risk::SendsCredentials));
+        for key in [
+            "tickets.http",
+            "tickets.http.url",
+            "tickets.operations.read.http",
+            "tickets.operations.read.http.path",
+            "tickets.operations.search.http.method",
+            "tickets.operations.search.http.query",
+            "tickets.operations.search.http.response_headers.state",
+        ] {
+            assert_eq!(Risk::of(key), Some(Risk::SendsCredentials), "{key}");
+        }
+        assert_eq!(Risk::of("tickets.operations.read.tool"), None);
+        assert_eq!(Risk::of("tickets.operations.read.result.http"), None);
+        assert_eq!(Risk::of("tickets.httpx"), None);
         assert_eq!(risk("chief.system_prompt"), Some(Risk::InstructsAgents));
         assert_eq!(risk("layout.sidebar_width"), None);
         assert_eq!(proposal.risks()[0], (Risk::RunsCommands, vec!["agents"]));

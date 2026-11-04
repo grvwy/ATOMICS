@@ -936,6 +936,8 @@ or tab for the others:
   worktrees are not sent, so a host with no session and no open plan offers none, and starting in a new worktree
   stays on the computer.
 - **The changed-files column** scrolls to a file's hunks, which the page has already.
+- **Tickets** show as their keys on the board, the plan's and each task's: the key is all `atomics.v1` carries, so a
+  chip has no address to open, and a page has no ticket reader. A click on one does nothing.
 - **Hidden, for lack of an action or of what it reads:** reopening a plan, cleaning one up, completing one, editing a
   brief, syncing tickets, renaming and resuming a session, the editor, the whole file of a file with no changes, the
   explorer; and the voice, since a browser has no microphone here. The mirror does not say whether a session is

@@ -114,7 +114,7 @@ pub fn classify(tool_name: &str, config: Option<&TicketConfig>) -> Option<Classi
             ("create", TraceOp::LinkOrSync),
             ("record_stage", TraceOp::LinkOrSync),
         ] {
-            if config.operation(name).is_some_and(|operation| operation.tool == tool) {
+            if config.operation(name).is_some_and(|operation| operation.http.is_none() && operation.tool == tool) {
                 classified.op = op;
                 classified.direct = true;
                 classified.operation = Some(name.into());
