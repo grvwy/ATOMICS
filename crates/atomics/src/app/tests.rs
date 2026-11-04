@@ -458,17 +458,11 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
     let (hook, rx) = permission("touch another-file", "Another request");
     app.runtime.on_hook(hook);
     assert!(rx.wait(Duration::ZERO).stdout.is_none());
-    assert!(
-        app.runtime
-            .approve(
-                0,
-                &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
-                Decision::Allow,
-                None
-            )
-            .is_err()
-    );
-    assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+    let expired = app.runtime.sessions[0].approvals[0].id.clone();
+    let error = app.runtime.approve(0, &expired, Decision::Allow, None).unwrap_err();
+    assert_eq!(error.message, "the permission hook has returned; answer in the agent terminal");
+    assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "the fallback menu still has time to draw");
+    assert_eq!(app.runtime.resolution(&expired), None);
     let event = atomics_core::hook::HookEvent::from_payload(&json!({
         "hook_event_name":"PostToolUse", "session_id":"s1", "cwd":dir.path(),
         "tool_name":"Bash", "tool_input":{"command":"touch another-file"}

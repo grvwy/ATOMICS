@@ -343,15 +343,26 @@ impl Devices {
 
     /// The desktop's answer to a claimed pairing: `Some` pairs the device with that access,
     /// `None` refuses it. Either uses the link up.
+    #[cfg(test)]
     pub fn decide(&self, access: Option<Access>) {
+        self.decide_checked(None, access);
+    }
+
+    pub fn decide_code(&self, code: &str, access: Option<Access>) -> bool {
+        self.decide_checked(Some(code), access)
+    }
+
+    fn decide_checked(&self, expected: Option<&str>, access: Option<Access>) -> bool {
+        let mut decided = false;
         self.edit(|inner| {
             Self::expire(inner);
-            if !matches!(inner.offer.as_ref().map(|offer| &offer.stage), Some(Stage::Claimed { .. })) {
+            if !matches!(inner.offer.as_ref().map(|offer| &offer.stage), Some(Stage::Claimed { code, .. }) if expected.is_none_or(|expected| expected == code)) {
                 return;
             }
             let Some(Offer { stage: Stage::Claimed { attempt, name, key, waker, .. }, .. }) = inner.offer.take() else {
                 return;
             };
+            decided = true;
             inner.answers.push((attempt, access));
             waker.wake();
             inner.note = Some(match access {
@@ -365,6 +376,7 @@ impl Devices {
                 None => format!("Refused “{name}”."),
             });
         });
+        decided
     }
 
     pub fn view(&self) -> PairingView {

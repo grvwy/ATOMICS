@@ -1,12 +1,11 @@
 //! The desktop's window frame: `atomics_ui::shell` lays it out and draws it over the in-process backend
 //! with the desktop's terminals ([`Desktop::draw_terminals`]). The hooks here draw what only this host has:
-//! the Tickets button and sign-in, the GitHub counter, the Remote indicator, the load gauge and Settings in
-//! the top bar; USAGE and TICKETS in the sidebar; the chief's trace lane; the Tickets panel, a pull
-//! request's diff and the editor in the right panel.
+//! the ticket integration, the GitHub counter and the VM indicator in the top bar. Settings, Remote,
+//! Project, USAGE/load, the chief with its trace, tickets, the editor and pull-request diffs are shared.
+//! The ticket hooks retain the fallback for a backend without the shared reader state.
 
 use atomics_ui::chief::VoiceState;
 use atomics_ui::shell::Platform;
-use atomics_ui::sidebar::section;
 use atomics_ui::terminal_surface::TerminalSurface;
 
 use super::*;
@@ -16,6 +15,24 @@ impl Platform for Desktop<'_> {
         &mut self,
         draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client, &mut dyn TerminalSurface) -> R,
     ) -> R {
+        // ctl and atomics:// links still address the desktop's navigation adapter. Import a new
+        // request once; ordinary reader selection and history remain in the shared client.
+        let panel = &self.runtime.tickets.panel;
+        if self.runtime.panel == PanelMode::Tickets && panel.seq != self.client.ui.tickets.external_revision {
+            let ui = &mut self.client.ui;
+            match panel.view {
+                tickets_panel::TicketsView::Read => {
+                    if let Some(read) = &panel.read {
+                        ui.tickets.open(read.link.clone(), false, self.client.ctx.input(|i| i.time), &mut ui.commands);
+                        ui.tickets.from_board = panel.from_board;
+                    }
+                }
+                tickets_panel::TicketsView::Find => {
+                    ui.tickets.found(&panel.query, panel.find.results.clone(), panel.find.from_chief)
+                }
+            }
+            ui.tickets.external_revision = panel.seq;
+        }
         self.draw_terminals(draw)
     }
 
@@ -41,44 +58,12 @@ impl Platform for Desktop<'_> {
         self.host_top_bar_items(ui, in_menu);
     }
 
-    fn top_bar_load(&mut self, ui: &mut egui::Ui) {
-        self.load_gauge(ui);
-    }
-
-    fn top_bar_settings(&mut self, ui: &mut egui::Ui) {
-        self.settings_button(ui);
-    }
-
-    fn sidebar_usage(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette();
-        section(ui, &p, "USAGE");
-        self.runtime.usage.show(ui, &p);
-        ui.separator();
-    }
-
     fn sidebar_tickets(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette();
-        self.tickets_section(ui, &p);
-    }
-
-    fn chief_window(&mut self, ui: &mut egui::Ui) {
-        self.chief_content(ui);
+        self.tickets_section(ui);
     }
 
     fn panel_tickets(&mut self, ui: &mut egui::Ui, rect: Rect) {
         self.tickets_panel(ui, rect);
-    }
-
-    fn panel_pull_request(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
-        self.github_pr_panel(ui, rect)
-    }
-
-    fn panel_editor_file(&self, root: &Path) -> Option<String> {
-        self.client.editor_file.get(root).cloned()
-    }
-
-    fn panel_editor(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {
-        self.editor_panel(ui, rect, root);
     }
 }
 
@@ -97,6 +82,7 @@ impl Desktop<'_> {
     /// The right panel (`atomics_ui::shell::right_panel`), with this host's Tickets panel, pull request diff
     /// and editor.
     pub(super) fn diff_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        self.apply_client_events(ui.ctx());
         atomics_ui::shell::right_panel(ui, rect, self);
     }
 

@@ -95,11 +95,24 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch, report, and the key of the ticket a plan or task follows (`ticket`, optional). |
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. An optional `warning` is what the host tells whoever decides, such as whose shared stash entries the command drops. |
-| Host → client | `host_upsert` | The host's own state (`host` capability): the open workspace, the saved ones, and the ticket system's sign-in (`signed_in`, `signed_out`, `expired`, `partial` when it lacks a resource such as the ticket API, `signing_in` with the address to open and why a pasted one was refused, or `unavailable`). Never a token. |
-| Client → host | `host_command` | `sign_in`, `sign_in_paste` (the address a browser ended on), `sign_in_cancel`, or `open_workspace` by name (`host` and `mutations`; grant `host`). |
+| Host → client | `host_upsert` | The host's own state (`host` capability): open/saved workspaces, projects/worktrees, editors and pull requests, Settings/Remote management, account usage and governor load/slots/queue (`resources`), the ticket system's sign-in, and the optional safe ticket-reader profile and replies. Never a token. |
+| Client → host | `host_command` | `sign_in`, `sign_in_paste`, `sign_in_cancel`, `open_workspace` / `save_workspace`, `browse_folder`, `open_project` / `close_project`, `config_propose` / `config_decide`, pairing and Settings tools, `edit` / `editor_hints`, `pull_request_diff`, `start_chief`, or `tickets` with a request ID and search/read/children/related/link/plan action (`host` and `mutations`; grant `host`). |
 | Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |
+
+Settings, Remote devices and the Project picker are shared `atomics-ui` views. `host.management`
+publishes the safe effective configuration and its sources, the oldest pending proposal (masked diff,
+risks, warnings and theme preview), host folder listings and remote-device status. `host.projects`
+is the common project/worktree list for the explorer, picker and new-session dialog. A client proposes
+a configuration edit; its user reviews it and sends `config_decide` to apply or reject. The host retains the original proposal for conflict detection, backups and reloads.
+Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
+The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.
+The `host` grant is checked before any of these commands reaches the runtime. View-only clients see
+the configuration and devices with changes disabled, and never receive a pairing link's secret,
+including in snapshots and replayed host updates. Pairing decisions name the code being compared,
+so a delayed decision cannot approve a later pairing. Native window placement and voice remain
+client concerns; Settings can add a VM section without another platform-specific menu.
 
 Major mismatch fails before subscription; minor changes are additive and capability-gated.
 Unknown optional fields are ignored; unknown commands fail explicitly. Never silently ignore a mutation.
@@ -115,6 +128,16 @@ until reconciled against worktrees/session records. Never promise exactly-once p
 Expired operation IDs cannot be rerun as new work automatically; reconnect requires fresh user intent.
 PTY input uses an ordered sequence within a control lease and is never replayed across a disconnect.
 Bound message sizes, subscriptions, pending operations and queues; reject excess work with a typed error.
+
+The `host` capability also carries `HostInfo.resources` in snapshots and `host_upsert`: Claude and
+Codex account limits (five-hour/session and weekly remaining, reset and source time), the host's sample
+time, one-minute load, core count, shared compiler jobs, and test/QA slot capacity, running count and
+waiting count. The runtime samples load every two seconds even with no window attached. `atomics-ui`
+draws USAGE in the sidebar and load in the top bar (slot details on hover or in Actions); the phone's
+⋯ menu draws both with the slot details visible. Clients use the host's sample time for expiry and age,
+so they need no local account files or matching clock. Older hosts omit `resources`; older clients
+ignore the new optional fields, and clients without `host` continue receiving `skipped` for its events.
+
 
 ## Terminal streaming and diff cost
 
@@ -263,7 +286,18 @@ allowed_origins = []     # exact Origin values; a native client sends none
   stay consecutive (`Mirror` only advances), and the client's copy of that diff or plan goes stale. Widening the set
   (adding a topic to a narrowed kind, or removing its last one) means the client missed events, so the host answers
   with a fresh `state_snapshot`. A client that subscribes to nothing gets everything, as before topics existed.
-- **Not yet.** `file_get` (answers `not_found`). A removed diff is sent as a `diff_summary` with no files and no base
+- **Explorer.** The additive `explorer` capability (with `host`) carries projects and worktrees in
+  `host.projects`. A `folder {worktree, path}` topic follows the immediate children of a worktree-relative
+  folder. It sends `folder_page {worktree, path, revision, offset, entries, next_offset}` at offset zero,
+  then again from zero when the published listing changes. `folder_get` asks for another page with that
+  revision and offset; a changed revision is `stale_revision`. Each page has at most 128 entries and fits
+  the frame budget. Folder topics share the 256-subscription bound with screens and board topics.
+  The host schedules file discovery and refresh for idle worktrees while followed; unsubscribe or
+  disconnect releases that interest. Clients retain one page per visible folder and request
+  the next only when the user asks. `file_get` returns a bounded whole-file preview for known worktree files,
+  refusing links and binary content; large files are marked truncated. Older clients negotiate neither
+  folder messages nor pages, and ignore the added host fields.
+- **Removal.** A removed diff is sent as a `diff_summary` with no files and no base
   (a tombstone). An approval that leaves the board says how it ended in `approval_resolved` (`allowed`,
   `allowed_always`, `denied`, `expired`), or `withdrawn` when it was not answered through ATOMICS (the hook gave up,
   the agent moved on, someone answered in the terminal).
@@ -936,7 +970,7 @@ time is up, on the host's sealed refusal (and forgets the key), a bare `not_pair
 not authenticate (the host's key is not the one this browser paired with).
 
 **What it offers.** What the desktop offers wherever `atomics.v1` can carry it, asked for in `hello` with `board`,
-`plans`, `approvals`, `diffs`, `terminals`, `input`, `mutations` and `host`. A host that does not offer `host` sends
+`plans`, `approvals`, `diffs`, `terminals`, `input`, `mutations`, `host`, `explorer` and `plan_complete`. A host that does not offer `host` sends
 `skipped` in place of `host_upsert`, its snapshots carry no host state, and the page offers no sign-in or workspace. A command is offered when
 `Command::remote` has mutations for it and `welcome`'s `may` grants them all, so a viewer, or a browser that is not
 connected, sees no action it cannot take. The shared views ask `Backend::available` and draw no button, menu entry
@@ -944,8 +978,8 @@ or tab for the others:
 
 - **Offered:** answering approvals; approving a plan, Dispatch, a card's start, accept, send back, unblock and reopen,
   integrate and Integrate; a tile's close and the sidebar's Close, asking where the desktop asks; review comments and
-  Send review; the steer bar, to the active session or the selected, and "Include in selected" (wide only: a phone's
-  terminal is right there); typing into terminals; the ticket system's sign-in (**Sign in to <system>**, or
+  Send review; the steer bar, to the active session or the selected, and "Include in selected" in both layouts
+  (the phone's Agents pane); typing into terminals; the ticket system's sign-in (**Sign in to <system>**, or
   **Reconnect** once the server refused the saved one) and opening a saved workspace (`host_command`).
 - **The ticket sign-in** is the desktop's banner (`atomics_ui::signin`), on an open plan's board, above AGENTS while
   no plan is open (the wide sidebar, the phone's Agents and Board panes), and in the popup of the wide top bar's
@@ -958,19 +992,23 @@ or tab for the others:
 - **The workspace** the host has open is the top bar's **Workspace: <name>** item (the phone's ⋯ menu), with the
   saved workspaces to open another (`open_workspace`); it is not drawn while none is open and none is saved. The
   Project menu (opening folders, saving workspaces) stays on the computer.
-- **Close plan…** offers Archive alone: `atomics.v1` has no way to complete a plan. An open plan's tab closes the same
+- **Close plan…** offers Complete plan when the host negotiates `plan_complete`, and Archive. Completion goes
+  through the same journal and workflow checks as the desktop. An open plan's tab closes the same
   way; a finished plan's tab has no close, and its board's Archive does that. A closed plan's board stays read-only.
   A plan that closes while it shows gives way to the first open plan, as on the desktop.
-- **`+ New`** (wide only) opens a small picker of what the host's board names: the agents its sessions and open plans
-  use, and a scratch folder or a folder its sessions and open plans use. The host's configured agents and its
-  worktrees are not sent, so a host with no session and no open plan offers none, and starting in a new worktree
+- **`+ New`** (the wide top bar, phone's menu and Agents pane) opens a picker of what the host's board names:
+  the agents its sessions and open plans use, and a scratch folder, project or existing worktree. The host's
+  configured agents are not sent, so a host with no session and no open plan offers none, and creating a new worktree
   stays on the computer.
 - **The changed-files column** scrolls to a file's hunks, which the page has already.
+- **EXPLORER** lists open projects and their worktrees, with folder navigation and paged files. It shares
+  the desktop's sidebar, stays reachable through the top bar's Explorer menu when the sidebar is hidden, and
+  appears in the phone's Agents pane. All and Repos filter only this client's sessions. A changed file opens
+  at its diff; an unchanged one opens its whole-file preview in the diff panel.
 - **Tickets** show as their keys on the board, the plan's and each task's: the key is all `atomics.v1` carries, so a
   chip has no address to open, and a page has no ticket reader. A click on one does nothing.
-- **Hidden, for lack of an action or of what it reads:** reopening a plan, cleaning one up, completing one, editing a
-  brief, syncing tickets, renaming and resuming a session, the editor, the whole file of a file with no changes, the
-  explorer; and the voice, since a browser has no microphone here. The mirror does not say whether a session is
+- **Hidden, for lack of an action or of what it reads:** reopening a plan, cleaning one up, editing a
+  brief, syncing tickets, renaming and resuming a session, the editor, and the voice, since a browser has no microphone here. The mirror does not say whether a session is
   sandboxed, outside ATOMICS or in a scratch folder, so closing an exited session outside a worktree and a plan asks, in
   case it deletes its folder. It has no agent kinds either, and a shell can run under any name, so there is no "All
   agents" target: typed into a shell, a steer would run as a command. A shell not named `shell` still counts as an
@@ -1238,3 +1276,53 @@ History Reopen persisted the open status. The QA process then exited cleanly.
 
 The separate daemon, browser rendering and remote deployment are not shipped by
 phase 2. Their gates remain the phase 3–5 gates above.
+
+### Shared editor, pull-request and chief panels
+
+Clients negotiate `host` and `panels` to use host editor and chief commands. `host_upsert`
+(and the initial snapshot) includes editor terminal IDs and GitHub/Azure pull-request metadata.
+The chief's cleaned trace uses the separate paged `trace` feed below. Older clients ignore the additional fields;
+a client connected to an older host hides the new actions. Panel mutations also require the
+controller's host grant.
+
+An editor runs once per worktree in a host PTY. `host_command` `edit` names a known worktree,
+a relative file and an optional line; `editor_hints` types its configured inlay-hint keys.
+The editor's opaque terminal ID uses the same screen subscriptions, history, resize and
+fenced input leases as agent terminals. Closing a panel or disconnecting a client leaves
+its editor running. Editor terminals are separate from the agent session list.
+
+`pull_request_diff` names a pull request advertised by the host. The host's existing GitHub
+or Azure worker fetches it, keeping credentials on the host. Its key names the diff for
+paged `diff_get` requests. The host keeps up to sixteen cached PR diffs and rejects late
+results from superseded fetches. Each client keeps its own PR selection, scrolling and
+folds. PR diffs are read-only: their files are not checked out locally and have no agent
+to receive review comments.
+
+The chief's docked and floating window, permission banner, terminal and trace cards draw
+in `atomics-ui` on every client. `start_chief` starts a missing chief without toggling or
+moving another client's window. Docking, floating, minimizing, the width and trace-card
+selection stay with each client; the in-process desktop still saves its own preferences.
+
+### Chief trace feed
+
+The `trace` capability carries the chief's cleaned MCP calls separately from the board cursor and replay
+ring. Clients subscribe with `{"kind":"subscribe","topics":[{"topic":"trace"}]}`. The host sends
+`trace_changed` with the current decimal-string `revision`, initially and whenever content changes,
+including completion of an existing running call. Notifications coalesce to the latest published revision;
+resubscribing after reconnect learns the current one. Unsubscribing stops notifications. Clients without
+`trace` receive none of these new message kinds. Viewers may read the feed.
+
+`trace_get` names that `revision`, an `offset` (initially zero), and a requested `limit`. `trace_page` echoes
+the revision and offset, carries `data` (the chief session, cleaned entries oldest first, and ticket state
+colors as task statuses), and supplies `next_offset` until the end. A changed revision is refused as
+`stale_revision` when starting a page chain; the host pins one bounded snapshot per connection until
+its last page, so live calls cannot invalidate a page chain in progress. Clients coalesce newer notices
+while reading those pages, replace the lane atomically, then fetch the newest revision. Old page replies
+cannot replace a different request. Removing a plan or replacing the chief also changes this feed.
+
+The host retains at most one chief log, 200 calls and 512 KiB of serialized entries, with each entry at most
+16 KiB. Pending trace credential jobs are capped at 64. Each page holds at most 32 entries and 64 KiB,
+further reduced for the connection's frame budget and envelope. No raw hook payload or credential crosses
+the projection boundary. Lane selection, expansion, clearing and height belong to each client. The shared
+`atomics-ui::trace_lane` paints the lane and handles Shift+Up/Down, Enter, PageUp/PageDown and Escape in
+the in-process desktop, connected native client, browser and phone.

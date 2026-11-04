@@ -38,6 +38,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, c
     let split = client.diff_split.unwrap_or(config.layout.diff_split);
     let state = client.diff_views.entry(root.to_path_buf()).or_default();
     let header = Header {
+        refresh: true,
         title: &heading.title,
         branch: heading.branch.as_deref(),
         can_send: heading.can_send,

@@ -192,7 +192,6 @@ fn the_wide_layout_alone_carries_out_the_chiefs_window() {
     for host in [
         Command::NewSession,
         Command::PickProject,
-        Command::SetView(None),
         Command::Rename("s1".into()),
         Command::OpenTicket(Default::default()),
     ] {

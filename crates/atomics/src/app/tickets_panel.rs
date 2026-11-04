@@ -10,7 +10,6 @@ use crate::markdown::{self, Block, Inline};
 use crate::panel_nav;
 use crate::tickets::{TicketOp, TicketOutput};
 use atomics_core::tickets::{TicketCard, TicketConfig, TicketLink, TicketMode};
-use egui::text::{LayoutJob, TextWrapping};
 use serde_json::{Map, Value};
 
 const ROW_H: f32 = 58.0;
@@ -362,15 +361,7 @@ pub(super) fn query_id() -> egui::Id {
 
 /// How full a score's bar is, relative to the lowest and highest score of the set. One
 /// result, or equal scores, fill the bar. The lowest keeps a visible stub.
-pub(super) fn relative_score(score: f64, low: f64, high: f64) -> f32 {
-    if high <= low { 1.0 } else { (0.1 + 0.9 * (score - low) / (high - low)).clamp(0.0, 1.0) as f32 }
-}
-
-pub(super) fn score_range(cards: &[TicketCard]) -> Option<(f64, f64)> {
-    let mut scores = cards.iter().filter_map(|c| c.score).filter(|s| s.is_finite());
-    let first = scores.next()?;
-    Some(scores.fold((first, first), |(low, high), s| (low.min(s), high.max(s))))
-}
+pub(super) use atomics_ui::tickets::{relative_score, score_range};
 
 impl State {
     pub(super) fn toggle_tickets(&mut self) {
@@ -682,14 +673,33 @@ impl State {
         mode: TicketMode,
         extra: &str,
     ) -> Result<PlanStart, String> {
+        let result = self.plan_ticket(link, mode, extra)?;
+        match &result {
+            PlanStart::Started(id) | PlanStart::Existing(id) => {
+                if let Some(index) = self.plans.iter().position(|plan| &plan.id == id) {
+                    self.selected_plan = index;
+                    self.show_plan_fleet();
+                }
+                self.panel = PanelMode::Tickets;
+                self.show_chief();
+            }
+            PlanStart::SignIn => {
+                self.tickets.panel.dialog = None;
+                self.panel = PanelMode::Tickets;
+                self.diff_open = true;
+                if let Some(config) = self.ticket_config() {
+                    self.toast(format!("Sign in to {} first", config.system));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// The host operation, independent of any client's selected plan, panel or chief window.
+    pub(super) fn plan_ticket(&mut self, link: TicketLink, mode: TicketMode, extra: &str) -> Result<PlanStart, String> {
         let Some(config) = self.ticket_config() else { return Err(self.no_ticket_system()) };
         if self.plan_needs_sign_in(&config) {
-            let panel = &mut self.tickets.panel;
-            panel.signin = true;
-            panel.dialog = None;
-            self.panel = PanelMode::Tickets;
-            self.diff_open = true;
-            self.toast(format!("Sign in to {} first", config.system));
+            self.tickets.panel.signin = true;
             return Ok(PlanStart::SignIn);
         }
         let Some(link) = self.stamp_system(Some(link)) else { return Err("No ticket to plan".into()) };
@@ -702,12 +712,7 @@ impl State {
             None => (self.precreate_ticket_plan(link.clone(), mode), true),
         };
         let id = self.plans[index].id.clone();
-        self.selected_plan = index;
-        self.show_plan_fleet();
-        // The plan board stays behind the ticket; the chief's window is what opens.
-        self.panel = PanelMode::Tickets;
         if !fresh && (!self.plans[index].tasks.is_empty() || self.tickets.panel.planning.contains(&id)) {
-            self.show_chief();
             self.toast(format!("{} already has a plan", link.label()));
             return Ok(PlanStart::Existing(id));
         }
@@ -722,7 +727,7 @@ impl State {
             plan_id: &id,
             extra,
         });
-        self.send_to_chief(&message)?;
+        self.chief_delivery(&message)?;
         self.tickets.panel.planning.insert(id.clone());
         self.toast(format!("Planning {} with the chief", own.label()));
         Ok(if fresh { PlanStart::Started(id) } else { PlanStart::Existing(id) })
@@ -825,33 +830,10 @@ impl State {
 }
 
 pub(super) fn state_color(config: &TicketConfig, state: &str, p: &Palette) -> Color32 {
-    config.states.status_of(state).map_or(p.muted, |status| super::board::task_color(status, p))
+    atomics_ui::tickets::state_color(&config.states, state, p)
 }
 
-pub(super) fn fit(ui: &egui::Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
-    let mut job = LayoutJob::simple_singleline(text.replace('\n', " "), font, color);
-    job.wrap =
-        TextWrapping { max_width: width.max(1.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-    ui.painter().layout_job(job)
-}
-
-/// Paints a state chip at `at` and returns the x where the next thing may start.
-pub(super) fn chip(
-    ui: &egui::Ui,
-    painter: &egui::Painter,
-    at: Pos2,
-    text: &str,
-    color: Color32,
-    limit: f32,
-    p: &Palette,
-) -> f32 {
-    let galley = fit(ui, text, p.ui(11.0), color, limit - at.x - 10.0);
-    let rect = Rect::from_min_size(at, galley.size() + vec2(10.0, 2.0));
-    painter.rect_filled(rect, 8.0, lerp(p.raised, color, 0.12));
-    painter.rect_stroke(rect, 8.0, Stroke::new(1.0, color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-    painter.galley(at + vec2(5.0, 1.0), galley, color);
-    rect.right() + 8.0
-}
+pub(super) use atomics_ui::tickets::fit;
 
 /// One result: key and title, then score bar, state, assignee and kind, then the snippet.
 fn find_row(
@@ -862,56 +844,7 @@ fn find_row(
     config: &TicketConfig,
     p: &Palette,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-    if selected {
-        painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, lerp(p.raised, p.accent, 0.18));
-        painter.rect_filled(Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height())), 0.0, p.accent);
-    } else if response.hovered() {
-        painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, p.raised);
-    }
-    let (left, right) = (rect.left() + 10.0, rect.right() - 8.0);
-    let key = fit(ui, card.link.label(), p.mono(12.5), p.accent, right - left);
-    let key_w = key.size().x;
-    painter.galley(pos2(left, rect.top() + 5.0), key, p.accent);
-    let title = card.link.title.as_deref().unwrap_or("");
-    let galley = fit(ui, title, p.ui(12.5), p.foreground, right - left - key_w - 8.0);
-    painter.galley(pos2(left + key_w + 8.0, rect.top() + 5.0), galley, p.foreground);
-
-    let y = rect.top() + 24.0;
-    let mut x = left;
-    if let (Some(score), Some((low, high))) = (card.score, range) {
-        let bar = Rect::from_min_size(pos2(x, y + 4.0), vec2(56.0, 8.0));
-        painter.rect_filled(bar, 2.0, p.border);
-        let full = relative_score(score, low, high);
-        painter.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * full, bar.height())), 2.0, p.accent);
-        let text = fit(ui, &format!("{score:.2}"), p.mono(11.0), p.muted, 40.0);
-        let width = text.size().x;
-        painter.galley(pos2(bar.right() + 5.0, y + 1.0), text, p.muted);
-        x = bar.right() + 5.0 + width + 8.0;
-    }
-    if let Some(state) = &card.link.state {
-        x = chip(ui, &painter, pos2(x, y), state, state_color(config, state, p), right, p);
-    }
-    let assignee = match &card.assignee {
-        Some(Some(name)) => Some(name.as_str()),
-        Some(None) => Some("unassigned"),
-        None => None,
-    };
-    for text in assignee.into_iter().chain(card.kind.as_deref()) {
-        if x >= right {
-            break;
-        }
-        let galley = fit(ui, text, p.ui(11.5), p.muted, right - x);
-        let width = galley.size().x;
-        painter.galley(pos2(x, y + 1.0), galley, p.muted);
-        x += width + 10.0;
-    }
-    if let Some(snippet) = card.snippet.as_deref().filter(|s| !s.is_empty()) {
-        let galley = fit(ui, &snippet.replace("**", ""), p.ui(11.5), p.muted, right - left);
-        painter.galley(pos2(left, rect.top() + 40.0), galley, p.muted);
-    }
-    response
+    atomics_ui::tickets::find_row(ui, card, selected, range, &config.states, p)
 }
 
 impl Desktop<'_> {
@@ -921,13 +854,13 @@ impl Desktop<'_> {
         // again while it has them would reset the focus lock that keeps Escape for the panel.
         if std::mem::take(&mut self.runtime.tickets.panel.focus) && !ui.memory(|m| m.has_focus(panel_nav::focus_id())) {
             self.client.focus_terminal = None;
-            self.client.focus_editor = false;
+            self.client.ui.focus_editor = false;
             ui.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
         }
         let p = self.palette();
         ui.painter().rect_filled(rect, 0.0, p.background);
         // The chief's newest trace card, one line, opens the chief.
-        let echo = self.runtime.lane_echo();
+        let echo = self.lane_echo();
         let body = if echo.is_some() { rect.with_max_y(rect.bottom() - ECHO_H) } else { rect };
         if let Some(echo) = echo {
             let strip = Rect::from_min_max(pos2(rect.left(), rect.bottom() - ECHO_H), rect.right_bottom());
@@ -1652,7 +1585,8 @@ mod tests {
     const SHIFT: egui::Modifiers = egui::Modifiers::SHIFT;
     const NONE: egui::Modifiers = egui::Modifiers::NONE;
 
-    /// One frame in the desktop's order: shortcuts, then the panel. The key releases follow.
+    /// The legacy fallback's host-owned panel state, in desktop order. The shared client-owned
+    /// path is covered separately below and by atomics-web's tests over the same renderer.
     fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
         frame_in(app, ctx, events, 1020.0, None)
     }
@@ -1700,7 +1634,12 @@ mod tests {
                     if let Some(id) = editor {
                         ui.interact(Rect::from_min_size(Pos2::ZERO, vec2(10.0, 10.0)), id, Sense::click());
                     }
-                    app.diff_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(width, 760.0)));
+                    let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(width, 760.0));
+                    if app.runtime.panel == PanelMode::Tickets {
+                        app.tickets_panel(ui, rect);
+                    } else {
+                        app.diff_panel(ui, rect);
+                    }
                 },
             );
             app.runtime.drain_actions();
@@ -1896,7 +1835,7 @@ mod tests {
                 assert!(!focused(ctx));
 
                 let editor = egui::Id::unique("test-editor");
-                app.client.editor_id = Some(editor);
+                app.client.ui.editor_id = Some(editor);
                 app.runtime.tickets.panel.find.selected = Some(1);
                 ctx.memory_mut(|m| {
                     if let Some(id) = m.focused() {
@@ -2324,7 +2263,7 @@ mod tests {
                         },
                         |ui| {
                             app.shortcuts(ui.ctx());
-                            app.diff_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(1020.0, 760.0)));
+                            app.tickets_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(1020.0, 760.0)));
                         },
                     )
                     .drop_without_applying_deltas();
@@ -2497,6 +2436,98 @@ mod tests {
         let config = example_profile("meaning-example", &state);
         app.runtime.config.tickets = config;
         app.runtime.apply_ticket_config();
+    }
+
+    #[test]
+    fn shared_tickets_desktop_search_read_keys_and_plan_draft_are_client_owned() {
+        with_app(
+            "app::tickets_panel::tests::shared_tickets_desktop_search_read_keys_and_plan_draft_are_client_owned",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                fake_profile(app, dir.path());
+                app.runtime.panel = PanelMode::Tickets;
+                app.runtime.diff_open = true;
+                app.runtime.tickets.panel.query = "legacy query".into();
+                let release = |code| egui::Event::Key {
+                    key: code,
+                    physical_key: Some(code),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: NONE,
+                };
+                let shared_frame = |app: &mut Desktop<'_>, events| {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1020.0, 800.0))),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            app.shortcuts(ui.ctx());
+                            app.diff_panel(ui, Rect::from_min_size(Pos2::ZERO, vec2(1020.0, 760.0)));
+                        },
+                    );
+                    app.runtime.drain_actions();
+                    output
+                };
+                shared_frame(app, vec![]).drop_without_applying_deltas();
+                settle(app);
+                let output = shared_frame(app, vec![]);
+                assert!(texts(&output).iter().any(|text| text == "Search"));
+                assert!(app.client.ui.tickets.results.len() > 1);
+                output.drop_without_applying_deltas();
+                ctx.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+                shared_frame(app, press(Key::ArrowDown, SHIFT)).drop_without_applying_deltas();
+                assert_eq!(app.client.ui.tickets.selected, Some(1));
+                assert_eq!(app.runtime.tickets.panel.find.selected, None);
+                shared_frame(app, vec![egui::Event::ModifiersChanged(NONE), release(Key::ArrowDown)])
+                    .drop_without_applying_deltas();
+
+                app.client.ui.tickets.query = "DEMO-2".into();
+                let output = shared_frame(app, vec![]);
+                let at = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "Search" => {
+                            Some(text.pos + text.galley.rect.center().to_vec2())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                output.drop_without_applying_deltas();
+                let click = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: NONE,
+                };
+                shared_frame(app, vec![egui::Event::PointerMoved(at), click(true), click(false)])
+                    .drop_without_applying_deltas();
+                settle(app);
+                shared_frame(app, vec![]).drop_without_applying_deltas();
+                assert_eq!(app.client.ui.tickets.results[0].link.label(), "DEMO-2");
+                assert_eq!(app.runtime.tickets.panel.query, "legacy query");
+                ctx.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+                let output = shared_frame(app, press(Key::Enter, NONE));
+                assert!(
+                    !output
+                        .platform_output
+                        .commands
+                        .iter()
+                        .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_)))
+                );
+                output.drop_without_applying_deltas();
+                settle(app);
+                shared_frame(app, vec![release(Key::Enter)]).drop_without_applying_deltas();
+                assert_eq!(app.client.ui.tickets.read.as_ref().unwrap().link.label(), "DEMO-2");
+                assert!(app.runtime.tickets.panel.read.is_none());
+                ctx.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+                shared_frame(app, press(Key::Enter, plan_chord())).drop_without_applying_deltas();
+                assert!(app.client.ui.tickets.dialog);
+                assert!(app.runtime.tickets.panel.dialog.is_none());
+            },
+        );
     }
 
     /// The same profile with its reads over HTTP; the guard keeps the fake API running.
@@ -3424,7 +3455,14 @@ mod tests {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, height))),
                     ..Default::default()
                 },
-                |ui| app.diff_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(width, height))),
+                |ui| {
+                    let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(width, height));
+                    if app.runtime.panel == PanelMode::Tickets {
+                        app.tickets_panel(ui, rect);
+                    } else {
+                        app.diff_panel(ui, rect);
+                    }
+                },
             );
             RASTER.with(|raster| raster.borrow_mut().feed(&output));
             output.textures_delta.clear();
@@ -3531,7 +3569,7 @@ mod tests {
             },
             |ui| {
                 app.shortcuts(ui.ctx());
-                app.diff_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 760.0)));
+                app.tickets_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 760.0)));
                 app.plan_dialog(ui.ctx());
             },
         );

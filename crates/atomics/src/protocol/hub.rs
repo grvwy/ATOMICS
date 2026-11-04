@@ -434,6 +434,20 @@ impl Hub {
         self.state.sessions.data.iter().any(|s| s.id == id)
     }
 
+    /// A folder subscription may wait for its first diff worker result, but may name only a root
+    /// the host has published, never an arbitrary path supplied by a client.
+    pub fn has_worktree(&self, root: &str) -> bool {
+        self.state.diffs.data.iter().any(|d| d.worktree == root)
+            || self
+                .state
+                .host
+                .data
+                .projects
+                .iter()
+                .any(|p| p.root == root || p.worktrees.iter().any(|w| w.path == root))
+            || self.state.sessions.data.iter().any(|s| s.worktree.as_deref().unwrap_or(&s.cwd) == root)
+    }
+
     /// Read the published projections and turn what changed into events for every client.
     pub fn poll(&mut self, projections: &Projections) {
         self.expire_ring();

@@ -117,9 +117,30 @@ pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clien
     }
 }
 
+/// Keeps the explorer reachable when the layout gives the sidebar's room to the diff or chief.
+pub fn explorer_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    if backend.repos().is_empty() {
+        return;
+    }
+    ui.menu_button("Explorer", |ui| {
+        ui.set_min_width(260.0);
+        ui.set_max_width(360.0);
+        ui.set_max_height(600.0);
+        crate::sidebar::explorer(ui, backend, client);
+    });
+}
+
 /// The Project menu: open a project, a recent project or a workspace, or save the open projects as one.
 pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    if backend.available(&Command::PickProject) && ui.button("Open project…").clicked() {
+    if backend.management().is_some() {
+        for project in backend.repos() {
+            ui.label(backend.display(&project));
+        }
+        if !backend.available(&Command::PickProject) {
+            ui.label("View only: opening projects requires the host grant.");
+        }
+    }
+    if ui.add_enabled(backend.available(&Command::PickProject), egui::Button::new("Open project…")).clicked() {
         ui.close();
         client.send(Command::PickProject);
     }

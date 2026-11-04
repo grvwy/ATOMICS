@@ -43,7 +43,66 @@ fn connected(role: Role) -> RemoteBackend {
     remote.set_now(10_000);
     remote.receive(welcome(role));
     remote.receive(snapshot());
+    remote.take_outgoing();
     remote
+}
+
+#[test]
+fn folder_subscriptions_page_reset_unsubscribe_and_reconnect() {
+    let remote = connected(Role::Viewer);
+    let root = Path::new(WORKTREE);
+    let paths: Vec<String> = (0..260).map(|i| format!("file{i:03}.rs")).collect();
+    remote.take_outgoing();
+    assert!(remote.folder(root, "").loading);
+    assert!(
+        matches!(&remote.take_outgoing()[0].message, Message::Subscribe { topics } if matches!(&topics[0], wire::Topic::Folder { worktree, path } if worktree == WORKTREE && path.is_empty()))
+    );
+    let page = |revision, offset| {
+        atomics_core::folder::page(
+            paths.iter().map(String::as_str),
+            WORKTREE,
+            "",
+            revision,
+            offset,
+            wire::MAX_FRAME_BYTES,
+        )
+        .unwrap()
+    };
+    remote.receive(Envelope::host(EPOCH, Message::FolderPage(page(4, 0))));
+    assert_eq!(remote.folder(root, "").entries.len(), 128);
+    remote.more_folder(root, "");
+    assert!(matches!(remote.take_outgoing()[0].message, Message::FolderGet { offset: 128, revision: Seq(4), .. }));
+    remote.receive(Envelope::host(EPOCH, Message::FolderPage(page(5, 0))));
+    remote.receive(Envelope::host(EPOCH, Message::FolderPage(page(4, 128))));
+    assert_eq!(remote.folder(root, "").entries.len(), 128, "an old page cannot join the new listing");
+    remote.more_folder(root, "");
+    remote.take_outgoing();
+    remote.receive(Envelope::host(EPOCH, Message::FolderPage(page(5, 128))));
+    assert_eq!(remote.folder(root, "").entries.len(), 128, "a page replaces the last to bound the client's file cache");
+    assert!(!remote.folder(root, "").first);
+    remote.end_frame();
+    remote.end_frame();
+    assert!(remote.take_outgoing().iter().any(|e| matches!(e.message, Message::Unsubscribe { .. })));
+    remote.receive(Envelope::host(EPOCH, Message::FolderPage(page(5, 0))));
+    assert!(remote.state.borrow().folders.is_empty(), "a late page does not restore a closed folder");
+    remote.folder(root, "");
+    remote.disconnected();
+    remote.receive(welcome(Role::Viewer));
+    remote.folder(root, "");
+    assert!(
+        remote.take_outgoing().iter().any(|e| matches!(e.message, Message::Subscribe { .. })),
+        "reconnect follows the folder again"
+    );
+}
+
+#[test]
+fn completing_a_plan_requires_the_hosts_capability() {
+    let remote = connected(Role::Controller);
+    let complete = Command::ClosePlan { plan: 0, status: PlanStatus::Completed };
+    assert!(remote.available(&complete));
+    remote.state.borrow_mut().welcome.as_mut().unwrap().capabilities.retain(|c| c != wire::PLAN_COMPLETE);
+    assert!(!remote.available(&complete));
+    assert!(remote.available(&Command::ClosePlan { plan: 0, status: PlanStatus::Archived }));
 }
 
 #[test]
@@ -170,7 +229,7 @@ fn operations_in_flight_are_sent_again_after_a_reconnect_while_young() {
 
     remote.receive(welcome(Role::Controller));
     let again: Vec<Message> = remote.take_outgoing().into_iter().map(|e| e.message).collect();
-    assert!(matches!(again.as_slice(), [Message::PlanCommand(c), ..] if c.op == "op-1"), "the same op: {again:?}");
+    assert!(again.iter().any(|m| matches!(m, Message::PlanCommand(c) if c.op == "op-1")), "the same op: {again:?}");
 
     remote.receive(snapshot());
 
@@ -294,17 +353,14 @@ fn what_atomics_v1_has_no_action_for_stays_hidden_and_a_voice_with_it() {
     wide(&controller);
     for command in [
         Command::VoiceToSession { session: 1, text: "go on".into() },
-        Command::ClosePlan { plan: 0, status: PlanStatus::Completed },
         Command::ArchiveFinished(0),
         Command::ReopenPlan(0),
         Command::CleanUpPlan(0),
         Command::ResumeSession("s1".into()),
         Command::EditBrief { plan: 0, task: "t2".into(), brief: "b".into() },
         Command::SyncTickets(0),
-        Command::Edit { root: WORKTREE.into(), path: None, line: None },
         Command::DismissMcp("s1".into()),
         Command::PickProject,
-        Command::SetView(None),
         Command::Rename("s1".into()),
     ] {
         assert!(!controller.available(&command), "{command:?}");
@@ -332,7 +388,10 @@ fn the_views_own_commands_stay_and_what_lives_in_one_layout_goes_with_it() {
     // The chief's window, the steer bar, the changed files' column and the picker are the wide layout's.
     let steer = Command::Steer { sessions: Vec::new(), text: String::new() };
     let open = Command::OpenFile { root: WORKTREE.into(), path: String::new() };
-    for command in [Command::ToggleChief, Command::HideChief, steer, open, Command::NewSession] {
+    for command in [steer, open, Command::NewSession, Command::SetView(None)] {
+        assert!(controller.available(&command), "{command:?} on a phone");
+    }
+    for command in [Command::ToggleChief, Command::HideChief] {
         assert!(!controller.available(&command), "{command:?} on a phone");
         wide(&controller);
         assert!(controller.available(&command), "{command:?} in the wide layout");
@@ -416,6 +475,7 @@ fn each_command_sends_its_mutation() {
         (Command::IntegrateTask { plan: 0, task: "t1".into() }, PlanAction::Integrate { task: "t1".into() }),
         (Command::ArchivePlan(0), PlanAction::Archive),
         (Command::ClosePlan { plan: 0, status: PlanStatus::Archived }, PlanAction::Archive),
+        (Command::ClosePlan { plan: 0, status: PlanStatus::Completed }, PlanAction::Complete),
     ] {
         remote.send(command.clone());
         let [Message::PlanCommand(plan)] = one(&remote) else { panic!("{command:?}") };
@@ -861,20 +921,29 @@ fn frame_text(remote: &RemoteBackend) -> Vec<String> {
 #[test]
 fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     let remote = connected(Role::Controller);
+    host_upsert(&remote, 4, fake_host::management().board.host);
     remote.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&remote);
     let has = |label: &str| text.iter().any(|t| t.starts_with(label));
-    for shown in
-        ["ATOMICS", "CHIEF", "Ungrouped · 0", "◆ Parse faster", "Diff", "Board 0/2", "AGENTS", "PLAN", "Approve plan"]
-    {
+    for shown in [
+        "ATOMICS",
+        "CHIEF",
+        "Ungrouped · 0",
+        "◆ Parse faster",
+        "Diff",
+        "Board 0/2",
+        "AGENTS",
+        "PLAN",
+        "Approve plan",
+        "Settings",
+        "Remote",
+        "Project",
+    ] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
-    for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {
-        assert!(!has(host_only), "{host_only} is the host's: {text:?}");
-    }
-    // Its steer bar is the wide layout's, and this frame's page has not said it is wide.
-    for not_drawn in ["All ·", "Repos", "EXPLORER", "Steer", "Send", "+ New", "Complete plan"] {
-        assert!(!has(not_drawn), "{not_drawn} has nothing to do here: {text:?}");
+    assert!(has("USAGE") && has("Session  76%") && has("Weekly  24%") && has("load 4.2"), "{text:?}");
+    for shown in ["All ·", "Repos", "Steer", "Send", "+ New"] {
+        assert!(has(shown), "{shown} is missing: {text:?}");
     }
     assert!(has("Close plan…"), "its archive goes through: {text:?}");
     wide(&remote);
@@ -883,6 +952,10 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     for shown in ["Steer", "Send", "+ New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
+
+    remote.state.borrow_mut().trace = fake_host::trace_data();
+    remote.set_chief_window(ChiefWindow { open: true, dock: ChiefDock::Docked, width: None }, true);
+    assert!(frame_text(&remote).iter().any(|text| text.starts_with("TRACE")));
 
     let viewer = connected(Role::Viewer);
     viewer.set_view(ViewHints { diff_open: true, ..default_hints() });
@@ -957,7 +1030,7 @@ fn host_commands_go_where_welcome_grants_host_and_no_other_project_command_does(
         assert!(!offline.available(command), "nothing goes offline: {command:?}");
         assert!(!older.available(command), "an older host has no {command:?}");
     }
-    // The host's folders stay its own.
+    // A host predating shared management cannot offer the new project operations.
     for command in [
         Command::PickProject,
         Command::SaveWorkspace("team".into()),
@@ -978,9 +1051,6 @@ fn host_commands_go_where_welcome_grants_host_and_no_other_project_command_does(
         let [Message::HostCommand(sent)] = one(&controller) else { panic!("{command:?}") };
         assert_eq!(sent.action, action, "{command:?}");
     }
-    controller.send(Command::SaveWorkspace("team".into()));
-    assert!(controller.take_outgoing().is_empty());
-    assert!(controller.notice().unwrap().contains("not available in the browser"));
 }
 
 #[test]
@@ -1023,4 +1093,166 @@ fn a_paste_that_does_not_go_through_says_why_and_never_repeats_the_address() {
     offline.receive(welcome(Role::Controller));
     assert!(offline.take_outgoing().iter().all(|e| !matches!(e.message, Message::HostCommand(_))), "nor later");
     assert!(said.iter().all(|notice| !notice.contains("c0de") && !notice.contains("127.0.0.1")), "{said:?}");
+}
+
+#[test]
+fn an_empty_host_offers_its_configured_agents_and_open_project_folders() {
+    let remote = RemoteBackend::new("op");
+    remote.receive(welcome(Role::Controller));
+    let mut state = snapshot();
+    let Message::StateSnapshot { sessions, plans, host, .. } = &mut state.message else { panic!() };
+    sessions.clear();
+    plans.clear();
+    *host = fake_host::management().board.host;
+    let info = host.management.as_mut().unwrap();
+    info.config["values"]["agents"] = serde_json::json!({"value":[{"name":"codex"}],"source":"main"});
+    host.projects.push(atomics_core::projection::ProjectInfo { root: "/home/user/repo".into(), worktrees: Vec::new() });
+    remote.receive(state);
+    wide(&remote);
+    assert_eq!(remote.ui_config().agents, ["codex"]);
+    assert!(remote.folders().contains(&PathBuf::from("/home/user/repo")));
+    assert!(remote.available(&Command::NewSession));
+}
+
+#[test]
+fn trace_pages_replace_atomically_follow_live_revisions_and_resubscribe() {
+    use atomics_core::trace::TraceState;
+    let remote = connected(Role::Viewer);
+    let data = fake_host::trace_data();
+    let deliver = |revision, offset, limit, request: &Envelope, source: &atomics_core::trace_feed::TraceData| {
+        let page = source.page(revision, offset, limit, 64000).unwrap();
+        remote.receive(Envelope::host(EPOCH, Message::TracePage(page)).reply_to(request.request_id.clone()));
+    };
+    remote.take_outgoing();
+    remote.receive(Envelope::host(EPOCH, Message::TraceChanged { revision: Seq(1) }));
+    let first = remote.take_outgoing().pop().unwrap();
+    deliver(1, 0, 1, &first, &data);
+    assert!(remote.trace().entries.is_empty(), "partial pages never replace the visible lane");
+    let second = remote.take_outgoing().pop().unwrap();
+    deliver(1, 1, 1, &second, &data);
+    assert_eq!(remote.trace(), data);
+    let mut completed = data.clone();
+    completed.entries[1].state = TraceState::Ok;
+    remote.receive(Envelope::host(EPOCH, Message::TraceChanged { revision: Seq(2) }));
+    let second_revision = remote.take_outgoing().pop().unwrap();
+    remote.receive(Envelope::host(EPOCH, Message::TraceChanged { revision: Seq(3) }));
+    assert!(remote.take_outgoing().is_empty(), "finish the pinned revision before following a newer one");
+    deliver(1, 1, 1, &second, &data);
+    assert_eq!(remote.trace(), data, "old page replies cannot change the lane");
+    deliver(2, 0, 1, &second_revision, &completed);
+    let next_page = remote.take_outgoing().pop().unwrap();
+    assert!(matches!(next_page.message, Message::TraceGet { revision: Seq(2), offset: 1, .. }));
+    deliver(2, 1, 1, &next_page, &completed);
+    assert_eq!(remote.trace(), completed, "busy streams still make visible progress");
+    let current = remote.take_outgoing().pop().unwrap();
+    assert!(matches!(current.message, Message::TraceGet { revision: Seq(3), offset: 0, .. }));
+    deliver(3, 0, 32, &current, &completed);
+    assert_eq!(remote.trace(), completed);
+    remote.disconnected();
+    remote.receive(welcome(Role::Viewer));
+    assert!(
+        remote
+            .take_outgoing()
+            .iter()
+            .any(|e| matches!(&e.message, Message::Subscribe { topics } if topics.contains(&wire::Topic::Trace)))
+    );
+    remote.receive(Envelope::host(EPOCH, Message::TraceChanged { revision: Seq(0) }));
+    let current = remote.take_outgoing().pop().unwrap();
+    deliver(0, 0, 32, &current, &Default::default());
+    assert!(remote.trace().entries.is_empty(), "a restarted host clears the former chief's trace");
+}
+
+#[test]
+fn resource_snapshots_and_upserts_are_shared_by_controllers_and_viewers() {
+    for role in [Role::Controller, Role::Viewer] {
+        let remote = connected(role);
+        assert_eq!(remote.resources(), Some(fake_host::resources()));
+        let mut host = fake_host::board().host;
+        host.resources.as_mut().unwrap().load = Some(6.1);
+        host_upsert(&remote, 4, host.clone());
+        assert_eq!(remote.resources(), host.resources);
+        host.resources = None;
+        host_upsert(&remote, 5, host);
+        assert_eq!(remote.resources(), None);
+    }
+}
+
+#[test]
+fn panel_commands_need_the_capability_and_a_control_grant() {
+    let edit = Command::Edit { root: WORKTREE.into(), path: Some("src/a.rs".into()), line: Some(12) };
+    let commands =
+        [edit, Command::EditorHints(WORKTREE.into()), Command::LoadPullRequest("pull:example/repo#7".into())];
+    let remote = connected(Role::Controller);
+    remote.take_outgoing();
+    for command in &commands {
+        assert!(remote.available(command));
+        remote.send(command.clone());
+    }
+    let sent = remote.take_outgoing();
+    assert!(
+        matches!(&sent[0].message, Message::HostCommand(c) if matches!(&c.action, HostAction::Edit { path, line: Some(12), .. } if path.as_deref() == Some("src/a.rs")))
+    );
+    assert!(matches!(&sent[1].message, Message::HostCommand(c) if matches!(c.action, HostAction::EditorHints { .. })));
+    assert!(
+        matches!(&sent[2].message, Message::HostCommand(c) if matches!(c.action, HostAction::PullRequestDiff { .. }))
+    );
+    for remote in [connected(Role::Viewer), RemoteBackend::new("offline")] {
+        for command in &commands {
+            assert!(!remote.available(command));
+        }
+    }
+    let old_host = connected(Role::Controller);
+    let mut old = welcome(Role::Controller);
+    if let Message::Welcome { capabilities, .. } = &mut old.message {
+        capabilities.retain(|c| c != wire::PANELS);
+    }
+    old_host.receive(old);
+    for command in &commands {
+        assert!(!old_host.available(command), "{command:?} on an older host");
+    }
+}
+
+#[test]
+fn tickets_use_the_host_grant_and_a_refusal_ends_the_clients_request() {
+    use atomics_core::ticket_ui::TicketAction;
+    let remote = connected(Role::Controller);
+    let mut host = HostInfo::default();
+    host.tickets = fake_host::ticket_reader().board.host.tickets;
+    remote.receive(Envelope::host(EPOCH, Message::HostUpsert { cursor: Seq(4), host: host.clone() }));
+    assert!(remote.available(&Command::OpenTicket(Default::default())));
+    assert!(remote.available(&Command::SetPanel(PanelMode::Tickets)));
+    let action =
+        TicketAction::Search { query: "parser".into(), keyword: false, view: 0, filters: vec![], cursor: None };
+    let command = Command::Ticket { request: "page-request".into(), action: action.clone() };
+    assert!(remote.available(&command));
+    remote.send(command);
+    let sent = remote
+        .take_outgoing()
+        .into_iter()
+        .find_map(|envelope| match envelope.message {
+            Message::HostCommand(command) => Some(command),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(sent.action, HostAction::Tickets { request: "page-request".into(), ticket: Box::new(action) });
+    remote.receive(Envelope::host(
+        EPOCH,
+        Message::CommandResult(CommandResult {
+            op: sent.op,
+            outcome: Outcome::refused(WireError::new(ErrorCode::Rejected, "ticket server unavailable")),
+        }),
+    ));
+    let reply = remote.tickets().unwrap().replies.pop().unwrap();
+    assert_eq!(reply.request, "page-request");
+    assert!(reply.error.unwrap().contains("ticket server unavailable"));
+
+    let viewer = connected(Role::Viewer);
+    viewer.receive(Envelope::host(EPOCH, Message::HostUpsert { cursor: Seq(4), host }));
+    assert!(!viewer.available(&Command::Ticket {
+        request: "read".into(),
+        action: TicketAction::Read { ticket: Default::default() }
+    }));
+    let old = connected(Role::Controller);
+    assert!(!old.available(&Command::OpenTicket(Default::default())));
+    assert!(!old.available(&Command::SetPanel(PanelMode::Tickets)));
 }

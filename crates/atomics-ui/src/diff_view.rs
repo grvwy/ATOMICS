@@ -46,6 +46,8 @@ pub struct DiffState {
 /// worktree under review laid over them.
 #[derive(Default)]
 pub struct ExplorerState {
+    /// The folder open in a paged remote listing.
+    pub folder: String,
     pub filter: String,
     pub changed_only: bool,
     pub open_dirs: HashSet<String>,
@@ -267,6 +269,7 @@ impl Row {
 }
 
 pub struct Header<'a> {
+    pub refresh: bool,
     pub title: &'a str,
     pub branch: Option<&'a str>,
     pub can_send: bool,
@@ -719,7 +722,7 @@ fn header_buttons(
     if touch.is_none() {
         close_button(ui, touch, action);
     }
-    if touch::small_button(ui, touch, "⟳").on_hover_text("Refresh").clicked() {
+    if header.refresh && touch::small_button(ui, touch, "⟳").on_hover_text("Refresh").clicked() {
         *action = DiffAction::Refresh;
     }
     if state.viewing.is_some() && touch::small_button(ui, touch, "← diff").on_hover_text("Back to the diff").clicked()
@@ -1481,6 +1484,7 @@ mod tests {
                     ui.label("drawn ahead of the diff");
                 }
                 let header = Header {
+                    refresh: true,
                     title: "title",
                     branch: None,
                     can_send: true,

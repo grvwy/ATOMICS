@@ -8,7 +8,7 @@ use atomics_core::theme::{Resolved, ThemeMode, ThemeTokens};
 pub use atomics_ui::keys::{
     consume_chord, consume_physical_shortcut, is_app_chord, is_digit, shortcut, shortcut_label,
 };
-pub use atomics_ui::theme::{Fonts, Palette, lerp};
+pub use atomics_ui::theme::{Fonts, Palette};
 pub use fonts::SystemFonts;
 
 /// The theme as the host keeps it, free of egui: a built-in or theme file plus `[theme]` overrides, resolved
@@ -238,12 +238,12 @@ mod tests {
     /// fails the scan, so it cannot outlive the code it excuses.
     const EXCEPTIONS: &[(&str, &str, &str)] = &[
         (
-            "atomics/src/app/pairing.rs",
+            "atomics-ui/src/management/remote.rs",
             "painter.rect_filled(rect, 0.0, Color32::WHITE);",
             "a QR code must be black on white to scan: the pairing code's light modules and quiet zone",
         ),
         (
-            "atomics/src/app/pairing.rs",
+            "atomics-ui/src/management/remote.rs",
             "painter.rect_filled(Rect::from_min_size(at, Vec2::splat(scale)), 0.0, Color32::BLACK);",
             "a QR code must be black on white to scan: the pairing code's dark modules",
         ),
@@ -310,13 +310,13 @@ mod tests {
         assert!(stale.is_empty(), "these exceptions no longer match their code; remove them:\n{}", stale.join("\n"));
         // An exception covers its own site only: the same color elsewhere, or other code there, is still found.
         assert_eq!(
-            exception("atomics/src/app/pairing.rs:189: painter.rect_filled(rect, 0.0, Color32::WHITE);"),
+            exception("atomics-ui/src/management/remote.rs:189: painter.rect_filled(rect, 0.0, Color32::WHITE);"),
             Some(0)
         );
         for other in [
             "atomics/src/app/other.rs:189: painter.rect_filled(rect, 0.0, Color32::WHITE);",
-            "atomics/src/app/pairing.rs:12: let c = Color32::WHITE;",
-            "atomics/src/app/pairing.rs:x: painter.rect_filled(rect, 0.0, Color32::WHITE);",
+            "atomics-ui/src/management/remote.rs:12: let c = Color32::WHITE;",
+            "atomics-ui/src/management/remote.rs:x: painter.rect_filled(rect, 0.0, Color32::WHITE);",
         ] {
             assert_eq!(exception(other), None, "{other}");
         }

@@ -372,9 +372,25 @@ pub struct WorktreeRow {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FolderSnapshot {
+    pub entries: Vec<atomics_core::folder::Entry>,
+    pub loading: bool,
+    pub more: bool,
+    pub first: bool,
+    pub error: Option<String>,
+}
+
 /// Everything the UI reads from a host, and the way its commands reach the host. Methods take `&self` and
 /// return owned or shared data, so an implementation can sit over a lock, a snapshot or a socket.
 pub trait Backend {
+    fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
+        Vec::new()
+    }
+
+    fn pull_requests(&self) -> Vec<atomics_core::projection::PullRequestInfo> {
+        Vec::new()
+    }
     /// Carries out a host's command: at once, or queued to run in order with the host's other work. What
     /// becomes of it shows in later reads. A view command is the UI's own and never comes here.
     fn send(&self, command: Command);
@@ -436,6 +452,16 @@ pub trait Backend {
     /// The chief: its session, its window and the last heartbeat.
     fn chief(&self) -> ChiefView;
 
+    /// Unix milliseconds from the platform's clock, for running trace durations.
+    fn trace_now_ms(&self) -> u64 {
+        0
+    }
+
+    /// The current chief's cleaned, bounded calls.
+    fn trace(&self) -> atomics_core::trace_feed::TraceData {
+        Default::default()
+    }
+
     /// What the diff panel's header shows of the worktree at `root`.
     fn diff_heading(&self, root: &Path) -> DiffHeading;
 
@@ -466,6 +492,16 @@ pub trait Backend {
     /// A project's worktrees other than its main checkout, as the host last listed them.
     fn worktrees(&self, project: &Path) -> Vec<WorktreeRow>;
 
+    /// Remote file trees arrive a folder at a time. Native backends may keep the prepared tree.
+    fn paged_folders(&self) -> bool {
+        false
+    }
+    fn folder(&self, _root: &Path, _path: &str) -> FolderSnapshot {
+        FolderSnapshot::default()
+    }
+    fn more_folder(&self, _root: &Path, _path: &str) {}
+    fn first_folder(&self, _root: &Path, _path: &str) {}
+
     /// `path` as the host writes paths, with its home folder as `~`.
     fn display(&self, path: &Path) -> String;
 
@@ -482,17 +518,36 @@ pub trait Backend {
     /// The Project menu's recent projects and workspaces.
     fn project_menu(&self) -> ProjectMenu;
 
+    /// Host management data, already scrubbed of configuration credentials.
+    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
+        None
+    }
+
     /// The folder the host was started in, where the welcome starts agents outside the Ungrouped tab;
     /// `None` when the host does not say.
     fn launch_dir(&self) -> Option<PathBuf>;
 
-    /// The host's Tickets panel, where it has one ([`PanelMode::Tickets`]); `None` without one.
+    /// The selected plan's safe ticket links, including board tickets without a task.
+    fn ticket_tree(&self, _plan: usize) -> Option<atomics_core::ticket_ui::TicketTree> {
+        None
+    }
+
+    /// The shared reader's safe profile and bounded request replies; absent on older hosts.
+    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
+        None
+    }
+
     fn tickets_panel(&self) -> Option<TicketsPanel> {
         None
     }
 
     /// The ticket system's sign-in, when the host's ticket system signs in with OAuth and says how it stands.
     fn sign_in(&self) -> Option<crate::signin::SignInView> {
+        None
+    }
+
+    /// The host's account usage and load, when it publishes them.
+    fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         None
     }
 }

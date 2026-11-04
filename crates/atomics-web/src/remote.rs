@@ -11,10 +11,13 @@
 //! What a host keeps of its own window and atomics.v1 does not send (the tab, the active session, the
 //! right panel, the chief's window) is the page's, set by the views from their [`crate::desk::Desk`]
 //! ([`RemoteBackend::set_view`], [`RemoteBackend::set_chief_window`]); what the host cannot send at all
-//! (its config, projects, worktrees, sandboxes, usage) reads as absent, so the frame's host-only items stay
-//! empty. What it says of itself with `host` (the workspace open there, the saved ones, the ticket sign-in)
-//! is the top bar's Workspace and sign-in items' and the sign-in banner's, and their commands go as
+//! (its config and sandboxes) reads as absent, so the frame's host-only items stay
+//! empty. What it says of itself with `host` (the workspace open there, the saved ones,
+//! the ticket sign-in, usage and governor load) supplies the shared resource displays,
+//! workspace and sign-in items, and their commands go as
 //! `host_command`.
+//! With `explorer`, its projects and worktrees come in host state and visible folders are subscribed to,
+//! one bounded page at a time. Whole-file previews use `file_get`, changed files their diff hunks.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -50,12 +53,25 @@ use crate::desk::{self, ChiefWindow};
 use crate::screens::{Lease, Refused, Screens};
 
 /// What this client asks the host for.
-pub const CAPABILITIES: &[&str] =
-    &["board", "plans", "approvals", "diffs", wire::TERMINALS, wire::INPUT, wire::MUTATIONS, wire::HOST];
+pub const CAPABILITIES: &[&str] = &[
+    "board",
+    "plans",
+    "approvals",
+    "diffs",
+    wire::TERMINALS,
+    wire::INPUT,
+    wire::MUTATIONS,
+    wire::HOST,
+    wire::PANELS,
+    wire::EXPLORER,
+    wire::PLAN_COMPLETE,
+    wire::TRACE,
+];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
 /// Pages of one file's diff read before the rest is left out.
 const MAX_PAGES: u32 = 16;
+const MAX_FILE_PREVIEWS: usize = 8;
 /// The agent name a host gives a plain shell. The mirror has no agent kinds, so this is only the usual shell, for
 /// counting agents and for whether a worktree has one to review; nothing that types can rely on it.
 const SHELL: &str = "shell";
@@ -78,6 +94,10 @@ pub struct RemoteBackend {
 }
 
 struct State {
+    folders: HashMap<(String, String), Folder>,
+    shown_folders: HashSet<(String, String)>,
+    /// Whole-file previews, one per worktree, requested explicitly by this client.
+    files: HashMap<String, Preview>,
     mirror: Mirror,
     welcome: Option<Welcome>,
     ttl_secs: u32,
@@ -95,6 +115,7 @@ struct State {
     unsent: Option<String>,
     /// Comments that did not go through, by worktree, for their boxes to hold again.
     unsent_comments: Vec<(PathBuf, ReviewComment)>,
+    ticket_failures: Vec<atomics_core::ticket_ui::TicketReply>,
     /// The host started a session this page asked for.
     started: bool,
     /// Diffs as fetched, by worktree.
@@ -112,10 +133,32 @@ struct State {
     chief: ChiefWindow,
     wide: bool,
     screens: Screens,
+    trace: atomics_core::trace_feed::TraceData,
+    trace_loading: atomics_core::trace_feed::TraceData,
+    trace_revision: Option<u64>,
+    trace_wanted: Option<u64>,
+    /// One page request at a time. Superseded replies never reach the visible trace.
+    trace_request: Option<(String, u32)>,
+}
+
+#[derive(Default)]
+struct Folder {
+    page: Option<atomics_core::folder::Page>,
+    loading: bool,
+    error: Option<String>,
+    request: Option<String>,
+}
+
+struct Preview {
+    path: String,
+    file: Option<Arc<atomics_core::diff_data::FileView>>,
+    error: Option<String>,
+    request: String,
 }
 
 /// What a mutation in flight changed on screen: gone with its outcome, and undone if that is not `done`.
 enum Flight {
+    Ticket(String),
     /// An approval decided here, by session and request: the banner hides it meanwhile.
     Decision(String, String),
     /// One target of a steer ([`Steering`]), by the steer's number and the target's title at send time.
@@ -193,10 +236,47 @@ fn default_hints() -> ViewHints {
 }
 
 impl RemoteBackend {
+    fn has_capability(&self, capability: &str) -> bool {
+        self.state.borrow().welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == capability))
+    }
+
+    /// Changed files open at their hunks; unchanged files use the host's bounded whole-file preview.
+    pub fn open_file(&self, root: &Path, path: &str) -> bool {
+        let mut s = self.state.borrow_mut();
+        let worktree = root.to_string_lossy().into_owned();
+        let changed =
+            s.mirror.diffs.get(&worktree).is_some_and(|diff| diff.files.iter().any(|f| summary_path(f) == path));
+        if changed {
+            s.files.remove(&worktree);
+            return false;
+        }
+        if s.welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::EXPLORER)) {
+            if !s.files.contains_key(&worktree)
+                && s.files.len() >= MAX_FILE_PREVIEWS
+                && let Some(key) = s.files.keys().next().cloned()
+            {
+                s.files.remove(&key);
+            }
+            s.next_request += 1;
+            let request = format!("file-{}", s.next_request);
+            s.files.insert(
+                worktree.clone(),
+                Preview { path: path.into(), file: None, error: None, request: request.clone() },
+            );
+            s.outgoing.push(
+                Envelope::new(Message::FileGet { worktree: worktree.clone(), path: path.into() })
+                    .reply_to(Some(request)),
+            );
+        }
+        true
+    }
     /// A backend with nothing in it yet. `prefix` starts every operation ID this client makes; give each
     /// page a random one, so two pages never reuse an ID.
     pub fn new(prefix: &str) -> Self {
         let state = State {
+            folders: HashMap::new(),
+            shown_folders: HashSet::new(),
+            files: HashMap::new(),
             mirror: Mirror::default(),
             welcome: None,
             ttl_secs: ops::OP_TTL_SECS,
@@ -208,6 +288,7 @@ impl RemoteBackend {
             last_steer: 0,
             unsent: None,
             unsent_comments: Vec::new(),
+            ticket_failures: Vec::new(),
             started: false,
             diffs: BTreeMap::new(),
             wanted: BTreeSet::new(),
@@ -220,6 +301,11 @@ impl RemoteBackend {
             chief: ChiefWindow { open: false, dock: ChiefDock::Floating, width: None },
             wide: false,
             screens: Screens::default(),
+            trace: Default::default(),
+            trace_loading: Default::default(),
+            trace_revision: None,
+            trace_wanted: None,
+            trace_request: None,
         };
         Self { state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
     }
@@ -255,7 +341,13 @@ impl RemoteBackend {
         s.resyncing = false;
         s.outgoing.clear();
         s.requests.clear();
+        s.folders.clear();
+        s.shown_folders.clear();
         s.screens.disconnected();
+        s.trace_request = None;
+        s.trace_revision = None;
+        s.trace_wanted = None;
+        s.trace_loading = Default::default();
         for fetched in s.diffs.values_mut() {
             fetched.files.retain(|_, body| matches!(body, Body::Got { more: false, .. } | Body::Failed));
         }
@@ -372,6 +464,11 @@ impl RemoteBackend {
         match &envelope.message {
             Message::SessionUpsert { session, .. } => s.screens.session_changed(Some(&session.id)),
             Message::StateSnapshot { .. } => s.screens.session_changed(None),
+            Message::HostUpsert { host, .. } => {
+                for editor in &host.editors {
+                    s.screens.session_changed(Some(&editor.terminal));
+                }
+            }
             _ => {}
         }
         s.receive(envelope);
@@ -398,8 +495,13 @@ impl RemoteBackend {
         let s = self.state.borrow();
         let projects =
             s.mirror.plans.values().filter(|p| p.status == PlanStatus::Open).filter_map(|p| p.project.as_ref());
-        let known: BTreeSet<PathBuf> =
-            projects.map(PathBuf::from).chain(s.mirror.sessions.values().map(root)).collect();
+        let known: BTreeSet<PathBuf> = projects
+            .map(PathBuf::from)
+            .chain(s.mirror.sessions.values().map(root))
+            .chain(s.mirror.host.projects.iter().flat_map(|p| {
+                std::iter::once(PathBuf::from(&p.root)).chain(p.worktrees.iter().map(|w| PathBuf::from(&w.path)))
+            }))
+            .collect();
         known.into_iter().collect()
     }
 
@@ -421,6 +523,13 @@ impl RemoteBackend {
         let mut s = self.state.borrow_mut();
         let s = &mut *s;
         s.screens.end_frame(&mut s.outgoing);
+        let shown = std::mem::take(&mut s.shown_folders);
+        let gone: Vec<_> = s.folders.keys().filter(|key| !shown.contains(*key)).cloned().collect();
+        for (worktree, path) in gone {
+            s.folders.remove(&(worktree.clone(), path.clone()));
+            s.outgoing
+                .push(Envelope::new(Message::Unsubscribe { topics: vec![wire::Topic::Folder { worktree, path }] }));
+        }
     }
 
     /// A read of `session`'s screen as received, with whether it is from before a disconnect.
@@ -496,6 +605,18 @@ impl State {
             Some(Flight::Steer(steer, title)) => self.steer_answered(steer, &title, done),
             Some(Flight::Comment(root, comment)) if !done => self.unsent_comments.push((root, comment)),
             Some(Flight::Start) if done => self.started = true,
+            Some(Flight::Ticket(request)) if !done => {
+                let mut reply = atomics_core::ticket_ui::TicketReply::new(request);
+                reply.error = Some(
+                    self.notice
+                        .clone()
+                        .unwrap_or_else(|| "The ticket request could not be confirmed. Try again.".into()),
+                );
+                self.ticket_failures.push(reply);
+                if self.ticket_failures.len() > 32 {
+                    self.ticket_failures.remove(0);
+                }
+            }
             _ => {}
         }
     }
@@ -535,8 +656,51 @@ impl State {
 
     fn receive(&mut self, envelope: Envelope) {
         match &envelope.message {
+            Message::FolderPage(page) => {
+                let key = (page.worktree.clone(), page.path.clone());
+                let Some(folder) = self.folders.get_mut(&key) else { return };
+                let applies = if page.offset == 0 {
+                    folder.page.as_ref().is_none_or(|old| old.revision <= page.revision)
+                } else {
+                    folder
+                        .page
+                        .as_ref()
+                        .is_some_and(|old| old.revision == page.revision && old.next_offset == Some(page.offset))
+                };
+                if !applies {
+                    return;
+                }
+                folder.page = Some(page.clone());
+                folder.loading = false;
+                folder.error = None;
+            }
+            Message::FileContent { worktree, path, content, truncated } => {
+                if let Some(preview) = self.files.get_mut(worktree)
+                    && preview.path == *path
+                    && envelope.request_id.as_deref() == Some(preview.request.as_str())
+                {
+                    let lines: Vec<String> = content.lines().map(str::to_string).collect();
+                    let longest_line = lines.iter().map(|line| line.chars().count()).max().unwrap_or_default();
+                    preview.file = Some(Arc::new(atomics_core::diff_data::FileView {
+                        lines,
+                        longest_line,
+                        highlights: Vec::new(),
+                        note: truncated.then(|| "File preview truncated at the host's size limit".into()),
+                    }));
+                    preview.error = None;
+                }
+            }
             Message::Welcome { capabilities, limits, role, may, .. } => {
                 self.welcome = Some(Welcome { role: *role, may: may.clone(), capabilities: capabilities.clone() });
+                self.trace_revision = None;
+                self.trace_wanted = None;
+                self.trace_request = None;
+                self.trace_loading = Default::default();
+                if capabilities.iter().any(|c| c == wire::TRACE) {
+                    self.outgoing.push(Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Trace] }));
+                } else {
+                    self.trace = Default::default();
+                }
                 if limits.op_ttl_secs > 0 {
                     self.ttl_secs = limits.op_ttl_secs;
                 }
@@ -560,7 +724,28 @@ impl State {
                 for command in &expired {
                     self.land(command.op(), false);
                 }
+                if capabilities.iter().any(|c| c == wire::EXPLORER) {
+                    for (worktree, preview) in &mut self.files {
+                        self.next_request += 1;
+                        preview.request = format!("file-{}", self.next_request);
+                        self.outgoing.push(
+                            Envelope::new(Message::FileGet { worktree: worktree.clone(), path: preview.path.clone() })
+                                .reply_to(Some(preview.request.clone())),
+                        );
+                    }
+                }
             }
+            Message::TraceChanged { revision } => {
+                if self.welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TRACE))
+                    && self.trace_wanted.is_none_or(|wanted| revision.0 > wanted)
+                {
+                    self.trace_wanted = Some(revision.0);
+                    if self.trace_request.is_none() {
+                        self.start_trace(revision.0);
+                    }
+                }
+            }
+            Message::TracePage(page) => self.trace_page(page, envelope.request_id.as_deref()),
             Message::DiffFile { body, truncated, next_offset } => self.diff_page(body, *truncated, *next_offset),
             Message::CommandResult(result) => {
                 let Some(outcome) = self.pending.apply(result) else { return };
@@ -590,6 +775,43 @@ impl State {
                 self.outgoing.push(pong);
             }
             Message::Error { code, message } => {
+                if let Some(id) = envelope.request_id.as_deref() {
+                    if let Some((key, folder)) =
+                        self.folders.iter_mut().find(|(_, folder)| folder.request.as_deref() == Some(id))
+                    {
+                        folder.loading = false;
+                        if *code == ErrorCode::StaleRevision {
+                            folder.loading = true;
+                            self.outgoing.push(
+                                Envelope::new(Message::Subscribe {
+                                    topics: vec![wire::Topic::Folder { worktree: key.0.clone(), path: key.1.clone() }],
+                                })
+                                .reply_to(Some(id.into())),
+                            );
+                        } else {
+                            folder.error = Some(message.clone());
+                        }
+                        return;
+                    }
+                    if let Some(preview) = self.files.values_mut().find(|preview| preview.request == id) {
+                        preview.error = Some(message.clone());
+                        return;
+                    }
+                }
+                if envelope.request_id.as_ref().is_some_and(|id| id.starts_with("trace-")) {
+                    if self.trace_request.as_ref().is_some_and(|(id, _)| Some(id) == envelope.request_id.as_ref()) {
+                        self.trace_request = None;
+                        self.trace_loading = Default::default();
+                        if *code != ErrorCode::StaleRevision {
+                            self.notice = Some(format!("Could not read trace: {message}"));
+                        } else if self.trace_wanted != self.trace_revision
+                            && let Some(wanted) = self.trace_wanted
+                        {
+                            self.start_trace(wanted);
+                        }
+                    }
+                    return;
+                }
                 let request = envelope.request_id.as_deref().and_then(|id| self.requests.remove(id));
                 match request {
                     Some((worktree, path)) => {
@@ -614,6 +836,60 @@ impl State {
                 Ok(_) => {}
                 Err(_) => self.resync(),
             },
+        }
+    }
+
+    fn start_trace(&mut self, revision: u64) {
+        self.trace_revision = Some(revision);
+        self.trace_loading = Default::default();
+        self.ask_trace(0);
+    }
+
+    fn ask_trace(&mut self, offset: u32) {
+        let Some(revision) = self.trace_revision else { return };
+        self.next_request += 1;
+        let id = format!("trace-{}", self.next_request);
+        self.trace_request = Some((id.clone(), offset));
+        self.outgoing.push(
+            Envelope::new(Message::TraceGet {
+                revision: Seq(revision),
+                offset,
+                limit: atomics_core::trace_feed::MAX_PAGE_ENTRIES as u32,
+            })
+            .reply_to(Some(id)),
+        );
+    }
+
+    fn trace_page(&mut self, page: &atomics_core::trace_feed::TracePage, id: Option<&str>) {
+        let Some((request, offset)) = &self.trace_request else { return };
+        if Some(request.as_str()) != id || page.revision.0 != self.trace_revision.unwrap_or(0) || page.offset != *offset
+        {
+            return;
+        }
+        self.trace_request = None;
+        // Transport decoders validate too; this backend also supports direct in-process callers.
+        if Message::TracePage(page.clone()).validate().is_err()
+            || page.offset as usize != self.trace_loading.entries.len()
+            || (page.offset > 0 && page.data.session != self.trace_loading.session)
+        {
+            return;
+        }
+        if page.offset == 0 {
+            self.trace_loading.session = page.data.session.clone();
+            self.trace_loading.states = page.data.states.clone();
+        }
+        self.trace_loading.entries.extend(page.data.entries.iter().cloned());
+        if self.trace_loading.validate().is_err() {
+            self.trace_loading = Default::default();
+            return;
+        }
+        if let Some(next) = page.next_offset {
+            self.ask_trace(next);
+        } else {
+            self.trace = std::mem::take(&mut self.trace_loading);
+            if let Some(wanted) = self.trace_wanted.filter(|wanted| *wanted != page.revision.0) {
+                self.start_trace(wanted);
+            }
         }
     }
 
@@ -769,9 +1045,9 @@ impl State {
             error: (failed > 0).then(|| format!("{failed} file(s) could not be read from the host")),
             loading,
             comments: summary.comments.clone(),
-            viewing: None,
-            file: None,
-            file_error: None,
+            viewing: self.files.get(worktree).map(|p| p.path.clone()),
+            file: self.files.get(worktree).and_then(|p| p.file.clone()),
+            file_error: self.files.get(worktree).and_then(|p| p.error.clone()),
         })
     }
 }
@@ -858,6 +1134,15 @@ fn root(session: &SessionInfo) -> PathBuf {
     PathBuf::from(session.worktree.as_deref().unwrap_or(&session.cwd))
 }
 
+fn project_of(mirror: &Mirror, dir: &Path) -> Option<PathBuf> {
+    mirror
+        .host
+        .projects
+        .iter()
+        .find(|p| dir.starts_with(&p.root) || p.worktrees.iter().any(|w| dir.starts_with(&w.path)))
+        .map(|p| PathBuf::from(&p.root))
+}
+
 fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
     let root = root(session);
     SessionRow {
@@ -869,7 +1154,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         chief: session.chief,
         worktree: session.worktree.as_ref().map(PathBuf::from),
         branch: session.branch.clone(),
-        project: None,
+        project: project_of(mirror, &root),
         ungrouped: !session.chief && session.task.is_none(),
         task: session.task.clone(),
         scratch: false,
@@ -884,8 +1169,21 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
 }
 
 /// The agents this page can name for a new session, sorted: those the host runs and those its open plans use.
-/// The host's configured list stays on the host, which refuses an agent it no longer has.
+/// The configured agent names, with the session/task names as a fallback for older hosts.
 fn known_agents(mirror: &Mirror) -> Vec<String> {
+    if let Some(agents) =
+        mirror.host.management.as_ref().and_then(|info| info.config["values"]["agents"]["value"].as_array())
+    {
+        let names: BTreeSet<String> = agents
+            .iter()
+            .filter_map(|agent| agent["name"].as_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !names.is_empty() {
+            return names.into_iter().collect();
+        }
+    }
     let tasks = mirror.plans.values().filter(|p| p.status == PlanStatus::Open).flat_map(|p| &p.tasks);
     let names = mirror.sessions.values().map(|s| &s.agent).chain(tasks.map(|t| &t.agent));
     let known: BTreeSet<&String> = names.filter(|name| !name.is_empty()).collect();
@@ -893,6 +1191,32 @@ fn known_agents(mirror: &Mirror) -> Vec<String> {
 }
 
 impl Backend for RemoteBackend {
+    fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
+        self.state.borrow().mirror.host.editors.clone()
+    }
+
+    fn pull_requests(&self) -> Vec<atomics_core::projection::PullRequestInfo> {
+        self.state.borrow().mirror.host.pull_requests.clone()
+    }
+    fn trace_now_ms(&self) -> u64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            js_sys::Date::now() as u64
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        }
+    }
+
+    fn trace(&self) -> atomics_core::trace_feed::TraceData {
+        self.state.borrow().trace.clone()
+    }
+
     fn send(&self, command: Command) {
         if let Command::RefreshDiff(root) = &command {
             return self.refetch(root);
@@ -946,16 +1270,41 @@ impl Backend for RemoteBackend {
     /// The view commands the frame carries out, a diff's refresh, and what can go to the host now
     /// ([`RemoteBackend::sends`]). Offline nothing can be sent.
     fn available(&self, command: &Command) -> bool {
-        let wide = self.state.borrow().wide;
+        if matches!(
+            command,
+            Command::OpenTicket(_) | Command::SetPanel(PanelMode::Tickets) | Command::ToggleView(PanelMode::Tickets)
+        ) {
+            return self.offers_tickets();
+        }
+        if matches!(command, Command::Ticket { .. }) && !self.offers_tickets() {
+            return false;
+        }
         let start = || Command::Start { agent: String::new(), folder: None };
         match command {
             Command::RefreshDiff(_) => return true,
+            Command::PickProject => {
+                return self.management().is_some()
+                    && self
+                        .sends(&Command::Manage(atomics_core::ops::HostAction::BrowseFolder { path: String::new() }));
+            }
             // The changed-files column, beside the wide layout's diff: a click scrolls to the file there.
-            Command::OpenFile { .. } => return wide,
-            // Only the wide layout has a steer bar; a phone's terminal is right there.
-            Command::Steer { .. } if !wide => return false,
+            Command::OpenFile { .. } => return self.live(),
+            Command::SetPanel(PanelMode::Editor) | Command::ToggleView(PanelMode::Editor) => {
+                return self
+                    .state
+                    .borrow()
+                    .welcome
+                    .as_ref()
+                    .is_some_and(|w| w.capabilities.iter().any(|c| c == wire::PANELS));
+            }
+            Command::ToggleChief if !self.session_list().iter().any(|s| s.chief && s.status != AgentStatus::Exited) => {
+                return self.sends(command);
+            }
             // The wide layout's picker, of what the mirror names.
-            Command::NewSession => return wide && self.sends(&start()),
+            Command::NewSession => return self.sends(&start()),
+            Command::ClosePlan { status: PlanStatus::Completed, .. } if !self.has_capability(wire::PLAN_COMPLETE) => {
+                return false;
+            }
             // An open plan's tab asks, and archives. A finished one's has no close; its board's Archive does that.
             Command::ClosePlanTab(plan) => {
                 let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
@@ -1073,7 +1422,7 @@ impl Backend for RemoteBackend {
     }
 
     fn diff_roots(&self) -> Vec<PathBuf> {
-        self.state.borrow().mirror.diffs.keys().map(PathBuf::from).collect()
+        self.state.borrow().mirror.diffs.keys().filter(|k| !k.starts_with("pull:")).map(PathBuf::from).collect()
     }
 
     fn diff(&self, root: &Path) -> Option<DiffSnapshot> {
@@ -1133,7 +1482,9 @@ impl Backend for RemoteBackend {
         let shown = |x: &SessionInfo| match plan {
             Some(plan) => in_plan(x, plan),
             None if s.view.ungrouped => x.task.is_none(),
-            None => true,
+            None => {
+                s.view.project.as_ref().is_none_or(|project| project_of(&s.mirror, &root(x)).as_ref() == Some(project))
+            }
         };
         s.mirror.sessions.values().enumerate().filter(|(_, x)| !x.chief && shown(x)).map(|(i, _)| i).collect()
     }
@@ -1147,19 +1498,98 @@ impl Backend for RemoteBackend {
     }
 
     fn repos(&self) -> Vec<PathBuf> {
-        Vec::new()
+        self.state.borrow().mirror.host.projects.iter().map(|p| PathBuf::from(&p.root)).collect()
     }
 
-    fn project_of(&self, _dir: &Path) -> Option<PathBuf> {
-        None
+    fn project_of(&self, dir: &Path) -> Option<PathBuf> {
+        project_of(&self.state.borrow().mirror, dir)
     }
 
     fn repo_workflow(&self, _project: &Path) -> Option<RepoWorkflow> {
         None
     }
 
-    fn worktrees(&self, _project: &Path) -> Vec<WorktreeRow> {
-        Vec::new()
+    fn worktrees(&self, project: &Path) -> Vec<WorktreeRow> {
+        self.state
+            .borrow()
+            .mirror
+            .host
+            .projects
+            .iter()
+            .find(|p| Path::new(&p.root) == project)
+            .map(|p| {
+                p.worktrees
+                    .iter()
+                    .map(|w| WorktreeRow { path: w.path.clone().into(), branch: w.branch.clone() })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn paged_folders(&self) -> bool {
+        self.has_capability(wire::EXPLORER)
+    }
+
+    fn folder(&self, root: &Path, path: &str) -> atomics_ui::FolderSnapshot {
+        let mut s = self.state.borrow_mut();
+        let key = (root.to_string_lossy().into_owned(), path.to_string());
+        s.shown_folders.insert(key.clone());
+        if s.welcome.is_some() && !s.folders.contains_key(&key) && s.folders.len() < wire::MAX_SUBSCRIPTIONS {
+            s.next_request += 1;
+            let request = format!("folder-{}", s.next_request);
+            s.folders
+                .insert(key.clone(), Folder { loading: true, request: Some(request.clone()), ..Default::default() });
+            s.outgoing.push(
+                Envelope::new(Message::Subscribe {
+                    topics: vec![wire::Topic::Folder { worktree: key.0.clone(), path: key.1.clone() }],
+                })
+                .reply_to(Some(request)),
+            );
+        }
+        let Some(folder) = s.folders.get(&key) else { return atomics_ui::FolderSnapshot::default() };
+        atomics_ui::FolderSnapshot {
+            entries: folder.page.as_ref().map(|p| p.entries.clone()).unwrap_or_default(),
+            loading: folder.loading,
+            more: folder.page.as_ref().is_some_and(|p| p.next_offset.is_some()),
+            first: folder.page.as_ref().is_none_or(|p| p.offset == 0),
+            error: folder.error.clone(),
+        }
+    }
+
+    fn more_folder(&self, root: &Path, path: &str) {
+        let mut s = self.state.borrow_mut();
+        if s.welcome.is_none() {
+            return;
+        }
+        let key = (root.to_string_lossy().into_owned(), path.to_string());
+        s.next_request += 1;
+        let request = format!("folder-{}", s.next_request);
+        let Some(folder) = s.folders.get_mut(&key).filter(|folder| !folder.loading) else { return };
+        let Some(page) = &folder.page else { return };
+        let Some(offset) = page.next_offset else { return };
+        let message =
+            Message::FolderGet { worktree: key.0.clone(), path: key.1.clone(), revision: page.revision, offset };
+        folder.loading = true;
+        folder.request = Some(request.clone());
+        s.outgoing.push(Envelope::new(message).reply_to(Some(request)));
+    }
+
+    fn first_folder(&self, root: &Path, path: &str) {
+        let mut s = self.state.borrow_mut();
+        if s.welcome.is_none() {
+            return;
+        }
+        let worktree = root.to_string_lossy().into_owned();
+        let key = (worktree.clone(), path.to_string());
+        s.next_request += 1;
+        let request = format!("folder-{}", s.next_request);
+        let Some(folder) = s.folders.get_mut(&key) else { return };
+        folder.loading = true;
+        folder.request = Some(request.clone());
+        s.outgoing.push(
+            Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Folder { worktree, path: path.into() }] })
+                .reply_to(Some(request)),
+        );
     }
 
     fn display(&self, path: &Path) -> String {
@@ -1181,22 +1611,54 @@ impl Backend for RemoteBackend {
 
     /// The host's saved workspaces and the one open there, which `host_command` opens. Its recent projects are
     /// folders on the host, and a page saves no workspace.
+    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
+        self.state.borrow().mirror.host.management.clone()
+    }
+
     fn project_menu(&self) -> ProjectMenu {
         let s = self.state.borrow();
         let host = &s.mirror.host;
         ProjectMenu {
-            recent: Vec::new(),
+            recent: host
+                .management
+                .as_ref()
+                .map(|info| info.recent.iter().map(|p| (PathBuf::from(p), p.clone())).collect())
+                .unwrap_or_default(),
             workspaces: host.workspaces.clone(),
             current: host.workspace.clone(),
-            can_save: false,
+            can_save: host.management.is_some() && !host.projects.is_empty(),
         }
     }
 
-    /// The host's ticket sign-in as the mirror has it. The host opens no browser for a page: the person opens its
-    /// link in a tab and pastes back the address that tab ends on. How long it still waits is the host's to say.
+    fn ticket_tree(&self, plan: usize) -> Option<atomics_core::ticket_ui::TicketTree> {
+        if !self.offers_tickets() {
+            return None;
+        }
+        self.state.borrow().mirror.plans.values().nth(plan)?.ticket_tree.clone()
+    }
+
+    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
+        let s = self.state.borrow();
+        if !s.welcome.as_ref().is_some_and(|welcome| welcome.capabilities.iter().any(|c| c == wire::HOST)) {
+            return None;
+        }
+        let mut info = s.mirror.host.tickets.clone()?;
+        info.replies.extend(s.ticket_failures.clone());
+        Some(info)
+    }
+
+    fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
+        self.offers_tickets().then_some(atomics_ui::TicketsPanel { signed_out: false })
+    }
+
+    /// The one sign-in's banner; the person opens its link and pastes back where the browser ended.
     fn sign_in(&self) -> Option<SignInView> {
         let info = self.state.borrow().mirror.host.sign_in.clone()?;
         Some(SignInView { info, opens_browser: false, seconds_left: None })
+    }
+
+    fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
+        self.state.borrow().mirror.host.resources.clone()
     }
 
     /// The host's folders are its own.
@@ -1206,6 +1668,14 @@ impl Backend for RemoteBackend {
 }
 
 impl RemoteBackend {
+    fn offers_tickets(&self) -> bool {
+        let s = self.state.borrow();
+        s.mirror.host.tickets.is_some()
+            && s.welcome
+                .as_ref()
+                .is_some_and(|welcome| welcome.capabilities.iter().any(|capability| capability == wire::HOST))
+    }
+
     fn session_row_in(&self, mirror: &Mirror, index: usize) -> Option<SessionRow> {
         mirror.sessions.values().nth(index).map(|x| session_row(x, mirror))
     }
@@ -1213,6 +1683,15 @@ impl RemoteBackend {
     /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
     fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
         match command {
+            Command::Manage(_)
+            | Command::OpenProject(_)
+            | Command::CloseProject(_)
+            | Command::SaveWorkspace(_)
+            | Command::DecideProposal { .. }
+                if self.state.borrow().mirror.host.management.is_none() =>
+            {
+                Remote::Unsupported
+            }
             Command::VoiceToSession { .. } => Remote::Unsupported,
             _ => command.remote(self, op),
         }
@@ -1222,6 +1701,14 @@ impl RemoteBackend {
     /// views ask with what they have in hand, a steer with no target yet or a review with no comment yet, so
     /// these ask as what they will send. A command that names what is gone cannot go.
     fn sends(&self, command: &Command) -> bool {
+        if matches!(
+            command,
+            Command::Edit { .. } | Command::EditorHints(_) | Command::LoadPullRequest(_) | Command::ToggleChief
+        ) && !self.state.borrow().welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::PANELS))
+        {
+            return false;
+        }
+
         if !self.live() {
             return false;
         }
@@ -1267,6 +1754,7 @@ impl RemoteBackend {
     /// What `mutation` of `command` changes on screen while it is in flight; `steer` is the number of a steer.
     fn flight(&self, mirror: &Mirror, mutation: &ops::Command, command: &Command, steer: u64) -> Option<Flight> {
         match (mutation, command) {
+            (_, Command::Ticket { request, .. }) => Some(Flight::Ticket(request.clone())),
             (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) => {
                 let row = self.session_row_in(mirror, *session)?;
                 Some(Flight::Decision(row.id, decide.approval.clone()))
@@ -1317,6 +1805,14 @@ impl RemoteBackend {
             Command::Decide { session, approval, .. } => {
                 if let Some(id) = s.mirror.sessions.values().nth(*session).map(|x| x.id.clone()) {
                     s.refused.push((id, approval.clone()));
+                }
+            }
+            Command::Ticket { request, .. } => {
+                let mut reply = atomics_core::ticket_ui::TicketReply::new(request.clone());
+                reply.error = Some(NOT_CONNECTED.into());
+                s.ticket_failures.push(reply);
+                if s.ticket_failures.len() > 32 {
+                    s.ticket_failures.remove(0);
                 }
             }
             Command::Steer { text, .. } => s.unsent = Some(text.clone()),

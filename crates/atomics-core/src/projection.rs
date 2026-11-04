@@ -101,6 +101,9 @@ pub struct TaskInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInfo {
+    /// Full safe links for the shared ticket sidebar, chunked with their plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_tree: Option<crate::ticket_ui::TicketTree>,
     pub id: String,
     pub status: PlanStatus,
     pub goal: String,
@@ -119,11 +122,23 @@ pub struct PlanInfo {
     pub ticket: Option<String>,
 }
 
-/// What the host says about itself beside the board: the workspace open there and the ticket system's
-/// sign-in. It never holds a token or a client secret; while a sign-in waits it holds the address to
+/// What the host says about itself beside the board: its workspace, ticket sign-in, account usage
+/// and governor load. It never holds a token or a client secret; while a sign-in waits it holds the address to
 /// open in a browser, as the desktop's banner shows it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
+    /// Safe ticket reader data; absent on hosts without a ticket profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tickets: Option<crate::ticket_ui::TicketsInfo>,
+    /// Editors run on the host; clients use these IDs with the terminal protocol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editors: Vec<EditorInfo>,
+    /// Pull requests discovered by the host's GitHub/Azure workers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pull_requests: Vec<PullRequestInfo>,
+    /// Open projects and their worktrees on the host. File trees are subscribed to separately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectInfo>,
     /// The workspace open on the host, by name; `None` when none is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
@@ -133,6 +148,149 @@ pub struct HostInfo {
     /// The configured ticket system's sign-in, when it signs in with OAuth from ATOMICS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in: Option<SignInInfo>,
+    /// Settings and host folders, absent on hosts predating the management UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management: Option<ManagementInfo>,
+    /// Account limits and machine load, sampled by the host, absent on older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceInfo>,
+}
+
+/// Plain host data for the shared USAGE section and load gauge. The host's clock determines expiry
+/// and source age, so clients on other machines need neither a native clock nor local pollers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceInfo {
+    pub claude: crate::usage::Usage,
+    pub codex: crate::usage::Usage,
+    pub sampled_at: i64,
+    pub load: Option<f64>,
+    pub cores: usize,
+    pub compiler_jobs: Option<usize>,
+    pub test: SlotInfo,
+    pub qa: SlotInfo,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotInfo {
+    pub slots: usize,
+    pub running: usize,
+    pub waiting: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorInfo {
+    pub root: String,
+    pub terminal: String,
+    pub running: bool,
+    pub file: Option<String>,
+    pub inlay_hints: bool,
+}
+
+/// A PR's metadata. Its diff uses the usual paged `diff_get`, under `key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestInfo {
+    pub key: String,
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub head: String,
+    pub base: String,
+    pub url: String,
+    pub head_sha: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+/// Editor IDs occupy a namespace separate from agent session IDs.
+pub fn editor_terminal(root: &str) -> String {
+    format!("editor:{root}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    pub root: String,
+    pub worktrees: Vec<WorktreeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+/// Safe effective configuration and bounded folder listings computed by the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagementInfo {
+    pub config: serde_json::Value,
+    pub proposals: Vec<ConfigProposalInfo>,
+    pub folder_start: String,
+    pub folders: Vec<FolderInfo>,
+    pub recent: Vec<String>,
+    pub remote: RemoteInfo,
+    #[serde(default)]
+    pub tools: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigProposalInfo {
+    pub id: String,
+    pub file: String,
+    pub scope: String,
+    pub from: String,
+    pub reason: Option<String>,
+    /// A credential-masked diff, never the raw file context.
+    pub diff: String,
+    pub risks: Vec<String>,
+    pub warnings: Vec<String>,
+    pub preview: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderInfo {
+    pub requested: String,
+    pub parent: Option<String>,
+    pub project: bool,
+    pub worktree: Option<String>,
+    /// The same sorted, byte-bounded page used by the worktree explorer.
+    pub page: crate::folder::Page,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteInfo {
+    pub enabled: bool,
+    pub status: String,
+    pub problems: Vec<String>,
+    pub pairing: Option<PairingInfo>,
+    pub devices: Vec<DeviceInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PairingInfo {
+    Idle {
+        note: Option<String>,
+    },
+    Open {
+        /// Only sent to a client granted host management; viewers receive no pairing secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        seconds_left: u64,
+        busy: bool,
+    },
+    Confirm {
+        name: String,
+        code: String,
+        seconds_left: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub controls: bool,
+    pub connected: bool,
+    pub seen_ms: u64,
 }
 
 /// Where the ticket system's sign-in stands, as the Sign in and Reconnect buttons show it.
@@ -294,6 +452,8 @@ pub struct Projections {
     pub approvals: Published<Vec<ApprovalInfo>>,
     pub diffs: Published<Vec<DiffSummary>>,
     pub host: Published<HostInfo>,
+    /// Bounded trace feed, outside the board cursor and replay ring.
+    pub trace: Published<crate::trace_feed::TraceData>,
     cursor: AtomicU64,
     /// How approvals that left the board ended, newest last, so `approval_resolved` can say.
     resolutions: Mutex<VecDeque<(String, Disposition)>>,

@@ -312,21 +312,11 @@ pub fn window(ctx: &egui::Context, palette: &Palette, add_contents: impl FnOnce(
         .show(ctx, add_contents);
 }
 
-/// The chief's window, docked or floating: a header with minimize ([`Command::HideChief`]) and dock or
-/// float, then the chief's terminal, drawn through `terminals` while the chief runs inside ATOMICS. `lane`
-/// says how high a strip the platform wants under the terminal, given the height there is; the strip is
-/// returned for the platform to draw in (the desktop's trace lane). Nothing is drawn while there is no
-/// chief.
-pub fn content(
-    ui: &mut egui::Ui,
-    backend: &dyn Backend,
-    client: &mut Client,
-    terminals: &mut dyn TerminalSurface,
-    lane: impl FnOnce(f32) -> f32,
-) -> Option<Rect> {
+/// The chief's header, terminal and shared trace lane. Nothing is drawn without a chief.
+pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, terminals: &mut dyn TerminalSurface) {
     let chief = backend.chief();
-    let index = chief.session?;
-    let session = backend.session_row(index)?;
+    let Some(index) = chief.session else { return };
+    let Some(session) = backend.session_row(index) else { return };
     let p = client.palette.clone();
     let touch = client.touch;
     // A phone keeps the header off the screen's sides; the terminal keeps to them itself.
@@ -361,7 +351,9 @@ pub fn content(
     let metrics = Metrics::new(ui, &p, backend.ui_config().font.size);
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, Sense::hover());
-    let lane_height = lane(rect.height());
+    let data = backend.trace();
+    crate::trace_lane::shortcuts(ui.ctx(), client, &data);
+    let lane_height = client.lane.height(&data, rect.height());
     let lane = (lane_height > 0.0).then(|| rect.with_min_y(rect.bottom() - lane_height));
     let rect = lane.map_or(rect, |lane| rect.with_max_y(lane.top()));
     if !session.outside {
@@ -373,7 +365,10 @@ pub fn content(
         }
         terminals.show(ui, index, &session.id, rect, id, &metrics, &p);
     }
-    lane
+    if let Some(lane) = lane {
+        crate::trace_lane::show(ui, lane, chief.dock == ChiefDock::Docked, backend, client, &data);
+        crate::trace_lane::lane_divider(ui, lane, &mut client.lane.height, &p);
+    }
 }
 
 /// The docked chief's right edge, `rect` being its panel. Dragging it resizes the chief
@@ -406,7 +401,8 @@ pub fn divider(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
 /// ([`send_steer`]).
 pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    ui.horizontal(|ui| {
+    let narrow = ui.available_width() < 600.0;
+    let draw = |ui: &mut egui::Ui| {
         let sessions = backend.session_list();
         let active = backend.view_hints().active;
         let active_title = active
@@ -420,13 +416,17 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
             SteerTarget::Agents => format!("→ all agents ({agents})"),
             SteerTarget::Selected => format!("→ selected ({selected})"),
         };
-        egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).truncate().show_ui(ui, |ui| {
             ui.selectable_value(&mut client.steer_target, SteerTarget::Active, format!("Active: {active_title}"));
             if backend.tells_agents_from_shells() {
                 ui.selectable_value(&mut client.steer_target, SteerTarget::Agents, format!("All agents ({agents})"));
             }
             ui.selectable_value(&mut client.steer_target, SteerTarget::Selected, format!("Selected ({selected})"));
         });
+
+        if narrow {
+            ui.end_row();
+        }
 
         let id = ui.scope_id().with("steer-input");
         let focused = ui.memory(|m| m.has_focus(id));
@@ -459,7 +459,12 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         if send {
             send_steer(backend, client);
         }
-    });
+    };
+    if narrow {
+        ui.horizontal_wrapped(draw);
+    } else {
+        ui.horizontal(draw);
+    }
 }
 
 /// Sends the steer bar's message, trimmed, as one [`Command::Steer`] to every target that can take it,
@@ -487,6 +492,36 @@ pub fn send_steer(backend: &dyn Backend, client: &mut Client) {
     }
     client.steer_text.clear();
     client.send(Command::Steer { sessions, text });
+}
+
+/// Shared chief window body, including approvals and the host's cleaned trace cards.
+pub fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, terminals: &mut dyn TerminalSurface) {
+    // Keep the terminal rect until the header and trace are drawn, so approval controls receive focus first.
+    #[derive(Default)]
+    struct Kept(Option<(usize, String, Rect, egui::Id, Metrics)>);
+    impl TerminalSurface for Kept {
+        fn show(
+            &mut self,
+            ui: &mut egui::Ui,
+            index: usize,
+            session: &str,
+            rect: Rect,
+            id: egui::Id,
+            metrics: &Metrics,
+            _p: &Palette,
+        ) -> egui::Response {
+            self.0 =
+                Some((index, session.into(), rect, id, Metrics { font: metrics.font.clone(), cell: metrics.cell }));
+            ui.interact(Rect::from_min_size(rect.min, vec2(0.0, 0.0)), id.with("kept"), Sense::hover())
+        }
+    }
+    let mut kept = Kept::default();
+    content(ui, backend, client, &mut kept);
+    if let Some((index, session, rect, id, metrics)) = kept.0 {
+        let p = client.palette.clone();
+        let rect = crate::approvals::banner(ui, rect, index, backend, client);
+        terminals.show(ui, index, &session, rect, id, &metrics, &p);
+    }
 }
 
 #[cfg(test)]

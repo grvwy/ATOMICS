@@ -80,8 +80,13 @@ pub struct FakeHost {
     /// Every event, by cursor (index + 1).
     pub events: Vec<Envelope>,
     pub files: HashMap<(String, String), FileDiff>,
+    pub listings: HashMap<String, Vec<String>>,
+    pub contents: HashMap<(String, String), String>,
     /// Bytes of one `diff_file` page.
     pub page_budget: usize,
+    pub trace: atomics_core::trace_feed::TraceData,
+    trace_revision: u64,
+    follows_trace: bool,
     /// Every message the browser sent on an open channel.
     pub received: Vec<Message>,
     /// Terminals by session.
@@ -297,7 +302,12 @@ impl FakeHost {
             board,
             events: Vec::new(),
             files: HashMap::new(),
+            listings: HashMap::new(),
+            contents: HashMap::new(),
             page_budget: wire::MAX_FRAME_BYTES,
+            trace: Default::default(),
+            trace_revision: 1,
+            follows_trace: false,
             received: Vec::new(),
             terminals: BTreeMap::new(),
             device: "Safari on iPhone".into(),
@@ -361,6 +371,17 @@ impl FakeHost {
         let terminal = self.terminals.get_mut(session).expect("a terminal");
         let out = terminal.change(session, |t| t.write(text));
         self.send(out)
+    }
+
+    pub fn publish_trace(&mut self, data: atomics_core::trace_feed::TraceData) -> Vec<Vec<u8>> {
+        data.validate().unwrap();
+        self.trace = data;
+        self.trace_revision += 1;
+        if self.follows_trace {
+            self.send(vec![Message::TraceChanged { revision: Seq(self.trace_revision) }])
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn public(&self) -> PublicKey {
@@ -575,6 +596,7 @@ impl FakeHost {
                     CAPABILITIES.iter().copied().filter(|c| self.offers_host || *c != wire::HOST).collect();
                 let capabilities = wire::common_capabilities(&capabilities, &offered);
                 self.host_negotiated = capabilities.iter().any(|c| c == wire::HOST);
+                self.follows_trace = false;
                 let role = self.access.role();
                 let resume =
                     wire::decide_resume(&self.epoch, Seq(self.head()), Seq(1), prior_epoch.as_deref(), prior_cursor);
@@ -612,6 +634,38 @@ impl FakeHost {
             | Message::TerminalResize { .. }
             | Message::HistoryGet(_)) => self.terminal_frame(message, id),
             Message::Ping { nonce } => vec![host(Message::Pong { nonce }).reply_to(id)],
+            Message::FolderGet { worktree, path, revision, offset } => {
+                match self.folder_page(&worktree, &path, offset) {
+                    Ok(page) if page.revision == revision => vec![host(Message::FolderPage(page)).reply_to(id)],
+                    Ok(_) => vec![
+                        WireError::new(ErrorCode::StaleRevision, "folder listing changed")
+                            .into_envelope(id, Some(self.epoch.clone())),
+                    ],
+                    Err(error) => vec![error.into_envelope(id, Some(self.epoch.clone()))],
+                }
+            }
+            Message::FileGet { worktree, path } => match self.contents.get(&(worktree.clone(), path.clone())) {
+                Some(content) => vec![
+                    host(Message::FileContent { worktree, path, content: content.clone(), truncated: false })
+                        .reply_to(id),
+                ],
+                None => vec![
+                    WireError::new(ErrorCode::NotFound, "no such worktree file")
+                        .into_envelope(id, Some(self.epoch.clone())),
+                ],
+            },
+            Message::TraceGet { revision, offset, limit } => {
+                if revision.0 != self.trace_revision {
+                    return vec![
+                        WireError::new(ErrorCode::StaleRevision, "trace changed")
+                            .into_envelope(id, Some(self.epoch.clone())),
+                    ];
+                }
+                match self.trace.page(self.trace_revision, offset, limit, self.page_budget) {
+                    Ok(page) => vec![host(Message::TracePage(page)).reply_to(id)],
+                    Err(error) => vec![error.into_envelope(id, Some(self.epoch.clone()))],
+                }
+            }
             Message::DiffGet { worktree, path, revision, offset } => {
                 let summary = self.board.diffs.iter().find(|d| d.worktree == worktree);
                 let file = self.files.get(&(worktree.clone(), path.clone()));
@@ -731,6 +785,7 @@ impl FakeHost {
                 found.integrated = Some(branch.integration_branch());
             }
             PlanAction::Archive => plan.status = PlanStatus::Archived,
+            PlanAction::Complete => plan.status = PlanStatus::Completed,
             PlanAction::Set { .. } => return refused(ErrorCode::Rejected, "not in this fake"),
         }
         let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
@@ -817,11 +872,133 @@ impl FakeHost {
         let mut host = self.board.host.clone();
         let now = host.sign_in.as_ref().map(|sign_in| sign_in.state);
         let (state, url) = match command.action {
+            HostAction::Tickets { request, ticket } => {
+                use atomics_core::ticket_ui::{TicketAction, TicketReply};
+                let Some(info) = host.tickets.as_mut() else {
+                    return refused(ErrorCode::Rejected, "tickets unavailable".into());
+                };
+                let mut reply = TicketReply::new(request);
+                match *ticket {
+                    TicketAction::Search { cursor, .. } => {
+                        reply.cards = vec![ticket_card(if cursor.is_some() { "ENG-124" } else { "ENG-123" })];
+                        reply.next = cursor.is_none().then(|| "next-page".into());
+                    }
+                    TicketAction::Read { ticket } => reply.cards = vec![ticket_card(ticket.label())],
+                    TicketAction::Children { .. } => reply.cards = vec![ticket_card("ENG-125")],
+                    TicketAction::Related { .. } => reply.cards = vec![ticket_card("ENG-126")],
+                    TicketAction::Plan { ticket, .. } => {
+                        reply.plan = self.board.plans.first().map(|plan| plan.id.clone());
+                        if let Some(plan) = self.board.plans.first_mut() {
+                            plan.ticket = Some(ticket.label().into());
+                        }
+                    }
+                    TicketAction::Link { plan, ticket, .. } => {
+                        let Some(plan) = self.board.plans.iter_mut().find(|p| p.id == plan) else {
+                            return refused(ErrorCode::NotFound, format!("no plan {plan}"));
+                        };
+                        plan.ticket = Some(ticket.label().into());
+                    }
+                }
+                info.replies.push(reply);
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+
+            HostAction::Edit { root, path, .. } => {
+                if !self.board.sessions.iter().any(|s| s.cwd == root || s.worktree.as_deref() == Some(&root)) {
+                    return refused(ErrorCode::NotFound, "no worktree at that root".into());
+                }
+                let terminal = atomics_core::projection::editor_terminal(&root);
+                self.terminals.entry(terminal.clone()).or_insert_with(|| FakeTerminal::new(80, 12, "Helix editor\r\n"));
+                host.editors.retain(|e| e.root != root);
+                host.editors.push(atomics_core::projection::EditorInfo {
+                    root,
+                    terminal,
+                    file: path,
+                    running: true,
+                    inlay_hints: true,
+                });
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::EditorHints { root } => {
+                return if host.editors.iter().any(|e| e.root == root && e.running) {
+                    Outcome::done(serde_json::Value::Null)
+                } else {
+                    refused(ErrorCode::NotFound, "no running editor".into())
+                };
+            }
+            HostAction::PullRequestDiff { key } => {
+                return if host.pull_requests.iter().any(|p| p.key == key) {
+                    Outcome::done(serde_json::Value::Null)
+                } else {
+                    refused(ErrorCode::NotFound, "no pull request".into())
+                };
+            }
+            HostAction::StartChief => {
+                if !self.board.sessions.iter().any(|s| s.chief) {
+                    let chief = board().sessions.into_iter().find(|s| s.chief).unwrap();
+                    self.terminals.insert(chief.id.clone(), FakeTerminal::new(80, 12, "chief> "));
+                    let _ = self.event(|cursor| Message::SessionUpsert { cursor, session: chief });
+                }
+                return Outcome::done(serde_json::Value::Null);
+            }
             HostAction::OpenWorkspace { name } if !host.workspaces.contains(&name) => {
                 return refused(ErrorCode::NotFound, format!("no workspace {name}"));
             }
             HostAction::OpenWorkspace { name } => {
                 host.workspace = Some(name);
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::BrowseFolder { path } => {
+                let Some(info) = host.management.as_mut() else {
+                    return refused(ErrorCode::Rejected, "no management".into());
+                };
+                info.folders = vec![atomics_core::projection::FolderInfo {
+                    requested: path.clone(),
+                    parent: (path != "/home/user").then(|| "/home/user".into()),
+                    project: path == "/home/user/repo",
+                    worktree: (path == "/home/user/repo").then(|| path.clone()),
+                    page: atomics_core::folder::entries_page(
+                        if path == "/home/user" {
+                            vec![atomics_core::folder::Entry { path: "repo".into(), directory: true }]
+                        } else {
+                            vec![]
+                        },
+                        &path,
+                        "",
+                        0,
+                        0,
+                        8192,
+                    )
+                    .unwrap(),
+                }];
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::OpenProject { path } => {
+                if !host.projects.iter().any(|project| project.root == path) {
+                    host.projects.push(atomics_core::projection::ProjectInfo { root: path, worktrees: Vec::new() });
+                }
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::PairDevice => {
+                if let Some(info) = host.management.as_mut() {
+                    info.remote.pairing = Some(atomics_core::projection::PairingInfo::Open {
+                        link: Some("https://example.com/pair#single-use".into()),
+                        seconds_left: 300,
+                        busy: false,
+                    });
+                }
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::CancelPairing => {
+                if let Some(info) = host.management.as_mut() {
+                    info.remote.pairing = Some(atomics_core::projection::PairingInfo::Idle { note: None });
+                }
                 let _ = self.publish_host(host);
                 return Outcome::done(serde_json::Value::Null);
             }
@@ -832,6 +1009,7 @@ impl FakeHost {
             }
             HostAction::SignInPaste { .. } => (SignInState::SignedIn, None),
             HostAction::SignInCancel => (SignInState::SignedOut, None),
+            _ => return refused(ErrorCode::Rejected, "management fixture has no handler".into()),
         };
         if let Some(sign_in) = host.sign_in.as_mut() {
             (sign_in.state, sign_in.url, sign_in.rejected) = (state, url, None);
@@ -857,7 +1035,17 @@ impl FakeHost {
                     return refuse(ErrorCode::NotFound, "no terminal");
                 }
                 let mut out = Vec::new();
+                if topics.contains(&Topic::Trace) {
+                    self.follows_trace = true;
+                    out.push(Message::TraceChanged { revision: Seq(self.trace_revision) });
+                }
                 for topic in topics {
+                    if let Topic::Folder { worktree, path } = &topic {
+                        match self.folder_page(worktree, path, 0) {
+                            Ok(page) => out.push(Message::FolderPage(page)),
+                            Err(error) => return vec![error.into_envelope(id, Some(self.epoch.clone()))],
+                        }
+                    }
                     let Topic::Screen { session, .. } = topic else { continue };
                     let Some(terminal) = self.terminals.get_mut(&session) else { continue };
                     if !terminal.followed {
@@ -869,6 +1057,9 @@ impl FakeHost {
                 out.into_iter().map(host).collect()
             }
             Message::Unsubscribe { topics } => {
+                if topics.contains(&Topic::Trace) {
+                    self.follows_trace = false;
+                }
                 // Unsubscribing ends this client's lease; it no longer follows, so it is told nothing.
                 for topic in topics {
                     let Topic::Screen { session, .. } = topic else { continue };
@@ -990,6 +1181,22 @@ impl FakeHost {
             _ => Vec::new(),
         }
     }
+
+    fn folder_page(&self, worktree: &str, path: &str, offset: u32) -> Result<atomics_core::folder::Page, WireError> {
+        let paths = self
+            .listings
+            .get(worktree)
+            .ok_or_else(|| WireError::new(ErrorCode::NotFound, "file listing is not ready"))?;
+        let revision = self.board.diffs.iter().find(|d| d.worktree == worktree).map_or(1, |d| d.revision);
+        atomics_core::folder::page(
+            paths.iter().map(String::as_str),
+            worktree,
+            path,
+            revision,
+            offset,
+            self.page_budget.saturating_sub(2048),
+        )
+    }
 }
 
 pub const WORKTREE: &str = "/w/repo-t1";
@@ -1039,6 +1246,7 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            ticket_tree: None,
             id: "p1".into(),
             status: PlanStatus::Open,
             goal: "Parse faster".into(),
@@ -1067,7 +1275,7 @@ pub fn board() -> Board {
             files: vec![file("src/a.rs"), file("src/b.rs")],
             comments: Vec::new(),
         }],
-        host: HostInfo::default(),
+        host: HostInfo { resources: Some(resources()), ..HostInfo::default() },
     }
 }
 
@@ -1092,6 +1300,7 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        ticket_tree: None,
         id: id.into(),
         status,
         goal: goal.into(),
@@ -1159,6 +1368,8 @@ pub fn tickets(state: SignInState) -> FakeHost {
     let mut host = self::host();
     let url = (state == SignInState::SigningIn).then(|| SIGN_IN_URL.to_string());
     host.board.host = HostInfo {
+        projects: Vec::new(),
+        resources: Some(resources()),
         workspace: Some("team".into()),
         workspaces: vec!["daily".into(), "team".into()],
         sign_in: Some(SignInInfo {
@@ -1170,7 +1381,30 @@ pub fn tickets(state: SignInState) -> FakeHost {
             rejected: None,
             browser_failed: false,
         }),
+        ..HostInfo::default()
     };
+    host
+}
+
+/// Two projects, a worktree and both changed and unchanged files for explorer checks.
+pub fn explorer() -> FakeHost {
+    use atomics_core::projection::{ProjectInfo, WorktreeInfo};
+    let mut host = working();
+    host.board.host.projects = vec![
+        ProjectInfo {
+            root: "/w/repo".into(),
+            worktrees: vec![WorktreeInfo { path: WORKTREE.into(), branch: Some("atomics/t1".into()) }],
+        },
+        ProjectInfo { root: "/w/other".into(), worktrees: Vec::new() },
+    ];
+    for root in ["/w/repo", WORKTREE] {
+        host.listings.insert(
+            root.into(),
+            vec!["README.md".into(), "src/a.rs".into(), "src/b.rs".into(), "src/unchanged.rs".into()],
+        );
+        host.contents.insert((root.into(), "README.md".into()), "A project readme\n".into());
+        host.contents.insert((root.into(), "src/unchanged.rs".into()), "pub fn unchanged() {}\n".into());
+    }
     host
 }
 
@@ -1182,5 +1416,171 @@ pub fn host() -> FakeHost {
     }
     host.terminals.insert("s1".into(), FakeTerminal::new(80, 12, "$ "));
     host.terminals.insert("chief".into(), FakeTerminal::new(80, 12, "chief> "));
+    host
+}
+
+/// A host with shared settings, pairing and a host folder picker.
+pub fn management() -> FakeHost {
+    use atomics_core::projection::{ManagementInfo, PairingInfo, RemoteInfo};
+    let mut host = self::host();
+    host.board.host.management = Some(ManagementInfo {
+        config: serde_json::json!({"values": {"layout.min_tile_width": {"value":520.0,"source":"default"}}}),
+        folder_start: "/home/user".into(),
+        remote: RemoteInfo {
+            enabled: true,
+            status: "Online".into(),
+            pairing: Some(PairingInfo::Idle { note: None }),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    host
+}
+
+/// The three host-backed panels, for browser and native-client parity checks.
+pub fn panels_host() -> FakeHost {
+    use atomics_core::projection::{EditorInfo, PullRequestInfo};
+    let mut host = host();
+    host.trace.session = Some("chief".into());
+    host.trace.entries.push(atomics_core::trace::TraceEntry {
+        seq: 1,
+        at: 0,
+        phase: atomics_core::trace::TracePhase::Post,
+        tool_use_id: None,
+        server: "example".into(),
+        tool: "lookup".into(),
+        op: atomics_core::trace::TraceOp::Other,
+        direct: false,
+        plan_id: None,
+        summary: "{}".into(),
+        state: atomics_core::trace::TraceState::Ok,
+        elapsed_ms: Some(10),
+        cards: vec![],
+        plan: None,
+        result_bytes: 0,
+        error: None,
+        hint: None,
+        truncated: false,
+        omitted: 0,
+    });
+    let terminal = atomics_core::projection::editor_terminal(WORKTREE);
+    host.terminals.insert(terminal.clone(), FakeTerminal::new(80, 12, "Helix editor\r\n"));
+    host.board.host.editors.push(EditorInfo {
+        root: WORKTREE.into(),
+        terminal,
+        running: true,
+        file: Some("src/a.rs".into()),
+        inlay_hints: true,
+    });
+    for (key, repo) in [
+        ("pull:example/repo#7", "example/repo"),
+        ("pull:dev.azure.com/org/project/repo#8", "dev.azure.com/org/project/repo"),
+    ] {
+        let file = file_diff("src/pull.rs", 6);
+        let diff = atomics_core::diff::WorktreeDiff {
+            base_ref: key.into(),
+            base: "base-sha".into(),
+            partial: false,
+            files: vec![file.clone()],
+        };
+        host.board.diffs.push(DiffSummary::new(key, 1, &diff));
+        host.files.insert((key.into(), "src/pull.rs".into()), file);
+        host.board.host.pull_requests.push(PullRequestInfo {
+            key: key.into(),
+            repo: repo.into(),
+            number: if repo.starts_with("dev.azure") { 8 } else { 7 },
+            title: "Review the parser".into(),
+            head: "feature".into(),
+            base: "main".into(),
+            url: "https://example.com/pull/7".into(),
+            head_sha: Some("reviewed-sha".into()),
+            loading: false,
+            error: None,
+        });
+    }
+    host
+}
+
+/// Trace fixture using the production reducer, including a completed and a live call.
+pub fn trace_data() -> atomics_core::trace_feed::TraceData {
+    use atomics_core::{hook::HookEvent, tickets::Cleaner, trace::TraceLog};
+    let mut log = TraceLog::default();
+    for (name, id, query) in [("PostToolUse", "1", "parse faster"), ("PreToolUse", "2", "follow up")] {
+        let event = HookEvent::from_payload(&serde_json::json!({
+            "session_id": "chief", "hook_event_name": name, "tool_name": "mcp__atomics__atomics_ticket_search",
+            "tool_use_id": id, "tool_input": {"query": query, "api_key": "hidden-secret"},
+            "tool_response": {"structuredContent": {"cards": [{
+                "system":"example", "id":"1", "key":"ENG-1", "title":"Example ticket", "body":"Ticket details"
+            }]}}
+        }))
+        .unwrap();
+        log.ingest(&event, None, &Cleaner::default(), 0).unwrap();
+    }
+    atomics_core::trace_feed::TraceData {
+        session: Some("chief".into()),
+        entries: log.entries.into_iter().collect(),
+        ..Default::default()
+    }
+}
+
+/// Account usage and governor values for parity tests, with a fixed host clock.
+pub fn resources() -> atomics_core::projection::ResourceInfo {
+    use atomics_core::projection::{ResourceInfo, SlotInfo};
+    use atomics_core::usage::{Usage, Window};
+    let now = 1_800_000_000;
+    let account = |session, weekly| Usage {
+        session: Some(Window { remaining: session, resets_at: now + 8040 }),
+        weekly: Some(Window { remaining: weekly, resets_at: now + 86400 }),
+        observed_at: now - 120,
+        plan: None,
+    };
+    ResourceInfo {
+        claude: account(76.0, 24.0),
+        codex: account(9.0, 100.0),
+        sampled_at: now,
+        load: Some(4.2),
+        cores: 8,
+        compiler_jobs: Some(6),
+        test: SlotInfo { slots: 2, running: 1, waiting: 3 },
+        qa: SlotInfo { slots: 1, running: 0, waiting: 1 },
+    }
+}
+
+pub fn ticket_card(key: &str) -> atomics_core::tickets::TicketCard {
+    use atomics_core::tickets::{Comment, TicketCard, TicketLink};
+    TicketCard {
+        link: TicketLink {
+            system: "tracker".into(),
+            id: key.into(),
+            key: Some(key.into()),
+            title: Some(format!("Fix ticket {key}")),
+            state: Some("Todo".into()),
+            url: Some(format!("https://tickets.example.com/{key}")),
+            ..TicketLink::default()
+        },
+        body: Some(
+            "# Description\nRead this ticket inside the app.\n\n[Documentation](https://example.com/docs)".into(),
+        ),
+        comments: vec![Comment {
+            author: Some("Example author".into()),
+            text: "The reproduction is attached.".into(),
+            ..Comment::default()
+        }],
+        snippet: Some("A searchable ticket".into()),
+        score: Some(0.8),
+        ..TicketCard::default()
+    }
+}
+
+pub fn ticket_reader() -> FakeHost {
+    let mut host = self::host();
+    host.board.host.tickets = Some(atomics_core::ticket_ui::TicketsInfo {
+        system: "tracker".into(),
+        search: true,
+        semantic_search: true,
+        views: vec!["Recent".into()],
+        filters: vec!["Mine".into()],
+        ..Default::default()
+    });
     host
 }

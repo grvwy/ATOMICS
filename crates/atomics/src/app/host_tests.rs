@@ -96,6 +96,51 @@ fn permission_hook_gets_its_reply_without_frames() {
 }
 
 #[test]
+fn client_tickets_search_and_read_on_the_host_without_frames() {
+    use crate::mcp_client::tests::{example_profile, fake_state};
+    use atomics_core::ticket_ui::TicketAction;
+    with_state("app::host_tests::client_tickets_search_and_read_on_the_host_without_frames", |mut state, _| {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = fake_state(
+            dir.path(),
+            json!([
+                {"id":"1", "key":"DEMO-1", "title":"Parser ticket", "state":"Todo", "body":"Read me", "comments":[]}
+            ]),
+        );
+        state.config.tickets = example_profile("meaning-example", &path);
+        state.apply_ticket_config();
+        let query = state.tickets.panel.query.clone();
+        state
+            .ticket_ui_command(
+                "client-a".into(),
+                TicketAction::Search { query: "Parser".into(), keyword: false, view: 0, filters: vec![], cursor: None },
+            )
+            .unwrap();
+        state
+            .ticket_ui_command(
+                "client-b".into(),
+                TicketAction::Read {
+                    ticket: atomics_core::tickets::TicketLink { id: "1".into(), ..Default::default() },
+                },
+            )
+            .unwrap();
+        let host = state.into_host();
+        eventually(&host, |state| state.tickets.client_replies.len() == 2);
+        let published = host.projections().host.load();
+        let info = published.data.tickets.as_ref().unwrap();
+        assert_eq!(info.system, "meaning-example");
+        for request in ["client-a", "client-b"] {
+            let reply = info.replies.iter().find(|reply| reply.request == request).unwrap();
+            assert!(reply.error.is_none(), "{reply:?}");
+            assert_eq!(reply.cards[0].link.label(), "DEMO-1");
+        }
+        assert_eq!(host.state().tickets.panel.query, query, "a request never changes desktop navigation");
+        let text = serde_json::to_string(&published.data).unwrap();
+        assert!(!text.contains("command") && !text.contains("arguments"), "configuration stays on the host");
+    });
+}
+
+#[test]
 fn approval_expires_without_frames() {
     with_state("app::host_tests::approval_expires_without_frames", |mut state, _| {
         let reply = expired_approval(&mut state);
@@ -978,13 +1023,12 @@ fn outcome_of(client: &mut crate::protocol::tests::TestClient, op: &str) -> atom
 
 /// How the client was told approval `id` ended.
 fn resolved_as(client: &mut crate::protocol::tests::TestClient, id: &str) -> atomics_core::wire::Disposition {
-    use atomics_core::wire::Message;
     loop {
-        if let Message::ApprovalResolved { id: resolved, disposition, .. } = client.step().expect("open").message
-            && resolved == id
-        {
+        // The event may arrive before the operation's result, whose wait already applied it.
+        if let Some(disposition) = client.resolutions.remove(id) {
             return disposition;
         }
+        client.step().expect("open");
     }
 }
 
@@ -1021,6 +1065,37 @@ fn waiting_approval(session: &mut Session, id: &str) -> Arc<ipc::ApprovalReply> 
     });
     session.status = AgentStatus::NeedsInput;
     reply
+}
+
+#[test]
+fn a_dead_hook_head_expires_for_clients_and_the_chief_without_frames() {
+    with_state("app::host_tests::a_dead_hook_head_expires_for_clients_and_the_chief_without_frames", |mut state, _| {
+        use atomics_core::ops::Outcome;
+        use atomics_core::wire::Disposition;
+        state.config.remote.enabled = true;
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let dead = waiting_approval(&mut state.sessions[0], "dead");
+        let live = waiting_approval(&mut state.sessions[0], "live");
+        let host = state.into_host();
+        let mut client = remote_client(&host);
+        client.sync_until(|m| m.approvals.contains_key("dead") && m.approvals.contains_key("live"));
+        let cursor = host.state().event_seq;
+
+        dead.wait(Duration::ZERO);
+        assert_eq!(resolved_as(&mut client, "dead"), Disposition::Expired);
+        eventually(&host, |state| {
+            state.events.iter().any(|event| {
+                event.seq > cursor
+                    && event.approval.as_ref().is_some_and(|request| request.command.as_deref() == Some("touch live"))
+            })
+        });
+        assert_eq!(host.state().sessions[0].approvals[0].id, "live");
+        client.send(&decide("answer-live", "live", Decision::Allow));
+        assert_eq!(outcome_of(&mut client, "answer-live"), Outcome::done(json!({"disposition":"allowed"})));
+        assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        assert_eq!(resolved_as(&mut client, "live"), Disposition::Allowed);
+        assert!(host.state().sessions[0].approvals.is_empty());
+    });
 }
 
 #[test]

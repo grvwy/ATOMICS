@@ -1,5 +1,3 @@
-use atomics_ui::sidebar::section;
-
 use super::*;
 
 impl State {
@@ -56,114 +54,8 @@ pub(super) fn plan_tab_name(plan: &Plan) -> String {
 
 impl Desktop<'_> {
     /// The TICKETS section: a plan's ticket tree in its view, else Find and the last tickets read.
-    pub(super) fn tickets_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let Some(config) = self.runtime.ticket_config() else { return };
-        let mut open: Option<atomics_core::tickets::TicketLink> = None;
-        let mut find = false;
-        section(ui, p, "TICKETS");
-        let plan = self.runtime.plan_view.then(|| &self.runtime.plans[self.runtime.selected_plan]);
-        let row = |ui: &mut egui::Ui,
-                   depth: usize,
-                   link: &atomics_core::tickets::TicketLink,
-                   status: Option<TaskStatus>| {
-            let dot = match (&link.state, status) {
-                (Some(state), _) => config.states.status_of(state).map_or(p.muted, |s| super::board::task_color(s, p)),
-                (None, Some(status)) => super::board::task_color(status, p),
-                (None, None) => p.muted,
-            };
-            let mut text = egui::text::LayoutJob::default();
-            text.append("● ", 0.0, egui::TextFormat { font_id: p.ui(10.0), color: dot, ..Default::default() });
-            text.append(
-                &format!("{} {}", link.label(), link.title.as_deref().unwrap_or("")),
-                0.0,
-                egui::TextFormat { font_id: p.ui(12.0), color: p.foreground, ..Default::default() },
-            );
-            ui.horizontal(|ui| {
-                ui.add_space(depth as f32 * 12.0);
-                ui.add(egui::Button::selectable(false, text).truncate())
-                    .on_hover_text(link.title.as_deref().unwrap_or(""))
-            })
-            .inner
-            .clicked()
-        };
-        match plan.and_then(|plan| plan.ticket.as_ref().map(|ticket| (plan, ticket))) {
-            Some((plan, ticket)) => {
-                if row(ui, 0, ticket, None) {
-                    open = Some(ticket.clone());
-                }
-                for task in &plan.tasks {
-                    if let Some(link) = &task.ticket
-                        && row(ui, 1, link, Some(task.status))
-                    {
-                        open = Some(link.clone());
-                    }
-                }
-                for item in self.runtime.tickets.boards.get(&plan.id).into_iter().flatten() {
-                    let tasked = plan.tasks.iter().any(|t| t.ticket.as_ref().is_some_and(|l| l.same_ticket(item)));
-                    if !tasked && row(ui, 1, item, None) {
-                        open = Some(item.clone());
-                    }
-                }
-            }
-            None => {
-                if ui.add(egui::Button::selectable(false, RichText::new("Find tickets…").size(12.0))).clicked() {
-                    find = true;
-                }
-                for link in &self.runtime.tickets.panel.recent {
-                    if row(ui, 0, link, None) {
-                        open = Some(link.clone());
-                    }
-                }
-            }
-        }
-        ui.add_space(10.0);
-        if find {
-            self.runtime.show_find();
-        } else if let Some(link) = open {
-            self.runtime.open_ticket(link, tickets_panel::Nav::Fresh);
-        }
-    }
-}
-
-impl Desktop<'_> {
-    pub(super) fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Edit config").clicked() {
-            let _ = open_path(&self.runtime.config_path);
-            ui.close();
-        }
-        if global_hooks_installed() {
-            ui.label(RichText::new("Hooks for all Claude sessions are installed").size(12.0));
-        } else if ui
-            .button("Install hooks for all Claude sessions")
-            .on_hover_text(
-                "Adds `atomics hook` to ~/.claude/settings.json so agents in any terminal show up here and can be steered",
-            )
-            .clicked()
-        {
-            match install_global_hooks() {
-                Ok(path) => self.runtime.toast(format!("Hooks added to {}", paths::display(&path))),
-                Err(err) => self.runtime.toast(format!("Installing hooks failed: {err:#}")),
-            }
-            ui.close();
-        }
-        ui.separator();
-        self.themes_menu(ui);
-        self.sandbox_menu(ui);
-        self.credentials_menu(ui);
-        self.connections_menu(ui);
-        ui.separator();
-        let keys = &self.runtime.config.keys;
-        for (key, what) in [
-            (&keys.quick_open, "open file"),
-            (&keys.toggle_diff, "show/hide diff"),
-            (&keys.next_attention, "next agent that needs you"),
-            (&keys.focus_steer, "steer bar"),
-            (&keys.new_session, "new session"),
-            (&keys.voice, "voice: record, send (Esc cancels)"),
-            (&keys.github, "GitHub controls"),
-        ] {
-            ui.label(RichText::new(format!("{}  {what}", shortcut_label(ui.ctx(), key))).size(12.0).monospace());
-        }
+    pub(super) fn tickets_section(&mut self, ui: &mut egui::Ui) {
+        self.draw(|backend, client| atomics_ui::tickets::sidebar(ui, backend, client));
     }
 }
 

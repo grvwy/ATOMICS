@@ -40,7 +40,7 @@ pub enum Grant {
     Plan,
     /// `review_command`.
     Review,
-    /// `host_command`: the ticket system's sign-in and the open workspace.
+    /// `host_command`: sign-in, settings proposals, pairing, setup and host projects.
     Host,
     /// A grant from a newer host.
     #[serde(other)]
@@ -105,6 +105,8 @@ pub enum PlanAction {
     },
     /// Close the plan as archived; its tasks and history stay.
     Archive,
+    /// Close the plan as completed, preserving its tasks and history.
+    Complete,
 }
 
 /// Review comments on a worktree's diff. They are shared: every client sees them in the diff
@@ -187,6 +189,18 @@ pub struct HostCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HostAction {
+    Edit {
+        root: String,
+        path: Option<String>,
+        line: Option<u32>,
+    },
+    EditorHints {
+        root: String,
+    },
+    PullRequestDiff {
+        key: String,
+    },
+    StartChief,
     /// Start the ticket system's sign-in on the host (or join the one under way). The host opens no
     /// browser for a client: the host's `sign_in.url` is the address to open, and the address the
     /// browser ends on comes back with `sign_in_paste`. Once it finishes, the ticket worker
@@ -194,11 +208,82 @@ pub enum HostAction {
     SignIn,
     /// The address (or just its query) a browser ended on after signing in, for the sign-in under
     /// way. One that does not match it is refused there and the sign-in keeps waiting.
-    SignInPaste { text: String },
+    SignInPaste {
+        text: String,
+    },
     /// Stop the sign-in under way.
     SignInCancel,
     /// Open a saved workspace on the host, by name, in place of the projects open there.
-    OpenWorkspace { name: String },
+    OpenWorkspace {
+        name: String,
+    },
+    /// Search, read and plan from the configured ticket system.
+    Tickets {
+        request: String,
+        ticket: Box<crate::ticket_ui::TicketAction>,
+    },
+    SaveWorkspace {
+        name: String,
+    },
+    /// All paths name folders on the host, never on the client.
+    BrowseFolder {
+        path: String,
+    },
+    BrowseFolderPage {
+        path: String,
+        offset: u32,
+    },
+    OpenProject {
+        path: String,
+    },
+    CloseProject {
+        path: String,
+    },
+    ConfigPropose {
+        scope: crate::selfconfig::Scope,
+        toml: String,
+        #[serde(default)]
+        remove: Vec<String>,
+        #[serde(default)]
+        theme: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    ConfigDecide {
+        id: String,
+        apply: bool,
+        note: String,
+    },
+    /// Host setup and credential-store operations. Config edits still use proposals.
+    SettingsTool {
+        tool: SettingsTool,
+    },
+    PairDevice,
+    CancelPairing,
+    /// Bind the decision to the exact device/code the user compared.
+    DecidePairing {
+        code: String,
+        controls: Option<bool>,
+    },
+    RevokeDevice {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tool", rename_all = "snake_case")]
+pub enum SettingsTool {
+    InstallHooks,
+    CheckSandbox,
+    RefreshConnections,
+    ImportConnections,
+    Connect { name: String, store_env: bool },
+    Disconnect { name: String },
+    AddConnection { name: String, url: String },
+    RefreshCredentials,
+    PutCredential { kind: String, value: String, host: Option<String> },
+    RemoveCredential { kind: String, host: Option<String> },
+    CleanCredentials,
 }
 
 /// What became of an operation.
@@ -375,7 +460,7 @@ impl PlanCommand {
             PlanAction::Integrate { task } => {
                 bounds.id("task", Some(task));
             }
-            PlanAction::Approve | PlanAction::Archive => {}
+            PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
         }
         bounds.check()?;
         if self.plan.is_none() && !matches!(self.action, PlanAction::Set { .. }) {
@@ -423,12 +508,99 @@ impl HostCommand {
     pub fn validate(&self) -> Result<(), WireError> {
         let mut bounds = Bounds::new(&self.op);
         match &self.action {
+            HostAction::Edit { root, path, .. } => {
+                bounds.id("root", Some(root)).id("path", path.as_deref());
+            }
+            HostAction::EditorHints { root } => {
+                bounds.id("root", Some(root));
+            }
+            HostAction::PullRequestDiff { key } => {
+                bounds.id("key", Some(key));
+            }
+            HostAction::StartChief => {}
             HostAction::SignInPaste { text } => {
                 bounds.text("text", Some(text));
             }
-            HostAction::OpenWorkspace { name } => {
-                bounds.id("name", Some(name));
+            HostAction::OpenWorkspace { name } | HostAction::SaveWorkspace { name } => {
+                bounds.id("workspace", Some(name));
             }
+            HostAction::Tickets { request, ticket } => {
+                if request.trim().is_empty() {
+                    return Err(WireError::new(ErrorCode::Malformed, "name the ticket request"));
+                }
+                bounds.id("request", Some(request));
+                use crate::ticket_ui::TicketAction;
+                match ticket.as_ref() {
+                    TicketAction::Search { query, filters, cursor, .. } => {
+                        bounds.text("query", Some(query));
+                        bounds.id("cursor", cursor.as_deref());
+                        if filters.len() > 64 {
+                            return Err(WireError::new(ErrorCode::TooMany, "too many ticket filters"));
+                        }
+                    }
+                    TicketAction::Read { ticket }
+                    | TicketAction::Children { ticket }
+                    | TicketAction::Related { ticket }
+                    | TicketAction::Plan { ticket, .. }
+                    | TicketAction::Link { ticket, .. } => {
+                        bounds.id("ticket.id", Some(&ticket.id));
+                        bounds.id("ticket.system", Some(&ticket.system));
+                        if ticket.id.trim().is_empty() {
+                            return Err(WireError::new(ErrorCode::Malformed, "name the ticket"));
+                        }
+                    }
+                }
+                if let TicketAction::Plan { extra, .. } = ticket.as_ref() {
+                    bounds.text("extra", Some(extra));
+                    if extra.chars().count() > crate::tickets::PLAN_EXTRA_MAX {
+                        return Err(WireError::new(ErrorCode::Oversize, "too many extra instructions"));
+                    }
+                }
+                if let TicketAction::Link { plan, task, .. } = ticket.as_ref() {
+                    bounds.id("plan", Some(plan));
+                    bounds.id("task", task.as_deref());
+                }
+            }
+            HostAction::BrowseFolderPage { path, .. }
+            | HostAction::BrowseFolder { path }
+            | HostAction::OpenProject { path }
+            | HostAction::CloseProject { path } => {
+                bounds.id("path", Some(path));
+            }
+            HostAction::ConfigPropose { toml, remove, theme, reason, .. } => {
+                bounds.text("toml", Some(toml)).text("reason", reason.as_deref()).id("theme", theme.as_deref());
+                if remove.len() > MAX_TASKS {
+                    return Err(WireError::new(ErrorCode::TooMany, "too many keys"));
+                }
+                for key in remove {
+                    bounds.id("key", Some(key));
+                }
+            }
+            HostAction::ConfigDecide { id, note, .. } => {
+                bounds.id("proposal", Some(id)).text("note", Some(note));
+            }
+            HostAction::DecidePairing { code, .. } => {
+                bounds.id("code", Some(code));
+            }
+            HostAction::RevokeDevice { id } => {
+                bounds.id("device", Some(id));
+            }
+            HostAction::SettingsTool { tool } => match tool {
+                SettingsTool::Connect { name, .. } | SettingsTool::Disconnect { name } => {
+                    bounds.id("name", Some(name));
+                }
+                SettingsTool::AddConnection { name, url } => {
+                    bounds.id("name", Some(name)).id("url", Some(url));
+                }
+                SettingsTool::PutCredential { kind, value, host } => {
+                    bounds.id("kind", Some(kind)).id("host", host.as_deref()).text("value", Some(value));
+                }
+                SettingsTool::RemoveCredential { kind, host } => {
+                    bounds.id("kind", Some(kind)).id("host", host.as_deref());
+                }
+                _ => {}
+            },
+            HostAction::PairDevice | HostAction::CancelPairing => {}
             HostAction::SignIn | HostAction::SignInCancel => {}
         }
         bounds.check()?;

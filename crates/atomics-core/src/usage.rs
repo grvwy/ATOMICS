@@ -1,15 +1,16 @@
 //! Account-wide limits reported by the providers' own clients.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Window {
     pub remaining: f64,
     pub resets_at: i64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub session: Option<Window>,
     pub weekly: Option<Window>,

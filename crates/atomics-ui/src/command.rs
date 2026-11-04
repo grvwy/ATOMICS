@@ -27,6 +27,8 @@ use crate::{Backend, PanelMode};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    EditorHints(PathBuf),
+    LoadPullRequest(String),
     // ── Approvals ──────────────────────────────────────────────────────────────────────────────────
     /// Answer a permission request of the session at `session` of the last session list read. The request
     /// is named, so the host refuses a decision made for an earlier one.
@@ -167,12 +169,17 @@ pub enum Command {
     /// Sign in to the ticket system, or again after the server refused the saved sign-in: the host's
     /// sign-in job, after which its ticket worker connects again. A desktop host may open its browser.
     SignInTickets,
+    Ticket {
+        request: String,
+        action: atomics_core::ticket_ui::TicketAction,
+    },
     /// The address a browser ended on after signing in, for the sign-in under way.
     PasteSignIn(String),
     /// Stop the sign-in under way.
     CancelSignIn,
 
     // ── Projects and worktrees ───────────────────────────────────────────────────────────────────────
+    Manage(HostAction),
     OpenProject(PathBuf),
     CloseProject(PathBuf),
     /// Open a saved workspace, by name, in place of the open projects.
@@ -357,6 +364,15 @@ impl Command {
             vec![ops::Command::HostCommand(HostCommand { op: op(), action })]
         };
         let sent = match self {
+            Command::Edit { root, path, line } => host(
+                HostAction::Edit { root: root.to_string_lossy().into_owned(), path: path.clone(), line: *line },
+                op,
+            ),
+            Command::EditorHints(root) => {
+                host(HostAction::EditorHints { root: root.to_string_lossy().into_owned() }, op)
+            }
+            Command::LoadPullRequest(key) => host(HostAction::PullRequestDiff { key: key.clone() }, op),
+            Command::ToggleChief => host(HostAction::StartChief, op),
             Command::Decide { approval, decision, .. } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
                 op: op(),
                 approval: approval.clone(),
@@ -384,6 +400,9 @@ impl Command {
             }
             Command::ArchivePlan(index) | Command::ClosePlan { plan: index, status: PlanStatus::Archived } => {
                 plan(*index, PlanAction::Archive, op).into_iter().collect()
+            }
+            Command::ClosePlan { plan: index, status: PlanStatus::Completed } => {
+                plan(*index, PlanAction::Complete, op).into_iter().collect()
             }
             Command::EditComments { root, before, after } => {
                 let Some(revision) = backend.diff(root).map(|diff| Seq(diff.revision)) else {
@@ -437,10 +456,24 @@ impl Command {
                 vec![session(action, op)]
             }
             Command::CloseSession(id) => vec![session(SessionAction::Close { session: id.clone() }, op)],
+            Command::Ticket { request, action } => {
+                host(HostAction::Tickets { request: request.clone(), ticket: Box::new(action.clone()) }, op)
+            }
             Command::SignInTickets => host(HostAction::SignIn, op),
             Command::PasteSignIn(text) => host(HostAction::SignInPaste { text: text.clone() }, op),
             Command::CancelSignIn => host(HostAction::SignInCancel, op),
             Command::OpenWorkspace(name) => host(HostAction::OpenWorkspace { name: name.clone() }, op),
+            Command::Manage(action) => host(action.clone(), op),
+            Command::OpenProject(path) => {
+                host(HostAction::OpenProject { path: path.to_string_lossy().into_owned() }, op)
+            }
+            Command::CloseProject(path) => {
+                host(HostAction::CloseProject { path: path.to_string_lossy().into_owned() }, op)
+            }
+            Command::SaveWorkspace(name) => host(HostAction::SaveWorkspace { name: name.clone() }, op),
+            Command::DecideProposal { id, apply, note } => {
+                host(HostAction::ConfigDecide { id: id.clone(), apply: *apply, note: note.clone() }, op)
+            }
             _ => return Remote::Unsupported,
         };
         Remote::Send(sent)

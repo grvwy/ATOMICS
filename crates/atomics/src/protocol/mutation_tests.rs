@@ -57,6 +57,10 @@ impl Recorder {
 }
 
 fn start(role: Role) -> (Server, Arc<Recorder>) {
+    start_with(role, Arc::new(Projections::default()))
+}
+
+fn start_with(role: Role, projections: Arc<Projections>) -> (Server, Arc<Recorder>) {
     let config = ServerConfig {
         poll_interval: Duration::from_millis(5),
         session: SessionConfig { tick: Duration::from_millis(5), ..SessionConfig::default() },
@@ -64,14 +68,9 @@ fn start(role: Role) -> (Server, Arc<Recorder>) {
         ..ServerConfig::default()
     };
     let recorder = Arc::new(Recorder::default());
-    let server = Server::start(
-        config,
-        Arc::new(Projections::default()),
-        Arc::new(NoDiffs),
-        Arc::new(Terminals::default()),
-        recorder.clone(),
-    )
-    .unwrap();
+    let server =
+        Server::start(config, projections, Arc::new(NoDiffs), Arc::new(Terminals::default()), recorder.clone())
+            .unwrap();
     (server, recorder)
 }
 
@@ -116,6 +115,31 @@ fn every_command(op: &str) -> Vec<Command> {
             action: SessionAction::Steer { session: "a".into(), text: "go on".into() },
         }),
     ]
+}
+
+#[test]
+fn completing_a_plan_is_capability_gated_and_reaches_the_journal() {
+    let (server, recorder) = start(Role::Controller);
+    let caps: Vec<_> = CAPABILITIES.iter().copied().filter(|cap| *cap != atomics_core::wire::PLAN_COMPLETE).collect();
+    let (mut old, _) = connect(&server, &caps);
+    let complete = |op: &str| {
+        Message::PlanCommand(PlanCommand {
+            op: op.into(),
+            plan: Some("p1".into()),
+            digest: None,
+            action: PlanAction::Complete,
+        })
+    };
+    old.send(&Envelope::new(complete("old")));
+    assert!(matches!(result(&mut old).2, Outcome::Refused { code: ErrorCode::Unauthorised, .. }));
+    assert_eq!(recorder.count(), 0);
+    let (mut client, _) = connect(&server, CAPABILITIES);
+    client.send(&Envelope::new(complete("new")));
+    recorder.answer(0, Outcome::done(serde_json::Value::Null));
+    assert!(matches!(result(&mut client).2, Outcome::Done { .. }));
+    assert!(
+        matches!(&recorder.0.lock().unwrap()[0].command, Command::PlanCommand(c) if c.action == PlanAction::Complete)
+    );
 }
 
 /// The next `command_result`, with the request it answers.
@@ -244,5 +268,103 @@ fn operations_under_way_are_bounded() {
     while recorder.count() < MAX_PENDING_OPS + 1 {
         assert!(std::time::Instant::now() < deadline, "the next one was not handed over");
         std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn settings_pairing_and_projects_require_the_host_grant() {
+    use atomics_core::ops::{HostAction, HostCommand, SettingsTool};
+    let actions = [
+        HostAction::BrowseFolder { path: "/home/user".into() },
+        HostAction::OpenProject { path: "/home/user/repo".into() },
+        HostAction::CloseProject { path: "/home/user/repo".into() },
+        HostAction::SaveWorkspace { name: "team".into() },
+        HostAction::ConfigPropose {
+            scope: atomics_core::selfconfig::Scope::Main,
+            toml: "[font]\nsize = 14.0".into(),
+            remove: vec![],
+            theme: None,
+            reason: None,
+        },
+        HostAction::ConfigDecide { id: "config-1".into(), apply: true, note: String::new() },
+        HostAction::PairDevice,
+        HostAction::CancelPairing,
+        HostAction::DecidePairing { code: "123456".into(), controls: Some(true) },
+        HostAction::RevokeDevice { id: "device".into() },
+        HostAction::SettingsTool {
+            tool: SettingsTool::PutCredential { kind: "openai".into(), value: "hidden".into(), host: None },
+        },
+    ];
+    for (role, capabilities) in [
+        (Role::Viewer, CAPABILITIES.to_vec()),
+        (Role::Controller, CAPABILITIES.iter().copied().filter(|c| *c != atomics_core::wire::HOST).collect()),
+    ] {
+        let (server, recorder) = start(role);
+        // Stay below the protocol's intentional per-connection refusal limit.
+        for chunk in actions.chunks(4) {
+            let (mut client, may) = connect(&server, &capabilities);
+            assert!(!may.contains(&Grant::Host));
+            for (index, action) in chunk.iter().enumerate() {
+                send(
+                    &mut client,
+                    Command::HostCommand(HostCommand { op: format!("management-{index}"), action: action.clone() }),
+                    "request",
+                );
+                assert!(matches!(result(&mut client).2, Outcome::Refused { code: ErrorCode::Unauthorised, .. }));
+            }
+        }
+        assert_eq!(recorder.count(), 0);
+    }
+}
+
+#[test]
+fn pairing_links_are_private_in_snapshots_and_host_updates() {
+    use atomics_core::projection::{HostInfo, ManagementInfo, PairingInfo, RemoteInfo};
+    let projections = Arc::new(Projections::default());
+    let host = |link: &str| HostInfo {
+        management: Some(ManagementInfo {
+            remote: RemoteInfo {
+                pairing: Some(PairingInfo::Open { link: Some(link.into()), seconds_left: 300, busy: false }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    projections.publish_host(host("https://example.com/pair#first-secret"));
+    let (viewer_server, _) = start_with(Role::Viewer, projections.clone());
+    let (control_server, _) = start_with(Role::Controller, projections.clone());
+    let (mut viewer, _) = connect(&viewer_server, CAPABILITIES);
+    let (mut control, _) = connect(&control_server, CAPABILITIES);
+    viewer.sync_until(|m| m.host.management.is_some());
+    control.sync_until(|m| m.host.management.is_some());
+    let link = |client: &TestClient| match &client.mirror.host.management.as_ref().unwrap().remote.pairing {
+        Some(PairingInfo::Open { link, .. }) => link.clone(),
+        _ => panic!("pairing"),
+    };
+    assert_eq!(link(&viewer), None);
+    assert_eq!(link(&control).as_deref(), Some("https://example.com/pair#first-secret"));
+    projections.publish_host(host("https://example.com/pair#next-secret"));
+    control.sync_until(|m| m.host.management.as_ref().is_some_and(|i| matches!(&i.remote.pairing, Some(PairingInfo::Open { link: Some(link), .. }) if link.ends_with("next-secret"))));
+    let cursor = control.mirror.cursor;
+    viewer.sync_until(|m| m.cursor >= cursor);
+    assert_eq!(link(&viewer), None, "host_upsert must not reveal the link either");
+}
+
+#[test]
+fn panel_operations_require_the_panels_capability_and_a_controller() {
+    use atomics_core::ops::{HostAction, HostCommand};
+    for (role, panels) in [(Role::Controller, false), (Role::Viewer, true)] {
+        let (server, recorder) = start(role);
+        let caps: Vec<_> =
+            CAPABILITIES.iter().copied().filter(|c| panels || *c != atomics_core::wire::PANELS).collect();
+        let (mut client, _) = connect(&server, &caps);
+        let command = Command::HostCommand(HostCommand {
+            op: "editor".into(),
+            action: HostAction::Edit { root: "/w/repo".into(), path: None, line: None },
+        });
+        send(&mut client, command, "editor-request");
+        assert!(matches!(result(&mut client).2, Outcome::Refused { code: ErrorCode::Unauthorised, .. }));
+        assert_eq!(recorder.count(), 0);
     }
 }

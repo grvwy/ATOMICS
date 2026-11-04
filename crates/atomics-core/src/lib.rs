@@ -22,6 +22,7 @@ pub mod diff;
 pub mod diff_data;
 pub mod doctor;
 pub mod files;
+pub mod folder;
 #[cfg(feature = "native")]
 pub mod git;
 pub mod github;
@@ -48,8 +49,10 @@ pub mod stash;
 pub mod steer;
 pub mod store;
 pub mod theme;
+pub mod ticket_ui;
 pub mod tickets;
 pub mod trace;
+pub mod trace_feed;
 pub mod tunnel;
 pub mod usage;
 #[cfg(feature = "native")]

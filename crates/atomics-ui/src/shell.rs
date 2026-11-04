@@ -3,8 +3,8 @@
 //! docked beside the agents or floating over them. The platform draws it through a [`Platform`]: it lends
 //! each piece the backend and its client, and carries out what that piece recorded before the next one
 //! draws, as the desktop did before the frame moved.
-//! The items only a host has (the desktop's Settings, Tickets, GitHub, Remote and load items, USAGE, the
-//! Tickets panel, a pull request's diff, the editor) are the trait's hooks; a platform that leaves a hook as
+//! The remaining platform items (ticket integration, GitHub and VM controls, and the
+//! Tickets panel) are the trait's hooks; a platform that leaves a hook as
 //! it is does without that item. Everything else asks [`Backend::available`] whether to draw an action.
 
 use std::path::{Path, PathBuf};
@@ -45,41 +45,14 @@ pub trait Platform {
     /// The host's items after the top bar's Plan button; in the Actions menu when `in_menu`.
     fn top_bar_items(&mut self, _ui: &mut egui::Ui, _in_menu: bool) {}
 
-    /// The host's load gauge, after the Project menu while the bar has room for it.
-    fn top_bar_load(&mut self, _ui: &mut egui::Ui) {}
-
-    /// The host's settings, last in the top bar.
+    /// Additional client preferences, such as the browser's layout chooser.
     fn top_bar_settings(&mut self, _ui: &mut egui::Ui) {}
-
-    /// The host's section at the top of the sidebar, with its separator.
-    fn sidebar_usage(&mut self, _ui: &mut egui::Ui) {}
 
     /// The host's section above the sidebar's agents.
     fn sidebar_tickets(&mut self, _ui: &mut egui::Ui) {}
 
-    /// The chief's window, docked or floating: its header and its terminal ([`chief::content`]). The desktop
-    /// adds the trace lane under the terminal.
-    fn chief_window(&mut self, ui: &mut egui::Ui) {
-        self.draw(|backend, client, terminals| chief::content(ui, backend, client, terminals, |_| 0.0));
-    }
-
     /// The right panel in [`PanelMode::Tickets`], which only the host has.
     fn panel_tickets(&mut self, _ui: &mut egui::Ui, _rect: Rect) {}
-
-    /// A pull request's diff in the right panel instead of the worktree's, while the host shows one; true
-    /// when it drew one.
-    fn panel_pull_request(&mut self, _ui: &mut egui::Ui, _rect: Rect) -> bool {
-        false
-    }
-
-    /// The file open in the editor of the worktree at `root`, which the changed-files column marks in
-    /// [`PanelMode::Editor`].
-    fn panel_editor_file(&self, _root: &Path) -> Option<String> {
-        None
-    }
-
-    /// The right panel in [`PanelMode::Editor`]: the editor of the worktree at `root`.
-    fn panel_editor(&mut self, _ui: &mut egui::Ui, _rect: Rect, _root: &Path) {}
 }
 
 /// Reads from the backend and the client, recording nothing.
@@ -118,6 +91,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let diff_open = !history_board
             && hints.diff_open
             && (hints.diff_target.is_some()
+                || client.pr_view.is_some()
                 || matches!(hints.panel, PanelMode::Plan | PanelMode::Tickets)
                 || !visible.is_empty()
                 || completed > 0);
@@ -146,8 +120,11 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             .show(ui, |ui| self::sidebar(ui, platform));
     }
 
-    let chief_rect =
-        (layout.dock_width > 0.0).then(|| chief::dock(ui, layout.dock_width, &p, |ui| platform.chief_window(ui)));
+    let chief_rect = (layout.dock_width > 0.0).then(|| {
+        chief::dock(ui, layout.dock_width, &p, |ui| {
+            platform.draw(|backend, client, terminals| chief::draw(ui, backend, client, terminals))
+        })
+    });
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
         let mut rect = ui.max_rect();
@@ -214,7 +191,9 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         platform.draw(|_, client, _| chief::divider(ui, rect, client));
     }
     if read(platform, |backend, _| backend.chief().open) && layout.dock_width == 0.0 {
-        chief::window(ui.ctx(), &p, |ui| platform.chief_window(ui));
+        chief::window(ui.ctx(), &p, |ui| {
+            platform.draw(|backend, client, terminals| chief::draw(ui, backend, client, terminals))
+        });
     }
 }
 
@@ -243,15 +222,24 @@ pub fn plan_board(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) {
     });
 }
 
-/// The right panel in `rect`: the plan board, the host's Tickets panel, or the diff target's diff or editor
+/// The right panel in `rect`: the plan board, the host's Tickets panel, a pull request, or the diff target's diff or editor
 /// with the changed-files column beside it when there is room.
 pub fn right_panel(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) {
     platform.draw(|backend, client, _| diff_panel::sync(backend, client));
     let hints = read(platform, |backend, _| backend.view_hints());
     match hints.panel {
         PanelMode::Plan => return plan_board(ui, rect, platform),
-        PanelMode::Tickets => return platform.panel_tickets(ui, rect),
-        PanelMode::Diff if platform.panel_pull_request(ui, rect) => return,
+        PanelMode::Tickets => {
+            if read(platform, |backend, _| backend.tickets().is_some()) {
+                return platform.draw(|backend, client, _| crate::tickets::panel(ui, rect, backend, client));
+            }
+            return platform.panel_tickets(ui, rect);
+        }
+        PanelMode::Diff
+            if platform.draw(|backend, client, _| crate::pull_request::panel(ui, rect, backend, client)) =>
+        {
+            return;
+        }
         _ => {}
     }
     let Some(root) = hints.diff_target else {
@@ -267,7 +255,9 @@ pub fn right_panel(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) 
     let rect = if rect.width() >= 760.0 && opens {
         let column = rect.with_max_x(rect.left() + 250.0);
         let current = match editor {
-            true => platform.panel_editor_file(&root),
+            true => read(platform, |backend, _| {
+                backend.editors().into_iter().find(|e| Path::new(&e.root) == root).and_then(|e| e.file)
+            }),
             false => read(platform, |_, client| client.diff_views.get(&root).and_then(|d| d.focused.clone())),
         };
         platform.draw(|_, client, _| {
@@ -282,7 +272,8 @@ pub fn right_panel(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) 
         rect
     };
     if editor {
-        return platform.panel_editor(ui, rect, &root);
+        return platform
+            .draw(|backend, client, terminals| crate::editor::draw(ui, rect, &root, backend, client, terminals));
     }
     platform.draw(|backend, client, _| diff_panel::draw(ui, rect, &root, backend, client));
 }
@@ -324,14 +315,18 @@ pub fn sidebar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let explorer = !backend.repos().is_empty() || backend.available(&Command::PickProject);
         (backend.view_hints().diff_target, explorer)
     });
-    platform.sidebar_usage(ui);
+    platform.draw(|backend, client, _| crate::resources::section(ui, backend, &client.palette));
     let total = ui.available_height();
     let sessions_height = if explorer && files_root.is_some() { (total * 0.46).max(150.0) } else { total };
     ui.add_space(6.0);
     egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(
         ui,
         |ui| {
-            platform.sidebar_tickets(ui);
+            if read(platform, |backend, _| backend.tickets().is_some()) {
+                platform.draw(|backend, client, _| crate::tickets::sidebar(ui, backend, client));
+            } else {
+                platform.sidebar_tickets(ui);
+            }
             platform.draw(|backend, client, _| sidebar::sessions(ui, backend, client));
         },
     );
@@ -511,16 +506,19 @@ fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, size: chief::Pill
 /// they fold into the Actions menu.
 fn top_bar_controls(ui: &mut egui::Ui, platform: &mut impl Platform, show_load: bool, in_menu: bool) {
     platform.draw(|backend, client, _| topbar::new_button(ui, in_menu, backend, client));
+    platform.draw(|backend, client, _| topbar::explorer_menu(ui, backend, client));
     platform.top_bar_items(ui, in_menu);
-    if read(platform, |backend, _| backend.available(&Command::PickProject)) {
+    platform.draw(|backend, client, _| crate::pull_request::menu(ui, backend, client));
+    if read(platform, |backend, _| backend.management().is_some() || backend.available(&Command::PickProject)) {
         let response = ui
             .menu_button("Project", |ui| platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client)))
             .response;
         record_item(ui, "Project", &response);
     }
-    if show_load {
-        platform.top_bar_load(ui);
+    if show_load || in_menu {
+        platform.draw(|backend, client, _| crate::resources::load(ui, backend, &client.palette, in_menu));
     }
+    platform.draw(|backend, client, _| crate::management::buttons(ui, backend, client));
     platform.top_bar_settings(ui);
 }
 

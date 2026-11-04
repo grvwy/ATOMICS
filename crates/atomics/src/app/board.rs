@@ -35,5 +35,3 @@ impl State {
         }
     }
 }
-
-pub(super) use atomics_ui::status::task_color;

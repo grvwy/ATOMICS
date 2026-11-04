@@ -12,7 +12,7 @@
 //!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
 //!   sees, in the phone's look ([`Looks`]): the theme's colours with proportional UI text, zoomed, spaced for a
 //!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]). Its top bar's ⋯ menu has the layout and
-//!   the host's workspace.
+//!   the host's workspace, account usage and load.
 //!
 //! Terminals are drawn by [`TermPane`]s through [`Terminals`]. After each piece of the frame, what the user
 //! asked for in it is carried out: a view command here, on the page's [`Desk`], any other through the
@@ -26,11 +26,11 @@ use atomics_core::layout::{DiffPlacement, Layout as Grid};
 use atomics_core::noise;
 use atomics_core::ops::Grant;
 use atomics_core::plan::PlanStatus;
+use atomics_core::session::AgentStatus;
 use atomics_core::theme::ThemeTokens;
 use atomics_core::wire::Role;
 use atomics_ui::chief::PillSize;
 use atomics_ui::shell::{self, Platform};
-use atomics_ui::terminal::Metrics;
 use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
 use atomics_ui::touch::{self, Touch};
@@ -171,6 +171,7 @@ impl FontHook for BundledFonts {
 /// on a phone with proportional UI text (monospace stays for code, terminals and IDs), zoomed by
 /// [`layout::ZOOM`] through the theme's UI size, with controls a finger's size and room between them.
 pub struct Looks {
+    tokens: ThemeTokens,
     pub desktop: Arc<Palette>,
     pub phone: Arc<Palette>,
     /// The look egui has: the phone's (`true`) or the desktop's; `None` until a frame gives it one.
@@ -183,6 +184,7 @@ impl Looks {
         phone.mono_ui = Some(false);
         let zoomed = Fonts { ui_size: Some(UI_SIZE * layout::ZOOM), ..Fonts::default() };
         Looks {
+            tokens: tokens.clone(),
             desktop: Arc::new(Palette::new(tokens, Fonts::default())),
             phone: Arc::new(Palette::new(&phone, zoomed)),
             applied: None,
@@ -238,11 +240,17 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
-    open_ticket(driver, view);
+    open_ticket(driver, client, view);
     view.term.begin_frame();
     let screen = ui.max_rect();
     // The layout follows the page's width in CSS pixels, which the phone's zoom leaves as they are.
     view.compact = layout::compact(screen.width() * ui.ctx().zoom_factor(), view.viewport.coarse, view.layout);
+    if let Some(info) = driver.remote.management()
+        && let Ok(tokens) = serde_json::from_value::<ThemeTokens>(info.config["theme_tokens"].clone())
+        && tokens != view.looks.tokens
+    {
+        view.looks = Looks::new(&tokens);
+    }
     view.looks.apply(ui.ctx(), client, view.compact);
     view.term.touch = client.touch;
     sync(ui.ctx(), driver, client, view);
@@ -251,17 +259,18 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     } else {
         wide(ui, driver, client, view);
     }
+    atomics_ui::management::dialogs(ui.ctx(), &driver.remote, client);
     dialogs::draw(ui.ctx(), &driver.remote, client, &mut view.picker);
     view.term.end_frame(ui.ctx(), &driver.remote);
     driver.remote.end_frame();
     carry_out(driver, client, view);
-    want(&driver.remote, view);
+    want(&driver.remote, client, view);
     driver.flush();
 }
 
 /// The boot's ticket key, once the board is in: its plan on the board, or the board the page opens on when no
 /// plan names it.
-fn open_ticket(driver: &Driver, view: &mut View) {
+fn open_ticket(driver: &Driver, client: &mut Client, view: &mut View) {
     let remote = &driver.remote;
     if view.ticket_key.is_none() || !remote.live() || remote.with_mirror(|m| m.epoch.is_none()) {
         return;
@@ -271,6 +280,13 @@ fn open_ticket(driver: &Driver, view: &mut View) {
     if let Some(index) = remote.plan_for_ticket(&key) {
         let open = remote.plan_row(index).is_some_and(|row| row.status == PlanStatus::Open);
         view.desk.apply(if open { Command::ShowPlan(index) } else { Command::ViewPlanHistory(index) }, remote);
+    } else if let Some(info) = remote.tickets() {
+        client.send(Command::OpenTicket(atomics_core::tickets::TicketLink {
+            system: info.system,
+            id: key,
+            ..Default::default()
+        }));
+        return;
     }
     view.desk.panel = PanelMode::Plan;
     view.desk.diff_open = true;
@@ -307,9 +323,10 @@ fn sync(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, view: &mu
     });
     hint(remote, view);
     let sessions = remote.session_list();
-    view.tiles.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    view.tiles
+        .retain(|id, _| sessions.iter().any(|s| &s.id == id) || remote.editors().iter().any(|e| &e.terminal == id));
     client.selected.retain(|id| sessions.iter().any(|s| &s.id == id));
-    view.target = if view.compact { None } else { view.desk.typing_target() };
+    view.target = if view.compact { None } else { typing_target(&driver.remote, view) };
     // The wide layout's note has no close button: it goes after a while.
     match (remote.notice(), &view.noted) {
         (None, _) => view.noted = None,
@@ -334,13 +351,25 @@ fn hint(remote: &RemoteBackend, view: &View) {
 }
 
 /// Fetch the hunks of the diff on screen, and of no other.
-fn want(remote: &RemoteBackend, view: &View) {
+fn want(remote: &RemoteBackend, client: &Client, view: &View) {
     let shown = if view.compact {
         view.diff.clone().filter(|_| view.tab == Tab::Diffs)
     } else {
         let hints = view.desk.hints(remote);
         hints.diff_target.filter(|_| hints.diff_open && hints.panel == PanelMode::Diff)
     };
+    let shown = client
+        .pr_view
+        .as_ref()
+        .filter(|_| {
+            if view.compact {
+                view.tab == Tab::Diffs
+            } else {
+                view.desk.diff_open && view.desk.panel == PanelMode::Diff
+            }
+        })
+        .map(|(key, _)| PathBuf::from(key))
+        .or(shown);
     remote.set_wanted(shown.as_deref());
 }
 
@@ -375,11 +404,6 @@ impl Platform for Web<'_> {
         self.view.place_clicked |= place(ui, self.view.place.as_ref(), &p);
     }
 
-    /// The chief's window, with the permission request it waits on over its terminal.
-    fn chief_window(&mut self, ui: &mut egui::Ui) {
-        self.draw(|backend, client, terminals| chief_window(ui, backend, client, terminals));
-    }
-
     /// Where the desktop has its Settings: the layout this page draws.
     fn top_bar_settings(&mut self, ui: &mut egui::Ui) {
         layout_menu(ui, self.view, |_| {});
@@ -388,6 +412,17 @@ impl Platform for Web<'_> {
 
 /// Lends `draw` the backend, the client and the page's terminals; a terminal a click picks takes the
 /// page's input next.
+fn typing_target(remote: &RemoteBackend, view: &View) -> Option<String> {
+    if view.desk.diff_open
+        && view.desk.panel == PanelMode::Editor
+        && view.desk.typing_in.is_none()
+        && let Some(root) = view.desk.diff_target(remote)
+    {
+        return remote.editors().into_iter().find(|e| Path::new(&e.root) == root && e.running).map(|e| e.terminal);
+    }
+    view.desk.typing_target()
+}
+
 fn lend<R>(
     driver: &Driver,
     client: &mut Client,
@@ -395,7 +430,7 @@ fn lend<R>(
     draw: impl FnOnce(&dyn Backend, &mut Client, &mut dyn TerminalSurface) -> R,
 ) -> R {
     if !view.compact {
-        view.target = view.desk.typing_target();
+        view.target = typing_target(&driver.remote, view);
     }
     let mut terminals = Terminals {
         pane: &mut view.term,
@@ -421,13 +456,53 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
     let remote = &driver.remote;
     for command in std::mem::take(&mut client.commands) {
         match command {
+            Command::OpenTicket(ticket) if remote.tickets().is_some() => {
+                client.tickets.open(ticket, false, view.now_ms / 1000.0, &mut client.commands);
+                client.tickets.from_board = true;
+                view_command(remote, view, Command::SetPanel(PanelMode::Tickets));
+                view_command(remote, view, Command::OpenDiff);
+                for command in std::mem::take(&mut client.commands) {
+                    if !command.is_view() {
+                        remote.send(command);
+                    }
+                }
+            }
+            Command::PickProject => atomics_ui::management::open_project(remote, client),
+            Command::OpenProject(path) => {
+                remote.send(Command::OpenProject(path.clone()));
+                view_command(remote, view, Command::ShowRoot(path));
+            }
             Command::CloseSession(id) if dialogs::may_be_scratch(remote, &id) => client.confirm_close = Some(id),
             Command::ClosePlanTab(plan) => client.confirm_plan_close = dialogs::plan_to_close(remote, plan),
             Command::NewSession => view.picker = Some(Picker::default()),
             // The changed files' column names files the page has the hunks of: the diff scrolls to them.
             Command::OpenFile { root, path } => {
+                let whole = remote.open_file(&root, &path);
+                view.desk.apply(Command::ShowRoot(root.clone()), remote);
+                view.desk.panel = PanelMode::Diff;
                 view.desk.diff_open = true;
-                client.diff_views.entry(root).or_default().open_resolved(&path, false);
+                if view.compact {
+                    view.diff = Some(root.clone());
+                    view.tab = Tab::Diffs;
+                }
+                remote.want_diff(&root);
+                client.diff_views.entry(root).or_default().open_resolved(&path, whole);
+            }
+            Command::Edit { root, path, line } => {
+                remote.send(Command::Edit { root: root.clone(), path, line });
+                view.desk.diff_open = true;
+                view.desk.panel = PanelMode::Editor;
+                view.desk.typing_in = Some(atomics_core::projection::editor_terminal(&root.to_string_lossy()));
+                if view.compact {
+                    view.tab = Tab::Diffs;
+                }
+                view.term.focus_next = !view.compact;
+            }
+            Command::ToggleChief
+                if !remote.session_list().iter().any(|s| s.chief && s.status != AgentStatus::Exited) =>
+            {
+                remote.send(Command::ToggleChief);
+                view.desk.chief.open = true;
             }
             command if command.is_view() || desk::window_command(&command) => view_command(remote, view, command),
             command => remote.send(command),
@@ -438,6 +513,18 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
 
 /// A view command: the page's desk as the desktop's model, and the phone's pane follows what was asked for.
 fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
+    if view.desk.panel == PanelMode::Editor
+        && matches!(
+            command,
+            Command::SetPanel(PanelMode::Diff | PanelMode::Plan | PanelMode::Tickets)
+                | Command::CloseDiff
+                | Command::Activate { .. }
+                | Command::OpenTaskSession(_)
+        )
+        && view.desk.typing_in.as_deref().is_some_and(|id| remote.editors().iter().any(|e| e.terminal == id))
+    {
+        view.desk.typing_in = None;
+    }
     let root = |id: &str| remote.session_list().into_iter().find(|s| s.id == id).map(|s| s.root);
     if view.compact {
         match &command {
@@ -457,12 +544,15 @@ fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
             }
             Command::ShowRoot(worktree) => {
                 view.diff = Some(worktree.clone());
-                view.tab = Tab::Diffs;
+                if view.tab != Tab::Agents {
+                    view.tab = Tab::Diffs;
+                }
             }
             Command::OpenDiff
             | Command::ToggleDiff
-            | Command::SetPanel(PanelMode::Diff)
+            | Command::SetPanel(PanelMode::Diff | PanelMode::Editor)
             | Command::ToggleView(PanelMode::Diff) => view.tab = Tab::Diffs,
+            Command::SetPanel(PanelMode::Tickets) | Command::ToggleView(PanelMode::Tickets) => view.tab = Tab::Diffs,
             Command::ToggleView(PanelMode::Plan) => view.tab = Tab::Board,
             Command::CloseDiff => view.diff = None,
             Command::SetPanel(PanelMode::Plan) | Command::TogglePlan | Command::ShowPlan(_) => view.tab = Tab::Board,
@@ -650,11 +740,24 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     topbar::slot(ui, "phone-actions", right, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let backend: &dyn Backend = &driver.remote;
-            // The phone's ⋯ menu: the layout, the host's workspace and where a native client's agents run.
+            // The phone's ⋯ menu also carries the host's usage and governor details.
             let (shown, mut clicked) = (view.place.clone(), false);
             layout_menu(ui, view, |ui| {
+                atomics_ui::management::buttons(ui, backend, client);
+                if backend.management().is_some() {
+                    ui.menu_button("Project", |ui| atomics_ui::topbar::project_menu(ui, backend, client));
+                }
+                topbar::new_button(ui, true, backend, client);
                 atomics_ui::topbar::workspace_menu(ui, backend, client);
+                if backend.tickets().is_some() && atomics_ui::touch::small_button(ui, client.touch, "Tickets").clicked()
+                {
+                    client.send(Command::ToggleView(PanelMode::Tickets));
+                    ui.close();
+                }
                 clicked = place(ui, shown.as_ref(), &p);
+                ui.separator();
+                atomics_ui::resources::load(ui, backend, &p, true);
+                atomics_ui::resources::section(ui, backend, &p);
             });
             view.place_clicked |= clicked;
             if approvals > 0 {
@@ -985,10 +1088,19 @@ fn phone_body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view:
 /// The AGENTS list, as the desktop's sidebar has it: a tap opens the agent's terminal.
 fn agents_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
     let backend: &dyn Backend = &driver.remote;
-    if backend.visible_sessions().is_empty() {
-        return empty(ui, client, "No agents are running on this computer.");
-    }
-    padded(ui, gutter(client), |ui| list(ui, |ui| sidebar::sessions(ui, backend, client)));
+    padded(ui, gutter(client), |ui| {
+        list(ui, |ui| {
+            topbar::new_button(ui, false, backend, client);
+            atomics_ui::tabs::filters(ui, backend, client);
+            sidebar::sessions(ui, backend, client);
+            if backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() }) {
+                chief::steer_bar(ui, backend, client);
+            }
+            if !backend.repos().is_empty() {
+                sidebar::explorer(ui, backend, client);
+            }
+        })
+    });
 }
 
 /// The active agent's tile at the pane's size (the first agent's while none is active): its header, the
@@ -1022,47 +1134,19 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
 /// The chief's window at the pane's size: its header, the permission request it waits on and its terminal.
 fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
     let Some(chief) = driver.remote.session_list().into_iter().find(|s| s.chief) else {
-        return empty(ui, client, "No chief is running on this computer.");
+        empty(ui, client, "No chief is running on this computer.");
+        if driver.remote.available(&Command::ToggleChief) && ui.button("Start chief").clicked() {
+            client.send(Command::ToggleChief);
+        }
+        return;
     };
     view.target = Some(chief.id);
     fill(ui, |ui, rect| {
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("chief").max_rect(rect));
         lend(driver, client, view, |backend, client, terminals| {
-            chief_window(&mut child, backend, client, terminals);
+            chief::draw(&mut child, backend, client, terminals);
         });
     });
-}
-
-/// The terminal a view asks for, kept to draw once what goes over it is drawn.
-#[derive(Default)]
-struct Kept(Option<(usize, String, Rect, egui::Id, Metrics)>);
-
-impl TerminalSurface for Kept {
-    fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        index: usize,
-        session: &str,
-        rect: Rect,
-        id: egui::Id,
-        metrics: &Metrics,
-        _palette: &Palette,
-    ) -> egui::Response {
-        let metrics = Metrics { font: metrics.font.clone(), cell: metrics.cell };
-        self.0 = Some((index, session.to_string(), rect, id, metrics));
-        ui.interact(Rect::from_min_size(rect.min, vec2(0.0, 0.0)), id.with("kept"), Sense::hover())
-    }
-}
-
-/// The chief's window, with the permission request the chief waits on over its terminal, as an agent's tile has
-/// it: the browser's one place to answer it where it asks.
-fn chief_window(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, terminals: &mut dyn TerminalSurface) {
-    let mut kept = Kept::default();
-    chief::content(ui, backend, client, &mut kept, |_| 0.0);
-    let Some((index, session, rect, id, metrics)) = kept.0 else { return };
-    let p = client.palette.clone();
-    let rest = approvals::banner(ui, rect, index, backend, client);
-    terminals.show(ui, index, &session, rest, id, &metrics, &p);
 }
 
 fn empty(ui: &mut egui::Ui, client: &Client, text: &str) {
@@ -1202,8 +1286,28 @@ fn approvals_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
 }
 
 /// The worktrees with changes; one picked shows in the diff panel.
-fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &View) {
+fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
     let backend: &dyn Backend = &driver.remote;
+    if view.desk.diff_open && view.desk.panel == PanelMode::Tickets && backend.tickets().is_some() {
+        return fill(ui, |ui, rect| atomics_ui::tickets::panel(ui, rect, backend, client));
+    }
+    atomics_ui::pull_request::menu(ui, backend, client);
+    if client.pr_view.is_some() && view.desk.panel != PanelMode::Editor {
+        return fill(ui, |ui, rect| {
+            atomics_ui::pull_request::panel(ui, rect, backend, client);
+        });
+    }
+    if view.desk.panel == PanelMode::Editor
+        && let Some(root) = view.diff.clone().or_else(|| view.desk.diff_target(backend))
+    {
+        view.target =
+            backend.editors().into_iter().find(|e| Path::new(&e.root) == root && e.running).map(|e| e.terminal);
+        return fill(ui, |ui, rect| {
+            lend(driver, client, view, |backend, client, terminals| {
+                atomics_ui::editor::draw(ui, rect, &root, backend, client, terminals);
+            })
+        });
+    }
     let roots = backend.diff_roots();
     if let Some(root) = view.diff.clone().filter(|root| roots.contains(root)) {
         diff_panel::sync(backend, client);

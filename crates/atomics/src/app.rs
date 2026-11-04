@@ -13,9 +13,9 @@ use atomics_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use atomics_core::session::{AgentStatus, UNTITLED, prompt_title, title_for};
 use atomics_core::store::{SessionRecord, Store};
 use atomics_core::{paths, steer, theme};
-use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{Color32, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
-use crate::diff_view::{self, DiffAction, DiffState, Header};
+use crate::diff_view::{self, DiffState};
 use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
@@ -24,7 +24,7 @@ use crate::lifecycle::Scope;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
-use crate::theme::{Palette, SystemFonts, Theme, lerp, shortcut, shortcut_label};
+use crate::theme::{Palette, SystemFonts, Theme, shortcut, shortcut_label};
 use crate::voice::{MAX_RECORDING, Recorder};
 use crate::watcher::{Change, Watcher};
 use atomics_core::approvals::{ApprovalRequest, Decision};
@@ -49,6 +49,7 @@ mod chief;
 mod commands;
 mod connections;
 mod control;
+#[cfg(test)]
 mod credentials;
 mod editor;
 mod fleet;
@@ -57,9 +58,9 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
+mod management;
 mod mutations;
 mod open_link;
-mod pairing;
 mod plan_cleanup;
 mod plan_read;
 mod plan_view;
@@ -455,6 +456,10 @@ pub(crate) struct State {
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
     remote: crate::host::RemoteView,
+    folder_cache: Vec<atomics_core::projection::FolderInfo>,
+    management_config: std::sync::OnceLock<serde_json::Value>,
+    credential_status: serde_json::Value,
+    credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
     remote_port: Option<u16>,
     wake: crate::host::Wake,
@@ -477,8 +482,6 @@ pub(crate) struct State {
     config_problems: Option<String>,
     /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
     theme_error: Option<String>,
-    /// The themes the Settings menu offers, read when the config or a theme file changes.
-    theme_choices: Arc<Vec<themes::ThemeChoice>>,
     /// This machine's config.d file picks a theme, which wins over config.toml's.
     host_theme: bool,
     /// The theme as resolved: what terminals answer and the highlighter draws with. Each change is a new
@@ -512,12 +515,10 @@ pub(crate) struct State {
     diffs: HashMap<PathBuf, DiffData>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
     traces: HashMap<String, atomics_core::trace::TraceLog>,
-    /// The trace lane's view state: collapse, height, selected card.
-    lane: trace_lane::Lane,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
-    usage: crate::usage::UsagePanel,
+    usage: crate::usage::UsagePoller,
     /// Account usage that sandboxed agents saw, read back from their VMs.
     sandbox_pull: crate::usage::SandboxPull,
     /// The ATOMICS VM on a Mac with its bundle installed, for the top bar (`vm.rs`).
@@ -537,7 +538,9 @@ pub(crate) struct State {
     governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
     jobserver: Option<Arc<Jobserver>>,
-    /// One-minute load average, read at most every 2 seconds.
+    /// Account usage and governor state published to every client.
+    resources: atomics_core::projection::ResourceInfo,
+    resources_checked: Instant,
     busy_checked: Instant,
     output_delay: Option<Duration>,
     approvals_checked: Instant,
@@ -559,6 +562,7 @@ pub(crate) struct State {
     plan_cleanup: Option<plan_cleanup::PlanCleanup>,
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
+    editor_files: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
     event_seq: u64,
     last_status: HashMap<String, AgentStatus>,
@@ -631,6 +635,7 @@ pub(crate) struct State {
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
 enum ClientEvent {
+    PullRequest(String),
     ApprovalDecided {
         session: String,
         approval: String,
@@ -678,32 +683,21 @@ struct Client {
     cleanup_delete_branches: bool,
     plan_cleanup_open: bool,
     plan_cleanup_selected: HashSet<(PathBuf, String)>,
-    load: (Instant, Option<f64>),
     editor_file: HashMap<PathBuf, String>,
-    focus_editor: bool,
-    editor_id: Option<egui::Id>,
     terminal_views: HashMap<egui::Id, TerminalView>,
     new_dialog: Option<NewDialog>,
     rename: Option<Rename>,
     quick_open: Option<QuickOpen>,
     voice: Voice,
-    /// The proposal on screen and when it appeared, which enables Apply after a moment.
-    config_seen: Option<(String, Instant)>,
-    /// The user's note on the proposal on screen, sent with Apply or Reject.
-    config_note: String,
-    /// The theme picker saves to this machine's config.d file instead of config.toml.
-    theme_host_only: bool,
-    credentials: credentials::CredentialUi,
     /// The GitHub modal's selection and confirmation, and the pull request diff's view state.
     github: github::GithubUi,
     /// Settings → Connections' fields for adding a remote server.
+    #[cfg(test)]
     connection_name: String,
+    #[cfg(test)]
     connection_url: String,
     /// Open or close the Settings menu on the next frame.
     show_settings: Option<bool>,
-    /// The Remote devices window (pairing and revoking), and the device whose Revoke asks.
-    remote_devices: bool,
-    revoke_confirm: Option<atomics_core::noise::PublicKey>,
     /// Nothing had the keyboard when the last frame ended: an Escape now is no field's or terminal's.
     keyboard_idle: bool,
     voice_tx: Sender<VoiceEvent>,
@@ -741,26 +735,19 @@ impl Client {
             cleanup_delete_branches: true,
             plan_cleanup_open: false,
             plan_cleanup_selected: HashSet::new(),
-            load: (Instant::now() - Duration::from_secs(10), None),
             editor_file: HashMap::new(),
-            focus_editor: false,
-            editor_id: None,
             terminal_views: HashMap::new(),
             new_dialog: None,
             rename: None,
             quick_open: None,
             voice: Voice::Idle,
-            config_seen: None,
-            config_note: String::new(),
-            theme_host_only: false,
-            credentials: credentials::CredentialUi::default(),
             github: github::GithubUi::default(),
+            #[cfg(test)]
             connection_name: String::new(),
+            #[cfg(test)]
             connection_url: String::new(),
             show_settings: None,
-            remote_devices: false,
             keyboard_idle: false,
-            revoke_confirm: None,
             voice_tx,
             voice_rx,
             screenshot: options.screenshot.take().map(|path| Screenshot {
@@ -956,7 +943,7 @@ impl State {
         let (control_tx, control_rx) = wake.channel();
         let (op_tx, op_rx) = wake.channel();
         let (action_tx, action_rx) = wake.channel();
-        let (usage, usage_tx) = crate::usage::UsagePanel::new(window.clone());
+        let (usage, usage_tx) = crate::usage::UsagePoller::new(window.clone());
         let sandbox_pull = crate::usage::SandboxPull::new(usage_tx.clone());
         let vm = crate::vm::Monitor::start(window.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
@@ -1011,6 +998,10 @@ impl State {
         let mut app = State {
             window,
             remote: crate::host::RemoteView::default(),
+            folder_cache: Vec::new(),
+            management_config: std::sync::OnceLock::new(),
+            credential_status: serde_json::Value::Null,
+            credential_busy: false,
             remote_port: options.remote_port,
             wake: wake.clone(),
             control_tx,
@@ -1029,7 +1020,6 @@ impl State {
             config_error,
             config_problems,
             theme_error,
-            theme_choices: Arc::default(),
             host_theme: false,
             sessions: Vec::new(),
             codex_versions: HashMap::new(),
@@ -1052,7 +1042,6 @@ impl State {
             diff_root: None,
             diffs: HashMap::new(),
             traces: HashMap::new(),
-            lane: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,
@@ -1069,6 +1058,8 @@ impl State {
             hook_error,
             governor,
             jobserver,
+            resources: Default::default(),
+            resources_checked: Instant::now() - Duration::from_secs(10),
             busy_checked: Instant::now(),
             output_delay: None,
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
@@ -1085,6 +1076,7 @@ impl State {
             plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
+            editor_files: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
             last_status: HashMap::new(),
@@ -1166,6 +1158,10 @@ impl State {
     }
 
     fn apply_config(&mut self) {
+        self.management_config.take();
+        if !self.effective_isolation().sandbox.azure.enabled {
+            self.relay.revoke_azure();
+        }
         let mut hub = self.hub.lock().unwrap();
         hub.session_context = self.config.fill(&self.config.steer.session_context);
         hub.external_prefix = self.config.steer.external_prefix.clone();
@@ -1458,11 +1454,6 @@ fn file_fingerprint(file: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
-fn open_path(path: &Path) -> std::io::Result<std::process::Child> {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    std::process::Command::new(opener).arg(path).spawn()
-}
-
 impl Desktop<'_> {
     fn apply_client_events(&mut self, ctx: &egui::Context) {
         if let Some(layout) = self.runtime.restart_layout.take() {
@@ -1521,8 +1512,12 @@ impl Desktop<'_> {
                 ClientEvent::Viewport(command) => ctx.send_viewport_cmd(command),
                 ClientEvent::ShowSettings(open) => self.client.show_settings = Some(open),
                 ClientEvent::VoiceFailed { text, error } => self.voice_failed(&text, &error),
+                ClientEvent::PullRequest(key) => {
+                    self.client.ui.pr_view = Some((key, DiffState::default()));
+                    self.client.ui.pr_target = None;
+                }
                 ClientEvent::Edit { root, path } => {
-                    self.client.focus_editor = true;
+                    self.client.ui.focus_editor = true;
                     if let Some(path) = path {
                         self.client.editor_file.insert(root, path);
                     }
@@ -1533,44 +1528,6 @@ impl Desktop<'_> {
 
     fn sync_diffs(&mut self) {
         self.draw(atomics_ui::diff_panel::sync);
-    }
-
-    /// Load per core, with the pool and queue on hover.
-    fn load_gauge(&mut self, ui: &mut egui::Ui) {
-        if self.client.load.0.elapsed() > Duration::from_secs(2) {
-            self.client.load = (Instant::now(), crate::governor::load_average());
-        }
-        let Some(load) = self.client.load.1 else { return };
-        let p = self.palette();
-        let per_core = load / self.runtime.governor.cores as f64;
-        let color = if per_core >= 1.0 {
-            p.error
-        } else if per_core >= 0.7 {
-            p.warning
-        } else {
-            p.muted
-        };
-        let (running, waiting) = self.runtime.governor.snapshot();
-        let mut hover = format!("Load {load:.1} on {} cores", self.runtime.governor.cores);
-        match &self.runtime.jobserver {
-            Some(jobserver) => hover.push_str(&format!("\nCompilers of all agents share {} jobs", jobserver.tokens())),
-            None => hover.push_str("\nNo shared compiler job pool"),
-        }
-        for class in [SlotClass::Test, SlotClass::Qa] {
-            let busy = running.iter().filter(|t| t.class == class).count();
-            let queued = waiting.iter().filter(|t| t.class == class).count();
-            hover.push_str(&format!(
-                "\n{} slots: {busy}/{} in use, {queued} waiting",
-                class.name(),
-                self.runtime.governor.slots(class)
-            ));
-        }
-        let response = ui.label(RichText::new(format!("load {load:.1}")).color(color).size(12.0)).on_hover_text(hover);
-        topbar::record_item(ui, "load", &response);
-    }
-
-    fn metrics(&self, ui: &egui::Ui) -> Metrics {
-        Metrics::new(ui, &self.palette(), self.runtime.config.font.size)
     }
 
     fn client_logic(&mut self, ctx: &egui::Context) {

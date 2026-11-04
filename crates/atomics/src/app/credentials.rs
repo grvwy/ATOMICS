@@ -1,15 +1,19 @@
 //! Credential I/O belongs to a worker, never the UI/state lock. The client only keeps a masked
 //! edit buffer and value-free status; submitting moves the buffer straight to that worker.
 use super::*;
+#[cfg(test)]
 use crate::credentials::{KINDS, Snapshot, Store};
 
+#[cfg(test)]
 struct StatusView {
     snapshot: Option<Snapshot>,
     lines: Vec<String>,
     azure: String,
 }
+#[cfg(test)]
 type Checked = Result<StatusView, String>;
 
+#[cfg(test)]
 fn write_azure_enabled(file: &Path, enabled: bool) -> Result<(), String> {
     let before = match std::fs::read_to_string(file) {
         Ok(text) => Some(text),
@@ -27,6 +31,7 @@ fn write_azure_enabled(file: &Path, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct CredentialUi {
     selected: usize,
@@ -38,6 +43,7 @@ pub(super) struct CredentialUi {
     pending: Option<Receiver<Checked>>,
 }
 
+#[cfg(test)]
 enum Action {
     Refresh,
     Put(String, Option<String>),
@@ -46,6 +52,7 @@ enum Action {
     Azure { enabled: bool, file: PathBuf },
 }
 
+#[cfg(test)]
 impl CredentialUi {
     fn start(&mut self, relay: Arc<crate::relay::Service>, action: Action, ctx: egui::Context) {
         if self.pending.is_some() {
@@ -212,25 +219,6 @@ impl CredentialUi {
             "Bare Claude can opt in with [isolation] bare_relay = true in config. The chief follows this setting too.",
         );
         action
-    }
-}
-
-impl Desktop<'_> {
-    pub(super) fn credentials_menu(&mut self, ui: &mut egui::Ui) {
-        let mut open = false;
-        ui.menu_button("Credentials", |ui| {
-            open = true;
-            if let Some(action) = self.client.credentials.draw(
-                ui,
-                self.runtime.effective_isolation().sandbox.azure.enabled,
-                &self.runtime.config_path,
-            ) {
-                self.client.credentials.start(self.runtime.relay.clone(), action, ui.ctx().clone());
-            }
-        });
-        if !open {
-            self.client.credentials.value.clear();
-        }
     }
 }
 

@@ -1,4 +1,3 @@
-use super::fleet::Terminals;
 use super::*;
 use atomics_core::heartbeat::{Finding, Kind};
 
@@ -215,25 +214,10 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_doctor",
 ];
 
+#[cfg(test)]
 impl Desktop<'_> {
-    /// The chief's window, docked or floating (`atomics_ui::chief::content`), with the trace lane under the
-    /// terminal while the chief has ticket calls to show. It draws as [`Desktop::draw_terminals`] does, but
-    /// the lane's height reads the model while the window draws.
     pub(super) fn chief_content(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette();
-        self.client.ui.palette = p.clone();
-        let state: &State = self.runtime;
-        let mut terminals = Terminals { sessions: &state.sessions, views: &mut self.client.terminal_views };
-        let lane = atomics_ui::chief::content(ui, &state.backend(), &mut self.client.ui, &mut terminals, |height| {
-            state.lane_height(height)
-        });
-        for command in std::mem::take(&mut self.client.ui.commands) {
-            self.send(command);
-        }
-        if let Some(lane) = lane {
-            self.trace_lane(ui, lane, self.runtime.chief_dock() == ChiefDock::Docked);
-            super::trace_lane::lane_divider(ui, lane, &mut self.runtime.lane.height, &p);
-        }
+        self.draw_terminals(|backend, client, terminals| atomics_ui::chief::draw(ui, backend, client, terminals));
     }
 }
 

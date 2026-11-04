@@ -40,7 +40,24 @@ pub const MAX_CAPABILITIES: usize = 64;
 pub const MAX_ID_BYTES: usize = 1024;
 
 /// Capabilities this implementation can offer in a `welcome`.
-pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", TERMINALS, INPUT, MUTATIONS, HOST];
+pub const CAPABILITIES: &[&str] = &[
+    "board",
+    "plans",
+    "approvals",
+    "diffs",
+    TERMINALS,
+    INPUT,
+    MUTATIONS,
+    HOST,
+    PANELS,
+    EXPLORER,
+    PLAN_COMPLETE,
+    TRACE,
+];
+/// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
+pub const EXPLORER: &str = "explorer";
+/// Completing a plan through the mutation journal.
+pub const PLAN_COMPLETE: &str = "plan_complete";
 /// Screen streaming: `screen` topics, `screen_snapshot`/`screen_delta` and `history_get`.
 pub const TERMINALS: &str = "terminals";
 /// Typing into subscribed screens: the `lease_*` messages, `lease_state`, `terminal_input` and
@@ -49,10 +66,14 @@ pub const INPUT: &str = "input";
 /// Changing things: `approval_decide`, `plan_command`, `review_command` and `session_command`,
 /// each answered by `command_result`. What a client may send is its `welcome`'s `may`.
 pub const MUTATIONS: &str = "mutations";
-/// What the host says about itself (`host_upsert`: the open workspace and the ticket sign-in) and,
+/// What the host says about itself (`host_upsert`: the open workspace, ticket sign-in, account usage and governor load) and,
 /// with `mutations`, `host_command`. A client without it is sent `skipped` in place of `host_upsert`;
 /// every `state_snapshot` carries `host` either way, which an older client ignores.
 pub const HOST: &str = "host";
+/// Host editor PTYs, pull-request diffs and chief lifecycle commands. Requires `host`.
+pub const PANELS: &str = "panels";
+/// Paged chief trace and live revision notifications (`trace` subscription).
+pub const TRACE: &str = "trace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -317,6 +338,11 @@ impl Disposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "topic", rename_all = "snake_case")]
 pub enum Topic {
+    Folder {
+        worktree: String,
+        path: String,
+    },
+    Trace,
     Diff {
         worktree: String,
     },
@@ -334,6 +360,8 @@ impl Topic {
     /// The subscription's identity; `focused` is a hint, not part of it.
     pub fn key(&self) -> String {
         match self {
+            Topic::Folder { worktree, path } => format!("folder:{}:{worktree}:{path}", worktree.len()),
+            Topic::Trace => "trace".into(),
             Topic::Diff { worktree } => format!("diff:{worktree}"),
             Topic::Plan { id } => format!("plan:{id}"),
             Topic::Screen { session, .. } => format!("screen:{session}"),
@@ -355,6 +383,13 @@ pub struct Revisions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Message {
+    FolderGet {
+        worktree: String,
+        path: String,
+        revision: Revision,
+        offset: u32,
+    },
+    FolderPage(crate::folder::Page),
     Hello {
         client_id: String,
         versions: Vec<Version>,
@@ -442,6 +477,17 @@ pub enum Message {
     HostUpsert {
         cursor: Cursor,
         host: HostInfo,
+    },
+    /// Fetch a bounded page, at the revision announced by `trace_changed`.
+    TraceGet {
+        revision: Seq,
+        offset: u32,
+        limit: u32,
+    },
+    TracePage(crate::trace_feed::TracePage),
+    /// Coalesced live notification. Subscribe again after reconnect to learn the current revision.
+    TraceChanged {
+        revision: Seq,
     },
     DiffGet {
         worktree: String,
@@ -545,6 +591,8 @@ pub enum Message {
 }
 
 const KINDS: &[&str] = &[
+    "folder_get",
+    "folder_page",
     "hello",
     "welcome",
     "subscribe",
@@ -560,6 +608,9 @@ const KINDS: &[&str] = &[
     "approval_resolved",
     "diff_summary",
     "host_upsert",
+    "trace_get",
+    "trace_page",
+    "trace_changed",
     "diff_get",
     "diff_file",
     "file_get",
@@ -660,15 +711,49 @@ impl Message {
             Message::Subscribe { topics } | Message::Unsubscribe { topics } => {
                 too_many("topics", topics.len(), MAX_SUBSCRIPTIONS).or_else(|| {
                     topics.iter().find_map(|t| match t {
+                        Topic::Trace => None,
                         Topic::Diff { worktree } => long("worktree", worktree),
                         Topic::Plan { id } => long("plan id", id),
                         Topic::Screen { session, .. } => long("session", session),
+                        Topic::Folder { worktree, path } => {
+                            long("worktree", worktree).or_else(|| long("path", path)).or_else(|| {
+                                (!crate::folder::valid_path(path)).then(|| {
+                                    WireError::new(ErrorCode::Malformed, "folder path must be worktree-relative")
+                                })
+                            })
+                        }
                     })
                 })
+            }
+            Message::FolderGet { worktree, path, .. } => {
+                long("worktree", worktree).or_else(|| long("path", path)).or_else(|| {
+                    (!crate::folder::valid_path(path))
+                        .then(|| WireError::new(ErrorCode::Malformed, "folder path must be worktree-relative"))
+                })
+            }
+            Message::TracePage(page) => {
+                page.data.validate()?;
+                if page.data.entries.len() > crate::trace_feed::MAX_PAGE_ENTRIES
+                    || json_len(page) > crate::trace_feed::MAX_PAGE_BYTES
+                    || page.offset as usize > crate::trace::MAX_ENTRIES
+                    || page.next_offset.is_some_and(|next| {
+                        next != page.offset + page.data.entries.len() as u32
+                            || next as usize > crate::trace::MAX_ENTRIES
+                            || page.data.entries.is_empty()
+                    })
+                {
+                    Some(WireError::new(ErrorCode::Malformed, "invalid trace page"))
+                } else {
+                    None
+                }
             }
             Message::DiffGet { worktree, path, .. } | Message::FileGet { worktree, path } => {
                 long("worktree", worktree).or_else(|| long("path", path))
             }
+            Message::FolderPage(page) => too_many("folder entries", page.entries.len(), crate::folder::PAGE_ENTRIES)
+                .or_else(|| long("worktree", &page.worktree))
+                .or_else(|| long("path", &page.path))
+                .or_else(|| page.entries.iter().find_map(|entry| long("entry path", &entry.path))),
             Message::StateSnapshot { part: Some(part), .. } => (part.count == 0 || part.index >= part.count)
                 .then(|| WireError::new(ErrorCode::Malformed, "a snapshot part is out of range")),
             Message::Resync { reason, screens } => too_many("screens", screens.len(), MAX_SUBSCRIPTIONS)

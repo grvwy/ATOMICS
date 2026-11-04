@@ -393,6 +393,10 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             return;
         }
         if let Some(path) = pick {
+            if backend.paged_folders() {
+                client.send(Command::ShowRoot(path));
+                return;
+            }
             match sessions.iter().find(|s| s.root == path).map(|s| s.id.clone()) {
                 Some(id) => client.send(Command::Activate { session: id, open_diff: true }),
                 None => client.send(Command::ShowRoot(path)),
@@ -404,6 +408,10 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if review != project {
         let name = review.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         ui.label(RichText::new(format!("changes from {name}")).color(p.accent).size(11.0));
+    }
+    if backend.paged_folders() {
+        folder_panel(ui, backend, client, &project, &review, can_open);
+        return;
     }
     let main = backend.diff(&project).and_then(|d| d.prepared);
     let changes = backend.diff(&review).and_then(|d| d.prepared);
@@ -422,5 +430,75 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         && can_open
     {
         client.send(Command::OpenFile { root: review, path });
+    }
+}
+
+/// A folder feed uses the same explorer in every remote client. Only folders on screen are followed;
+/// opening a child releases the previous listing, and another page is fetched only on request.
+fn folder_panel(
+    ui: &mut egui::Ui,
+    backend: &dyn Backend,
+    client: &mut Client,
+    project: &std::path::Path,
+    root: &std::path::Path,
+    can_open: bool,
+) {
+    let p = client.palette.clone();
+    let touch = client.touch;
+    let explorer = client.explorers.entry(project.to_path_buf()).or_default();
+    ui.horizontal_wrapped(|ui| {
+        if !explorer.folder.is_empty() && crate::touch::small_button(ui, touch, "↑ Parent folder").clicked() {
+            explorer.folder = explorer.folder.rsplit_once('/').map_or(String::new(), |(parent, _)| parent.into());
+        }
+        ui.label(if explorer.folder.is_empty() { "/" } else { &explorer.folder });
+    });
+    ui.add(
+        egui::TextEdit::singleline(&mut explorer.filter).hint_text("Filter files").desired_width(ui.available_width()),
+    );
+    let path = explorer.folder.clone();
+    let snapshot = backend.folder(root, &path);
+    let changed = backend.diff(root).and_then(|diff| diff.prepared);
+    let mut open = None;
+    egui::ScrollArea::vertical().id_salt(("folder-files", root, &path)).auto_shrink([false, false]).show(ui, |ui| {
+        for entry in &snapshot.entries {
+            let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+            if !explorer.filter.is_empty() && !name.to_lowercase().contains(&explorer.filter.to_lowercase()) {
+                continue;
+            }
+            let changed = changed.as_ref().is_some_and(|diff| diff.diff.files.iter().any(|f| f.path() == entry.path));
+            let label = if entry.directory { format!("▸ {name}/") } else { name.into() };
+            let color = if changed { p.accent } else { p.foreground };
+            if ui
+                .add(crate::touch::sized(
+                    egui::Button::selectable(false, RichText::new(label).color(color)).truncate(),
+                    touch,
+                ))
+                .clicked()
+            {
+                if entry.directory {
+                    explorer.folder = entry.path.clone();
+                } else if can_open {
+                    open = Some(entry.path.clone());
+                }
+            }
+        }
+        if snapshot.loading {
+            ui.label("Reading files…");
+        }
+        if let Some(error) = &snapshot.error {
+            ui.label(RichText::new(error).color(p.warning));
+        }
+        if !snapshot.first && crate::touch::small_button(ui, touch, "First page").clicked() {
+            backend.first_folder(root, &path);
+        }
+        if snapshot.more && !snapshot.loading && crate::touch::small_button(ui, touch, "Next files").clicked() {
+            backend.more_folder(root, &path);
+        }
+        if snapshot.entries.is_empty() && !snapshot.loading && snapshot.error.is_none() {
+            ui.label("No files in this folder");
+        }
+    });
+    if let Some(path) = open {
+        client.send(Command::OpenFile { root: root.to_path_buf(), path });
     }
 }

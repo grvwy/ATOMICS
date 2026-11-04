@@ -2,6 +2,8 @@
 use super::*;
 use atomics_core::trace::{self, TraceLog};
 
+const MAX_TRACE_JOBS: usize = 64;
+
 /// Raw events stay in memory until the worker has read the current token heads. Neither disk
 /// persistence nor rendering can observe an event cleaned with stale credentials.
 pub(super) enum TraceAction {
@@ -22,7 +24,35 @@ pub(super) enum TraceAction {
 }
 
 impl State {
+    pub(super) fn trace_data(&self) -> atomics_core::trace_feed::TraceData {
+        use atomics_core::trace_feed::{MAX_STATES, TraceData};
+        let session = self.chief_session_id().map(str::to_string);
+        let entries = session
+            .as_ref()
+            .and_then(|id| self.traces.get(id))
+            .map(|log| log.entries.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut states = std::collections::BTreeMap::new();
+        if let Some(config) = self.ticket_config() {
+            for name in entries.iter().flat_map(|e| &e.cards).filter_map(|c| c.link.state.as_ref()) {
+                if states.len() < MAX_STATES
+                    && name.len() <= 300
+                    && let Some(status) = config.states.status_of(name)
+                {
+                    states.insert(name.clone(), status);
+                }
+            }
+        }
+        TraceData { session, entries, states }
+    }
+
     fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
+        if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
+            if let TraceAction::Respond { reply, .. } = action {
+                let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Trace is busy; try again")));
+            }
+            return;
+        }
         let seq = self.tickets.next_trace_job;
         self.tickets.next_trace_job += 1;
         self.tickets.trace_jobs.insert(seq, (config.clone(), action));
@@ -90,6 +120,7 @@ impl State {
                 }
             }
         }
+        self.traces.clear();
         self.traces.insert(id.into(), log);
     }
 
@@ -224,6 +255,22 @@ impl State {
 mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
+
+    #[test]
+    fn trace_credential_backlog_is_bounded_and_refuses_extra_readers() {
+        with_app("app::trace::tests::trace_credential_backlog_is_bounded_and_refuses_extra_readers", |app, _| {
+            let config = Arc::new(atomics_core::tickets::TicketConfig::default());
+            for seq in 0..MAX_TRACE_JOBS as u64 {
+                app.runtime.tickets.trace_jobs.insert(seq, (config.clone(), TraceAction::Load(seq.to_string())));
+            }
+            let (reply, response) = channel();
+            app.runtime.queue_trace(config.clone(), TraceAction::Respond { reference: None, limit: None, reply });
+            let ControlOutcome::Done(response) = response.recv().unwrap() else { panic!("expected a refusal") };
+            assert!(!response.ok);
+            app.runtime.queue_trace(config, TraceAction::Load("new-chief".into()));
+            assert_eq!(app.runtime.tickets.trace_jobs.len(), MAX_TRACE_JOBS);
+        });
+    }
 
     #[test]
     fn a_refreshed_token_is_redacted_before_the_trace_is_shown_or_saved() {

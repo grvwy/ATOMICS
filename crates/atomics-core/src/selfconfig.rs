@@ -601,6 +601,28 @@ pub fn picks_theme(text: &str) -> bool {
     lookup(&table, &["theme", "name"]).or_else(|| lookup(&table, &["theme", "preset"])).is_some()
 }
 
+/// A reviewable diff with all credential-bearing values masked before diffing. Comments and
+/// unrelated file context stay on the host; clients review the actual changed keys and values.
+pub fn public_diff(proposal: &Proposal, cleaner: &Cleaner) -> String {
+    let safe = |text: &str| {
+        let table = toml::from_str::<toml::Table>(text).unwrap_or_default();
+        let mut leaves = Vec::new();
+        collect_leaves(&table, &mut Vec::new(), &mut leaves);
+        leaves
+            .into_iter()
+            .map(|(path, value)| {
+                let value = if path == ["voice", "api_key"] {
+                    Value::String(MASKED.into())
+                } else {
+                    masked(&path, serde_json::to_value(value).unwrap_or_default())
+                };
+                format!("{} = {}\n", key(&path), cleaner.setting(value))
+            })
+            .collect::<String>()
+    };
+    unified_diff(&proposal.file, &safe(proposal.before.as_deref().unwrap_or("")), &safe(&proposal.after))
+}
+
 fn unified_diff(file: &str, before: &str, after: &str) -> String {
     similar::TextDiff::from_lines(before, after).unified_diff().context_radius(3).header(file, file).to_string()
 }

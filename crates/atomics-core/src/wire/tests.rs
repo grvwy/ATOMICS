@@ -22,7 +22,19 @@ fn session() -> SessionInfo {
 fn host() -> crate::projection::HostInfo {
     use crate::projection::{HostInfo, SignInInfo, SignInState};
     HostInfo {
+        projects: Vec::new(),
+        resources: Some(crate::projection::ResourceInfo {
+            claude: crate::usage::Usage {
+                observed_at: 100,
+                session: Some(crate::usage::Window { remaining: 76.5, resets_at: 200 }),
+                ..Default::default()
+            },
+            load: Some(4.2),
+            cores: 8,
+            ..Default::default()
+        }),
         workspace: Some("team".into()),
+        tickets: None,
         workspaces: vec!["daily".into(), "team".into()],
         sign_in: Some(SignInInfo {
             system: "tracker".into(),
@@ -33,11 +45,13 @@ fn host() -> crate::projection::HostInfo {
             rejected: None,
             browser_failed: true,
         }),
+        ..HostInfo::default()
     }
 }
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        ticket_tree: None,
         id: "p".into(),
         status: PlanStatus::Open,
         goal: "ship".into(),
@@ -181,6 +195,15 @@ fn every_message() -> Vec<Message> {
             may: vec![],
         },
         Message::Subscribe { topics: topics.clone() },
+        Message::FolderGet { worktree: "/w/a".into(), path: "src".into(), revision: Seq(1), offset: 128 },
+        Message::FolderPage(crate::folder::Page {
+            worktree: "/w/a".into(),
+            path: "src".into(),
+            revision: Seq(1),
+            offset: 0,
+            entries: vec![crate::folder::Entry { path: "src/a.rs".into(), directory: false }],
+            next_offset: None,
+        }),
         Message::Unsubscribe { topics },
         Message::StateSnapshot {
             cursor: Seq(3),
@@ -322,6 +345,14 @@ fn every_message() -> Vec<Message> {
         Message::CommandResult(crate::ops::CommandResult {
             op: "o7".into(),
             outcome: crate::ops::Outcome::Uncertain { message: "the host stopped".into() },
+        }),
+        Message::TraceChanged { revision: Seq(1) },
+        Message::TraceGet { revision: Seq(1), offset: 0, limit: 32 },
+        Message::TracePage(crate::trace_feed::TracePage {
+            revision: Seq(1),
+            offset: 0,
+            data: Default::default(),
+            next_offset: None,
         }),
         Message::Ack { cursor: Seq(11) },
         Message::Resync { reason: Some("gap".into()), screens: vec![] },

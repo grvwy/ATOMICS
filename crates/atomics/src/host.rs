@@ -56,7 +56,7 @@ pub(crate) struct RemoteView {
 impl Host {
     pub(crate) fn start(mut state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
         let projections = Arc::new(Projections::default());
-        let bodies = Arc::new(DiffBodies::default());
+        let bodies = Arc::new(DiffBodies::with_wake(wake.clone()));
         let remote = state.remote_access();
         let ownership =
             if remote.enabled { remote_lock(&atomics_core::paths::atomics_home()).map(Some) } else { Ok(None) };
@@ -100,6 +100,7 @@ impl Host {
                 while !stop.load(Ordering::Acquire) {
                     let (deadline, flush) = {
                         let mut state = runtime.lock().unwrap();
+                        bodies.refresh_folders(&mut state);
                         let window = state.window().clone();
                         if state.runtime_tick() {
                             window.request_repaint();

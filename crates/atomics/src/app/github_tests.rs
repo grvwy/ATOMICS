@@ -374,7 +374,7 @@ fn github_pull_request_diff_loads_read_only_into_the_diff_viewer() {
         assert!(texts.iter().any(|t| t == "feature-7 → main · sha-7"), "the head the diff was loaded at");
         assert_eq!(app.runtime.github.pr_diff.as_ref().unwrap().head_sha.as_deref(), Some("sha-7"));
         assert!(texts.iter().any(|t| t.contains("new line from 7")), "the diff's lines are drawn");
-        let state = &app.client.github.pr_view.as_ref().unwrap().1;
+        let state = &app.client.ui.pr_view.as_ref().unwrap().1;
         assert_eq!(state.prepared.as_ref().unwrap().diff.files.len(), 2);
         let mut diffs_after: Vec<PathBuf> = app.runtime.diffs.keys().cloned().collect();
         diffs_after.retain(|path| !diffs_before.contains(path));
@@ -384,7 +384,7 @@ fn github_pull_request_diff_loads_read_only_into_the_diff_viewer() {
         app.runtime.active = None;
         app.runtime.diff_root = Some(root.clone());
         draw(app);
-        assert!(app.runtime.github.pr_diff.is_none() && app.client.github.pr_view.is_none());
+        assert!(app.runtime.github.pr_diff.is_none() && app.client.ui.pr_view.is_none());
     });
 }
 
@@ -898,8 +898,7 @@ fn github_pull_request_diff_takes_the_diff_keys() {
             app.diff_panel(ui, Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0)));
         })
         .drop_without_applying_deltas();
-        let focused =
-            |app: &Desktop<'_>| app.client.github.pr_view.as_ref().and_then(|(_, state)| state.focused.clone());
+        let focused = |app: &Desktop<'_>| app.client.ui.pr_view.as_ref().and_then(|(_, state)| state.focused.clone());
         for expected in ["README.md", "src/pr7.rs", "src/pr7.rs"] {
             assert!(route(app, ctx, vec![key(Key::ArrowDown, egui::Modifiers::SHIFT)]).is_empty());
             assert_eq!(focused(app).as_deref(), Some(expected));
@@ -1057,6 +1056,43 @@ fn azure_devops_lists_assigned_and_own_pull_requests_first_and_folds_the_rest() 
             let texts = show(app, ctx);
             assert!(texts.iter().any(|(text, _)| text.contains("run az login")), "{texts:?}");
             assert!(has(&texts, "Check again") && !has(&texts, "Connect GitHub"), "{texts:?}");
+        },
+    );
+}
+
+#[test]
+fn remote_pull_request_fetches_keep_the_native_selection_and_publish_paged_diffs() {
+    with_app(
+        "app::github::tests::remote_pull_request_fetches_keep_the_native_selection_and_publish_paged_diffs",
+        |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let fake = FakeGithub::start(TOKEN);
+            pulls(&fake);
+            connect_to(app, &fake, dir.path());
+            store(app).put_github_app("github.com", TOKEN).unwrap();
+            poll(app);
+            let pull = app
+                .runtime
+                .github
+                .rows(atomics_core::github::Filter::All)
+                .into_iter()
+                .find(|r| r.pull.number == 7)
+                .unwrap()
+                .pull;
+            app.runtime.github_view_diff(repo(), &pull);
+            let key = pr_key(&repo(), 8);
+            assert!(app.runtime.load_pull_request(&key));
+            settle(app, "both cached diffs", |app| app.runtime.pull_request_bodies().count() == 2);
+            assert_eq!(app.runtime.github.pr_diff.as_ref().unwrap().number, 7);
+            let host = app.runtime.host_info();
+            assert!(host.pull_requests.iter().any(|p| p.key == key && p.head_sha.as_deref() == Some("sha-8")));
+            let projections = atomics_core::projection::Projections::default();
+            let bodies = super::super::projection::DiffBodies::default();
+            app.runtime.publish_projections(&projections, &mut Default::default(), &bodies);
+            assert!(projections.diffs.load().data.iter().any(|d| d.worktree == key && !d.files.is_empty()));
+            use crate::protocol::DiffSource;
+            assert!(bodies.file(&key, "src/pr8.rs").is_some());
+            assert!(!app.runtime.load_pull_request("pull:unknown/repo#99"));
         },
     );
 }

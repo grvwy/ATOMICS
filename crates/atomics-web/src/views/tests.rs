@@ -93,6 +93,77 @@ fn live_with(host: fake_host::FakeHost) -> (egui::Context, World, Client, View) 
     (egui::Context::default(), world, Client::default(), View::default())
 }
 
+#[test]
+fn explorer_opens_worktree_folders_changed_files_and_whole_files_in_both_layouts() {
+    for size in [BOARD, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::explorer());
+        view.tab = Tab::Agents;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        for label in ["EXPLORER", "All ·", "Repos", "Steer", "Send", "+ New"] {
+            assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
+        }
+        assert!(has(&shown, "README.md"));
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "README.md");
+        assert!(has(&shown, "A project readme"), "unchanged files open whole: {shown:?}");
+        assert_eq!(view.desk.diff_target(&world.driver.remote), Some(PathBuf::from(WORKTREE)));
+        if view.compact {
+            assert_eq!(view.tab, Tab::Diffs);
+            view.tab = Tab::Agents;
+        }
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "▸ src/");
+        assert!(has(&shown, "a.rs") && has(&shown, "unchanged.rs"), "{shown:?}");
+        click_on(&ctx, &mut world, &mut client, &mut view, size, "a.rs");
+        let diff = client.diff_views.get(Path::new(WORKTREE)).unwrap();
+        assert!(diff.viewing.is_none(), "changed files open at their hunks");
+        assert_eq!(view.desk.panel, PanelMode::Diff);
+        assert!(world.sent().iter().any(
+            |m| matches!(m, Message::DiffGet { worktree, path, .. } if worktree == WORKTREE && path == "src/a.rs")
+        ));
+        if view.compact {
+            view.tab = Tab::Agents;
+        }
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "↑ Parent folder");
+        assert!(has(&shown, "README.md"), "parent folder: {shown:?}");
+        click_on(&ctx, &mut world, &mut client, &mut view, size, "▸ worktrees");
+        click_on(&ctx, &mut world, &mut client, &mut view, size, "main checkout");
+        assert_eq!(view.desk.diff_target(&world.driver.remote), Some(PathBuf::from("/w/repo")));
+        if view.compact {
+            assert_eq!(view.tab, Tab::Agents, "picking a worktree keeps its files in reach");
+        }
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "README.md"));
+    }
+}
+
+#[test]
+fn phone_filters_steering_start_and_completion_work() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::explorer());
+    view.tab = Tab::Agents;
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "All ·");
+    assert!(!view.desk.plan_view && view.desk.project.is_none());
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Repos");
+    let other = menu.iter().find(|(text, _)| text.starts_with("other · 0 sessions")).unwrap().1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(other));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.desk.project, Some(PathBuf::from("/w/other")));
+    assert!(world.driver.remote.visible_sessions().is_empty());
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "All ·");
+    assert_eq!(world.driver.remote.visible_sessions().len(), 1);
+    client.steer_text = "Continue the review".into();
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Send");
+    assert_eq!(world.host.steered.last(), Some(&("s1".into(), "Continue the review".into())));
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "+ New");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "New session"), "{shown:?}");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Start");
+    assert_eq!(world.host.board.sessions.len(), 3);
+    view.tab = Tab::Board;
+    client.send(Command::ShowPlan(0));
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Close plan…");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Complete plan");
+    assert_eq!(world.host.board.plans[0].status, PlanStatus::Completed);
+}
+
 fn has(shown: &[(String, Rect)], label: &str) -> bool {
     shown.iter().any(|(text, _)| text.starts_with(label))
 }
@@ -365,7 +436,9 @@ fn a_boards_ticket_keys_show_in_either_layout_and_offer_nothing() {
 
 #[test]
 fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
-    let (ctx, mut world, mut client, mut view) = live();
+    let mut host = fake_host::management();
+    host.trace = fake_host::trace_data();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
     let mut text = Vec::new();
     for _ in 0..3 {
         text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
@@ -383,6 +456,7 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "Connected",
         "⋯",
         "◆ CHIEF AGENT",
+        "TRACE",
         "float",
         "minimize",
         "Fix the parser",
@@ -396,12 +470,14 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "Send",
         "×",
         "Close plan…",
+        "Settings",
+        "Remote",
+        "Project",
     ] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
-    for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {
-        assert!(!has(host_only), "{host_only} is the host's: {text:?}");
-    }
+    // At this width the sidebar yields to the chief and diff; the wider parity test covers USAGE.
+    assert!(has("load 4.2"), "{text:?}");
     assert!(!has("Workspace") && !has("No workspace"), "the host has no workspace to pick: {text:?}");
     assert!(!text.iter().any(|t| t.contains("focuses")), "a page has no chord to focus it: {text:?}");
     // Both terminals are followed, the agent's (the active session) with the page's input over it.
@@ -996,7 +1072,7 @@ fn closing_a_plan_offers_what_atomics_v1_has_and_the_page_moves_on() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Close plan…");
     assert!(has(&shown, "Close “Parse faster”? You can view it from History"), "{shown:?}");
-    assert!(has(&shown, "Archive plan") && !has(&shown, "Complete plan"), "atomics.v1 has no complete: {shown:?}");
+    assert!(has(&shown, "Archive plan") && has(&shown, "Complete plan"), "atomics.v1 offers both ways: {shown:?}");
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Cancel");
     assert!(!has(&shown, "Archive plan"), "{shown:?}");
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Open);
@@ -1628,21 +1704,28 @@ fn the_picker_starts_an_agent_on_the_ungrouped_tab() {
 
 #[test]
 fn a_hosts_empty_frame_offers_what_the_browser_does() {
-    // No chief and none to start; no agent the mirror can name, so nothing to start: a welcome that promises
-    // only what the browser does.
+    // The host can start its chief without a mirrored agent. The welcome offers no other agent
+    // until the mirror names one.
     let mut host = fake_host::host();
     host.board.sessions.clear();
     host.board.approvals.clear();
     host.board.plans.clear();
     let (ctx, mut world, mut client, mut view) = live_with(host);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "CHIEF") && !has(&shown, "start"), "{shown:?}");
+    assert!(has(&shown, "CHIEF") && has(&shown, "start"), "{shown:?}");
     assert!(!has(&shown, "+ New") && !has(&shown, "Start "), "the mirror names no agent: {shown:?}");
     assert!(has(&shown, "AGENTS") && !has(&shown, "EXPLORER"), "no projects, no way to open one: {shown:?}");
     let text: String = shown.iter().map(|(text, _)| text.as_str()).collect();
     assert!(!text.contains("scratch folder"), "nothing to start, nowhere to say it starts: {text}");
     assert!(text.contains("No agents yet.") && !text.contains("+ New"), "{text}");
     assert!(text.contains("worktree's diff against main") && text.contains("Comment on any line"), "{text}");
+
+    client.send(Command::ToggleChief);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(world.driver.remote.session_list().iter().any(|s| s.chief));
+    assert!(
+        world.sent().iter().any(|m| matches!(m, Message::HostCommand(c) if matches!(c.action, HostAction::StartChief)))
+    );
 
     // A plan's agent is one the mirror can name; the empty tab offers to start it, in a scratch folder.
     let mut host = fake_host::host();
@@ -1725,7 +1808,7 @@ fn a_phones_board_acts_and_its_dialogs_ask() {
     assert_eq!(world.host.board.plans[0].tasks[2].status, TaskStatus::Running);
 
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Close plan…");
-    assert!(has(&shown, "Archive plan") && !has(&shown, "Complete plan"), "{shown:?}");
+    assert!(has(&shown, "Archive plan") && has(&shown, "Complete plan"), "{shown:?}");
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Archive plan");
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Archived);
 
@@ -1747,13 +1830,13 @@ fn a_phones_board_acts_and_its_dialogs_ask() {
     assert!(!world.host.board.sessions.iter().any(|s| s.id == "s1"));
     assert!(view.picker.is_none());
 
-    // Its AGENTS list offers no steering: there is no bar to steer from.
+    // Its AGENTS list offers selecting sessions for the steer bar.
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
     view.tab = Tab::Agents;
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, right_click(on(&shown, "Fix the parser")));
     let menu = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
-    assert!(has(&menu, "Close") && !has(&menu, "Include in"), "{menu:?}");
+    assert!(has(&menu, "Close") && has(&menu, "Include in"), "{menu:?}");
 }
 
 #[test]
@@ -1782,7 +1865,10 @@ fn headless_shots() {
     let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&dir).unwrap();
     // The last ones over a host whose ticket system needs the user to sign in again.
-    let shots: [(&str, (f32, f32), Tab, bool); 10] = [
+    let shots: [(&str, (f32, f32), Tab, bool); 13] = [
+        ("wide-2800-explorer", BOARD, Tab::Agents, false),
+        ("phone-390-explorer", PHONE, Tab::Agents, false),
+        ("phone-360-explorer", (360.0, 780.0), Tab::Agents, false),
         ("wide-1600", WIDE, Tab::Board, false),
         ("wide-1100", (1100.0, 800.0), Tab::Board, false),
         ("wide-700", (700.0, 800.0), Tab::Board, false),
@@ -1795,8 +1881,13 @@ fn headless_shots() {
         ("phone-390-reconnect", PHONE, Tab::Board, true),
     ];
     for (name, (width, height), tab, reconnect) in shots {
-        let (ctx, mut world, mut client, mut view) =
-            if reconnect { live_with(fake_host::tickets(SignInState::Expired)) } else { live() };
+        let (ctx, mut world, mut client, mut view) = if name.contains("explorer") {
+            live_with(fake_host::explorer())
+        } else if reconnect {
+            live_with(fake_host::tickets(SignInState::Expired))
+        } else {
+            live()
+        };
         view.tab = tab;
         let mut raster = crate::test_raster::Raster::default();
         let mut last = None;
@@ -2121,8 +2212,382 @@ fn a_host_that_does_not_offer_its_own_state_leaves_the_page_as_it_was() {
     let mirror = world.driver.remote.with_mirror(|m| (m.host.clone(), m.cursor));
     assert_eq!(mirror, (HostInfo::default(), world.host.head()), "the cursor moves on, and nothing else");
     assert!(!world.sent().iter().any(|m| matches!(m, Message::Resync { .. })), "no gap");
-    for absent in ["tracker", "Sign in", "Reconnect", "Project", "Workspace", "No workspace"] {
+    for absent in ["tracker", "Sign in", "Reconnect", "Project", "Workspace", "No workspace", "USAGE", "load "] {
         assert!(!has(&shown, absent), "{absent} shows: {shown:?}");
     }
     assert!(has(&shown, "PLAN") && has(&shown, "Approve plan"), "the rest as before: {shown:?}");
+}
+
+#[test]
+fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Effective configuration") && has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
+        client.management.settings = false;
+        client.management.remote = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Pair a device")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "https://example.com/pair#single-use"), "{size:?}: {shown:?}");
+        assert!(
+            world.sent().iter().any(|m| matches!(m, Message::HostCommand(c) if c.action == HostAction::PairDevice))
+        );
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Cancel pairing")));
+        client.management.remote = false;
+        client.send(Command::PickProject);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Choose a folder on the host."), "{size:?}: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "▸ repo")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Open this project or worktree")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!client.management.project);
+        assert!(world.sent().iter().any(|m| matches!(m, Message::HostCommand(c) if c.action == (HostAction::OpenProject { path: "/home/user/repo".into() }))));
+        assert!(world.driver.remote.repos().contains(&PathBuf::from("/home/user/repo")));
+    }
+}
+
+#[test]
+fn view_only_clients_read_settings_and_devices_but_cannot_change_them() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = viewing(fake_host::management());
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(
+            has(&shown, "Effective configuration") && has(&shown, "View only: settings changes"),
+            "{size:?}: {shown:?}"
+        );
+        client.management.settings = false;
+        client.management.remote = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "View only: pairing") && has(&shown, "Paired devices"), "{size:?}: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Pair a device")));
+        assert!(
+            world.sent().iter().all(|m| !matches!(m, Message::HostCommand(_))),
+            "a disabled action must send nothing"
+        );
+        assert!(!world.driver.remote.available(&Command::PickProject));
+    }
+}
+
+#[test]
+fn applied_host_themes_reach_both_client_layouts() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let mut host = world.host.board.host.clone();
+        host.management.as_mut().unwrap().config["theme_tokens"] =
+            serde_json::to_value(atomics_core::theme::builtin("paper").unwrap()).unwrap();
+        let frames = world.host.publish_host(host);
+        world.deliver(frames);
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert_eq!(client.palette.mode, ThemeMode::Light, "{size:?}");
+    }
+}
+
+#[test]
+fn trace_lane_draws_and_navigates_in_the_desktop_frame_and_phone_chief() {
+    let mut host = fake_host::host();
+    host.trace = fake_host::trace_data();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    for size in [WIDE, PHONE] {
+        if size == PHONE {
+            view.tab = Tab::Chief;
+        }
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let text = shown.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("TRACE") && text.contains("2 calls") && text.contains("search") && text.contains("open ↗"),
+            "{text}"
+        );
+        assert!(!text.contains("hidden-secret"));
+        ctx.memory_mut(|m| m.request_focus(atomics_ui::trace_lane::focus_id()));
+        let key =
+            |key, modifiers| egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers };
+        drawn(&ctx, &mut world, &mut client, &mut view, size, vec![key(egui::Key::ArrowDown, egui::Modifiers::SHIFT)]);
+        assert_eq!(client.lane.selected, Some(1));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(client.lane.expanded.contains(&1));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert!(!ctx.memory(|m| m.has_focus(atomics_ui::trace_lane::focus_id())));
+        client.lane.selected = None;
+        client.lane.expanded.clear();
+    }
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let open = on(&shown, "open ↗");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(open));
+    let preview = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(preview.iter().any(|(text, _)| text == "Example ticket"));
+    let messages = world.host.publish_trace(Default::default());
+    world.deliver(messages);
+    assert!(world.driver.remote.trace().entries.is_empty());
+    let text = sized(&ctx, &mut world, &mut client, &mut view, PHONE, Vec::new());
+    assert!(!text.iter().any(|t| t.starts_with("TRACE")));
+}
+
+#[test]
+fn usage_and_load_reach_the_wide_frame_and_the_phones_overflow_and_update_live() {
+    for size in [BOARD, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live();
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = if size == PHONE {
+            assert!(!has(&shown, "USAGE") && !has(&shown, "load "), "under overflow: {shown:?}");
+            click_on(&ctx, &mut world, &mut client, &mut view, size, "⋯")
+        } else {
+            shown
+        };
+        for label in [
+            "USAGE",
+            "Claude",
+            "Codex",
+            "Session  76%",
+            "Session  9%",
+            "Weekly  24%",
+            "Weekly  100%",
+            "2m ago",
+            "load 4.2",
+        ] {
+            assert!(has(&shown, label), "{size:?}: {label} missing: {shown:?}");
+        }
+        if size == PHONE {
+            for label in [
+                "Load 4.2 on 8 cores",
+                "Compilers of all agents share 6 jobs",
+                "test slots: 1/2 in use, 3 waiting",
+                "qa slots: 0/1 in use, 1 waiting",
+            ] {
+                assert!(shown.iter().any(|(text, _)| text.contains(label)), "{label} missing: {shown:?}");
+            }
+        }
+        let mut host = world.host.board.host.clone();
+        let resources = host.resources.as_mut().unwrap();
+        resources.load = Some(7.3);
+        resources.claude.session.as_mut().unwrap().remaining = 53.0;
+        resources.test.waiting = 0;
+        resources.sampled_at += 120;
+        let frames = world.host.publish_host(host);
+        world.deliver(frames);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Session  53%") && has(&shown, "4m ago") && has(&shown, "load 7.3"), "{size:?}: {shown:?}");
+        assert!(world.host.host_commands.is_empty(), "read-only displays");
+    }
+}
+
+#[test]
+fn an_older_host_without_resources_draws_neither_usage_nor_load() {
+    let mut host = fake_host::host();
+    host.board.host.resources = None;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(!has(&shown, "USAGE") && !has(&shown, "load "));
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    assert!(!has(&menu, "USAGE") && !has(&menu, "load "));
+}
+
+#[test]
+fn host_resources_explorer_and_trace_share_the_wide_frame() {
+    let mut host = fake_host::explorer();
+    host.trace = fake_host::trace_data();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    for label in ["USAGE", "Session  76%", "load 4.2", "TRACE", "2 calls", "EXPLORER", "README.md", "All ·", "Repos"] {
+        assert!(has(&shown, label), "{label} missing from the shared frame: {shown:?}");
+    }
+}
+
+#[test]
+fn host_panels_draw_in_both_layouts_and_editor_input_uses_its_own_terminal() {
+    for size in [BOARD, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::panels_host());
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        client.send(Command::Edit { root: WORKTREE.into(), path: Some("src/a.rs".into()), line: None });
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "EDITOR"), "{size:?}: {shown:?}");
+        if !view.compact {
+            for label in ["USAGE", "Session  76%", "load 4.2", "TRACE"] {
+                assert!(has(&shown, label), "{label} must coexist with the editor: {shown:?}");
+            }
+        }
+        let editor = atomics_core::projection::editor_terminal(WORKTREE);
+        assert!(world.host.terminals[&editor].followed);
+        assert_eq!(view.term.session(), Some(editor.as_str()));
+        // Type only after a focus gesture and the lease, as the browser overlay does.
+        view.term.inputs.push(term_pane::TermInput::Focus(true));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(view.term.typing());
+        view.term.inputs.push(term_pane::TermInput::Text("editor-only".into()));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(world.host.terminals[&editor].typed.contains("editor-only"));
+        assert!(!world.host.terminals["s1"].typed.contains("editor-only"));
+        client.send(Command::SetPanel(PanelMode::Diff));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        for key in ["pull:example/repo#7", "pull:dev.azure.com/org/project/repo#8"] {
+            client.pr_target = None;
+            client.pr_view = Some((key.into(), Default::default()));
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(
+                has(&shown, "Review the parser") || shown.iter().any(|(s, _)| s.contains("Review the parser")),
+                "{size:?}: {shown:?}"
+            );
+            assert!(client.pr_view.as_ref().unwrap().1.prepared.is_some());
+            assert!(!has(&shown, "Send review") && !has(&shown, "editor"), "a PR is read-only: {shown:?}");
+        }
+        client.pr_view = None;
+        if view.compact {
+            view.tab = Tab::Chief;
+        }
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "TRACE") && has(&shown, "example: lookup"), "{size:?}: {shown:?}");
+        if !view.compact {
+            client.send(Command::SetChiefDock(atomics_core::config::ChiefDock::Floating));
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(has(&shown, "TRACE") && has(&shown, "dock"), "the floating chief: {shown:?}");
+        }
+    }
+}
+
+#[test]
+fn settings_tickets_resources_trace_explorer_and_panels_share_one_host() {
+    let mut host = fake_host::panels_host();
+    let explorer = fake_host::explorer();
+    host.board.host.projects = explorer.board.host.projects;
+    host.listings = explorer.listings;
+    host.contents = explorer.contents;
+    host.board.host.management = fake_host::management().board.host.management;
+    host.board.host.tickets = fake_host::ticket_reader().board.host.tickets;
+    host.board.plans[0].ticket_tree = Some(atomics_core::ticket_ui::TicketTree {
+        plan: host.board.plans[0].id.clone(),
+        ticket: Some(fake_host::ticket_card("ENG-40").link),
+        tasks: vec![fake_host::ticket_card("ENG-41").link],
+        unassigned: vec![fake_host::ticket_card("ENG-123").link],
+    });
+    host.trace = fake_host::trace_data();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    for label in
+        ["Settings", "Remote", "Project", "USAGE", "load 4.2", "TRACE", "EXPLORER", "README.md", "TICKETS", "Tickets"]
+    {
+        assert!(has(&shown, label), "{label} missing from the combined frame: {shown:?}");
+    }
+    client.management.settings = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(has(&shown, "Effective configuration"));
+    client.management.settings = false;
+    client.send(Command::OpenTicket(fake_host::ticket_card("ENG-123").link));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    for label in ["Open in browser", "Plan with chief", "USAGE", "TRACE", "EXPLORER", "TICKETS"] {
+        assert!(has(&shown, label), "{label} remains available with the ticket reader: {shown:?}");
+    }
+    client.send(Command::Edit { root: WORKTREE.into(), path: Some("src/a.rs".into()), line: None });
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(has(&shown, "EDITOR"), "the editor remains available: {shown:?}");
+    client.send(Command::SetPanel(PanelMode::Diff));
+    client.pr_view = Some(("pull:example/repo#7".into(), Default::default()));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(
+        shown.iter().any(|(text, _)| text.contains("Review the parser")),
+        "the PR panel remains available: {shown:?}"
+    );
+}
+
+#[test]
+fn tickets_sidebar_and_panel_search_read_page_link_and_plan_on_wide_and_phone() {
+    use atomics_core::ticket_ui::TicketAction;
+    let button = |shown: &[(String, Rect)], label: &str| {
+        shown
+            .iter()
+            .rev()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("missing {label}: {shown:?}"))
+            .1
+            .center()
+    };
+    for size in [BOARD, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+        view.desk.panel = PanelMode::Tickets;
+        view.desk.diff_open = true;
+        view.tab = Tab::Diffs;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Tickets"), "{size:?}: {shown:?}");
+        if size == BOARD {
+            assert!(has(&shown, "TICKETS"), "{shown:?}");
+        }
+        assert!(has(&shown, "ENG-123"), "the default view lists on {size:?}: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "More")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "ENG-124"), "{shown:?}");
+        client.tickets.query = "parser failure".into();
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(button(&shown, "Search")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(world.host.host_commands.iter().any(|command| matches!(command,
+            HostAction::Tickets { ticket, .. } if matches!(ticket.as_ref(), TicketAction::Search { query, .. } if query == "parser failure"))));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "ENG-123")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        for label in
+            ["Open in browser", "Plan with chief", "Link to plan", "Description", "Comments", "Children", "Related"]
+        {
+            assert!(has(&shown, label), "{size:?}: missing {label}: {shown:?}");
+        }
+        assert_eq!(client.tickets.read.as_ref().unwrap().link.label(), "ENG-123");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Link to plan")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(button(&shown, "Parse faster")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(world.host.host_commands.iter().any(|command| matches!(command,
+            HostAction::Tickets { ticket, .. } if matches!(ticket.as_ref(), TicketAction::Link { plan, ticket, .. } if plan == "p1" && ticket.id == "ENG-123"))));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Plan with chief")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        client.tickets.extra = "Keep the public API stable".into();
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Plan with chief ⏎")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(world.host.host_commands.iter().any(|command| matches!(command,
+            HostAction::Tickets { ticket, .. } if matches!(ticket.as_ref(), TicketAction::Plan { extra, mode: atomics_core::tickets::TicketMode::Board, .. }
+                if extra == "Keep the public API stable"))), "{:?}", world.host.host_commands);
+        assert!(!client.tickets.dialog);
+        if size == PHONE {
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            drawn(&ctx, &mut world, &mut client, &mut view, size, click(button(&shown, "×")));
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(!has(&shown, "Open in browser"), "the phone can close the reader: {shown:?}");
+        }
+    }
+}
+
+#[test]
+fn a_second_ticket_client_keeps_its_query_read_and_history_and_older_hosts_keep_their_frame() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+    view.desk.panel = PanelMode::Tickets;
+    view.desk.diff_open = true;
+    client.tickets.query = "my own query".into();
+    client.send(Command::OpenTicket(fake_host::ticket_card("ENG-123").link));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Fix ticket ENG-123"));
+    let mut second = Client::default();
+    second.send(Command::OpenTicket(fake_host::ticket_card("ENG-124").link));
+    let mut second_view = View::default();
+    settled(&ctx, &mut world, &mut second, &mut second_view, WIDE);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.tickets.query, "my own query");
+    assert_eq!(client.tickets.read.as_ref().unwrap().link.label(), "ENG-123");
+    assert_eq!(second.tickets.read.as_ref().unwrap().link.label(), "ENG-124");
+    assert!(client.tickets.crumbs.is_empty());
+    let (ctx, mut world, mut client, mut view) = live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "TICKETS") && !has(&shown, "Tickets"));
+}
+
+#[test]
+fn a_late_ticket_read_cannot_reopen_find_after_the_client_goes_back() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+    client.send(Command::OpenTicket(fake_host::ticket_card("ENG-123").link));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![]);
+    assert!(client.tickets.read.is_some());
+    // The host has answered, but the client has not consumed its replies yet.
+    client.tickets.show_find(false);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.tickets.read.is_none());
+    assert!(has(&shown, "Search"));
 }
