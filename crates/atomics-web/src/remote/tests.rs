@@ -1,7 +1,8 @@
 //! The remote Backend's reads and writes, fed frames directly.
 
 use atomics_core::approvals::Decision;
-use atomics_core::ops::{CommandResult, Outcome};
+use atomics_core::ops::{CommandResult, HostAction, Outcome};
+use atomics_core::projection::{HostInfo, SignInState};
 use atomics_core::steer::ReviewComment;
 use atomics_core::wire::{Limits, ResetReason, Resume, Revisions, WireError};
 
@@ -26,11 +27,12 @@ fn snapshot() -> Envelope {
         EPOCH,
         Message::StateSnapshot {
             cursor: Seq(3),
-            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1), host: Seq(0) },
             sessions: board.sessions,
             plans: board.plans,
             approvals: board.approvals,
             diffs: board.diffs,
+            host: board.host,
             part: None,
         },
     )
@@ -353,11 +355,12 @@ fn a_finished_plans_tab_has_no_close_and_what_names_nothing_is_not_offered() {
         EPOCH,
         Message::StateSnapshot {
             cursor: Seq(3),
-            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1), host: Seq(0) },
             sessions: board.sessions,
             plans: board.plans,
             approvals: board.approvals,
             diffs: board.diffs,
+            host: board.host,
             part: None,
         },
     ));
@@ -597,11 +600,12 @@ fn a_steer_missed_by_a_session_gone_from_the_mirror_names_its_title() {
         EPOCH,
         Message::StateSnapshot {
             cursor: Seq(3),
-            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1), host: Seq(0) },
             sessions: board.sessions,
             plans: board.plans,
             approvals: board.approvals,
             diffs: board.diffs,
+            host: board.host,
             part: None,
         },
     ));
@@ -768,11 +772,12 @@ fn an_integrated_task_is_not_offered_again_and_no_steer_goes_to_every_agent() {
         EPOCH,
         Message::StateSnapshot {
             cursor: Seq(3),
-            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1), host: Seq(0) },
             sessions: board.sessions,
             plans: board.plans,
             approvals: board.approvals,
             diffs: board.diffs,
+            host: board.host,
             part: None,
         },
     ));
@@ -895,4 +900,135 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
         assert!(!text.iter().any(|t| t.starts_with(action)), "{action}: a viewer cannot change it: {text:?}");
     }
     assert!(!text.iter().any(|t| t.starts_with("Steer")), "{text:?}");
+}
+
+/// What a browser ends on after signing in, with a code a notice must never repeat.
+const PASTE: &str = "http://127.0.0.1:53682/callback?code=c0de-from-the-browser&state=s1";
+
+/// The host's own state changes, as its `host_upsert` says.
+fn host_upsert(remote: &RemoteBackend, cursor: u64, host: HostInfo) {
+    remote.receive(Envelope::host(EPOCH, Message::HostUpsert { cursor: Seq(cursor), host }));
+}
+
+#[test]
+fn the_hosts_own_state_is_the_sign_in_and_the_project_menu() {
+    let remote = connected(Role::Controller);
+    assert_eq!(remote.sign_in(), None, "a host that says nothing of a sign-in");
+    assert_eq!(remote.project_menu(), ProjectMenu::default());
+    let host = fake_host::tickets(SignInState::Expired).board.host;
+    host_upsert(&remote, 4, host.clone());
+    assert_eq!(remote.with_mirror(|m| m.cursor), 4);
+    // A page never has the host open a browser: its link opens here, and how long it waits is the host's.
+    let view = remote.sign_in().expect("the sign-in");
+    assert_eq!(view, SignInView { info: host.sign_in.clone().unwrap(), opens_browser: false, seconds_left: None });
+    let menu = remote.project_menu();
+    let expected = ProjectMenu {
+        recent: Vec::new(),
+        workspaces: vec!["daily".into(), "team".into()],
+        current: Some("team".into()),
+        can_save: false,
+    };
+    assert_eq!(menu, expected, "the host's workspaces, none of its folders, and no saving");
+    // Offline it reads as the host last said.
+    remote.disconnected();
+    assert_eq!(remote.sign_in(), Some(view));
+}
+
+#[test]
+fn host_commands_go_where_welcome_grants_host_and_no_other_project_command_does() {
+    assert!(CAPABILITIES.contains(&wire::HOST), "the browser asks for the host's own state");
+    let host_commands = [
+        Command::SignInTickets,
+        Command::PasteSignIn(String::new()),
+        Command::CancelSignIn,
+        Command::OpenWorkspace(String::new()),
+    ];
+    let controller = connected(Role::Controller);
+    let viewer = connected(Role::Viewer);
+    let offline = connected(Role::Controller);
+    offline.disconnected();
+    // A host from before `host`: its welcome lacks it, so it grants no `host_command`, and the rest as before.
+    let older = RemoteBackend::new("op");
+    let capabilities: Vec<String> = CAPABILITIES.iter().filter(|c| **c != wire::HOST).map(|c| c.to_string()).collect();
+    let may = Role::Controller.may(&capabilities);
+    let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
+    let role = Role::Controller;
+    older.receive(Envelope::host(
+        EPOCH,
+        Message::Welcome { version: VERSION, capabilities, limits: Limits::default(), role, resume, may },
+    ));
+    older.receive(snapshot());
+    assert!(older.may(Grant::Approve) && !older.may(Grant::Host));
+    for command in &host_commands {
+        assert!(controller.available(command), "a controller may {command:?}");
+        assert!(!viewer.available(command), "a viewer may not {command:?}");
+        assert!(!offline.available(command), "nothing goes offline: {command:?}");
+        assert!(!older.available(command), "an older host has no {command:?}");
+    }
+    // The host's folders stay its own.
+    for command in [
+        Command::PickProject,
+        Command::SaveWorkspace("team".into()),
+        Command::OpenProject("/w/repo".into()),
+        Command::CloseProject("/w/repo".into()),
+    ] {
+        assert!(!controller.available(&command), "{command:?}");
+    }
+
+    controller.take_outgoing();
+    for (command, action) in [
+        (Command::SignInTickets, HostAction::SignIn),
+        (Command::PasteSignIn(PASTE.into()), HostAction::SignInPaste { text: PASTE.into() }),
+        (Command::CancelSignIn, HostAction::SignInCancel),
+        (Command::OpenWorkspace("daily".into()), HostAction::OpenWorkspace { name: "daily".into() }),
+    ] {
+        controller.send(command.clone());
+        let [Message::HostCommand(sent)] = one(&controller) else { panic!("{command:?}") };
+        assert_eq!(sent.action, action, "{command:?}");
+    }
+    controller.send(Command::SaveWorkspace("team".into()));
+    assert!(controller.take_outgoing().is_empty());
+    assert!(controller.notice().unwrap().contains("not available in the browser"));
+}
+
+#[test]
+fn a_paste_that_does_not_go_through_says_why_and_never_repeats_the_address() {
+    let remote = connected(Role::Controller);
+    remote.take_outgoing();
+    remote.send(Command::PasteSignIn(PASTE.into()));
+    let [Message::HostCommand(sent)] = one(&remote) else { panic!("a host command") };
+    let refused = Outcome::refused(WireError::new(ErrorCode::Rejected, "that address is from another sign-in"));
+    result(&remote, &sent.op, refused);
+    assert_eq!(remote.notice().as_deref(), Some("The host refused: that address is from another sign-in"));
+    assert!(remote.state.borrow().pending.is_empty(), "nothing keeps it once the host has answered");
+
+    let mut said = Vec::new();
+    remote.dismiss_notice();
+    remote.send(Command::PasteSignIn(PASTE.into()));
+    result(&remote, "op-2", Outcome::Uncertain { message: "the host restarted".into() });
+    said.push(remote.notice().unwrap());
+    assert!(said[0].contains("could not confirm"), "{said:?}");
+    // Over the host's limit: not sent, and nothing waits.
+    remote.dismiss_notice();
+    remote.take_outgoing();
+    remote.send(Command::PasteSignIn(format!("{PASTE}{}", "x".repeat(ops::MAX_TEXT_BYTES))));
+    assert!(remote.take_outgoing().is_empty() && remote.state.borrow().pending.is_empty());
+    said.push(remote.notice().unwrap());
+    assert!(said[1].starts_with("That was not sent: text is over"), "{said:?}");
+
+    // A viewer and a page offline send nothing and say why.
+    let viewer = connected(Role::Viewer);
+    viewer.take_outgoing();
+    viewer.send(Command::PasteSignIn(PASTE.into()));
+    assert!(viewer.take_outgoing().is_empty());
+    said.push(viewer.notice().unwrap());
+    assert!(said[2].contains("may only view"), "{said:?}");
+    let offline = connected(Role::Controller);
+    offline.disconnected();
+    offline.send(Command::PasteSignIn(PASTE.into()));
+    said.push(offline.notice().unwrap());
+    assert!(said[3].contains("Not connected"), "{said:?}");
+    offline.receive(welcome(Role::Controller));
+    assert!(offline.take_outgoing().iter().all(|e| !matches!(e.message, Message::HostCommand(_))), "nor later");
+    assert!(said.iter().all(|notice| !notice.contains("c0de") && !notice.contains("127.0.0.1")), "{said:?}");
 }

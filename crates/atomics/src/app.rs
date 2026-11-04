@@ -540,6 +540,8 @@ pub(crate) struct State {
     repos: Vec<PathBuf>,
     open_projects: Vec<PathBuf>,
     workspace: Option<String>,
+    /// The saved workspaces, by name, as last read: the host's state lists them for every client.
+    workspace_names: Vec<String>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     title: String,
@@ -1057,6 +1059,7 @@ impl State {
             repos: Vec::new(),
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),
+            workspace_names: Vec::new(),
             worktree_project: HashMap::new(),
             title: String::new(),
             cleanup: None,
@@ -1121,6 +1124,7 @@ impl State {
         };
         app.refresh_themes();
         app.open_initial_projects(options.projects, options.workspace);
+        app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
             app.begin_startup_cleanup();

@@ -59,8 +59,10 @@ impl State {
         blockers
     }
 
+    /// Relaunches with the arguments ATOMICS started with, but the workspace open now.
     pub(super) fn restart(&mut self, force: bool, reason: Option<String>) -> ControlResponse {
-        self.restart_using(force, reason, crate::restart::Target::current)
+        let workspace = self.workspace.clone();
+        self.restart_using(force, reason, move || crate::restart::Target::current(workspace.as_deref()))
     }
 
     fn restart_using(

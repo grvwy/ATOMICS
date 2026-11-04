@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::diff::{FileDiff, Hunk};
 use crate::lease::{self, GridSize, LeaseState};
 pub use crate::ops::Grant;
-use crate::ops::{ApprovalDecide, CommandResult, OP_TTL_SECS, PlanCommand, ReviewCommand, SessionCommand};
-use crate::projection::{ApprovalInfo, DiffFileBody, DiffSummary, Loaded, PlanInfo, ReportInfo, SessionInfo};
+use crate::ops::{ApprovalDecide, CommandResult, HostCommand, OP_TTL_SECS, PlanCommand, ReviewCommand, SessionCommand};
+use crate::projection::{ApprovalInfo, DiffFileBody, DiffSummary, HostInfo, Loaded, PlanInfo, ReportInfo, SessionInfo};
 pub use crate::screen::Part;
 use crate::screen::{self, HistoryChunk, HistoryGet, ScreenDelta, ScreenSnapshot};
 
@@ -40,7 +40,7 @@ pub const MAX_CAPABILITIES: usize = 64;
 pub const MAX_ID_BYTES: usize = 1024;
 
 /// Capabilities this implementation can offer in a `welcome`.
-pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", TERMINALS, INPUT, MUTATIONS];
+pub const CAPABILITIES: &[&str] = &["board", "plans", "approvals", "diffs", TERMINALS, INPUT, MUTATIONS, HOST];
 /// Screen streaming: `screen` topics, `screen_snapshot`/`screen_delta` and `history_get`.
 pub const TERMINALS: &str = "terminals";
 /// Typing into subscribed screens: the `lease_*` messages, `lease_state`, `terminal_input` and
@@ -49,6 +49,10 @@ pub const INPUT: &str = "input";
 /// Changing things: `approval_decide`, `plan_command`, `review_command` and `session_command`,
 /// each answered by `command_result`. What a client may send is its `welcome`'s `may`.
 pub const MUTATIONS: &str = "mutations";
+/// What the host says about itself (`host_upsert`: the open workspace and the ticket sign-in) and,
+/// with `mutations`, `host_command`. A client without it is sent `skipped` in place of `host_upsert`;
+/// every `state_snapshot` carries `host` either way, which an older client ignores.
+pub const HOST: &str = "host";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -197,19 +201,23 @@ impl Role {
     /// What the role allows, before capabilities narrow it.
     pub fn grants(self) -> &'static [Grant] {
         match self {
-            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review],
+            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review, Grant::Host],
             Role::Viewer => &[],
         }
     }
 
     /// What a client with this role may do over the capabilities it negotiated: typing needs
-    /// `input`, the rest `mutations`. This is `welcome`'s `may`.
+    /// `input`, `host` needs `host` and `mutations`, the rest `mutations`. This is `welcome`'s `may`.
     pub fn may(self, capabilities: &[String]) -> Vec<Grant> {
         let has = |name: &str| capabilities.iter().any(|c| c == name);
         self.grants()
             .iter()
             .copied()
-            .filter(|grant| if *grant == Grant::Type { has(INPUT) } else { has(MUTATIONS) })
+            .filter(|grant| match grant {
+                Grant::Type => has(INPUT),
+                Grant::Host => has(HOST) && has(MUTATIONS),
+                _ => has(MUTATIONS),
+            })
             .collect()
     }
 }
@@ -339,6 +347,8 @@ pub struct Revisions {
     pub plans: Revision,
     pub approvals: Revision,
     pub diffs: Revision,
+    #[serde(default)]
+    pub host: Revision,
 }
 
 /// Every message, tagged by `kind`. Fields beyond those listed are ignored on read.
@@ -379,6 +389,9 @@ pub enum Message {
         plans: Vec<PlanInfo>,
         approvals: Vec<ApprovalInfo>,
         diffs: Vec<DiffSummary>,
+        /// The host's own state; every part carries it whole.
+        #[serde(default, skip_serializing_if = "is_default")]
+        host: HostInfo,
         /// Set when the board does not fit in one frame, as for `screen_snapshot`: every part has
         /// the same `cursor` and `revisions` and a slice of the collections, and the client
         /// applies the snapshot once it holds all `count` parts.
@@ -424,6 +437,11 @@ pub enum Message {
     DiffSummary {
         cursor: Cursor,
         summary: DiffSummary,
+    },
+    /// The host's own state changed (`host` capability): the open workspace or the ticket sign-in.
+    HostUpsert {
+        cursor: Cursor,
+        host: HostInfo,
     },
     DiffGet {
         worktree: String,
@@ -497,6 +515,7 @@ pub enum Message {
     PlanCommand(PlanCommand),
     ReviewCommand(ReviewCommand),
     SessionCommand(SessionCommand),
+    HostCommand(HostCommand),
     /// What became of a mutation: `accepted` first for work that takes a while, then `done`,
     /// `refused` or `uncertain`. Echoes the mutation's `request_id`.
     CommandResult(CommandResult),
@@ -540,6 +559,7 @@ const KINDS: &[&str] = &[
     "approval_pending",
     "approval_resolved",
     "diff_summary",
+    "host_upsert",
     "diff_get",
     "diff_file",
     "file_get",
@@ -558,6 +578,7 @@ const KINDS: &[&str] = &[
     "plan_command",
     "review_command",
     "session_command",
+    "host_command",
     "command_result",
     "ack",
     "resync",
@@ -604,11 +625,13 @@ impl Envelope {
                     plans: Seq(loaded.plans.revision),
                     approvals: Seq(loaded.approvals.revision),
                     diffs: Seq(loaded.diffs.revision),
+                    host: Seq(loaded.host.revision),
                 },
                 sessions: loaded.sessions.data.clone(),
                 plans: loaded.plans.data.clone(),
                 approvals: loaded.approvals.data.clone(),
                 diffs: loaded.diffs.data.clone(),
+                host: loaded.host.data.clone(),
                 part: None,
             },
         )
@@ -677,11 +700,16 @@ impl Message {
             Message::PlanCommand(c) => c.validate().err(),
             Message::ReviewCommand(c) => c.validate().err(),
             Message::SessionCommand(c) => c.validate().err(),
+            Message::HostCommand(c) => c.validate().err(),
             Message::CommandResult(c) => c.validate().err(),
             _ => None,
         };
         failure.map_or(Ok(()), Err)
     }
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 /// Bytes `value` takes as JSON, without building the text.
@@ -743,13 +771,13 @@ pub fn snapshot_frames(epoch: &str, loaded: &Loaded, budget: usize) -> Result<Ve
     if json_len(&whole) <= budget {
         return Ok(vec![encode(&whole)?]);
     }
-    let Message::StateSnapshot { cursor, revisions, .. } = whole.message else {
+    let Message::StateSnapshot { cursor, revisions, host, .. } = whole.message else {
         unreachable!("a snapshot is a state_snapshot")
     };
     let part = |slice: Slice, part: Option<Part>| {
         let Slice { sessions, plans, approvals, diffs } = slice;
-        let message =
-            Message::StateSnapshot { cursor, revisions: revisions.clone(), sessions, plans, approvals, diffs, part };
+        let (revisions, host) = (revisions.clone(), host.clone());
+        let message = Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, host, part };
         Envelope::host(epoch, message)
     };
     // What a part costs before its items, with the longest part numbers it could have.

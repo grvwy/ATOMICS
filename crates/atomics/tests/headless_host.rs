@@ -461,6 +461,116 @@ fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
+/// The chief's `atomics_ticket_search` through `atomics mcp --chief`: whether it failed, and its text.
+fn chief_ticket_search(instance: &Instance) -> (bool, String) {
+    let mut mcp = TestChild::spawn(instance.command(["mcp", "--chief"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut stdin = mcp.child.stdin.take().unwrap();
+    for message in [
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+               "params":{"name":"atomics_ticket_search", "arguments":{"query":"sign-in"}}}),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+    let output = mcp.wait_output().unwrap();
+    assert!(output.status.success());
+    let reply = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+        .find(|reply| reply["id"] == 2)
+        .expect("an answer to the tool call");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    (reply["result"]["isError"] == true, text)
+}
+
+/// Send one `host_command` and wait for its final outcome.
+fn host_command(home: &Path, action: atomics_core::ops::HostAction) -> atomics_core::ops::Outcome {
+    let mut socket = connect(home);
+    // Each operation has an ID of its own: the journal answers a reused one with its first outcome.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let op = format!("gate-op-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let command = atomics_core::ops::HostCommand { op, action };
+    send(&mut socket, Envelope::new(Message::HostCommand(command)));
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));
+    loop {
+        assert!(Instant::now() < deadline, "the host_command was never answered");
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => match wire::decode(text.as_str()).unwrap().message {
+                Message::CommandResult(result) if result.outcome.is_final() => {
+                    let _ = socket.close(None);
+                    return result.outcome;
+                }
+                Message::Ping { nonce } => send(&mut socket, Envelope::new(Message::Pong { nonce })),
+                Message::Error { code, message } => {
+                    panic!("the host_command was refused as a frame: {code:?}: {message}")
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => panic!("protocol connection failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn a_start_without_a_workspace_opens_the_last_one_and_the_ticket_tools_say_why_when_none_is_open() {
+    let instance = Instance::new(Some(0));
+    // Saved workspaces, as flat files that load whatever this machine is called; one has [tickets].
+    let saved = instance.dir.path().join("workspaces");
+    std::fs::create_dir_all(&saved).unwrap();
+    std::fs::write(
+        saved.join("team.toml"),
+        "projects = []\n[tickets]\nsystem = \"tracker\"\n[tickets.server]\ncommand = [\"/bin/false\"]\n",
+    )
+    .unwrap();
+    std::fs::write(saved.join("daily.toml"), "projects = []\n").unwrap();
+
+    // Started with no workspace and none open last time: the chief's ticket tools name the cause.
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let (failed, text) = chief_ticket_search(&instance);
+    assert!(failed, "{text}");
+    assert!(text.contains("no workspace is open; saved: daily, team (has [tickets])"), "{text}");
+    // Clients see that no workspace is open, and which are saved.
+    let mirror = board(&instance.home(), |m| m.host.workspaces.len() == 2);
+    assert_eq!(
+        (mirror.host.workspace.clone(), mirror.host.workspaces.clone()),
+        (None, vec!["daily".into(), "team".into()])
+    );
+
+    // A client opens one from its picker; every client sees it, and the ticket tools have a system.
+    let opened = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "team".into() });
+    assert!(matches!(opened, atomics_core::ops::Outcome::Done { .. }), "{opened:?}");
+    board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
+    let (_, text) = chief_ticket_search(&instance);
+    assert!(!text.contains("No ticket system is configured"), "{text}");
+    // A workspace that is not saved is refused, and nothing changes.
+    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "gone".into() });
+    assert!(matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("gone")));
+    // No OAuth server in this profile: a sign-in is refused, saying why.
+    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::SignIn);
+    assert!(
+        matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("oauth = true")),
+        "{refused:?}"
+    );
+
+    // The next start names no workspace either, as from the Dock: the one open last opens again.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    let mut again = instance.host();
+    instance.ready(&mut again);
+    board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
+    let (_, text) = chief_ticket_search(&instance);
+    assert!(!text.contains("No ticket system is configured"), "{text}");
+    assert_eq!(unsafe { libc::kill(again.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(again.wait_output().unwrap().status.success());
+}
+
 #[test]
 fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
     let instance = Instance::new(None);

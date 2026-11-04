@@ -565,7 +565,8 @@ impl State {
         self.diff_open = true;
         self.window.request_repaint();
         let Some(config) = self.ticket_config() else {
-            self.toast("Tickets are not configured ([tickets] in the config)");
+            let reason = self.no_ticket_system();
+            self.toast(reason);
             return;
         };
         let Some(link) = self.stamp_system(Some(link)) else { return };
@@ -688,7 +689,7 @@ impl State {
         mode: TicketMode,
         extra: &str,
     ) -> Result<PlanStart, String> {
-        let Some(config) = self.ticket_config() else { return Err("Tickets are not configured".into()) };
+        let Some(config) = self.ticket_config() else { return Err(self.no_ticket_system()) };
         if self.plan_needs_sign_in(&config) {
             let panel = &mut self.tickets.panel;
             panel.signin = true;
@@ -992,6 +993,17 @@ impl Desktop<'_> {
             ui.label(
                 "Tickets are not configured. Add a [tickets] profile to the config to search and read your tickets.",
             );
+            if self.runtime.workspace.is_none() {
+                let names = &self.runtime.workspace_names;
+                let saved =
+                    if names.is_empty() { "none saved".to_string() } else { format!("saved: {}", names.join(", ")) };
+                ui.label(
+                    RichText::new(format!(
+                        "No workspace is open ({saved}); a workspace's [tickets] applies once it is."
+                    ))
+                    .color(p.warning),
+                );
+            }
             ui.label(RichText::new("docs/tickets.md has example profiles.").color(p.muted));
             return;
         };
@@ -3790,7 +3802,10 @@ mod tests {
                 app.runtime.config.tickets = Default::default();
                 app.runtime.apply_ticket_config();
                 assert!(open(app, "DEMO-1", None).is_err());
-                assert!(toasted(app).contains("not configured"), "{}", toasted(app));
+                // It says why: no workspace is open, and the config has no [tickets] either.
+                let why = toasted(app);
+                assert!(why.contains("No ticket system is configured: no workspace is open"), "{why}");
+                assert!(why.contains("config.toml has no [tickets] either"), "{why}");
             },
         );
     }
@@ -4008,7 +4023,8 @@ mod tests {
             app.runtime.diff_open = true;
             let text = texts(&frame(app, ctx, vec![])).join("\n");
             assert!(text.contains("echo needs one more sign-in") && text.contains("127.0.0.1"), "{text}");
-            assert!(text.contains("Sign in with the browser") && text.contains("Sign out"), "{text}");
+            // The shared banner's one button runs the one sign-in; the panel adds the way out.
+            assert!(text.contains("Sign in to echo") && text.contains("Sign out"), "{text}");
 
             // Reading first changes nothing: the banner again, and no token asked for.
             read_the_ticket(app);

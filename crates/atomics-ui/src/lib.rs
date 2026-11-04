@@ -30,6 +30,7 @@ pub mod markdown;
 pub mod panel_nav;
 pub mod shell;
 pub mod sidebar;
+pub mod signin;
 pub mod status;
 pub mod tabs;
 pub mod terminal;

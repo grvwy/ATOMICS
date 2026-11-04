@@ -30,7 +30,7 @@ impl State {
             return Ok(());
         }
         let Some(reference) = link.ticket else { return Ok(()) };
-        let Some(config) = self.ticket_config() else { return Err("Tickets are not configured".into()) };
+        let Some(config) = self.ticket_config() else { return Err(self.no_ticket_system()) };
         let system = config.system.trim();
         if let Some(wanted) = link.system.as_deref().filter(|wanted| !wanted.eq_ignore_ascii_case(system)) {
             let wanted: String = wanted.chars().take(40).collect();

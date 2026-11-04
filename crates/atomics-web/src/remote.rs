@@ -12,7 +12,9 @@
 //! right panel, the chief's window) is the page's, set by the views from their [`crate::desk::Desk`]
 //! ([`RemoteBackend::set_view`], [`RemoteBackend::set_chief_window`]); what the host cannot send at all
 //! (its config, projects, worktrees, sandboxes, usage) reads as absent, so the frame's host-only items stay
-//! empty.
+//! empty. What it says of itself with `host` (the workspace open there, the saved ones, the ticket sign-in)
+//! is the top bar's Workspace and sign-in items' and the sign-in banner's, and their commands go as
+//! `host_command`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -37,6 +39,7 @@ use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
 use atomics_core::tickets::TicketLink;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
+use atomics_ui::signin::SignInView;
 use atomics_ui::{
     ApprovalRow, Backend, BoardView, ChiefView, Command, CompletedTile, DiffHeading, DiffSnapshot, Notices, PanelMode,
     PlanRow, PlanState, ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints,
@@ -48,7 +51,7 @@ use crate::screens::{Lease, Refused, Screens};
 
 /// What this client asks the host for.
 pub const CAPABILITIES: &[&str] =
-    &["board", "plans", "approvals", "diffs", wire::TERMINALS, wire::INPUT, wire::MUTATIONS];
+    &["board", "plans", "approvals", "diffs", wire::TERMINALS, wire::INPUT, wire::MUTATIONS, wire::HOST];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
 /// Pages of one file's diff read before the rest is left out.
@@ -1166,8 +1169,24 @@ impl Backend for RemoteBackend {
         SandboxLoad::default()
     }
 
+    /// The host's saved workspaces and the one open there, which `host_command` opens. Its recent projects are
+    /// folders on the host, and a page saves no workspace.
     fn project_menu(&self) -> ProjectMenu {
-        ProjectMenu::default()
+        let s = self.state.borrow();
+        let host = &s.mirror.host;
+        ProjectMenu {
+            recent: Vec::new(),
+            workspaces: host.workspaces.clone(),
+            current: host.workspace.clone(),
+            can_save: false,
+        }
+    }
+
+    /// The host's ticket sign-in as the mirror has it. The host opens no browser for a page: the person opens its
+    /// link in a tab and pastes back the address that tab ends on. How long it still waits is the host's to say.
+    fn sign_in(&self) -> Option<SignInView> {
+        let info = self.state.borrow().mirror.host.sign_in.clone()?;
+        Some(SignInView { info, opens_browser: false, seconds_left: None })
     }
 
     /// The host's folders are its own.

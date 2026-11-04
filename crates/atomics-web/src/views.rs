@@ -3,14 +3,16 @@
 //! - **Wide**: the desktop's own window, `atomics_ui::shell::frame`, through [`Web`], this page's
 //!   `Platform`: the top bar, the sidebar, the tiled terminals, the board or a diff in the right panel and the
 //!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials,
-//!   ticket sign-in, GitHub) are hooks this page leaves empty; its connection's state and the layout menu
-//!   take the top bar's last slots, connection trouble a line under the frame, and what the page has to say,
-//!   why a command failed above all, a note under the top bar that a click dismisses.
+//!   GitHub) are hooks this page leaves empty; its connection's state, the ticket sign-in while the host needs
+//!   one, the host's workspace and the layout menu take the top bar's last slots, connection trouble a line
+//!   under the frame, and what the page has to say, why a command failed above all, a note under the top bar
+//!   that a click dismisses.
 //! - **Phone**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
 //!   current plan's board under a picker of the others, the approval banners, a worktree's diff panel, an
 //!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
 //!   sees, in the phone's look ([`Looks`]): the theme's colours with proportional UI text, zoomed, spaced for a
-//!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]).
+//!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]). Its top bar's ⋯ menu has the layout and
+//!   the host's workspace.
 //!
 //! Terminals are drawn by [`TermPane`]s through [`Terminals`]. After each piece of the frame, what the user
 //! asked for in it is carried out: a view command here, on the page's [`Desk`], any other through the
@@ -340,10 +342,14 @@ impl Platform for Web<'_> {
     }
 
     /// Where the desktop has its Tickets, GitHub and Remote items: how this page's connection is.
+    /// Then the shared items the host's state gives: Sign in or Reconnect while its ticket system needs
+    /// it, and the workspace open there with the picker.
     fn top_bar_items(&mut self, ui: &mut egui::Ui, _in_menu: bool) {
         let (text, good) = status_line(self.driver);
         let p = &self.client.palette;
         ui.label(RichText::new(text).color(status_color(good, p)).size(11.5));
+        self.draw(|backend, client, _| atomics_ui::signin::top_bar_item(ui, backend, client));
+        self.draw(|backend, client, _| atomics_ui::topbar::workspace_menu(ui, backend, client));
     }
 
     /// The chief's window, with the permission request it waits on over its terminal.
@@ -353,7 +359,7 @@ impl Platform for Web<'_> {
 
     /// Where the desktop has its Settings: the layout this page draws.
     fn top_bar_settings(&mut self, ui: &mut egui::Ui) {
-        layout_menu(ui, self.view);
+        layout_menu(ui, self.view, |_| {});
     }
 }
 
@@ -457,7 +463,7 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                     ui.label(RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace());
                     let (text, good) = status_line(driver);
                     ui.label(RichText::new(text).color(status_color(good, &p)).size(11.5));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| layout_menu(ui, view));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| layout_menu(ui, view, |_| {}));
                 });
             });
         egui::CentralPanel::default()
@@ -537,7 +543,9 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     // The bars' colour reaches the screen's edges, under the notch and the home indicator.
     let top = Rect::from_x_y_ranges(screen.x_range(), screen.top()..=regions.top.bottom());
     ui.painter().rect_filled(top, 0.0, p.topbar);
-    region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| phone_top(ui, driver, view, &p));
+    region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| {
+        phone_top(ui, driver, client, view, &p);
+    });
     region(ui, regions.body, "phone-body", |ui| phone_body(ui, driver, client, view));
     ui.painter().hline(screen.x_range(), top.bottom() - 0.5, Stroke::new(1.0, p.separator));
     if let Some(bar) = regions.bar {
@@ -548,14 +556,17 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     }
 }
 
-fn phone_top(ui: &mut egui::Ui, driver: &Driver, view: &mut View, p: &Palette) {
+/// The brand, the connection, the approvals waiting and the ⋯ menu, which has the host's workspace: a phone's
+/// top bar has no room for the wide layout's items.
+fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View, p: &Palette) {
     let approvals = driver.remote.with_mirror(|m| m.approvals.len());
     ui.horizontal_centered(|ui| {
         ui.label(RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace());
         let (text, good) = status_line(driver);
         ui.label(RichText::new(text).color(status_color(good, p)).size(11.0));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            layout_menu(ui, view);
+            let backend: &dyn Backend = &driver.remote;
+            layout_menu(ui, view, |ui| atomics_ui::topbar::workspace_menu(ui, backend, client));
             if approvals > 0 {
                 // Selected while the approvals show, as a pane is in the bar.
                 let badge = RichText::new(format!("◆ {approvals}")).color(p.warning).strong();
@@ -569,8 +580,8 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, view: &mut View, p: &Palette) {
     });
 }
 
-/// "Layout": automatic (from the screen), phone or desktop.
-fn layout_menu(ui: &mut egui::Ui, view: &mut View) {
+/// "Layout": automatic (from the screen), phone or desktop, then what `more` adds.
+fn layout_menu(ui: &mut egui::Ui, view: &mut View, more: impl FnOnce(&mut egui::Ui)) {
     let button = egui::Button::new("⋯");
     let button = if view.compact { button.min_size(vec2(layout::TOUCH, layout::TOUCH)) } else { button };
     egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
@@ -583,6 +594,7 @@ fn layout_menu(ui: &mut egui::Ui, view: &mut View) {
                 ui.close();
             }
         }
+        more(ui);
     });
 }
 
@@ -922,6 +934,10 @@ fn fill(ui: &mut egui::Ui, draw: impl FnOnce(&mut egui::Ui, Rect)) {
 /// The selected plan's board, under a picker when there are other plans to pick.
 fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view: &View) {
     let plans = backend.plan_list();
+    // With no open plan to draw it, the ticket sign-in goes above what the pane says instead.
+    if atomics_ui::signin::no_board_shows(backend) {
+        padded(ui, gutter(client), |ui| atomics_ui::signin::framed(ui, backend, client));
+    }
     if plans.is_empty() {
         return empty(ui, client, "No plans on this computer yet.");
     }

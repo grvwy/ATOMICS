@@ -46,6 +46,10 @@ pub struct Client {
     pub icon: Option<egui::TextureHandle>,
     /// The name typed for saving the open projects as a workspace.
     pub workspace_input: String,
+    /// The address being pasted back for the ticket system's sign-in.
+    pub sign_in_paste: String,
+    /// The sign-in's manual steps (the link and the paste box) show although the host opened a browser.
+    pub sign_in_manual: bool,
     /// The message typed in the steer bar.
     pub steer_text: String,
     /// Who the steer bar sends to.
@@ -75,6 +79,8 @@ impl Default for Client {
             focus_terminal: None,
             icon: None,
             workspace_input: String::new(),
+            sign_in_paste: String::new(),
+            sign_in_manual: false,
             steer_text: String::new(),
             steer_target: SteerTarget::Active,
             focus_steer: false,
