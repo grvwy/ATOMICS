@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Machine identity shared by config overrides and workspace storage.
@@ -129,9 +130,15 @@ pub fn env_override(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(format!("ATOMICS_{name}")).or_else(|| std::env::var_os(format!("IMACS_{name}")))
 }
 
+/// Set by a host in each of its terminals, beside `ATOMICS_SOCKET` and to the same path: that socket is the
+/// host's, given so its agents reach it, and not one chosen for an instance of their own. So an explicit
+/// `ATOMICS_HOME` there (a separate test instance) still keeps its socket beside its state.
+pub const HOST_SOCKET_ENV: &str = "ATOMICS_HOST_SOCKET";
+
 pub fn socket_path() -> PathBuf {
-    if let Some(path) = env_override("SOCKET") {
-        return PathBuf::from(path);
+    let socket = env_override("SOCKET");
+    if let Some(path) = chosen_socket(socket, std::env::var_os(HOST_SOCKET_ENV), env_override("HOME").is_some()) {
+        return path;
     }
     let state = atomics_home();
     // Explicit instance homes and existing installs retain their socket location.
@@ -142,6 +149,14 @@ pub fn socket_path() -> PathBuf {
         return runtime.join("atomics.sock");
     }
     state.join("atomics.sock")
+}
+
+/// `ATOMICS_SOCKET`, unless it is only the socket a host gave its terminal ([`HOST_SOCKET_ENV`]) and
+/// `ATOMICS_HOME` names an instance of its own.
+fn chosen_socket(socket: Option<OsString>, host_socket: Option<OsString>, own_home: bool) -> Option<PathBuf> {
+    let socket = socket?;
+    let inherited = host_socket.is_some_and(|host| host == socket);
+    (!(inherited && own_home)).then(|| PathBuf::from(socket))
 }
 
 #[derive(Debug, Default)]
@@ -339,6 +354,22 @@ mod tests {
     }
 
     #[test]
+    fn a_hosts_socket_routes_its_terminals_but_not_an_instance_of_their_own() {
+        let os = |text: &str| Some(OsString::from(text));
+        // Nothing set: the default place.
+        assert_eq!(chosen_socket(None, None, false), None);
+        assert_eq!(chosen_socket(None, os("/host.sock"), true), None);
+        // Set by hand, with or without a home of its own.
+        assert_eq!(chosen_socket(os("/mine.sock"), None, true), Some(PathBuf::from("/mine.sock")));
+        // A host's terminal: its host's socket.
+        assert_eq!(chosen_socket(os("/host.sock"), os("/host.sock"), false), Some(PathBuf::from("/host.sock")));
+        // A test instance started there with only ATOMICS_HOME keeps its socket beside its state ...
+        assert_eq!(chosen_socket(os("/host.sock"), os("/host.sock"), true), None);
+        // ... and one given a socket of its own uses that.
+        assert_eq!(chosen_socket(os("/mine.sock"), os("/host.sock"), true), Some(PathBuf::from("/mine.sock")));
+    }
+
+    #[test]
     fn scratch_folders_are_the_folders_directly_in_scratch() {
         let root = Path::new("/state/scratch");
         assert_eq!(scratch_in(root, &root.join("a1b2")), Some(root.join("a1b2")));
@@ -373,6 +404,8 @@ mod tests {
         let Ok(case) = std::env::var(CHILD) else {
             for case in
                 ["new", "legacy", "explicit", "socket", "relative", "empty", "missing-runtime", "public-runtime"]
+                    .into_iter()
+                    .chain(["host-socket", "host-socket-home"])
             {
                 let dir = crate::test_support::tempdir().unwrap();
                 let home = dir.path().join("home");
@@ -395,6 +428,7 @@ mod tests {
                     .env("XDG_RUNTIME_DIR", &runtime)
                     .env_remove("ATOMICS_HOME")
                     .env_remove("ATOMICS_SOCKET")
+                    .env_remove(HOST_SOCKET_ENV)
                     .env_remove("ATOMICS_CONFIG");
                 match case {
                     "explicit" => {
@@ -402,6 +436,15 @@ mod tests {
                     }
                     "socket" => {
                         command.env("ATOMICS_SOCKET", home.join("custom.sock"));
+                    }
+                    // A host's terminal, and an instance with a home of its own started there.
+                    "host-socket" | "host-socket-home" => {
+                        command
+                            .env("ATOMICS_SOCKET", home.join("host.sock"))
+                            .env(HOST_SOCKET_ENV, home.join("host.sock"));
+                        if case == "host-socket-home" {
+                            command.env("ATOMICS_HOME", home.join("isolated"));
+                        }
                     }
                     "relative" | "empty" => {
                         for name in ["XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"] {
@@ -426,7 +469,7 @@ mod tests {
         let home = home();
         let state = match case.as_str() {
             "legacy" => home.join(".atomics"),
-            "explicit" => home.join("isolated"),
+            "explicit" | "host-socket-home" => home.join("isolated"),
             "relative" | "empty" => home.join(".local/state/atomics"),
             _ => home.join("state/atomics"),
         };
@@ -453,7 +496,8 @@ mod tests {
         }
         let expected = match case.as_str() {
             "socket" => home.join("custom.sock"),
-            "legacy" | "explicit" => state.join("atomics.sock"),
+            "host-socket" => home.join("host.sock"),
+            "legacy" | "explicit" | "host-socket-home" => state.join("atomics.sock"),
             _ => runtime.unwrap_or_else(|| state.clone()).join("atomics.sock"),
         };
         assert_eq!(socket_path(), expected);

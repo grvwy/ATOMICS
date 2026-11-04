@@ -283,7 +283,9 @@ and variables an interactive session has, starting in the first writable shared 
 Mac). It waits for the Mac's folders to be mounted, restarts on failure and stops cleanly on
 `systemctl stop`, ending its agents. Its socket is `/run/atomics/atomics.sock` (mode 0700 folder),
 which `ATOMICS_SOCKET` names in every login shell too, so hooks, MCP servers, `atomics ctl` and
-`atomics queue` reach this host. A first config is seeded with `[isolation] mode = "bare"`: the VM is
+`atomics queue` reach this host. Its agents' terminals get it from the host itself, as every ATOMICS
+gives its terminals its own socket: their login shells inherit the service's
+`__NIXOS_SET_ENVIRONMENT_DONE` and so skip the profile's session variables. A first config is seeded with `[isolation] mode = "bare"`: the VM is
 the agents' boundary. `--remote-port` turns on the protocol server whatever the config says, on
 `127.0.0.1` only (`ss -ltn` shows nothing else listening on it).
 
@@ -521,8 +523,8 @@ restricted forward that would carry only the agent tools, with a token per pane,
 **Without it**, agents in the VM run in their tiles as plain terminals. Their hooks and MCP servers
 cannot reach ATOMICS: no status, turn ends or approval prompts on the Mac (agents ask in their own
 terminal), no `atomics_report` or ticket tools, and a chief in the VM cannot start or steer agents.
-`atomics queue` in the VM runs its command at once, without a slot. `atomics-onboard` reports the host
-item as `skipped`.
+`atomics queue` in the VM runs its command at once, without a slot, and says so on stderr.
+`atomics-onboard` reports the host item as `skipped`.
 
 **Turning it on.** `bin/atomics-vm-forward` holds one `ssh -N -R <socket>:<socket>` to the VM. Load
 its launchd agent once you accept the trust above:

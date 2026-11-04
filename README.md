@@ -186,7 +186,8 @@ On Linux, a private, user-owned `XDG_RUNTIME_DIR` holds each new install's socke
 in an `atomics/<instance hash>` subdirectory, with the FIFO isolated inside `jobserver/`. Without it, the socket stays beside the state and the FIFO uses the user's
 temporary directory. Existing `~/.atomics` installs retain their state and socket paths; the FIFO can use XDG runtime storage.
 `ATOMICS_HOME` always overrides the state path and keeps the socket beside that state; `ATOMICS_SOCKET` overrides just the
-socket, and `ATOMICS_CONFIG` overrides the config file. Runtime FIFO paths are distinct for each state home. Empty or relative
+socket (except the one an agent's terminal gets from its host, which yields to an explicit `ATOMICS_HOME`), and
+`ATOMICS_CONFIG` overrides the config file. Runtime FIFO paths are distinct for each state home. Empty or relative
 XDG paths are ignored. The earlier `~/.cox` and config rename migration still runs without overwriting existing state.
 
 ### Upgrading from IMACS
@@ -521,12 +522,15 @@ Codex sends wait for the complete message to appear in the transcript or visible
 prompt hook. ATOMICS retries unconfirmed input and returns an error if delivery cannot be confirmed;
 another message cannot replace a send still awaiting confirmation.
 
-Agent terminals inherit no `ATOMICS_SOCKET`, `ATOMICS_PANE`, `ATOMICS_HOME` or `ATOMICS_CONFIG`.
-Codex hooks receive the socket as an argument and their pane in `ATOMICS_HOOK_PANE`, which ATOMICS
+Agent terminals inherit no `ATOMICS_PANE`, `ATOMICS_HOME` or `ATOMICS_CONFIG`, and whatever `ATOMICS_SOCKET` the
+parent had is replaced with the socket of the ATOMICS that runs the terminal (`ATOMICS_HOST_SOCKET` names the same
+path), so `atomics queue` and `atomics ctl` there reach that ATOMICS, whatever a login profile sets. Codex hooks
+receive the socket as an argument and their pane in `ATOMICS_HOOK_PANE`, which ATOMICS
 sets for that session only (a terminal never inherits another's), then use the mapped Codex session
 ID; Claude hooks receive socket and pane arguments. MCP servers receive
-their own routing environment. An ATOMICS launched from an agent therefore uses its own defaults; explicitly set
-`ATOMICS_HOME`, `ATOMICS_SOCKET` and `ATOMICS_CONFIG` when launching a separate test instance.
+their own routing environment. An ATOMICS launched from an agent with an explicit `ATOMICS_HOME` keeps its socket
+beside that state rather than its host's; explicitly set `ATOMICS_HOME`, `ATOMICS_SOCKET` and `ATOMICS_CONFIG` when
+launching a separate test instance. `atomics queue` says on stderr when it runs a command without a slot, and why.
 An explicit `ATOMICS_HOME` also gives bare agents their own `CODEX_HOME` (`<home>/codex`) and
 `CLAUDE_CONFIG_DIR` (`<home>/claude`). Codex's per-event hook trust slots and Claude's folder trust
 then belong to that instance. Sign in separately in those provider homes when needed.
