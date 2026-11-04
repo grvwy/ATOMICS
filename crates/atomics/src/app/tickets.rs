@@ -3675,27 +3675,37 @@ mod tests {
             let output = board_frame(app, ctx, vec![]);
             let shown = texts(&output);
             assert!(!shown.iter().any(|(text, _)| text.starts_with("ticket says")));
-            let chip = shown.iter().find(|(text, _)| text == "CARD-1 · Doing").unwrap().1;
+            let at = |label: &str| shown.iter().find(|(text, _)| text == label).unwrap().1;
+            let chips = [(at("CARD-1 · Doing"), "CARD-1"), (at("b1"), "b1")];
             output.drop_without_applying_deltas();
-            let button = |pressed| egui::Event::PointerButton {
-                pos: chip,
+            let press = |pos, pressed| egui::Event::PointerButton {
+                pos,
                 button: egui::PointerButton::Primary,
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             };
-            board_frame(app, ctx, vec![egui::Event::PointerMoved(chip), button(true)]).drop_without_applying_deltas();
-            let released = board_frame(app, ctx, vec![button(false)]);
-            let opened: Vec<String> = released
-                .platform_output
-                .commands
-                .iter()
-                .filter_map(|command| match command {
-                    egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(opened, ["https://tickets.example/CARD-1"]);
-            released.drop_without_applying_deltas();
+            let opened = |output: &egui::FullOutput| -> Vec<String> {
+                let commands = output.platform_output.commands.iter();
+                commands
+                    .filter_map(|command| match command {
+                        egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // A task's chip and the plan's read their ticket in the app, each afresh.
+            for (chip, label) in chips {
+                board_frame(app, ctx, vec![egui::Event::PointerMoved(chip), press(chip, true)])
+                    .drop_without_applying_deltas();
+                let released = board_frame(app, ctx, vec![press(chip, false)]);
+                assert_eq!(opened(&released), Vec::<String>::new(), "{label}: not in the browser");
+                released.drop_without_applying_deltas();
+                assert_eq!(app.runtime.panel, PanelMode::Tickets, "{label}");
+                let panel = &app.runtime.tickets.panel;
+                assert_eq!(panel.read.as_ref().unwrap().link.label(), label);
+                assert!(panel.crumbs.is_empty(), "{label}");
+                app.runtime.panel = PanelMode::Plan;
+            }
 
             // The sync button reads the tickets again.
             let reads = count(&state, "card_list");

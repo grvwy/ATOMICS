@@ -77,9 +77,9 @@ impl Backend for Local<'_> {
         self.run(command);
     }
 
-    /// The desktop carries out every command.
-    fn available(&self, _command: &atomics_ui::Command) -> bool {
-        true
+    /// The desktop carries out every command. Its ticket reader needs a ticket system to read from.
+    fn available(&self, command: &atomics_ui::Command) -> bool {
+        !matches!(command, atomics_ui::Command::OpenTicket(_)) || self.0.ticket_config().is_some()
     }
 
     fn launch_dir(&self) -> Option<PathBuf> {
@@ -500,6 +500,7 @@ mod tests {
             assert_eq!(map(Command::ToggleDiff), Remote::Client);
             assert_eq!(map(Command::ShowPlan(0)), Remote::Client);
             assert_eq!(map(Command::OpenProject(root.clone())), Remote::Unsupported);
+            assert_eq!(map(Command::OpenTicket(Default::default())), Remote::Client);
             assert_eq!(map(Command::SyncTickets(0)), Remote::Unsupported);
 
             // The host takes what the mapping sends: approving through the journal, as a protocol client does.
