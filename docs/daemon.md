@@ -675,7 +675,9 @@ a launcher).
   frame's raw input before egui sees it: a click on the cells gives the terminal the keyboard (and asks for the
   lease, as a tap does), keys and text go to it while it has the keyboard, a click anywhere else or a text box
   taking the keyboard lets go, the wheel over the cells scrolls this client's history, Copy copies the
-  selection, and Command-key shortcuts stay the window's.
+  selection, and Command on macOS or Ctrl+Shift elsewhere stays the window's. Plain Ctrl still goes to the
+  terminal. Reserved chords remain in egui's input; the client has no general `[keys]` handlers, so an unhandled
+  chord does nothing and sends nothing to the terminal.
 - **Closing the window** ends only the connection: the host's agents, terminals, plans and approvals go on, and
   a window opened again finds them as they are. The client takes no lock on the home and starts no runtime.
 - **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop

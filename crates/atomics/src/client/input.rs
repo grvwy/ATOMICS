@@ -3,7 +3,7 @@
 //! the terminal's share of each frame's raw input before egui sees it and hands it to the pane as the
 //! overlay would ([`TermInput`]). A click on the cells focuses them and asks for the lease, keys and text
 //! typed while they have the keyboard go to the terminal, and a click anywhere else, or a text box taking
-//! the keyboard, lets go. Command-key shortcuts stay the window's.
+//! the keyboard, lets go. Command on macOS and Ctrl+Shift elsewhere stay the window's.
 
 use atomics_web::gesture::{Kind, Phase, Pointer};
 use atomics_web::term_pane::{Overlay, TermInput};
@@ -72,9 +72,11 @@ fn ctrl_char(key: Key) -> Option<String> {
     }
 }
 
-/// The window's own shortcuts: Command on a Mac, never Ctrl, which terminals need.
+/// The window's own shortcuts: Command on a Mac, Ctrl+Shift elsewhere; plain Ctrl belongs to terminals.
 fn shortcut(modifiers: Modifiers) -> bool {
-    modifiers.mac_cmd || (cfg!(target_os = "macos") && modifiers.command)
+    modifiers.mac_cmd
+        || (cfg!(target_os = "macos") && modifiers.command)
+        || (!cfg!(target_os = "macos") && modifiers.ctrl && modifiers.shift)
 }
 
 fn over(overlay: &Overlay, pos: Pos2) -> bool {
@@ -294,6 +296,70 @@ mod tests {
             ]
         );
         assert_eq!(kept.len(), 1, "the window keeps its Command shortcuts");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_chords_stay_in_the_window() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        let overlay = overlay();
+        let modifiers = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        for code in [Key::B, Key::D, Key::T, Key::K] {
+            let events = vec![
+                key(code, modifiers),
+                Event::Key { key: code, physical_key: None, pressed: false, repeat: false, modifiers },
+            ];
+            let (inputs, kept) = route(&mut keyboard, &overlay, events.clone());
+            assert!(inputs.is_empty(), "{code:?} with Ctrl+Shift must never become terminal input");
+            assert_eq!(kept, events, "egui keeps the chord even if the client has no handler for it");
+            assert!(keyboard.focused, "a window shortcut does not blur the terminal");
+        }
+    }
+
+    #[test]
+    fn plain_ctrl_and_other_terminal_keys_still_reach_the_terminal() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        let ctrl = Modifiers { command: !cfg!(target_os = "macos"), ..Modifiers::CTRL };
+        let (inputs, kept) = route(
+            &mut keyboard,
+            &overlay(),
+            vec![
+                key(Key::D, ctrl),
+                key(Key::C, ctrl),
+                key(Key::Enter, Modifiers::NONE),
+                key(Key::Tab, Modifiers::NONE),
+                key(Key::ArrowLeft, Modifiers::SHIFT),
+                Event::Text("d".into()),
+            ],
+        );
+        assert_eq!(
+            inputs,
+            vec![
+                TermInput::Key { name: "d".into(), mods: Modifiers::CTRL },
+                TermInput::Key { name: "c".into(), mods: Modifiers::CTRL },
+                TermInput::Key { name: "Enter".into(), mods: Modifiers::NONE },
+                TermInput::Key { name: "Tab".into(), mods: Modifiers::NONE },
+                TermInput::Key { name: "ArrowLeft".into(), mods: Modifiers::SHIFT },
+                TermInput::Text("d".into()),
+            ]
+        );
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn mac_command_shortcuts_and_ctrl_shift_are_unchanged() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        for modifiers in [Modifiers::MAC_CMD, Modifiers::COMMAND] {
+            let event = key(Key::D, modifiers);
+            let (inputs, kept) = route(&mut keyboard, &overlay(), vec![event.clone()]);
+            assert!(inputs.is_empty());
+            assert_eq!(kept, vec![event]);
+        }
+        let modifiers = Modifiers::CTRL | Modifiers::SHIFT;
+        let (inputs, kept) = route(&mut keyboard, &overlay(), vec![key(Key::D, modifiers)]);
+        assert_eq!(inputs, vec![TermInput::Key { name: "d".into(), mods: modifiers }]);
+        assert!(kept.is_empty(), "Ctrl+Shift still belongs to the terminal on a Mac");
     }
 
     #[test]
