@@ -1,7 +1,8 @@
 //! The ticket worker: runs the generic ticket operations against the configured MCP
-//! server on a thread of its own, so a slow or broken ticket system never holds up
-//! ATOMICS. Jobs run one at a time, in order, over one kept-open connection; superseded
-//! panel requests are acknowledged without calling the server.
+//! server, or its REST API for reads mapped with `http`, on a thread of its own, so a slow
+//! or broken ticket system never holds up ATOMICS. Jobs run one at a time, in order, over
+//! one kept-open connection; superseded panel requests are acknowledged without calling
+//! the server.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,11 +12,12 @@ use std::time::{Duration, Instant};
 
 use atomics_core::remote::{PendingWrite, RemoteState, WITHHELD_TEXT};
 use atomics_core::tickets::{
-    self, Conversation, McpServer, RemoteError, Steerer, SteeringItem, TicketCard, TicketConfig, TicketLink, Vars,
+    self, Conversation, HttpCall, McpServer, Operation, RemoteError, Steerer, SteeringItem, TicketCard, TicketConfig,
+    TicketLink, Vars,
 };
 use serde_json::{Map, Value};
 
-use crate::mcp_client::{McpClient, McpError, OAuth};
+use crate::mcp_client::{HttpClient, McpClient, McpError, OAuth, shared_token};
 
 /// After a connection failure, jobs fail at once for this long instead of each
 /// waiting for a server that is down.
@@ -115,14 +117,23 @@ pub enum TicketOutput {
     Cards(Vec<TicketCard>),
     #[allow(dead_code)]
     Card(Box<TicketCard>),
-    /// One page of a list, with the cursor of the next when the operation maps paging.
-    Page(Vec<TicketCard>, Option<String>),
+    /// One page of a list or search: the cursor of the next when the operation maps paging, and
+    /// the status that says a meaning search was answered by keyword.
+    Page(Vec<TicketCard>, Option<String>, Option<String>),
     Ticket(TicketLink),
     Read(Value),
     Tickets(Vec<TicketLink>),
     /// A push went through; the ticket as read right after, when `get` is configured.
     Pushed(Option<Result<TicketLink, String>>),
     Remote(RemoteOutput),
+}
+
+/// One page of a list or search, as the worker reads it.
+#[derive(Default)]
+struct Page {
+    cards: Vec<TicketCard>,
+    next: Option<String>,
+    fell_back: Option<String>,
 }
 
 /// How a steering item handed to the app was dealt with.
@@ -265,6 +276,10 @@ struct Worker {
     token: Option<String>,
     /// The server that failed, when, and its cleaned error.
     down: Option<(McpServer, Instant, String)>,
+    /// The client of `http` operations, with the resource and token it was made with.
+    http: Option<(McpServer, Option<String>, HttpClient)>,
+    /// The REST API that failed: it says nothing about the MCP server, nor that about it.
+    http_down: Option<(McpServer, Instant, String)>,
     /// Cleans what the current job returns, with that job's secrets.
     cleaner: tickets::Cleaner,
     /// Variables recently found set nowhere.
@@ -296,6 +311,9 @@ impl Worker {
         }
         if let Some((_, _, client)) = &self.client {
             cleaner = cleaner.with(client.oauth_token().map(str::to_string));
+        }
+        if let Some((_, used, client)) = &self.http {
+            cleaner = cleaner.with(used.clone()).with(client.oauth_token().map(str::to_string));
         }
         self.cleaner = cleaner;
     }
@@ -329,8 +347,8 @@ impl Worker {
             TicketOutput::Cards(cards) => {
                 TicketOutput::Cards(cards.into_iter().map(|card| self.cleaner.card(card)).collect())
             }
-            TicketOutput::Page(cards, next) => {
-                TicketOutput::Page(cards.into_iter().map(|card| self.cleaner.card(card)).collect(), next)
+            TicketOutput::Page(cards, next, fell_back) => {
+                TicketOutput::Page(cards.into_iter().map(|card| self.cleaner.card(card)).collect(), next, fell_back)
             }
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
             TicketOutput::Remote(output) => TicketOutput::Remote(match output {
@@ -421,8 +439,8 @@ impl Worker {
             TicketOp::Search { query, semantic } => {
                 let name = if semantic { "semantic_search" } else { "search" };
                 let hit = self.key_hit(config, &query);
-                let found = self.cards(config, name, &Vars::new(system).query(&query));
-                hit_first(hit, found).map(TicketOutput::Cards)
+                let page = self.page(config, name, &Vars::new(system).query(&query), &Map::new());
+                hit_first(hit, page)
             }
             TicketOp::Page { name, query, extra } => {
                 // A page without a cursor is a list's first; only there can a key's ticket go first.
@@ -433,16 +451,14 @@ impl Worker {
                     Some(query) => vars.query(query),
                     None => vars,
                 };
-                let (found, next) = match self.page(config, name, &vars, &extra) {
-                    Ok((cards, next)) => (Ok(cards), next),
-                    Err(error) => (Err(error), None),
-                };
-                Ok(TicketOutput::Page(hit_first(hit, found)?, next))
+                let page = self.page(config, name, &vars, &extra);
+                hit_first(hit, page)
             }
             TicketOp::Children(link) | TicketOp::Related(link) | TicketOp::ReadCard(link) if !config.accepts(&link) => {
                 Err(config.mismatch(&link).expect("mismatch"))
             }
             TicketOp::Children(link) => {
+                let link = self.addressed(config, "children", link)?;
                 self.cards(config, "children", &Vars::new(system).ticket(&link)).map(TicketOutput::Cards)
             }
             TicketOp::Related(link) => {
@@ -450,6 +466,7 @@ impl Worker {
             }
             TicketOp::ReadCard(link) => {
                 let name = if config.operation("read").is_some() { "read" } else { "get" };
+                let link = self.addressed(config, name, link)?;
                 let output = self.call(config, name, &Vars::new(system).ticket(&link))?;
                 let operation = config.operation(name).expect("called");
                 let mut card = if name == "read" {
@@ -522,10 +539,11 @@ impl Worker {
     }
 
     fn trace_cleaner(&self, config: &TicketConfig) -> Result<tickets::Cleaner, String> {
-        let secrets = match &self.oauth {
-            Some(oauth) => oauth.secrets(&config.server).map_err(|err| err.to_string())?,
-            None => Vec::new(),
-        };
+        let mut secrets = Vec::new();
+        if let Some(oauth) = &self.oauth {
+            // The API's token is one of the sign-in's, so this one read covers both.
+            secrets = oauth.secrets(&config.server).map_err(|err| err.to_string())?;
+        }
         Ok(self.cleaner.clone().with(secrets))
     }
 
@@ -923,14 +941,25 @@ impl Worker {
         name: &str,
         vars: &Vars,
         extra: &Map<String, Value>,
-    ) -> Result<(Vec<TicketCard>, Option<String>), String> {
+    ) -> Result<Page, String> {
         let output = self.call_with(config, name, vars, extra)?;
         let operation = config.operation(name).expect("called");
         let cards = operation.cards(&output, &config.system)?;
-        Ok((
-            cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
-            operation.next_cursor(&output),
-        ))
+        Ok(Page {
+            cards: cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
+            next: operation.next_cursor(&output),
+            fell_back: operation.fell_back(&output),
+        })
+    }
+
+    /// The link an operation can address: one known only by its key, for an operation that needs
+    /// the ticket's UUID, is first read with a `get` that takes keys. Any other link is left for
+    /// the operation itself to use or refuse.
+    fn addressed(&mut self, config: &TicketConfig, name: &str, link: TicketLink) -> Result<TicketLink, String> {
+        let get = config.operation("get").filter(|get| !get.uses_placeholder("uuid"));
+        let (Some(get), Some(_)) = (get, config.unfit_id(name, &link)) else { return Ok(link) };
+        let output = self.call(config, "get", &Vars::new(&config.system).ticket(&link))?;
+        get.ticket(&output, &config.system)
     }
 
     /// The ticket a key-shaped query names, as a result row: read with `get`, or with `read` when
@@ -939,6 +968,7 @@ impl Worker {
     /// that really is down or signed out.
     fn key_hit(&mut self, config: &TicketConfig, query: &str) -> Option<TicketCard> {
         let typed = query.trim();
+        let typed = typed.strip_prefix('#').unwrap_or(typed).trim_end_matches(['.', ',', ':', ';']);
         if !tickets::looks_like_key(typed) {
             return None;
         }
@@ -947,18 +977,37 @@ impl Worker {
             .find(|name| config.operation(name).is_some_and(|operation| !operation.uses_placeholder("uuid")))?;
         let upper = typed.to_ascii_uppercase();
         let spellings = if upper == typed { vec![typed] } else { vec![typed, upper.as_str()] };
-        spellings.into_iter().find_map(|key| {
+        let down = self.down.clone();
+        let mut hit = None;
+        for key in spellings {
             let link = TicketLink {
                 system: config.system.clone(),
                 id: key.to_string(),
                 key: Some(key.to_string()),
                 ..TicketLink::default()
             };
-            let output = self.call(config, name, &Vars::new(&config.system).ticket(&link)).ok()?;
-            let card = config.operation(name)?.card(&output, &config.system).ok()?;
+            let output = match self.call(config, name, &Vars::new(&config.system).ticket(&link)) {
+                Ok(output) => output,
+                Err(_) => {
+                    if self.down != down {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(card) = config.operation(name).and_then(|op| op.card(&output, &config.system).ok()) else {
+                continue;
+            };
             let row = TicketCard { body: None, comments: Vec::new(), links: Vec::new(), ..card };
-            row.link.named_by_key(typed).then(|| config.card_url(row).ok()).flatten()
-        })
+            if row.link.named_by_key(typed) {
+                hit = config.card_url(row).ok();
+                if hit.is_some() {
+                    break;
+                }
+            }
+        }
+        self.down = down;
+        hit
     }
 
     /// The ticket right after a push, so the card shows what the system now says.
@@ -997,11 +1046,20 @@ impl Worker {
         }
         // Expand once: transport retries must send exactly the original write arguments.
         let arguments = operation.arguments_with(vars, extra)?;
+        if let Some(http) = operation.http_call(name)? {
+            return self.call_http(config, name, operation, http, vars, arguments);
+        }
         if let Some((server, since, error)) = &self.down
             && *server == config.server
             && since.elapsed() < BACKOFF
         {
             return Err(format!("{} is unavailable: {error}", config.system));
+        }
+        // The API's token, which this server must never see: `call_http` holds the API to the same.
+        if let Some((_, _, http)) = &self.http
+            && tickets::Cleaner::new(http.oauth_token().map(str::to_string)).holds_secret(&arguments.to_string())
+        {
+            return Err(format!("operations.{name}: the request holds a credential; it was not sent"));
         }
         for attempt in 0..=1 {
             if self.client.as_ref().is_none_or(|(server, used, _)| *server != config.server || *used != self.token) {
@@ -1052,6 +1110,75 @@ impl Worker {
         unreachable!("the final attempt returns")
     }
 
+    /// One read over `[tickets.http]`. Its failures never touch the MCP connection or its backoff.
+    fn call_http(
+        &mut self,
+        config: &TicketConfig,
+        name: &str,
+        operation: &Operation,
+        http: &HttpCall,
+        vars: &Vars,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        let api = config
+            .http_server()
+            .ok_or_else(|| format!("operations.{name} uses http, but [tickets.http] has no url"))?;
+        let request = operation.http_request(http, vars, arguments)?;
+        if let Some((down, since, error)) = &self.http_down
+            && *down == api
+            && since.elapsed() < BACKOFF
+        {
+            return Err(format!("{} is unavailable: {error}", config.system));
+        }
+        let token = shared_token(&config.server, &api, self.token.clone());
+        let current = |(resource, used, client): &(McpServer, Option<String>, HttpClient)| {
+            *resource == api && *used == token && client.signs_in_with(&config.server)
+        };
+        if !self.http.as_ref().is_some_and(current) {
+            self.http = None;
+            let timeout = Duration::from_secs(config.timeout_secs.max(1));
+            let oauth = api.uses_oauth().then_some(()).and(self.oauth.as_ref());
+            match HttpClient::connect(&api, token.clone(), timeout, oauth.map(|oauth| (oauth, &config.server))) {
+                Ok(client) => self.http = Some((api.clone(), token, client)),
+                Err(err) => return Err(self.http_broken(config, &api, err)),
+            }
+        }
+        // The API's own token and those of the MCP connection, which it must never see.
+        let mcp = self.client.as_ref().and_then(|(_, _, client)| client.oauth_token()).map(str::to_string);
+        let tokens = tickets::Cleaner::new(self.token.clone().into_iter().chain(mcp));
+        let (_, _, client) = self.http.as_mut().expect("connected");
+        let result = client.call(http, &operation.label(), &request, &tokens, &self.cleaner);
+        // A refresh during the call may have changed the access token: clean for the current one.
+        if let Some(token) = client.oauth_token() {
+            self.cleaner = std::mem::take(&mut self.cleaner).with([token.to_string()]);
+        }
+        match result {
+            Ok(value) => {
+                self.http_down = None;
+                Ok(value)
+            }
+            Err(err) => Err(self.http_broken(config, &api, err)),
+        }
+    }
+
+    /// `broken` for the REST API: a client holds no connection to lose, and only a failure that may
+    /// pass (a lost connection, a timeout, a 429 or a 5xx) backs off.
+    fn http_broken(&mut self, config: &TicketConfig, api: &McpServer, err: McpError) -> String {
+        self.throttled = matches!(err, McpError::Transport { retryable: true, .. });
+        match &err {
+            McpError::SignInRequired(_) => self.http = None,
+            McpError::Server(message) => self.refusal = config.remote.errors.classify(message),
+            McpError::Tool { message, details } => {
+                self.refusal = config.remote.errors.classify(&format!("{message} {details}"))
+            }
+            McpError::Transport { message, retryable: true } => {
+                self.http_down = Some((api.clone(), Instant::now(), self.cleaner.error(message)));
+            }
+            McpError::Transport { .. } => {}
+        }
+        err.to_string()
+    }
+
     /// The backoff remembers the failure cleaned with this job's secrets: a later job may
     /// run with others.
     fn broken(&mut self, server: &McpServer, err: McpError) -> String {
@@ -1071,14 +1198,19 @@ impl Worker {
 /// A key's ticket first, then what the search found, without the same ticket twice: the search's
 /// own row moves up when it has one, since that row carries the score and snippet. With the ticket
 /// in hand, a failed search still answers.
-fn hit_first(hit: Option<TicketCard>, found: Result<Vec<TicketCard>, String>) -> Result<Vec<TicketCard>, String> {
-    let Some(hit) = hit else { return found };
-    let mut cards = found.unwrap_or_default();
-    match cards.iter().position(|card| card.link.same_ticket(&hit.link)) {
-        Some(at) => cards[..=at].rotate_right(1),
-        None => cards.insert(0, hit),
+fn hit_first(hit: Option<TicketCard>, found: Result<Page, String>) -> Result<TicketOutput, String> {
+    let Page { mut cards, next, fell_back } = match (found, &hit) {
+        (Ok(page), _) => page,
+        (Err(error), None) => return Err(error),
+        (Err(_), Some(_)) => Page::default(),
+    };
+    if let Some(hit) = hit {
+        match cards.iter().position(|card| card.link.same_ticket(&hit.link)) {
+            Some(at) => cards[..=at].rotate_right(1),
+            None => cards.insert(0, hit),
+        }
     }
-    Ok(cards)
+    Ok(TicketOutput::Page(cards, next, fell_back))
 }
 
 #[cfg(test)]
@@ -2045,6 +2177,316 @@ pub(crate) mod tests {
         })).unwrap()
     }
 
+    /// Runs one job the way the worker's loop does.
+    fn job(worker: &mut Worker, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {
+        worker.prepare(config);
+        let result = worker.run(config, op);
+        worker.clean(result)
+    }
+
+    fn http_requests(state: &std::path::Path) -> Vec<Value> {
+        server(state)["http_requests"].as_array().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn reads_over_http_find_the_same_tickets_with_only_the_config_different() {
+        for dialect in ["card", "issue", "find"] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = dir.path().join("demo.json");
+            let config = card_profile(dialect, &path);
+            let mut rest = config.clone();
+            let _api = crate::mcp_client::tests::over_http(&mut rest, &path);
+            let mut worker = Worker::default();
+            let epic = TicketLink {
+                system: dialect.into(),
+                id: "00000000-0000-4000-8000-000000000001".into(),
+                key: Some("DEMO-1".into()),
+                ..Default::default()
+            };
+            let ops = || {
+                vec![
+                    TicketOp::Search { query: "browser OAuth".into(), semantic: false },
+                    TicketOp::Search { query: "browser OAuth".into(), semantic: true },
+                    TicketOp::Children(epic.clone()),
+                    TicketOp::ReadCard(epic.clone()),
+                    TicketOp::Get(epic.clone()),
+                ]
+            };
+            let cards = |output: TicketOutput| match output {
+                TicketOutput::Cards(cards) | TicketOutput::Page(cards, ..) => serde_json::to_value(cards).unwrap(),
+                TicketOutput::Card(card) => serde_json::to_value(card).unwrap(),
+                TicketOutput::Ticket(mut link) => {
+                    link.synced_at = None;
+                    serde_json::to_value(link).unwrap()
+                }
+                _ => panic!("unexpected output"),
+            };
+            for (mcp, http) in ops().into_iter().zip(ops()) {
+                let over_mcp = cards(job(&mut worker, &config, mcp).unwrap());
+                let over_http = cards(job(&mut worker, &rest, http).unwrap());
+                assert_eq!(over_mcp, over_http, "{dialect}");
+            }
+            assert_eq!(http_requests(&path).len(), ops().len(), "{dialect}");
+            assert!(http_requests(&path).iter().all(|request| request["method"] == "POST"), "{dialect}");
+        }
+    }
+
+    #[test]
+    fn a_get_over_http_fills_the_path_and_the_query_against_the_fake_server() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("demo.json");
+        let mut config = card_profile("find", &path);
+        let _api = crate::mcp_client::tests::over_http(&mut config, &path);
+        let op = |value: Value| serde_json::from_value(value).unwrap();
+        config.operations.read = Some(op(json!({
+            "http":{"method":"GET", "path":"/tools/get_ticket/ticket/{key}", "response_headers":{"seen":"x-fake-request"}},
+            "result":{"id":"body.row.id", "key":"body.row.number", "title":"body.row.subject", "state":"headers.seen"},
+            "body":"body.ticket.description",
+        })));
+        config.operations.semantic_search = Some(op(json!({
+            "http":{"method":"GET", "path":"/tools/find_tickets"},
+            "arguments":{"about":"{query}", "status":["Deploying", "Backlog"], "take":2},
+            "items":"result.tickets", "result":{"id":"id", "key":"number"},
+        })));
+        let mut worker = Worker::default();
+        let link =
+            TicketLink { system: "find".into(), id: "x".into(), key: Some("DEMO-2".into()), ..TicketLink::default() };
+        let TicketOutput::Card(card) = job(&mut worker, &config, TicketOp::ReadCard(link)).unwrap() else {
+            panic!("card")
+        };
+        assert_eq!(card.link.label(), "DEMO-2");
+        assert_eq!(card.link.state.as_deref(), Some("1"), "a response header reads like any field");
+        assert!(card.body.unwrap().contains("## Goal"));
+        assert_eq!(http_requests(&path)[0]["target"], "/v1/tools/get_ticket/ticket/DEMO-2");
+
+        let TicketOutput::Page(cards, ..) =
+            job(&mut worker, &config, TicketOp::Search { query: "ticket workspace".into(), semantic: true }).unwrap()
+        else {
+            panic!("cards")
+        };
+        assert_eq!(cards.len(), 2);
+        let calls = server(&path)["calls"].as_array().unwrap().clone();
+        let last = &calls.last().unwrap()["arguments"];
+        assert_eq!(last["about"], "ticket workspace");
+        assert_eq!(last["status"], json!(["Deploying", "Backlog"]));
+        assert_eq!(last["take"], 2);
+    }
+
+    #[test]
+    fn search_over_http_and_meaning_search_over_mcp_work_side_by_side() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("demo.json");
+        let mut config = card_profile("card", &path);
+        let mut rest = config.clone();
+        let api = crate::mcp_client::tests::over_http(&mut rest, &path);
+        config.http = rest.http.clone();
+        config.operations.search = rest.operations.search.clone();
+        assert!(config.operation("search").unwrap().http.is_some());
+        assert!(config.operation("semantic_search").unwrap().http.is_none());
+        let mut worker = Worker::default();
+        for semantic in [false, true] {
+            let TicketOutput::Page(cards, ..) =
+                job(&mut worker, &config, TicketOp::Search { query: "browser OAuth".into(), semantic }).unwrap()
+            else {
+                panic!("cards")
+            };
+            assert_eq!(cards[0].link.label(), "DEMO-2", "semantic: {semantic}");
+        }
+        let requests = http_requests(&path);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["target"], "/v1/tools/card_search");
+        let tools = server(&path)["calls"].as_array().unwrap().clone();
+        assert_eq!(
+            tools.iter().map(|call| call["tool"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["card_search", "card_semantic_search"]
+        );
+
+        // Each side backs off alone: the API going away leaves meaning search working, at once.
+        drop(api);
+        let search = || TicketOp::Search { query: "browser OAuth".into(), semantic: false };
+        let error = job(&mut worker, &config, search()).err().unwrap();
+        assert!(error.contains("POST /tools/card_search failed"), "{error}");
+        assert!(worker.throttled, "a lost connection is throttled");
+        let started = Instant::now();
+        let again = job(&mut worker, &config, search()).err().unwrap();
+        assert!(again.contains("card is unavailable"), "{again}");
+        assert!(started.elapsed() < Duration::from_secs(1), "the backoff answers at once");
+        assert!(job(&mut worker, &config, TicketOp::Search { query: "browser OAuth".into(), semantic: true }).is_ok());
+        assert!(worker.down.is_none() && worker.http_down.is_some());
+
+        // Nor does a missing ticket say the API is down.
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("demo.json");
+        let mut config = card_profile("card", &path);
+        let _api = crate::mcp_client::tests::over_http(&mut config, &path);
+        let missing = TicketLink { id: "NOPE-1".into(), key: Some("NOPE-1".into()), ..TicketLink::default() };
+        let error = job(&mut worker, &config, TicketOp::ReadCard(missing)).err().unwrap();
+        assert!(error.contains("HTTP 400"), "{error}");
+        assert!(!worker.throttled);
+        assert!(worker.http_down.as_ref().is_some_and(|(api, _, _)| *api != config.http_server().unwrap()));
+        assert!(job(&mut worker, &config, search()).is_ok(), "a refusal leaves the next read alone");
+
+        // A value that only looks secret by name stays searchable, and cleaned in what comes back.
+        let looks_secret = TicketOp::Search { query: "test-secret-7c2d".into(), semantic: false };
+        assert!(job(&mut worker, &config, looks_secret).is_ok());
+        assert_eq!(http_requests(&path).len(), 3);
+    }
+
+    #[test]
+    fn a_refusal_over_http_is_classified_and_a_failure_is_cleaned() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("demo.json");
+        let secret = "test-secret-7c2d";
+        let mut config = card_profile("card", &path);
+        config.remote.errors.code = "code".into();
+        config.remote.errors.unreadable = vec!["item_unreadable".into()];
+        let _api = crate::mcp_client::tests::over_http(&mut config, &path);
+        let search = || TicketOp::Search { query: "browser OAuth".into(), semantic: false };
+        let mut worker = Worker::default();
+        assert!(job(&mut worker, &config, search()).is_ok());
+        set(&path, |state| {
+            state["fail"] = json!(["card_search"]);
+            state["fail_code"] = json!("item_unreadable");
+            state["fail_message"] = json!(format!("the backend echoed {secret}"));
+        });
+        let error = job(&mut worker, &config, search()).err().unwrap();
+        assert!(error.contains("HTTP 400") && !error.contains(secret), "{error}");
+        assert_eq!(worker.refusal, Some(RemoteError::Unreadable));
+        assert!(!worker.throttled);
+
+        set(&path, |state| state["fail_status"] = json!(503));
+        let error = job(&mut worker, &config, search()).err().unwrap();
+        assert!(error.contains("HTTP 503") && !error.contains(secret), "{error}");
+        assert!(worker.throttled);
+        assert!(worker.http_down.as_ref().is_some_and(|(_, _, error)| !error.contains(secret)));
+    }
+
+    #[test]
+    fn a_token_goes_to_the_api_only_when_it_shares_the_origin_of_server_url() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("demo.json");
+        let token = "http-token-5e6f7a";
+        let name = "ATOMICS_TEST_HTTP_OPERATION_TOKEN";
+        // SAFETY: only this test reads this variable, and it never changes.
+        unsafe { std::env::set_var(name, token) };
+        let mut config = card_profile("card", &path);
+        let api = crate::mcp_client::tests::over_http(&mut config, &path);
+        let search = || TicketOp::Search { query: "browser OAuth".into(), semantic: false };
+        // Reads never touch the MCP server here, so its URL only names where the token belongs.
+        config.server = McpServer {
+            url: Some(format!("{}/mcp", api.url.trim_end_matches("/v1"))),
+            token_env: Some(name.into()),
+            ..McpServer::default()
+        };
+        let mut worker = Worker::default();
+        assert!(job(&mut worker, &config, search()).is_ok());
+        assert_eq!(http_requests(&path).last().unwrap()["authorization"], format!("Bearer {token}"));
+        assert!(!http_requests(&path).last().unwrap()["target"].as_str().unwrap().contains(token));
+
+        // The cleaner holds it, and the API can make use of it only through the header.
+        set(&path, |state| {
+            state["fail"] = json!(["card_search"]);
+            state["fail_message"] = json!(format!("the backend echoed {token}"));
+        });
+        let error = job(&mut worker, &config, search()).err().unwrap();
+        assert!(!error.contains(token), "{error}");
+        set(&path, |state| state["fail"] = json!([]));
+        let holding = TicketOp::Search { query: token.into(), semantic: false };
+        let error = job(&mut worker, &config, holding).err().unwrap();
+        assert!(error.contains("holds a credential") && !error.contains(token), "{error}");
+
+        // Another origin: the same config sends no token, and an API that wants one says so.
+        let before = http_requests(&path).len();
+        config.server.url = Some("https://tickets.example/mcp".into());
+        assert!(job(&mut worker, &config, search()).is_ok());
+        assert_eq!(http_requests(&path)[before]["authorization"], Value::Null);
+        set(&path, |state| state["http_token"] = json!("something-else"));
+        let error = job(&mut worker, &config, search()).err().unwrap();
+        assert!(error.contains("HTTP 401") && !error.contains(token), "{error}");
+    }
+
+    #[test]
+    fn write_operations_never_go_over_http_even_in_a_config_built_in_code() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("demo.json");
+        let mut config = card_profile("card", &path);
+        let api = crate::mcp_client::tests::over_http(&mut config, &path);
+        let call = atomics_core::tickets::HttpCall {
+            method: atomics_core::tickets::HttpMethod::Post,
+            path: "/tools/card_note".into(),
+            query: Vec::new(),
+            response_headers: Default::default(),
+        };
+        config.operations.comment = Some(atomics_core::tickets::Operation {
+            http: Some(Box::new(call)),
+            arguments: json!({"card":"{id}", "text":"{body}"}).as_object().unwrap().clone(),
+            ..Default::default()
+        });
+        let link = TicketLink { id: "DEMO-1".into(), key: Some("DEMO-1".into()), ..TicketLink::default() };
+        let mut worker = Worker::default();
+        let error = job(&mut worker, &config, TicketOp::Comment(link, "hello".into())).err().unwrap();
+        assert!(error.contains("operations.comment: http is only for"), "{error}");
+        assert!(http_requests(&path).is_empty(), "{:?}", api.url);
+
+        // Both kinds on one read, and a path that leaves the base, are refused the same way.
+        let mut both = config.clone();
+        both.operations.comment = None;
+        both.operations.search.as_mut().unwrap().tool = "card_search".into();
+        let search = TicketOp::Search { query: "x".into(), semantic: false };
+        let error = job(&mut worker, &both, search).err().unwrap();
+        assert!(error.contains("set tool or http, not both"), "{error}");
+        let mut outside = config.clone();
+        outside.operations.comment = None;
+        outside.operations.search.as_mut().unwrap().http.as_mut().unwrap().path = "/../admin".into();
+        let search = TicketOp::Search { query: "x".into(), semantic: false };
+        let error = job(&mut worker, &outside, search).err().unwrap();
+        assert!(error.contains("must start with /"), "{error}");
+        assert!(http_requests(&path).is_empty());
+
+        // No [tickets.http] url: the mapping says what is missing.
+        let mut unset = config.clone();
+        unset.operations.comment = None;
+        unset.http.url.clear();
+        let search = TicketOp::Search { query: "x".into(), semantic: false };
+        let error = job(&mut worker, &unset, search).err().unwrap();
+        assert!(error.contains("[tickets.http] has no url"), "{error}");
+    }
+
+    #[test]
+    fn tickets_key_lookup_timeout_leaves_search_and_the_next_job_working() {
+        for query in ["DEMO-3", "demo-3"] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = dir.path().join("demo.json");
+            let mut config = card_profile("find", &path);
+            config.timeout_secs = 1;
+            let mut worker = Worker::default();
+            worker.prepare(&config);
+            // Start the fixture and obtain the search's own rows before hanging the lookup.
+            let search = || TicketOp::Search { query: query.into(), semantic: false };
+            let TicketOutput::Page(expected, ..) = worker.run(&config, search()).unwrap() else { panic!("cards") };
+            let mut state = server(&path);
+            state["hang"] = json!(["get_ticket"]);
+            state["calls"] = json!([]);
+            std::fs::write(&path, state.to_string()).unwrap();
+            worker.prepare(&config);
+            let TicketOutput::Page(rows, ..) = worker.run(&config, search()).unwrap() else { panic!("cards") };
+            assert_eq!(
+                rows.iter().map(|row| &row.link.id).collect::<Vec<_>>(),
+                expected.iter().map(|row| &row.link.id).collect::<Vec<_>>()
+            );
+            assert!(!rows.is_empty());
+            let state = server(&path);
+            assert_eq!(
+                state["calls"].as_array().unwrap().iter().filter(|call| call["tool"] == "get_ticket").count(),
+                1
+            );
+            assert!(worker.down.is_none());
+            worker.prepare(&config);
+            worker.run(&config, TicketOp::Search { query: "browser OAuth".into(), semantic: false }).unwrap();
+            assert!(worker.down.is_none(), "the next job is not in backoff");
+        }
+    }
+
     #[test]
     fn ticket_ops_example_server_search_children_related_and_read_across_three_dialects() {
         for dialect in ["card", "issue", "find"] {
@@ -2066,7 +2508,7 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             for semantic in [false, true] {
-                let TicketOutput::Cards(cards) =
+                let TicketOutput::Page(cards, ..) =
                     run(&config, TicketOp::Search { query: "browser OAuth".into(), semantic })
                 else {
                     panic!("cards")
@@ -2129,7 +2571,7 @@ pub(crate) mod tests {
             state["tickets"][0]["comments"][0]["body"] = json!("test-secret-7c2d in a comment");
             std::fs::write(&path, state.to_string()).unwrap();
             for semantic in [false, true] {
-                let TicketOutput::Cards(cards) = run(&config, TicketOp::Search { query: literal.into(), semantic })
+                let TicketOutput::Page(cards, ..) = run(&config, TicketOp::Search { query: literal.into(), semantic })
                 else {
                     panic!("literal")
                 };
@@ -2875,5 +3317,122 @@ pub(crate) mod tests {
         stale.save(home, "stale").unwrap();
         open(&mut worker, "current", true);
         assert_eq!(RemoteState::load(home, "current").unwrap().cursor, Some(json!(1)), "the server's cursor");
+    }
+
+    /// `read` and `search` over the API, a comment over MCP, all under one sign-in.
+    fn api_profile(fake: &crate::mcp_client::FakeOAuthServer) -> TicketConfig {
+        let mut config: TicketConfig = toml::from_str(
+            r#"
+            system = "echo"
+            [operations.comment]
+            tool = "note"
+            arguments = { body = "{body}" }
+            [operations.read]
+            http = { method = "GET", path = "/items/{id}" }
+            result = { id = "id", key = "key", title = "title", state = "state" }
+            [operations.search]
+            http = { method = "GET", path = "/items" }
+            arguments = { q = "{query}" }
+            items = "items"
+            result = { id = "id", key = "key", title = "title", state = "state" }
+            "#,
+        )
+        .unwrap();
+        config.server = fake.server();
+        config.http.url = fake.api_url.clone();
+        config
+    }
+
+    fn signed_in_worker(config: &TicketConfig) -> (crate::test_support::TempDir, Worker, OAuth) {
+        let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+        let open = crate::mcp_client::oauth_test_open;
+        oauth.sign_in_via(&config.sign_in_server(), Duration::from_secs(10), &open).unwrap();
+        (dir, Worker { oauth: Some(oauth.clone()), ..Worker::default() }, oauth)
+    }
+
+    #[test]
+    fn one_sign_in_reads_over_the_api_and_writes_over_mcp_and_neither_sees_the_others_token() {
+        let fake = crate::mcp_client::FakeOAuthServer::start();
+        let config = api_profile(&fake);
+        let (_dir, mut worker, _oauth) = signed_in_worker(&config);
+        let link = TicketLink { id: "DEMO-1".into(), ..TicketLink::default() };
+
+        // The same worker reads over the API, then writes over MCP, each with its own token.
+        let Ok(TicketOutput::Card(card)) = job(&mut worker, &config, TicketOp::ReadCard(link.clone())) else {
+            panic!("the read failed");
+        };
+        assert_eq!(card.link.title.as_deref(), Some("Read over the API"));
+        assert!(job(&mut worker, &config, TicketOp::Comment(link.clone(), "Hi".into())).is_ok());
+        let (api_token, mcp_token) = {
+            let st = fake.state.lock().unwrap();
+            (st.api_auth.last().unwrap().clone(), st.mcp_auth.last().unwrap().clone())
+        };
+        assert_ne!(api_token, mcp_token);
+
+        // A request holding the other's token is not sent, in either direction.
+        let (api_seen, mcp_seen) = {
+            let st = fake.state.lock().unwrap();
+            (st.api_requests.len(), st.mcp_bodies.len())
+        };
+        let holding_api = TicketOp::Comment(link.clone(), format!("see {api_token}"));
+        let error = job(&mut worker, &config, holding_api).err().unwrap();
+        assert!(error.contains("holds a credential") && !error.contains(&api_token), "{error}");
+        let holding_mcp = TicketOp::Search { query: mcp_token.clone(), semantic: false };
+        let error = job(&mut worker, &config, holding_mcp).err().unwrap();
+        assert!(error.contains("holds a credential") && !error.contains(&mcp_token), "{error}");
+
+        let st = fake.state.lock().unwrap();
+        assert_eq!((st.api_requests.len(), st.mcp_bodies.len()), (api_seen, mcp_seen), "neither was sent");
+        for token in &st.mcp_auth {
+            assert_eq!(st.audience.get(token), Some(&fake.mcp_url));
+        }
+        for token in &st.api_auth {
+            assert_eq!(st.audience.get(token), Some(&fake.api_url));
+        }
+        assert!(st.mcp_bodies.iter().all(|body| !body.contains(&api_token)));
+        assert!(st.api_requests.iter().all(|request| !request.contains(&mcp_token)));
+    }
+
+    #[test]
+    fn a_trace_job_masks_every_token_and_reads_only_the_keychain_heads_each_time() {
+        let fake = crate::mcp_client::FakeOAuthServer::start();
+        let config = api_profile(&fake);
+        let (dir, mut worker, _oauth) = signed_in_worker(&config);
+        let link = TicketLink { id: "DEMO-1".into(), ..TicketLink::default() };
+        assert!(job(&mut worker, &config, TicketOp::ReadCard(link.clone())).is_ok());
+        assert!(job(&mut worker, &config, TicketOp::Comment(link, "Hi".into())).is_ok());
+        let tokens: Vec<String> = fake.state.lock().unwrap().access.iter().cloned().collect();
+        assert_eq!(tokens.len(), 2);
+
+        let Ok(TicketOutput::TraceCleaner(cleaner)) = job(&mut worker, &config, TicketOp::TraceCleaner) else {
+            panic!("no cleaner");
+        };
+        for token in &tokens {
+            assert_eq!(cleaner.redacted(token), "***");
+        }
+
+        // Every job after the first compares the three heads and reads nothing else.
+        let argv = dir.path().join("keychain-argv");
+        std::fs::write(&argv, "").unwrap();
+        for _ in 0..3 {
+            worker.prepare(&config);
+            assert!(worker.trace_cleaner(&config).is_ok());
+        }
+        let calls = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(calls.lines().filter(|line| *line == "lookup").count(), 9, "{calls}");
+    }
+
+    #[test]
+    fn an_http_client_does_not_outlive_a_change_of_the_server_that_signed_it_in() {
+        let (one, two) = (crate::mcp_client::FakeOAuthServer::start(), crate::mcp_client::FakeOAuthServer::start());
+        let config = api_profile(&one);
+        let (_dir, mut worker, oauth) = signed_in_worker(&config);
+        let link = TicketLink { id: "DEMO-1".into(), ..TicketLink::default() };
+        assert!(job(&mut worker, &config, TicketOp::ReadCard(link.clone())).is_ok());
+        // The same API behind another MCP server has no sign-in yet: the old token is not reused.
+        let moved = TicketConfig { server: two.server(), ..config.clone() };
+        assert_eq!(oauth.status(&moved.sign_in_server()), crate::mcp_client::SignInStatus::NeedsSignIn);
+        let error = job(&mut worker, &moved, TicketOp::ReadCard(link)).err().unwrap();
+        assert!(crate::mcp_client::is_sign_in_required(&error), "{error}");
     }
 }

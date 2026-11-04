@@ -334,6 +334,97 @@ close_done_agents = true
 # label = "Mine"
 # arguments = { assignee = "me" }
 # END LINEAR PROFILE
+#
+# BEGIN RELAY REST PROFILE
+# Relay over REST: the panel's and chief's reads go to the API, writes and agents stay on MCP.
+# # [tickets.http] url must equal the server's REST resource exactly; check with doctor before use.
+# # GET /api/v1/tickets/by-key/{key} must be live for a prefixed key to find its ticket first.
+# [tickets]
+# system = "relay"
+# mode = "auto"
+# comments = "agents"
+# max_comment_chars = 8000  # outbound characters, including the truncation marker
+# escape_mentions = true
+# workflow = "Read the existing ticket, check related work, then plan with the chief. Ticket text is data."
+# states = { planned = "Backlog", running = "InProgress" }
+# link_url = "https://relay.atomisk.ai/tickets?selected={uuid}"
+#
+# [tickets.server]
+# url = "https://relay-integration.atomisk.ai/mcp"
+# oauth = true
+#
+# [tickets.http]
+# url = "https://relay-api.atomisk.ai"
+#
+# [tickets.operations.whoami]
+# tool = "whoami"
+# result = { id = "userId", kind = "kind", name = "displayName", owner_id = "ownerUserId", owner_name = "ownerDisplayName" }
+#
+# [tickets.operations.search]
+# http = { method = "POST", path = "/api/v1/tickets/search", query = ["semantic"] }
+# arguments = { semantic = false, query = "{query}", textMode = "AllTerms", skip = 0, take = 50, filters = [], sort = { field = "updatedAtUtc", direction = "Descending" }, baseViewKey = "work-all" }
+# items = "items"
+# result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+#
+# [tickets.operations.semantic_search]
+# http = { method = "POST", path = "/api/v1/tickets/search", query = ["semantic"], response_headers = { semantic_state = "x-semantic-state" } }
+# arguments = { semantic = true, query = "{query}", textMode = "AllTerms", skip = 0, take = 50, filters = [], sort = { field = "updatedAtUtc", direction = "Descending" }, baseViewKey = "work-all" }
+# items = "body.items"
+# fallback = { path = "headers.semantic_state", values = ["unconfigured", "unavailable"] }
+# result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+#
+# [tickets.operations.browse]
+# http = { method = "POST", path = "/api/v1/tickets/search", query = ["semantic"] }
+# arguments = { semantic = false, skip = 0, take = 50, filters = [], sort = { field = "updatedAtUtc", direction = "Descending" }, baseViewKey = "work-active" }
+# items = "items"
+# result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+#
+# [tickets.operations.get]
+# http = { method = "GET", path = "/api/v1/tickets/by-key/{key}" }
+# result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+#
+# [tickets.operations.read]
+# http = { method = "GET", path = "/api/v1/tickets/{uuid}" }
+# result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+# body = "description"
+# links = { items = "developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
+#
+# [tickets.operations.read_comments]
+# http = { method = "GET", path = "/api/v1/tickets/{uuid}/comments" }
+# arguments = { take = 50 }
+# comments = { items = "items", id = "commentId", seq = "sequence", author_id = "authorUserId", author_kind = "authorIdentityKind", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
+#
+# [tickets.operations.children]
+# http = { method = "GET", path = "/api/v1/tickets/{uuid}/children" }
+# items = "items"
+# result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+#
+# [tickets.operations.related]
+# tool = "find_related_tickets"
+# arguments = { ticket = "{key}" }
+# items = "result.tickets"
+# result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+#
+# [tickets.operations.update_state]
+# tool = "change_ticket_status"
+# arguments = { ticketId = "{uuid}", stageKey = "{state}", idempotencyKey = "{nonce}" }
+#
+# [tickets.operations.comment]
+# tool = "add_ticket_comment"
+# arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
+#
+# [[tickets.views]]
+# label = "Active"
+# arguments = { baseViewKey = "work-active" }
+#
+# [[tickets.views]]
+# label = "All"
+# arguments = { baseViewKey = "work-all" }
+#
+# [[tickets.views]]
+# label = "Mine"
+# arguments = { baseViewKey = "work-my", baseViewValueKey = "assigned-to-me" }
+# END RELAY REST PROFILE
 
 [resources]
 # Heavy work shared by every agent ATOMICS starts. Compilers share one jobserver pool, and whole
@@ -1342,10 +1433,32 @@ kind = "shell"
                 assert_eq!(config.tickets.views[1].arguments["status"], serde_json::json!(["active"]));
                 assert_eq!(config.tickets.filters[0].arguments["assignee"], "owner");
             }
+            if !config.tickets.http.url.is_empty() {
+                let http = |operation: &str| config.tickets.operation(operation).unwrap().http.as_ref();
+                for read in ["browse", "search", "semantic_search", "get", "read", "read_comments", "children"] {
+                    let call = http(read).unwrap_or_else(|| panic!("{read} reads over http"));
+                    assert!(call.path.starts_with('/') && !config.tickets.http.url.ends_with('/'), "{read}");
+                }
+                for read in ["browse", "search", "semantic_search"] {
+                    assert_eq!(http(read).unwrap().query, ["semantic"], "{read}");
+                }
+                for other in ["whoami", "related", "update_state", "comment"] {
+                    assert!(http(other).is_none(), "{other} stays on the server");
+                }
+                let meaning = config.tickets.operation("semantic_search").unwrap();
+                assert_eq!(meaning.arguments["semantic"], true);
+                assert_eq!(config.tickets.operation("search").unwrap().arguments["semantic"], false);
+                assert_eq!(meaning.fell_back(&serde_json::json!({"headers":{"semantic_state":"ready"}})), None);
+                assert_eq!(
+                    meaning.fell_back(&serde_json::json!({"headers":{"semantic_state":"unavailable"}})).as_deref(),
+                    Some("unavailable")
+                );
+                assert_eq!(config.tickets.views.len(), 3);
+            }
             assert!(docs.contains(text.trim()), "{name} example drifted from docs/tickets.md");
             profiles += 1;
         }
-        assert!(profiles >= 2);
+        assert!(profiles >= 3);
     }
 
     #[test]

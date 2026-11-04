@@ -1,5 +1,6 @@
 //! A small MCP client: ATOMICS calling tools on another MCP server, over stdio or
-//! streamable HTTP. The ticket layer uses it; nothing here knows about tickets.
+//! streamable HTTP. The ticket layer uses it; nothing here knows about tickets, except
+//! `http_operation`, which makes the REST requests reads may use instead of a tool.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -10,11 +11,18 @@ use std::time::{Duration, Instant};
 use atomics_core::tickets::McpServer;
 use serde_json::{Value, json};
 
+mod http_operation;
 mod oauth;
+pub use http_operation::{HttpClient, http_base, shared_token};
 use oauth::Session;
 #[cfg(test)]
-pub(crate) use oauth::tests::{Fake as FakeOAuthServer, browse as oauth_test_browse, machine as oauth_test_machine};
-pub use oauth::{OAuth, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required};
+pub(crate) use oauth::tests::{
+    Fake as FakeOAuthServer, browse as oauth_test_browse, machine as oauth_test_machine,
+    open_in_browser as oauth_test_open,
+};
+pub use oauth::{
+    OAuth, ResourceAccess, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required,
+};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL: usize = 2000;
@@ -573,9 +581,10 @@ pub(crate) mod tests {
     /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
     pub(crate) fn example_profile(name: &str, state: &std::path::Path) -> atomics_core::tickets::TicketConfig {
         let template = atomics_core::config::DEFAULT_CONFIG;
-        let semantic = match name {
-            "meaning-example" => true,
-            "keyword-example" => false,
+        let wanted = |config: &atomics_core::tickets::TicketConfig| match name {
+            "meaning-example" => config.operation("semantic_search").is_some(),
+            "keyword-example" => config.operation("semantic_search").is_none(),
+            "rest-example" => !config.http.url.is_empty(),
             _ => panic!("unknown example profile {name}"),
         };
         let mut tickets = template
@@ -592,8 +601,8 @@ pub(crate) mod tests {
                     .join("\n");
                 toml::from_str::<atomics_core::config::Config>(&text).unwrap().tickets
             })
-            .find(|config| config.operation("semantic_search").is_some() == semantic)
-            .expect("the commented examples include meaning and keyword profiles");
+            .find(wanted)
+            .expect("the commented examples include meaning, keyword and REST profiles");
         tickets.system = name.into();
         tickets.workflow = "Example ticket workflow.".into();
         if tickets.link_url.is_some() {
@@ -604,6 +613,74 @@ pub(crate) mod tests {
             ..McpServer::default()
         };
         tickets
+    }
+
+    /// The fake ticket server's tools over HTTP, on a state file shared with its stdio process.
+    pub(crate) struct FakeHttp {
+        child: Child,
+        pub(crate) url: String,
+    }
+
+    impl FakeHttp {
+        pub(crate) fn start(state: &std::path::Path) -> FakeHttp {
+            let mut child = Command::new(fake_server())
+                .arg("--http")
+                .arg(state)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut port = String::new();
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut port).unwrap();
+            FakeHttp { child, url: format!("http://127.0.0.1:{}/v1", port.trim()) }
+        }
+    }
+
+    impl Drop for FakeHttp {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The shipped REST example against the fake server: its paths on the fake's REST API, its tools
+    /// on the fake's stdio server.
+    pub(crate) fn rest_example(state: &std::path::Path) -> (atomics_core::tickets::TicketConfig, FakeHttp) {
+        let mut config = example_profile("rest-example", state);
+        let api = FakeHttp::start(state);
+        config.http.url = api.url.clone();
+        (config, api)
+    }
+
+    /// The same profile with every read that may use `http` moved from its tool to a POST of that
+    /// tool's name on the fake server. Writes stay on MCP. The rest of the config does not change.
+    pub(crate) fn over_http(config: &mut atomics_core::tickets::TicketConfig, state: &std::path::Path) -> FakeHttp {
+        let fake = FakeHttp::start(state);
+        config.http.url = fake.url.clone();
+        let operations = &mut config.operations;
+        for operation in [
+            &mut operations.browse,
+            &mut operations.search,
+            &mut operations.semantic_search,
+            &mut operations.read,
+            &mut operations.read_comments,
+            &mut operations.get,
+            &mut operations.children,
+            &mut operations.related,
+            &mut operations.list,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let tool = std::mem::take(&mut operation.tool);
+            operation.http = Some(Box::new(atomics_core::tickets::HttpCall {
+                method: atomics_core::tickets::HttpMethod::Post,
+                path: format!("/tools/{tool}"),
+                query: Vec::new(),
+                response_headers: Default::default(),
+            }));
+        }
+        fake
     }
 
     /// The fake ticket server built from `examples/fake_ticket_server.rs`. Only workspace-wide

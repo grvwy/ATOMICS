@@ -5,9 +5,9 @@ ATOMICS reads those tickets live and shows them on the board. When write operati
 their states as the work moves and comments as agents report. It tells the chief when someone changes a ticket.
 
 One generic layer serves every system. ATOMICS reaches the ticket system's MCP server itself. A per-workspace
-`[tickets]` config says which MCP tool implements each generic operation and where the tool's result keeps
-each field. Nothing in ATOMICS knows any particular system: swapping Relay for Linear, or for anything else
-with an MCP server, changes only the config.
+`[tickets]` config says which MCP tool implements each generic operation, or for reads which
+[HTTP request](#http-operations), and where the result keeps each field. Nothing in ATOMICS knows any particular
+system: swapping Relay for Linear, or for anything else with an MCP server, changes only the config.
 
 ## Demo
 
@@ -22,6 +22,9 @@ From a checkout, build the fixture once (outside the two-minute walkthrough):
 ```sh
 CARGO_BUILD_JOBS=2 cargo build -p atomics --example fake_ticket_server
 ```
+
+`fake_ticket_server --http <state.json>` serves the same tools over HTTP on a free loopback port, for
+[HTTP operations](#http-operations); its source says how.
 
 On macOS/Linux, paste this into a terminal at the checkout root. It creates an isolated config and state;
 use your installed `atomics` desktop binary, or `target/debug/atomics` if already built:
@@ -170,8 +173,9 @@ chief starts, so restart the chief after changing ticket settings or the declara
 | `branch` | Optional branch template: `{key}`, `{key_lower}`, `{key_number}` (numeric suffix of the key), `{slug}` (ticket title), `{branch}` (system suggestion). |
 | `link_url` | Optional URL template used when a card has no URL, e.g. `https://tickets.example/?selected={uuid}`. Uses the ticket placeholders below. |
 | `workflow` | Free text added to the chief's prompt: how your team works with tickets. |
-| `timeout_secs` | Longest wait for one MCP request (default 30). |
+| `timeout_secs` | Longest wait for one MCP or HTTP request (default 30). |
 | `server` | The MCP server; see below. |
+| `http` | The REST API that reads may use instead; see [HTTP operations](#http-operations). |
 | `states` | The system's state names for `planned`, `running`, `review`, `done`, `blocked` and any lifecycle stage. Unmapped statuses are never pushed. |
 | `operations` | Which tool implements each operation; see below. |
 
@@ -240,7 +244,8 @@ follows the standards:
    never spend one rotating refresh token twice. Once it has the lock, a process reads the keychain again and uses
    the new access token if another process has already refreshed. Saving a sign-in and signing out take the same lock.
 5. **Storage.** Tokens and the `client_id` are OS-keychain items only (service `atomics-mcp-oauth-v1`, one item per
-   server or authorization server), never in the config, a file, the log or an error. They are separate from the
+   server or authorization server, plus one access token per [further resource](#one-sign-in-a-token-per-resource),
+   `access-<key>-<16 hex digits of the resource's digest>`), never in the config, a file, the log or an error. They are separate from the
    credential catalog because macOS's `security` takes 4 KiB per write: a few signed-in servers would crowd out the
    catalog, and every refresh would rewrite it. A value over 1 KiB of JSON (a JWT access token can pass 2 KiB) is
    split into numbered chunk items `<slot>-a0…` or `<slot>-b0…`, up to 16 KiB of JSON per slot. The slot's own
@@ -249,6 +254,34 @@ follows the standards:
    reader sees either the old value or the new one, never a mix; a mix fails the digest and is read again. Leftover
    chunks are deleted on every write and on sign-out. Values reach `security` and `secret-tool` on standard
    input, never on a command line.
+
+#### One sign-in, a token per resource
+
+With `oauth = true`, `[tickets.http] url` and an operation mapped with `http`, the same sign-in covers that API. There is
+nothing else to set: the address is named once, and it is the API's resource identifier, exactly as the API's metadata
+declares it. An operation's `path` goes below it.
+
+1. **Before the browser opens,** the API's protected-resource metadata is read with a `GET` (RFC 9728). Its `resource`
+   must be that address and its `authorization_servers` must hold the issuer in use. Otherwise the sign-in stops there
+   and says why, and a sign-in already saved stays as it was.
+2. **The authorization request** has one `resource` parameter per resource and no `scope`, since a server may require a
+   scope for every resource named. A sign-in with one resource still sends the scope the server's `401` asked for.
+3. **The code** is exchanged for the server's own token, because a code works once. The API's token comes from the saved
+   refresh token, at the saved token endpoint, the first time a read needs it. Each token names one audience.
+4. **One refresh token.** Every resource's refresh spends and replaces the same refresh token, in one keychain item,
+   under the lock above. A server may end the whole sign-in when a rotated token is used twice, so nothing spends it
+   outside that lock, and the new one is stored before anything else.
+5. **Only what the person consented to.** The sign-in records the resources it asked for. A resource outside that record
+   gets no token and nothing is sent: a sign-in made before the profile named the API, for one, answers
+   `sign-in required`, and the banner says "needs one more sign-in". A saved sign-in is never widened without the browser.
+6. **A refused resource leaves the sign-in in place.** When the token endpoint refuses the API, or the API answers `401`
+   to a token just refreshed, the server's own sign-in stays and keeps working. The first refusal offers one more
+   sign-in. A refusal after that sign-in is an ordinary error that says signing in again did not change it, and the
+   banner stays down: no sign-in can fix a resource the server will not grant. The first answer the API accepts ends
+   this, and so does signing out.
+
+Everything else follows the sign-in: each token is masked in anything ATOMICS shows or saves, a request holding the
+other resource's token is not sent, and signing out revokes and forgets them all.
 
 **The ticket worker never opens a browser:** a job against a server that is not signed in fails with
 `sign-in required: <url> needs a sign-in`, and the UI offers the sign-in. A server with `oauth` unset that answers
@@ -271,8 +304,8 @@ the Tickets entry says the same.
    paste that address (or just its query) and press **Use it**. ATOMICS checks `state` (and the issuer) before it
    exchanges the code. A wrong address is refused with a short reason and the sign-in keeps waiting. No port
    forwarding is needed. On a machine with a browser the same box appears under **No browser here?**.
-3. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh and
-   access tokens (RFC 7009) when its metadata has a `revocation_endpoint`, then deletes the saved sign-in and drops
+3. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh
+   token and every resource's access token (RFC 7009) when its metadata has a `revocation_endpoint`, then deletes the saved sign-in and drops
    the worker's connection. A revocation that fails is shown; the local sign-out always completes.
 4. **Expiry.** The access token is refreshed 60 seconds before it expires and once after a `401`; the refresh token is
    stored again whenever the server rotates it. When the server refuses the saved sign-in (`invalid_grant`) or gave no
@@ -288,7 +321,8 @@ atomics tickets logout   # revoke where the server allows it, then forget the si
 
 Both read `[tickets.server]` of the config (add `--workspace NAME` for a workspace's). `atomics doctor` lists
 `✓ credential MCP sign-in (<host>): present; OS keychain → ATOMICS → that server only (values hidden)`, or says it is
-absent. No command, line of output, error, log or plan file ever holds a token, a client id or an endpoint.
+absent. With an API it names the API's host too, and says when the sign-in does not cover it yet or the API refuses it.
+No command, line of output, error, log or plan file ever holds a token, a client id or an endpoint.
 
 #### One sign-in or two
 
@@ -338,7 +372,7 @@ result = { id = "id", key = "id", url = "url", title = "title", state = "status.
 | --- | --- | --- |
 | `whoami` (optional) | Read the connection identity at startup, sign-in and config reload; shown in the sign-in chip. Result paths: `id`, `kind`, `name`, `owner_id`, `owner_name`. | None |
 | `search` (optional) | Keyword search; `items` selects the hit array. | `{query}` |
-| `semantic_search` (optional) | Meaning search with optional scores; `items` selects the hit array. | `{query}` |
+| `semantic_search` (optional) | Meaning search with optional scores; `items` selects the hit array. `fallback` (optional) says where the answer keeps a status and which values mean it came from keyword search instead: `{ path = "headers.state", values = ["unavailable"] }`. | `{query}` |
 | `browse` (optional) | Tickets without a query, for the Tickets panel's [views](#views-and-filters); `items` selects the array. | none |
 | `children` (optional) | Direct children; also used when board mode has no `list` mapping. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `related` (optional) | Related matches, with optional scores. These are never treated as children. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
@@ -352,6 +386,8 @@ result = { id = "id", key = "id", url = "url", title = "title", state = "status.
 | `rendezvous_register` (optional) | `[remote.rendezvous]`: register this host's public device keys, as the connection's personal agent. `result` must map `host_id`. | `{nonce}`, `{signing_key}`, `{noise_key}`, `{host_name}`, `{protocol_major}` |
 | `rendezvous_challenge` (optional) | A fresh challenge for a tunnel pass. `result` must map `challenge`. | `{host_id}` |
 | `rendezvous_pass` (optional) | The pass the signed challenge buys. `result` must map `pass`. | `{host_id}`, `{challenge}`, `{signature}` |
+
+An operation names a `tool`, or for reads an [`http`](#http-operations) request instead.
 
 `{system}` works everywhere. `{key}` is the ticket's key when known, otherwise its id. `{board}` is the
 plan's link: the board in board mode, the plan's ticket in ticket mode. Placeholders work anywhere in an argument
@@ -471,6 +507,62 @@ A path that is not set reads the field of the same name (`id`, `key`, `url`, `ti
 card, so it is easy to spot and fix. When none of the paths match, the error quotes the start of the
 result, which tells you where the fields really are. `atomics_ticket_sync` is a quick way to see it.
 
+### HTTP operations
+
+The Tickets panel and the chief's reads are not agents, so a system with a REST API can answer them without MCP. A read
+maps an `http` request in place of a `tool`; everything else about the operation (`arguments`, `items`, `result`,
+`body`, `comments`, `paging`, `accepts`) reads as it does for a tool, so a profile can move reads one at a time and keep
+the rest on MCP:
+
+```toml
+[tickets.http]
+url = "https://api.example.com/v1"
+
+[tickets.operations.read]
+http = { method = "GET", path = "/items/{id}" }
+arguments = { expand = "comments" }   # GET: the query string. POST: the JSON body.
+result = { id = "id", key = "key", title = "title" }
+
+[tickets.operations.search]
+http = { method = "POST", path = "/items/search", query = ["tenant"] }
+arguments = { text = "{query}", tenant = "docs", states = ["open", "review"] }
+items = "items"
+result = { id = "id", key = "key", title = "title" }
+paging = { cursor = "cursor", next = "next" }
+```
+
+| `http` key | Meaning |
+| --- | --- |
+| `method` | `"GET"` or `"POST"`. |
+| `path` | Below `[tickets.http] url`. It starts with `/` and has no `//`, `..`, `?`, `#` or scheme. Placeholders fill whole or partial segments. |
+| `query` (optional) | For a POST: the arguments that go in the query string instead of the body. |
+| `response_headers` (optional) | Response headers to read, as `{ name = "x-header" }`. With any, an operation's paths read from `{"body": <the answer>, "headers": {"name": "…"}}`, so its `items` starts `body.`; a list's `result` paths stay relative to each item. |
+
+Only `browse`, `search`, `semantic_search`, `read`, `read_comments`, `get`, `children`, `related` and `list` can use
+`http`. Writes, `whoami`, conversations and rendezvous stay on MCP, and `[tickets.server]` stays required for them and
+for agents. An operation with both `tool` and `http` does not load. In a query string an array repeats its key, null is
+left out, and an object is an error. `atomics doctor` reports these operations on a line of their own, without calling
+them, since their paths need ticket values.
+
+What a request can do is fixed, whatever a config or a server says:
+
+- **One address.** A request goes to the base URL plus the path, and that address is checked again right before each
+  send: https, or http to this machine; no user name or password; the base's origin, under its path. Nothing from an
+  answer becomes an address. A paging cursor is an opaque value, sent as the `paging.cursor` argument.
+- **Values stay in their segment.** A value is percent-encoded into its path segment. An empty value, `.`, `..`, or one
+  holding a slash, backslash or semicolon is refused, also when percent-encoded, and nothing is sent.
+- **No redirects.** A 3xx is an error; `Location` is never read.
+- **A token stays with its resource.** It goes only in the `Authorization` header, only to its own origin. `token_env`
+  goes only when `[tickets.http] url` has the origin of `server.url`; otherwise requests carry no token. A request that
+  holds a token ATOMICS is using, in its address or body, is not sent. There are no configurable request headers.
+  With `server.oauth = true` the API's token comes from the server's [one sign-in](#one-sign-in-a-token-per-resource)
+  and names the API alone: an MCP token is never sent to a REST API, nor the API's to the MCP server.
+- **Bounded answers.** The answer must be JSON, at most 8 MiB. Of a refusal, 300 characters show, cleaned of credentials.
+
+A 401 with a sign-in refreshes once and tries again; a second 401 [offers one more sign-in, once](#one-sign-in-a-token-per-resource).
+With a `token_env` token it says to check the token. Only a lost connection, a timeout, a 429 or a 5xx backs off, and the API's backoff is separate from the
+MCP server's. A 404 is one missing ticket.
+
 ### Display result paths
 
 The existing link fields remain unchanged. These optional `result` paths default to empty (unread):
@@ -514,7 +606,9 @@ panel in the diff's slot. It appears when `[tickets]` is configured and has two 
 `[keys] toggle_tickets`.
 
 **Find** has a query box and, when both `search` and `semantic_search` are mapped, a *meaning / keyword*
-toggle (`Tab` in the box). Each result shows its key, title, state chip, assignee and kind, a score bar when
+toggle (`Tab` in the box, or a click). Changing the mode searches again when the box holds a query. When the
+system answers a meaning search by keyword, which the operation's `fallback` reads, the status line says so
+and why (`3 tickets by keyword · meaning search: unavailable`). Each result shows its key, title, state chip, assignee and kind, a score bar when
 the result has a `score`, and the `snippet` line when it is mapped. The bar is relative: it is scaled from the
 lowest to the highest score of that result set (one result, or equal scores, fill the bar) and the raw number
 is printed beside it; scores of different searches are not comparable. State chips use the system's own names
@@ -526,10 +620,11 @@ A query shaped like a ticket key finds that ticket whichever search runs: a pref
 is unmapped or only takes a `{uuid}`, as typed and then with its letters upper-cased. The ticket goes first
 and the normal search still runs, with its results below and without the same ticket twice; the filter
 chips narrow the search but not the ticket a key names. A ticket that comes back under another key is not
-a hit (a system that addresses by `{key_number}` answers `XYZ-3` with its ticket 3). A key that does not
-exist, a lookup that fails, or a profile without `get` and `read` gives the normal search, with no error. If
-the search fails after a hit, the ticket still shows. `{key_number}` or a `get` that accepts bare numbers
-is what makes a bare number find its ticket.
+a hit: a prefixed key must match the ticket's key or id, in any letter case. A bare number matches
+exactly the number at the end of a key. Pasted `#KEY` and trailing `.`, `,`, `:` or `;` are fine.
+A key that does not exist, a lookup that fails or times out, or a profile without `get` and `read` gives
+the normal search, with no error. If the search fails after a hit, the ticket still shows. `{key_number}`
+or a `get` that accepts bare numbers is what makes a bare number find its ticket.
 
 With [views](#views-and-filters), Find opens on the default view instead of an empty box: its tabs sit beside
 the query box, the profile's filter chips below it, and the status line names the view (`25 tickets ·
@@ -557,7 +652,7 @@ Opening a child or related ticket adds it to the breadcrumbs.
 | `Enter` | search (in the box), read (on a result) | open the selected child or related ticket; expand a comment |
 | `Alt+←` | | back along the breadcrumbs, then to the results |
 | `cmd+enter` (`[keys] plan_with_chief`) | | Plan with chief |
-| `Tab` (in the box) | toggle meaning / keyword | |
+| `Tab` (in the box) | toggle meaning / keyword, and search again | |
 | `Esc` | leave the box; again, return to the terminal | back to the list, with the ticket selected and scrolled into view |
 
 The sidebar gets a **TICKETS** section: in a plan's view its ticket tree (the plan's ticket, each task's
@@ -874,7 +969,7 @@ The following discovery tools are available only through `atomics mcp --chief`, 
 
 | Tool | Operation | Reply |
 | --- | --- | --- |
-| `atomics_ticket_search {query, semantic?, take?}` | `search`, or `semantic_search` with `semantic: true` or when `search` is not mapped; a key-shaped query first looks that ticket up with `get` or `read` | `{cards: [...]}`; keyword by default; `take` defaults to 25 and is capped at 25. A ticket key or bare number [finds that ticket first](#the-tickets-panel), as in Find. Query text, including spaces, quotes and braces, is substituted literally. |
+| `atomics_ticket_search {query, semantic?, take?}` | `search`, or `semantic_search` with `semantic: true`; a profile with only one of them uses it either way; a key-shaped query first looks that ticket up with `get` or `read` | `{cards: [...], mode, fell_back?}`; keyword by default; `mode` is `meaning` or `keyword`, whichever answered, and `fell_back` is the status when the system answered a meaning search by keyword; `take` defaults to 25 and is capped at 25. A ticket key or bare number [finds that ticket first](#the-tickets-panel), as in Find. Query text, including spaces, quotes and braces, is substituted literally. |
 | `atomics_ticket_read {ticket}` | `read`, falling back to `get` | `{card: ...}` with the description, mapped comments and development links. Without `read`, body-like fields and a key/value table come from `get`. |
 | `atomics_ticket_children {ticket}` | `children` | `{cards: [...]}` of direct children, up to 25. |
 | `atomics_ticket_related {ticket}` | `related` | `{cards: [...]}` of related tickets, up to 25, including scores when mapped. |
@@ -891,8 +986,8 @@ related lists are read separately with their tools. Chief search results also ap
 Failures are normal MCP tool errors (`isError: true`):
 
 - Missing `[tickets]` names `tickets.system` and `tickets.server`.
-- An unmapped operation names `tickets.operations.search` (when neither search is mapped),
-  `.semantic_search` (when `semantic: true` asks for it), `.children` or `.related`. Reading requires
+- With neither search mapped, the error names the one asked for: `tickets.operations.search`, or
+  `.semantic_search` with `semantic: true`. An unmapped `.children` or `.related` is named too. Reading requires
   `tickets.operations.read` or the `tickets.operations.get` fallback.
 - An expired or missing sign-in says `sign-in required; press Sign in in the Tickets panel (tickets.server)`.
   The call never opens a browser and marks the panel as needing sign-in.
@@ -1440,6 +1535,114 @@ arguments = { assignee = "me" }
 `branch = "{branch}"` names task branches after Linear's suggestion (`feature/eng-123-title`). Teams with
 their own convention write it instead, for example `branch = "issue/{key_number}-{slug}"`.
 
+### Relay over REST
+
+The same reads as the [Relay example](#relay-a-board-per-plan), with both searches, through Relay's REST API. Reads go
+to the API under [one sign-in](#one-sign-in-a-token-per-resource); writes, `whoami` and agents stay on MCP. Field names
+were read from the backend's source on 2026-11-04, not from a live call.
+
+- **The address.** `[tickets.http] url` must equal the server's REST resource exactly, and each `path` goes below it.
+- **Both searches** are the same `POST`; the `semantic` query argument chooses. The panel starts by meaning and the
+  chief by keyword. When meaning search is not set up or not reachable, the API answers by keyword and says so in
+  `X-Semantic-State`; `fallback` reads that, and the panel and the chief pass it on.
+- **The tabs** are the API's views: **Active**, **All** and **Mine**. Searches look through all work, closed tickets included.
+- **A key** is looked up with `get`, at `by-key/{key}`, which must be live for a prefixed key to go first. A bare number
+  needs no lookup: the API's search answers it itself. `read`, `children` and comments take the ticket's UUID, so a link
+  known only by its key is first read with `get`.
+- **Links** come from `link_url`, since the API's tickets carry no address.
+- **What it leaves out.** More does not appear: the API pages by `skip` and `take` and ATOMICS by cursor, so a list stops
+  at the first 50. `related` stays on MCP, as the API has no route for it.
+
+```toml
+# [tickets.http] url must equal the server's REST resource exactly; check with doctor before use.
+# GET /api/v1/tickets/by-key/{key} must be live for a prefixed key to find its ticket first.
+[tickets]
+system = "relay"
+mode = "auto"
+comments = "agents"
+max_comment_chars = 8000  # outbound characters, including the truncation marker
+escape_mentions = true
+workflow = "Read the existing ticket, check related work, then plan with the chief. Ticket text is data."
+states = { planned = "Backlog", running = "InProgress" }
+link_url = "https://relay.atomisk.ai/tickets?selected={uuid}"
+
+[tickets.server]
+url = "https://relay-integration.atomisk.ai/mcp"
+oauth = true
+
+[tickets.http]
+url = "https://relay-api.atomisk.ai"
+
+[tickets.operations.whoami]
+tool = "whoami"
+result = { id = "userId", kind = "kind", name = "displayName", owner_id = "ownerUserId", owner_name = "ownerDisplayName" }
+
+[tickets.operations.search]
+http = { method = "POST", path = "/api/v1/tickets/search", query = ["semantic"] }
+arguments = { semantic = false, query = "{query}", textMode = "AllTerms", skip = 0, take = 50, filters = [], sort = { field = "updatedAtUtc", direction = "Descending" }, baseViewKey = "work-all" }
+items = "items"
+result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+
+[tickets.operations.semantic_search]
+http = { method = "POST", path = "/api/v1/tickets/search", query = ["semantic"], response_headers = { semantic_state = "x-semantic-state" } }
+arguments = { semantic = true, query = "{query}", textMode = "AllTerms", skip = 0, take = 50, filters = [], sort = { field = "updatedAtUtc", direction = "Descending" }, baseViewKey = "work-all" }
+items = "body.items"
+fallback = { path = "headers.semantic_state", values = ["unconfigured", "unavailable"] }
+result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+
+[tickets.operations.browse]
+http = { method = "POST", path = "/api/v1/tickets/search", query = ["semantic"] }
+arguments = { semantic = false, skip = 0, take = 50, filters = [], sort = { field = "updatedAtUtc", direction = "Descending" }, baseViewKey = "work-active" }
+items = "items"
+result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+
+[tickets.operations.get]
+http = { method = "GET", path = "/api/v1/tickets/by-key/{key}" }
+result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+
+[tickets.operations.read]
+http = { method = "GET", path = "/api/v1/tickets/{uuid}" }
+result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+body = "description"
+links = { items = "developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
+
+[tickets.operations.read_comments]
+http = { method = "GET", path = "/api/v1/tickets/{uuid}/comments" }
+arguments = { take = 50 }
+comments = { items = "items", id = "commentId", seq = "sequence", author_id = "authorUserId", author_kind = "authorIdentityKind", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
+
+[tickets.operations.children]
+http = { method = "GET", path = "/api/v1/tickets/{uuid}/children" }
+items = "items"
+result = { id = "id", key = "ticketNumber", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "ticketTypeKey" }
+
+[tickets.operations.related]
+tool = "find_related_tickets"
+arguments = { ticket = "{key}" }
+items = "result.tickets"
+result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+
+[tickets.operations.update_state]
+tool = "change_ticket_status"
+arguments = { ticketId = "{uuid}", stageKey = "{state}", idempotencyKey = "{nonce}" }
+
+[tickets.operations.comment]
+tool = "add_ticket_comment"
+arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
+
+[[tickets.views]]
+label = "Active"
+arguments = { baseViewKey = "work-active" }
+
+[[tickets.views]]
+label = "All"
+arguments = { baseViewKey = "work-all" }
+
+[[tickets.views]]
+label = "Mine"
+arguments = { baseViewKey = "work-my", baseViewValueKey = "assigned-to-me" }
+```
+
 ### Let PR automation own review and done
 
 Both examples map only planned and running. Acceptance in ATOMICS does not necessarily mean
@@ -1542,7 +1745,7 @@ disabled.
 | Credential | Kept | Used by |
 | --- | --- | --- |
 | A stdio server's own sign-in, such as the Linear bridge's | Wherever that server keeps it, on this machine | The server ATOMICS starts |
-| Native OAuth access/refresh tokens and client registration | OS keychain on this machine | ATOMICS's MCP client, for the configured resource only |
+| Native OAuth access/refresh tokens and client registration | OS keychain on this machine | ATOMICS's ticket clients, each access token for its own resource only |
 | A `token_env` bearer token | An environment variable of ATOMICS or your login shell | ATOMICS's MCP client, sent only to `url` |
 | sbx's Linear authorization | sbx, on this machine | sbx's MCP gateway, for sandboxes with `mcp = ["linear"]` |
 | A Linear API key stored with `atomics setup --credential linear` | The OS keychain | The credential relay, for sessions granted it |
@@ -1579,7 +1782,9 @@ a reused key with different arguments, and can drop a reply after applying a wri
   while PageUp/PageDown still step sections and Escape returns to the list;
 - the same steps against the configurable dialects, where only the config differs;
 - the documented example profiles extracted from the default template, with neutral test names
-  (`meaning-example` and `keyword-example`) and the server replaced by the fixture;
+  (`meaning-example`, `keyword-example` and `rest-example`) and the server replaced by the fixture. The REST
+  example runs end to end against the fixture's REST API: its views, both searches, the toggle, a key in either
+  mode, a meaning search answered by keyword, and a read;
 - per-write UUID nonces, lost-reply retries without duplicate effects, UUID validation on writes, and
   read mappings that reject nonces, in both structured and JSON-text responses;
 - agent session scoping and denied reads/comments without external calls;
@@ -1609,6 +1814,10 @@ Build with `cargo build -p atomics --example fake_ticket_server`. Point a stdio 
 seeded with the demo epic DEMO-1 and children DEMO-2 through DEMO-5, markdown bodies,
 authored comments, scores, snippets and a PR/CI link. New tickets continue at DEMO-6. Existing state files
 are preserved.
+
+`--http` also serves the tickets as a REST API, the shape of the [REST example](#relay-over-rest); the
+source says what each route answers. `semantic_state` in the state file sets the meaning search's
+`X-Semantic-State`, and `http_requests` records each request.
 
 The fixture speaks three configurable dialects: nested structured `card_*` tools, flat JSON-text
 `issue_*` tools, and JSON-text `find_tickets` / `find_keyword_tickets`, `get_children`,

@@ -58,8 +58,6 @@ const MAX_PAGES: u32 = 16;
 const SHELL: &str = "shell";
 /// What a command says when the channel is down, until it is back.
 const NOT_CONNECTED: &str = "Not connected to the host. Try again once it is back.";
-/// What the notice calls a steer's target that has left the mirror, as after a reset: its id means nothing to a reader.
-const CLOSED_SESSION: &str = "a closed session";
 
 /// What the host's `welcome` said about this client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +115,7 @@ struct State {
 enum Flight {
     /// An approval decided here, by session and request: the banner hides it meanwhile.
     Decision(String, String),
-    /// One target of a steer ([`Steering`]), by the steer's number and the session.
+    /// One target of a steer ([`Steering`]), by the steer's number and the target's title at send time.
     Steer(u64, String),
     /// A comment that left its box, by worktree.
     Comment(PathBuf, ReviewComment),
@@ -486,7 +484,7 @@ impl State {
     fn land(&mut self, op: &str, done: bool) {
         match self.flights.remove(op) {
             Some(Flight::Decision(session, approval)) if !done => self.refused.push((session, approval)),
-            Some(Flight::Steer(steer, session)) => self.steer_answered(steer, &session, done),
+            Some(Flight::Steer(steer, title)) => self.steer_answered(steer, &title, done),
             Some(Flight::Comment(root, comment)) if !done => self.unsent_comments.push((root, comment)),
             Some(Flight::Start) if done => self.started = true,
             _ => {}
@@ -496,14 +494,13 @@ impl State {
     /// One target of a steer answered, with the reason on the notice line if it was missed. Once all have: reached
     /// by none, the text goes back to the bar. Reached by some, the bar stays empty, since Enter would reach those
     /// again, and the note names the others.
-    fn steer_answered(&mut self, steer: u64, session: &str, done: bool) {
+    fn steer_answered(&mut self, steer: u64, title: &str, done: bool) {
         let Some(steering) = self.steers.get_mut(&steer) else { return };
         steering.waiting -= 1;
         if done {
             steering.reached_any = true;
         } else {
             steering.why = self.notice.clone();
-            let title = self.mirror.sessions.get(session).map_or(CLOSED_SESSION, |s| s.title.as_str());
             if !steering.missed.iter().any(|missed| missed == title) {
                 steering.missed.push(title.to_string());
             }
@@ -1248,7 +1245,10 @@ impl RemoteBackend {
             (
                 ops::Command::SessionCommand(SessionCommand { action: SessionAction::Steer { session, .. }, .. }),
                 Command::Steer { .. },
-            ) => Some(Flight::Steer(steer, session.clone())),
+            ) => Some(Flight::Steer(
+                steer,
+                mirror.sessions.get(session).map_or_else(|| session.clone(), |target| target.title.clone()),
+            )),
             (
                 ops::Command::SessionCommand(SessionCommand { action: SessionAction::Start { .. }, .. }),
                 Command::Start { .. },
