@@ -251,6 +251,13 @@ app's current binary with `--connect vm`. The two windows run as separate proces
 (the Mac's command-line compiler is required). An existing launcher with that bundle ID is
 replaced only after the new one builds and signs successfully; an unrelated app is kept.
 
+### Doctor
+
+`atomics doctor` includes the image and bundle versions/dates, whether the installed bundle is
+outdated, the selected instance state, this Mac's pairing, the guest host, and the names of any
+sign-ins left. It uses the panel's same read-only collector. A stopped guest is reported as
+needing a start before sign-ins can be checked; doctor never starts it or signs in.
+
 ### By hand
 
 The bundle's `lima.yaml` is the host definition, generated from the settings above: by default

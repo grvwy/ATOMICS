@@ -182,6 +182,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         }
     }
 
+    lines.extend(crate::vm::doctor_lines());
     lines.extend(plans_check(&paths::atomics_home()));
     let kept = crate::lifecycle::kept_leftovers(&paths::atomics_home());
     for note in &kept {

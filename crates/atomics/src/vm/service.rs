@@ -873,3 +873,101 @@ fn safe_sign_in_url(address: &str) -> bool {
                 || key == "code_verifier"
         })
 }
+
+/// CLI diagnostics use the same collector as the native panel, without starting a monitor thread.
+pub fn doctor_lines() -> Vec<String> {
+    if !cfg!(target_os = "macos") {
+        return vec!["VM: macOS-only; agents run directly on Linux".into()];
+    }
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let source = atomics_core::paths::env_override("VM_BUILD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("target/atomics-vm"));
+    let instance = atomics_core::paths::env_override("VM_INSTANCE")
+        .map(|s| s.to_string_lossy().into_owned())
+        .or_else(|| BundleInfo::installed().map(|(_, i)| i.instance))
+        .or_else(|| BundleInfo::read(&source.join("bundle")).ok().map(|i| i.instance))
+        .unwrap_or_else(|| "atomics-vm".into());
+    let mut worker = Worker {
+        shared: Arc::new(Mutex::new(Snapshot::default())),
+        cancel: Arc::default(),
+        wake: Arc::new(|| {}),
+        source,
+        instance,
+        in_use: None,
+        lima: super::limactl().unwrap_or_else(|| "limactl".into()),
+        binary: std::env::current_exe().unwrap_or_default(),
+        keychain: crate::relay::Keychain::current(),
+        input: Arc::default(),
+    };
+    worker.refresh();
+    diagnostics(&worker.shared.lock().unwrap())
+}
+fn diagnostics(view: &Snapshot) -> Vec<String> {
+    use atomics_core::doctor::check_line;
+    let describe = |artifact: &Artifact| {
+        if artifact.built { format!("{} · {}", artifact.version, artifact.date) } else { "not built".into() }
+    };
+    let mut lines = vec![
+        check_line(
+            view.image.built,
+            &format!("VM image: {}", describe(&view.image)),
+            "Settings → VM → Build or update image",
+        ),
+        check_line(
+            view.bundle.built,
+            &format!("VM built bundle: {}", describe(&view.bundle)),
+            "Settings → VM → Build or update image",
+        ),
+        check_line(
+            view.installed.is_some() && !view.outdated,
+            &format!(
+                "VM installed bundle: {}{}",
+                view.installed.as_ref().map_or("none".into(), describe),
+                if view.outdated { " (outdated)" } else { "" }
+            ),
+            "Settings → VM → Set up",
+        ),
+        format!("VM instance {}: {}", view.instance, view.selected().map_or("not set up", |i| i.state.label())),
+        check_line(view.paired == "paired", &format!("VM pairing: {}", view.paired), "Open VM window to pair this Mac"),
+        format!("VM host: {}", view.host),
+    ];
+    if let Some(note) = &view.sign_in_note {
+        lines.push(format!("VM sign-ins: {note}"));
+    } else {
+        let missing: Vec<_> = view.sign_ins.iter().filter(|i| i.state == "missing").map(|i| i.name.as_str()).collect();
+        lines.push(check_line(
+            missing.is_empty(),
+            &format!("VM sign-ins left: {}", if missing.is_empty() { "none".into() } else { missing.join(", ") }),
+            "Settings → VM → Sign in",
+        ));
+    }
+    if let Some(error) = &view.error {
+        lines.push(check_line(false, &format!("VM: {error}"), "Settings → VM → Refresh"));
+    }
+    lines
+}
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+    #[test]
+    fn doctor_names_versions_state_pairing_and_only_missing_sign_ins() {
+        let view = Snapshot {
+            image: Artifact { built: true, version: "0.1.3 (abc123)".into(), date: "2026-01-01T00:00:00Z".into() },
+            instance: "test-vm".into(),
+            instances: vec![Instance { name: "test-vm".into(), state: State::Stopped, ..Default::default() }],
+            paired: "paired".into(),
+            sign_ins: parse_sign_ins("ok claude done\nmissing codex missing\nskipped host skipped"),
+            ..Default::default()
+        };
+        let lines = diagnostics(&view).join("\n");
+        for expected in
+            ["0.1.3 (abc123)", "2026-01-01", "test-vm: stopped", "VM pairing: paired", "VM sign-ins left: codex"]
+        {
+            assert!(lines.contains(expected), "{lines}");
+        }
+        assert!(!lines.contains("left: claude") && !lines.contains("left: host"));
+    }
+}

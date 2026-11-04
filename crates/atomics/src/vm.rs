@@ -12,7 +12,7 @@ pub mod launcher;
 mod process;
 mod service;
 pub mod setup;
-pub use service::Monitor;
+pub use service::{Monitor, doctor_lines};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
