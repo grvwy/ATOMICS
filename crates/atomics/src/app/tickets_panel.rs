@@ -1656,6 +1656,7 @@ mod tests {
             _ => None,
         });
         let mut last = None;
+        let mut commands = Vec::new();
         for (pass, mut events) in [events, releases].into_iter().enumerate() {
             // egui learns the held modifiers from this event, not from the key events.
             events.insert(
@@ -1679,9 +1680,12 @@ mod tests {
             app.runtime.drain_actions();
             RASTER.with(|raster| raster.borrow_mut().feed(&output));
             output.textures_delta.clear();
+            commands.append(&mut output.platform_output.commands);
             last = Some(output);
         }
-        last.unwrap()
+        let mut output: egui::FullOutput = last.unwrap();
+        output.platform_output.commands = commands;
+        output
     }
 
     thread_local! {
@@ -1972,6 +1976,49 @@ mod tests {
                 frame(app, ctx, vec![]);
                 assert_eq!(read_stop(app), Some(Stop::Description(1)), "PageDown steps a section");
                 assert!(offset(app) > 0.0, "and scrolls to it");
+            },
+        );
+    }
+
+    #[test]
+    fn the_open_ticket_command_reads_it_with_the_browser_one_click_away() {
+        with_app(
+            "app::tickets_panel::tests::the_open_ticket_command_reads_it_with_the_browser_one_click_away",
+            |app, ctx| {
+                open_panel(app, ctx, TicketsView::Find);
+                app.runtime.panel = PanelMode::Plan;
+                app.runtime.diff_open = false;
+                app.runtime.tickets.panel.crumbs.push(card(7, None).link);
+                let url = "https://tickets.example/DEMO-1";
+                let link = TicketLink { url: Some(url.into()), ..card(1, None).link };
+                app.send(Command::OpenTicket(link.clone()));
+                assert_eq!((app.runtime.panel, app.runtime.diff_open), (PanelMode::Tickets, true));
+                let panel = &app.runtime.tickets.panel;
+                assert_eq!(panel.view, TicketsView::Read);
+                assert!(panel.read.as_ref().unwrap().link.same_ticket(&link));
+                assert!(panel.crumbs.is_empty(), "a fresh trail");
+
+                let output = frame(app, ctx, vec![]);
+                let button = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Open in browser" => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                });
+                let button = button.expect("the reader offers the browser");
+                let press = |pressed| egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: NONE,
+                };
+                frame(app, ctx, vec![egui::Event::PointerMoved(button), press(true)]);
+                let released = frame(app, ctx, vec![press(false)]);
+                let opened = released.platform_output.commands.iter().filter_map(|command| match command {
+                    egui::OutputCommand::OpenUrl(open) => Some(open.url.as_str()),
+                    _ => None,
+                });
+                assert_eq!(opened.collect::<Vec<_>>(), [url]);
             },
         );
     }
