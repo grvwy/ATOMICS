@@ -1010,7 +1010,9 @@ fn remote_client(host: &Host) -> crate::protocol::tests::TestClient {
     client
 }
 
-/// The final outcome of `op`, applying the board frames that come first.
+/// The final outcome of `op`, applying the board frames that come first. A failure names the
+/// caller's line, which says whose read it was.
+#[track_caller]
 fn outcome_of(client: &mut crate::protocol::tests::TestClient, op: &str) -> atomics_core::ops::Outcome {
     use atomics_core::wire::Message;
     loop {
@@ -1025,6 +1027,7 @@ fn outcome_of(client: &mut crate::protocol::tests::TestClient, op: &str) -> atom
 }
 
 /// How the client was told approval `id` ended.
+#[track_caller]
 fn resolved_as(client: &mut crate::protocol::tests::TestClient, id: &str) -> atomics_core::wire::Disposition {
     loop {
         // The event may arrive before the operation's result, whose wait already applied it.

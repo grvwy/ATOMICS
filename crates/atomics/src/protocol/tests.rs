@@ -313,14 +313,26 @@ impl TestClient {
         self.ws.send(tungstenite::Message::text(text)).expect("send");
     }
 
-    /// The next text frame, or `None` on close, error or timeout.
+    /// The next text frame, or `None` on close, error or timeout. Each of those says so on stderr,
+    /// so a failing test tells a read that waited in vain from a connection that ended. An
+    /// interrupted read has not ended: a socket read with a timeout stops with EINTR even with
+    /// SA_RESTART.
     pub(crate) fn next(&mut self) -> Option<Envelope> {
+        let started = Instant::now();
         loop {
             match self.ws.read() {
                 Ok(tungstenite::Message::Text(t)) => {
                     return Some(wire::decode(t.as_str()).expect("the host sends valid frames"));
                 }
-                Ok(tungstenite::Message::Close(_)) | Err(_) => return None,
+                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Ok(tungstenite::Message::Close(frame)) => {
+                    eprintln!("test client: the host closed the connection after {:?}: {frame:?}", started.elapsed());
+                    return None;
+                }
+                Err(e) => {
+                    eprintln!("test client: the read ended after {:?}: {e}", started.elapsed());
+                    return None;
+                }
                 Ok(_) => {}
             }
         }
