@@ -832,7 +832,8 @@ with its progress and a count of the tasks in review or blocked), **Diff** (the 
 number of changed files; the editor counts as the diff) and **Tickets** (when `[tickets]` is set; a dot while the ticket
 system wants a sign-in, else how many tickets on the plan's board no task follows). The view on screen is filled;
 picking it again hides the panel. Each window remembers its choice: the desktop in its state folder, a browser in
-its `localStorage`; picking another plan's tab keeps it. The CHIEF pill stays in the middle of the bar.
+its `localStorage`; picking another plan's tab keeps it. The CHIEF pill stays in the middle of the bar. The location
+line over the agents says where the window is, plan › task › session ([Navigation](docs/navigation.md)).
 
 
 `cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.
@@ -855,6 +856,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `↓` / `↑`, `Home` / `End` | scroll a line, or go to the top / bottom of the focused diff; Esc, typing, or clicking the terminal returns focus to it |
 | `cmd+d` | the diff: shows it, or hides the panel while it shows (the view switcher's **Diff**) |
 | `cmd+j` | next agent that needs you |
+| `cmd+alt+left` / `cmd+alt+right` | back / forward along the places the window showed (tab, session, view), as the ‹ › at the start of the location line; Escape goes back too while nothing has the keyboard ([Navigation](docs/navigation.md)) |
 | `cmd+k` | the Tickets panel (when `[tickets]` is set; the view switcher's **Tickets**), or hides the panel while it shows: Find, then Read; the same keys as the diff — `shift+↓/↑` next / previous result (in Read: next / previous ticket; not from a text field or the editor), `PageUp/PageDown` a page in Find and the next / previous section in Read, ↑/↓ and Home/End, `Enter` read or open, `Alt+←` back, `Tab` in the box meaning ⇄ keyword, `Esc` leaves the box, then the panel; the chief's trace lane takes `shift+↓/↑` and the page keys when you click it |
 | `cmd+enter` | in a ticket the Tickets panel is reading: Plan with chief |
 | `cmd+l` | steer bar |

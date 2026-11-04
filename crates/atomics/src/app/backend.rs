@@ -55,6 +55,10 @@ impl Local<'_> {
             branch: session.branch().map(str::to_string),
             project: self.0.project_of(&root),
             ungrouped: self.0.ungrouped_session(session),
+            task: self.0.plans.iter().find_map(|plan| {
+                let task = plan.tasks.iter().find(|task| task.session.as_deref() == Some(session.id.as_str()))?;
+                Some(atomics_ui::TaskLink { plan: plan.id.clone(), task: task.id.clone() })
+            }),
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
             outside: session.terminal.is_none(),

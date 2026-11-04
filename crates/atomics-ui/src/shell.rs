@@ -1,7 +1,8 @@
-//! The window's frame: the top bar over the steer bar, the sidebar, and between them the fleet's tiles, the
-//! right panel (the plan board or a worktree's diff) and the chief, docked beside the agents or floating over
-//! them. The platform draws it through a [`Platform`]: it lends each piece the backend and its client, and
-//! carries out what that piece recorded before the next one draws, as the desktop did before the frame moved.
+//! The window's frame: the top bar over the steer bar, the sidebar, and between them the location line
+//! ([`nav`]) over the fleet's tiles, the right panel (the plan board or a worktree's diff) and the chief,
+//! docked beside the agents or floating over them. The platform draws it through a [`Platform`]: it lends
+//! each piece the backend and its client, and carries out what that piece recorded before the next one
+//! draws, as the desktop did before the frame moved.
 //! The items only a host has (the desktop's Settings, Tickets, GitHub, Remote and load items, USAGE, the
 //! Tickets panel, a pull request's diff, the editor) are the trait's hooks; a platform that leaves a hook as
 //! it is does without that item. Everything else asks [`Backend::available`] whether to draw an action.
@@ -16,7 +17,7 @@ use egui::{Rect, RichText, Sense, Stroke, vec2};
 use crate::chief::{self, VoiceState};
 use crate::terminal_surface::TerminalSurface;
 use crate::topbar::{self, measure, record_item, slot};
-use crate::{Backend, Client, Command, PanelMode, board, diff_panel, diff_view, fleet, sidebar, switcher, tabs};
+use crate::{Backend, Client, Command, PanelMode, board, diff_panel, diff_view, fleet, nav, sidebar, switcher, tabs};
 
 /// The height of the tab strip over the tiles, when the sessions do not all fit as tiles.
 pub const TAB_HEIGHT: f32 = 30.0;
@@ -90,6 +91,8 @@ fn read<R>(platform: &mut impl Platform, read: impl FnOnce(&dyn Backend, &Client
 /// panel, and the floating chief.
 pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let p = read(platform, |_, client| client.palette.clone());
+    let time = ui.input(|i| i.time);
+    platform.draw(|backend, client, _| nav::track(backend, client, time));
     egui::Panel::top("top")
         .exact_size(34.0)
         .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
@@ -120,9 +123,10 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let compute = |height| {
             layout::compute(area.width(), height, visible.len(), completed, diff_open, dock_width, &layout_config)
         };
-        let mut layout = compute(area.height());
+        // The location line takes the top of the agents' area.
+        let mut layout = compute(area.height() - nav::HEIGHT);
         if layout.tabs {
-            layout = compute(area.height() - TAB_HEIGHT);
+            layout = compute(area.height() - nav::HEIGHT - TAB_HEIGHT);
             layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
         }
         (layout, visible, completed, history_board, diff_open, sidebar_width)
@@ -142,6 +146,9 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
         let mut rect = ui.max_rect();
+        let line = rect.with_max_y(rect.top() + nav::HEIGHT);
+        platform.draw(|backend, client, _| nav::location(ui, line, backend, client));
+        rect.min.y = line.bottom();
         if history_board {
             plan_board(ui, rect, platform);
             return;

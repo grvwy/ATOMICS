@@ -27,6 +27,7 @@ pub mod diff_view;
 pub mod fleet;
 pub mod keys;
 pub mod markdown;
+pub mod nav;
 pub mod panel_nav;
 pub mod shell;
 pub mod sidebar;
@@ -42,7 +43,7 @@ pub mod touch;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot, Heartbeat,
-    Notices, PanelMode, PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TicketsPanel,
+    Notices, PanelMode, PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TaskLink, TicketsPanel,
     TileView, UiConfig, ViewHints, WorktreeRow,
 };
 pub use client::Client;

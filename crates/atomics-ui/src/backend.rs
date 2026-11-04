@@ -7,6 +7,7 @@ use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff_data::{FileView, Prepared};
 use atomics_core::layout::LayoutConfig;
 use atomics_core::plan::{Plan, PlanStatus, Task};
+pub use atomics_core::projection::TaskLink;
 use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
@@ -96,6 +97,8 @@ pub struct SessionRow {
     pub project: Option<PathBuf>,
     /// Neither the chief nor in any plan's task: the Ungrouped tab shows it.
     pub ungrouped: bool,
+    /// The plan and the task it works on, by id, if it runs a plan's task.
+    pub task: Option<TaskLink>,
     /// It works in a scratch folder of its own, outside any project.
     pub scratch: bool,
     /// The sandbox it runs in, if any.

@@ -5,6 +5,30 @@ impl State {
 }
 
 impl Desktop<'_> {
+    /// Takes an Escape pressed while nothing had the keyboard at the end of the last frame and no menu or
+    /// dialog is open.
+    fn escape_goes_back(&self, ctx: &egui::Context) -> bool {
+        let client = &self.client;
+        let idle = client.keyboard_idle
+            && ctx.memory(|m| m.focused().is_none())
+            && !egui::Popup::is_any_open(ctx)
+            && client.project_picker.is_none()
+            && !client.cleanup_open
+            && !client.plan_cleanup_open
+            && client.new_dialog.is_none()
+            && client.rename.is_none()
+            && client.quick_open.is_none()
+            && !client.remote_devices
+            && client.revoke_confirm.is_none()
+            && client.ui.confirm_close.is_none()
+            && client.ui.confirm_plan_close.is_none()
+            && !self.runtime.github.modal
+            && self.runtime.tickets.panel.dialog.is_none()
+            && matches!(client.voice, Voice::Idle)
+            && client.ui.history.can_go(-1);
+        idle && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+    }
+
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         let keys = self.runtime.config.keys.clone();
         let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s)));
@@ -117,6 +141,14 @@ impl Desktop<'_> {
         }
         if pressed(&keys.toggle_plan) {
             self.send(Command::ToggleView(PanelMode::Plan));
+        }
+        // Back and forward along the places the window showed; Escape goes back too while the keyboard is in no
+        // terminal, text field, menu or dialog, so it never takes an Escape meant for an agent.
+        if pressed(&keys.back) || self.escape_goes_back(ctx) {
+            self.draw(atomics_ui::nav::back);
+        }
+        if pressed(&keys.forward) {
+            self.draw(atomics_ui::nav::forward);
         }
         // Plan with chief, from a ticket the panel is reading.
         if self.runtime.panel == PanelMode::Tickets
@@ -1228,6 +1260,101 @@ mod tests {
             assert_received(&first, b"");
             assert_received(&second, b"");
         });
+    }
+
+    #[test]
+    fn back_forward_and_an_idle_escape_walk_the_places_the_location_names_and_the_sidebar_groups_by_plan() {
+        with_app(
+            "app::input::tests::back_forward_and_an_idle_escape_walk_the_places_the_location_names_and_the_sidebar_groups_by_plan",
+            |app, ctx| {
+                let cwd = Path::new("/project");
+                app.runtime.sessions = vec![
+                    session("a", AgentKind::Generic, AgentStatus::NeedsInput, cwd),
+                    session("b", AgentKind::Generic, AgentStatus::Idle, cwd),
+                ];
+                app.runtime.plans = vec![Plan {
+                    id: "p".into(),
+                    goal: "Ship it".into(),
+                    status: PlanStatus::Open,
+                    tasks: vec![Task {
+                        id: "t".into(),
+                        title: "Do the thing".into(),
+                        session: Some("a".into()),
+                        status: TaskStatus::Running,
+                        ..Task::default()
+                    }],
+                    ..Plan::default()
+                }];
+                app.runtime.selected_plan = 0;
+                app.send(Command::ShowPlan(0));
+                app.send(Command::Activate { session: "a".into(), open_diff: false });
+                let mut time = 0.0;
+                let mut frame = |app: &mut Desktop<'_>, events: Vec<egui::Event>| {
+                    // A second apart: every place shows long enough to be a step.
+                    time += 1.0;
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| app.paint(ui),
+                    );
+                    app.runtime.drain_actions();
+                    let text: Vec<String> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|s| match &s.shape {
+                            egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    output.drop_without_applying_deltas();
+                    text
+                };
+                let text = frame(app, vec![]);
+                for part in ["Ship it", "Do the thing", "a · needs you"] {
+                    assert!(text.iter().any(|t| t == part), "the location names {part}: {text:?}");
+                }
+                // Every project's tab: the sidebar groups the sessions under their plan, the rest outside plans.
+                app.send(Command::SetView(None));
+                let text = frame(app, vec![]);
+                let at = |label: &str| text.iter().position(|t| t == label);
+                let (plan, outside) =
+                    (at("Ship it").expect("the plan's heading"), at("Outside plans").expect("outside"));
+                assert!(plan < outside, "{text:?}");
+                assert!(!app.runtime.plan_view);
+                let modifiers = if cfg!(target_os = "macos") {
+                    egui::Modifiers::MAC_CMD | egui::Modifiers::ALT
+                } else {
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT | egui::Modifiers::ALT
+                };
+                frame(app, vec![key(Key::ArrowLeft, Key::ArrowLeft, modifiers)]);
+                frame(app, vec![]);
+                assert!(app.runtime.plan_view, "back on the plan's tab");
+                assert_eq!(app.runtime.active.as_deref(), Some("a"));
+                frame(app, vec![key(Key::ArrowRight, Key::ArrowRight, modifiers)]);
+                frame(app, vec![]);
+                assert!(!app.runtime.plan_view, "forward again");
+                // Nothing has the keyboard: Escape goes back. In a field it is the field's.
+                ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+                frame(app, vec![key(Key::Escape, Key::Escape, egui::Modifiers::NONE)]);
+                frame(app, vec![]);
+                assert!(app.runtime.plan_view, "Escape goes back");
+                app.send(Command::SetView(None));
+                frame(app, vec![]);
+                app.client.focus_steer = true;
+                frame(app, vec![]);
+                frame(app, vec![key(Key::Escape, Key::Escape, egui::Modifiers::NONE)]);
+                frame(app, vec![]);
+                assert!(!app.runtime.plan_view, "the steer bar keeps its Escape");
+            },
+        );
     }
 
     #[test]

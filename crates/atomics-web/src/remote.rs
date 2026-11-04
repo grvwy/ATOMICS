@@ -856,6 +856,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         branch: session.branch.clone(),
         project: None,
         ungrouped: !session.chief && session.task.is_none(),
+        task: session.task.clone(),
         scratch: false,
         sandbox: None,
         outside: false,

@@ -11,6 +11,7 @@ use atomics_core::plan::PlanStatus;
 use crate::Command;
 use crate::chief::SteerTarget;
 use crate::diff_view::{DiffState, ExplorerState};
+use crate::nav::History;
 use crate::theme::{Fonts, Palette};
 use crate::touch::Touch;
 
@@ -54,6 +55,8 @@ pub struct Client {
     pub focus_steer: bool,
     /// Set while the platform draws for a finger on a small screen; the desktop leaves it `None`.
     pub touch: Option<Touch>,
+    /// The places this window showed before and after the one on screen ([`crate::nav`]).
+    pub history: History,
 }
 
 impl Default for Client {
@@ -79,6 +82,7 @@ impl Default for Client {
             steer_target: SteerTarget::Active,
             focus_steer: false,
             touch: None,
+            history: History::default(),
         }
     }
 }

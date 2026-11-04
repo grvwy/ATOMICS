@@ -427,6 +427,8 @@ toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
 plan_with_chief = "cmd+enter"   # in a ticket the Tickets panel reads
 voice = "cmd+shift+space"
 github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
+back = "cmd+alt+left"       # back to the place the window showed before (also the location line's ‹)
+forward = "cmd+alt+right"
 
 [remote]
 # The atomics.v1 protocol server for other clients on this machine (see docs/daemon.md). Off by default.
@@ -833,6 +835,9 @@ pub struct KeyConfig {
     pub plan_with_chief: String,
     pub voice: String,
     pub github: String,
+    /// Back to the place the window showed before, and forward again.
+    pub back: String,
+    pub forward: String,
 }
 
 /// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere;
@@ -933,6 +938,8 @@ impl Default for KeyConfig {
             plan_with_chief: "cmd+enter".into(),
             voice: "cmd+shift+space".into(),
             github: "primary+g".into(),
+            back: "cmd+alt+left".into(),
+            forward: "cmd+alt+right".into(),
         }
     }
 }
