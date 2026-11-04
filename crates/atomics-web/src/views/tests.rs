@@ -133,6 +133,107 @@ fn every_tab_draws_over_a_live_host() {
 }
 
 #[test]
+fn the_chiefs_pill_keeps_the_middle_of_the_phones_top_bar_and_opens_the_chiefs_pane() {
+    let (ctx, mut world, mut client, mut view) = live();
+    view.tab = Tab::Diffs;
+    for size in [PHONE, (360.0, 780.0), (430.0, 932.0)] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let width = ctx.content_rect().width();
+        let name = shown.iter().find(|(text, _)| text == "CHIEF").expect("the pill is named on a phone").1;
+        // The name follows the pill's mark, in the middle of the bar.
+        assert!(name.left() > width * 0.4 && name.right() < width * 0.6, "{size:?}: {name:?} in {width}");
+        assert!(name.bottom() <= layout::TOP_BAR + 1.0, "{size:?}: in the top bar");
+        assert!(!has(&shown, "Chief"), "{size:?}: the pane bar has no Chief of its own");
+    }
+    let pill = on(&settled(&ctx, &mut world, &mut client, &mut view, PHONE), "CHIEF");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    assert_eq!(view.tab, Tab::Chief, "a tap opens the chief's pane");
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    assert_eq!(view.tab, Tab::Diffs, "another goes back to the pane it left");
+}
+
+#[test]
+fn the_location_line_says_where_the_window_is_and_back_and_forward_walk_the_places() {
+    use atomics_ui::nav;
+    let (ctx, mut world, mut client, mut view) = live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    // Plan › task › session, under the top bar.
+    let parts: Vec<_> = ["Parse faster", "Task t1", "Fix the parser · needs you"]
+        .map(|part| shown.iter().find(|(text, _)| text == part).unwrap_or_else(|| panic!("{part}: {shown:?}")).1)
+        .into();
+    assert!(parts.windows(2).all(|w| w[0].right() < w[1].left()), "in order: {parts:?}");
+    assert!(parts.iter().all(|r| r.top() > 34.0 && r.bottom() < 34.0 + nav::HEIGHT + 2.0), "{parts:?}");
+    assert!(!client.history.can_go(-1) && !client.history.can_go(1));
+
+    // Another tab is a step; back returns to the plan's, forward goes to it again.
+    // A place is a step once it has shown a while.
+    view.now_ms += 1000.0;
+    client.send(Command::ShowUngrouped);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    view.now_ms += 1000.0;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.ungrouped && client.history.can_go(-1));
+    nav::back(&world.driver.remote, &mut client);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.plan_view && !view.desk.ungrouped, "back on the plan's tab");
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+    assert!(client.history.can_go(1) && !client.history.can_go(-1), "nothing before it, the Ungrouped tab after");
+    nav::forward(&world.driver.remote, &mut client);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.ungrouped, "forward again");
+
+    // Its back arrow does the same as the key.
+    let arrow = back_arrow(&ctx, &mut world, &mut client, &mut view).expect("the location line");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(arrow));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.plan_view, "the ‹ arrow goes back");
+}
+
+/// Where the location line's back arrow is: left of the forward arrow, left of its first part.
+fn back_arrow(ctx: &egui::Context, world: &mut World, client: &mut Client, view: &mut View) -> Option<egui::Pos2> {
+    let shown = settled(ctx, world, client, view, WIDE);
+    let first = shown.iter().find(|(text, _)| text == "Ungrouped" || text == "Parse faster")?.1;
+    Some(egui::pos2(first.left() - 8.0 - 24.0 - 11.0, first.center().y))
+}
+
+#[test]
+fn a_task_cards_click_shows_its_session_and_diff_and_marks_the_card() {
+    let (ctx, mut world, mut client, mut view) = live();
+    view.desk.active = None;
+    view.desk.diff_root = Some("/w/other".into());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    // The card's agent line, which is no button: the card takes the click.
+    let at = on(&shown, "t1 · claude");
+    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(at));
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    let hints = view.desk.hints(&world.driver.remote);
+    assert_eq!(hints.active.as_deref(), Some("s1"), "{hints:?}");
+    assert!(hints.diff_open && hints.panel == PanelMode::Diff, "{hints:?}");
+    // A planned task has no session: its card's click does nothing.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    client.send(Command::ToggleView(PanelMode::Plan));
+    let shown =
+        if has(&shown, "t2 · claude") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, BOARD) };
+    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(on(&shown, "t2 · claude")));
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert_eq!(view.desk.hints(&world.driver.remote).panel, PanelMode::Plan);
+}
+
+#[test]
+fn the_diff_with_nothing_to_show_says_how_to_pick_something() {
+    let (ctx, mut world, mut client, mut view) = live();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    (view.desk.active, view.desk.diff_root) = (None, None);
+    (view.desk.panel, view.desk.diff_open) = (PanelMode::Diff, true);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "No diff to show") && has(&shown, "Pick an agent in the sidebar"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Show the board")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(view.desk.panel, PanelMode::Plan, "its button shows the board");
+}
+
+#[test]
 fn opening_a_diff_fetches_it_and_shows_it_in_the_panel() {
     let (ctx, mut world, mut client, mut view) = live();
     world.host.received.clear();
@@ -277,8 +378,8 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "ATOMICS",
         "◆ Parse faster",
         "CHIEF",
-        "Hide diff",
-        "Plan 0/2",
+        "Diff",
+        "Board 0/2",
         "Connected",
         "⋯",
         "◆ CHIEF AGENT",
@@ -344,7 +445,7 @@ fn a_wide_window_over_a_host_without_plans_shows_every_agent_and_no_plan_button(
         text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(text.iter().any(|t| t == "Fix the parser"), "{text:?}");
-    assert!(!text.iter().any(|t| t.starts_with("Plan")), "no Plan button without a plan: {text:?}");
+    assert!(!text.iter().any(|t| t.starts_with("Board")), "no board's segment without a plan: {text:?}");
     assert_eq!(view.term.session(), Some("s1"));
 }
 
@@ -355,7 +456,7 @@ fn a_wide_window_shows_a_diff_and_fetches_only_it() {
         sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(!world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the board shows, no diff");
-    client.send(Command::TogglePlan);
+    client.send(Command::ToggleView(PanelMode::Diff));
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert!(world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the active session's diff");
     let text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
@@ -383,7 +484,7 @@ fn a_page_of_many_plans_opens_on_the_open_plan_with_its_board() {
     let hints = view.desk.hints(&world.driver.remote);
     assert_eq!(view.desk.plan.as_deref(), Some("p1"));
     assert!(hints.plan_view && hints.panel == PanelMode::Plan && hints.selected_plan == 23, "{hints:?}");
-    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Plan 0/2", "History"] {
+    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Board 0/2", "History"] {
         assert!(has(&shown, wanted), "{wanted} is missing: {shown:?}");
     }
     assert!(!has(&shown, "Archived"), "no archived plan shows unless it is picked: {shown:?}");
@@ -1634,6 +1735,56 @@ fn a_terminal_taking_the_keyboard_takes_it_from_a_text_box() {
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert_eq!(world.host.terminals["s1"].typed, "ls");
     assert_eq!(client.steer_text, "");
+}
+
+/// What the views draw, as PNGs for a person to look at beside the desktop's QA screenshots: the wide window
+/// and the phone at the browser test's sizes and narrower, over the fake host, through the desktop's CPU
+/// rasterizer. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
+#[test]
+#[ignore]
+fn headless_shots() {
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    // The last ones over a host whose ticket system needs the user to sign in again.
+    let shots: [(&str, (f32, f32), Tab, bool); 10] = [
+        ("wide-1600", WIDE, Tab::Board, false),
+        ("wide-1100", (1100.0, 800.0), Tab::Board, false),
+        ("wide-700", (700.0, 800.0), Tab::Board, false),
+        ("phone-390-board", PHONE, Tab::Board, false),
+        ("phone-390-diffs", PHONE, Tab::Diffs, false),
+        ("phone-390-chief", PHONE, Tab::Chief, false),
+        ("phone-360-agents", (360.0, 780.0), Tab::Agents, false),
+        ("wide-1600-reconnect", WIDE, Tab::Board, true),
+        ("wide-1100-reconnect", (1100.0, 800.0), Tab::Board, true),
+        ("phone-390-reconnect", PHONE, Tab::Board, true),
+    ];
+    for (name, (width, height), tab, reconnect) in shots {
+        let (ctx, mut world, mut client, mut view) =
+            if reconnect { live_with(fake_host::tickets(SignInState::Expired)) } else { live() };
+        view.tab = tab;
+        let mut raster = crate::test_raster::Raster::default();
+        let mut last = None;
+        for _ in 0..6 {
+            view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height))),
+                time: Some(view.now_ms / 1000.0),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        let ppp = output.pixels_per_point;
+        let size = [(width * ppp).round() as usize, (height * ppp).round() as usize];
+        let image = raster.paint(&ctx, output, size, client.palette.background);
+        let path = dir.join(format!("{name}.png"));
+        crate::test_raster::save_png(&path, &image).unwrap();
+        println!("saved {}", path.display());
+    }
 }
 
 /// The address a browser ends on after signing in, with a code nothing but the frame to the host may hold.

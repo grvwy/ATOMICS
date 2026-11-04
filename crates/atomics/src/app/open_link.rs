@@ -111,9 +111,12 @@ impl State {
         self.tickets.workspace_file.is_some() && (self.sign_server().is_none() || self.tickets.sign.state().is_some())
     }
 
+    /// A link to a plan opens its tab with its board beside the agents.
     fn show_plan_at(&mut self, index: usize) {
         self.selected_plan = index;
         self.show_plan_fleet();
+        self.panel = PanelMode::Plan;
+        self.diff_open = true;
     }
 
     /// The answer to the read a link started: the draft "Plan KEY: title" for the chief.

@@ -331,6 +331,18 @@ impl Desktop<'_> {
             }
             Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
             Command::TogglePlan => self.runtime.toggle_plan(),
+            Command::ToggleView(view) => {
+                self.runtime.toggle_view(view);
+                // The Tickets panel takes the keyboard where it opens; the terminal gets it back where it closes.
+                if view == PanelMode::Tickets {
+                    if self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
+                        self.client.focus_terminal = None;
+                        self.client.focus_editor = false;
+                    } else {
+                        self.client.focus_terminal = self.runtime.active.clone();
+                    }
+                }
+            }
             Command::OpenTicket(link) => {
                 self.runtime.open_ticket(link, tickets_panel::Nav::Fresh);
                 self.runtime.tickets.panel.from_board = true;

@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use egui::{FontId, RichText, Sense, pos2, vec2};
+use egui::{FontId, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::status::{status_color, status_dot};
 use crate::theme::{Palette, lerp};
@@ -24,11 +24,25 @@ fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, sel
     let height = 38.0;
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
+    // What needs the user stands out whether or not it is the active one: a bar in the warning color.
+    let needs = s.status.needs_attention() || s.pending_approvals > 0;
     if active {
         painter.rect_filled(rect, 2.0, lerp(p.panel, p.accent, 0.14));
-        painter.rect_filled(rect.with_max_x(rect.left() + 2.0), 0.0, p.accent);
+    } else if needs {
+        painter.rect_filled(rect, 2.0, lerp(p.panel, p.warning, 0.08));
     } else if response.hovered() {
         painter.rect_filled(rect, 2.0, p.raised);
+    }
+    if active || needs {
+        let bar = if needs { p.warning } else { p.accent };
+        painter.rect_filled(rect.with_max_x(rect.left() + 2.0), 0.0, bar);
+    }
+    if active && needs {
+        painter.rect_filled(rect.with_min_x(rect.right() - 2.0), 0.0, p.accent);
+    }
+    if response.has_focus() {
+        let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
+        painter.rect_stroke(rect.shrink(1.0), 2.0, ring, StrokeKind::Inside);
     }
     let now = ui.input(|i| i.time);
     painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
@@ -53,19 +67,33 @@ fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, sel
         p.ui(13.0),
         if active { p.accent } else { p.foreground },
     );
-    let mut detail = if s.scratch {
-        format!("{} · scratch · {}", s.agent, s.status.label())
-    } else {
-        format!("{} · {}", s.agent, s.status.label())
-    };
+    let mut detail = if s.scratch { format!("{} · scratch", s.agent) } else { s.agent.clone() };
     if s.outside {
         detail.push_str(" · outside");
     }
-    if selected {
-        detail.push_str(" · ✔");
+    let detail =
+        clip.text(pos2(rect.left() + 20.0, rect.top() + 21.0), egui::Align2::LEFT_TOP, detail, p.ui(11.0), p.muted);
+    // The status in its own color after the agent, and what waits on the user.
+    let mut state = format!(" · {}", s.status.label());
+    if s.pending_approvals > 0 {
+        let n = s.pending_approvals;
+        state.push_str(&format!(" · {n} approval{}", if n == 1 { "" } else { "s" }));
     }
-    clip.text(pos2(rect.left() + 20.0, rect.top() + 21.0), egui::Align2::LEFT_TOP, detail, p.ui(11.0), p.muted);
+    let state_color = if needs { p.warning } else { status_color(s.status, p) };
+    let state = clip.text(detail.right_top(), egui::Align2::LEFT_TOP, state, p.ui(11.0), state_color);
+    if selected {
+        clip.text(state.right_top(), egui::Align2::LEFT_TOP, " · ✔ selected", p.ui(11.0), p.accent);
+    }
     response
+}
+
+/// A group's heading in the AGENTS list: the plan its sessions work for, in the plan's color; a click shows
+/// the plan's tab where the backend can.
+fn group_heading(ui: &mut egui::Ui, p: &Palette, text: &str, color: egui::Color32, hover: &str) -> egui::Response {
+    ui.add_space(4.0);
+    let label =
+        egui::Label::new(RichText::new(text).font(p.ui(11.0)).color(color).strong()).truncate().sense(Sense::click());
+    ui.add(label).on_hover_text(hover)
 }
 
 /// The AGENTS section: the sessions the current tab shows, worktrees being checked out, and the RECENT
@@ -87,9 +115,46 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let can_close = backend.available(&Command::CloseSession(String::new()));
     // What "selected" is for: the steer bar sends to them.
     let can_steer = backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() });
-    for (index, session) in sessions.iter().enumerate() {
-        if !visible.contains(&index) {
-            continue;
+    // The sessions grouped by the plan they work for, in the plans' order, then those outside any plan; one
+    // group alone needs no heading.
+    let plans = backend.plan_list();
+    let group_of =
+        |session: &SessionRow| session.task.as_ref().and_then(|link| plans.iter().position(|row| row.id == link.plan));
+    let mut groups: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for &index in &visible {
+        let group = group_of(&sessions[index]);
+        match groups.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, members)) => members.push(index),
+            None => groups.push((group, vec![index])),
+        }
+    }
+    groups.sort_by_key(|(group, _)| group.unwrap_or(usize::MAX));
+    let headed = groups.len() > 1 || groups.iter().any(|(group, _)| group.is_some());
+    let mut order = Vec::new();
+    for (group, members) in &groups {
+        order.push((Some(*group), members[0]));
+        order.extend(members.iter().skip(1).map(|&index| (None, index)));
+    }
+    for (heading, index) in order {
+        let session = &sessions[index];
+        if headed && let Some(group) = heading {
+            let (text, color, hover, show) = match group.map(|g| (g, &plans[g])) {
+                Some((g, row)) => {
+                    let show = if row.status == atomics_core::plan::PlanStatus::Open {
+                        Command::ShowPlan(g)
+                    } else {
+                        Command::ViewPlanHistory(g)
+                    };
+                    (row.tab_name.clone(), row.state.color(&p), format!("The plan: {}", row.goal), Some(show))
+                }
+                None => ("Outside plans".to_string(), p.muted, "Sessions no plan's task uses".to_string(), None),
+            };
+            let response = group_heading(ui, &p, &text, color, &hover);
+            if let Some(show) = show.filter(|show| backend.available(show))
+                && response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+            {
+                client.send(show);
+            }
         }
         let active = active_id.as_deref() == Some(session.id.as_str());
         let row = session_row(ui, &p, session, active, client.selected.contains(&session.id));

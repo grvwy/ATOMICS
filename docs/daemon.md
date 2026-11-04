@@ -942,8 +942,9 @@ sidebar's AGENTS list; a tap opens the agent's tile), Board (the current plan's 
 from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History, the one picked
 there joining the strip, which scrolls to it and keeps a tap's width of the plan before it), Diffs (the
 worktrees with changes, then the diff panel), Terminal (the active agent's fleet tile at the pane's size: its header,
-its approval banner, its terminal) and Chief (the chief's window, with the request it waits on). The approvals are
-behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
+its approval banner, its terminal); Board and Diffs carry the view switcher's icons and counts. The chief's window
+(with the request it waits on) opens from the CHIEF pill in the middle of the top bar, as on the desktop; a second
+tap goes back to the pane before it. The approvals are behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
 insets (the sides too, for a phone held sideways). The page's own
 controls take the theme's colours as CSS custom properties.
 

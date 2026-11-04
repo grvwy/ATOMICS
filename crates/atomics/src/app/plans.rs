@@ -27,7 +27,7 @@ impl State {
         self.view = self.plans[self.selected_plan].project.clone();
         self.plan_view = true;
         self.ungrouped = false;
-        self.panel = PanelMode::Diff;
+        // The panel keeps the view the user chose: the board shows this plan's.
         if self.chief_dock() == ChiefDock::Floating || self.last_layout.is_some_and(|layout| layout.dock_width == 0.0) {
             self.chief_open = false;
         }
@@ -2295,7 +2295,8 @@ mod tests {
                     app.runtime.chief_open = true;
                     app.runtime.store.chief_dock = Some(dock);
                     assert_eq!(app.runtime.dispatch(index, Some("a")).unwrap(), ["a"]);
-                    assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Diff);
+                    // The fleet shows beside the board, which the panel keeps: the view the user chose.
+                    assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Plan);
                     assert_eq!(app.runtime.chief_open, dock == ChiefDock::Docked);
                     assert!(!app.runtime.changed_plans.contains(&app.runtime.plans[index].id));
                     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
@@ -2426,10 +2427,12 @@ mod tests {
                     app.runtime.selected_plan = index;
                     app.runtime.show_plan_fleet();
                     assert_eq!(app.runtime.visible_sessions(), visible);
+                    app.runtime.panel = PanelMode::Diff;
                     app.runtime.toggle_plan();
-                    assert!(app.runtime.panel == PanelMode::Plan);
+                    assert!(app.runtime.panel == PanelMode::Plan && app.runtime.diff_open);
+                    // Toggling the board again hides the panel; its view stays the board's.
                     app.runtime.toggle_plan();
-                    assert!(app.runtime.panel == PanelMode::Diff);
+                    assert!(app.runtime.panel == PanelMode::Plan && !app.runtime.diff_open);
                 }
                 app.runtime.set_view(None);
                 assert_eq!(app.runtime.visible_sessions(), [0, 1, 2]);

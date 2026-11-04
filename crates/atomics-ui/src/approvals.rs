@@ -27,7 +27,13 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     let inner = touch.map_or(banner.shrink(6.0), |touch| banner.shrink2(egui::vec2(touch.gutter, 8.0)));
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("approval", &pending.session)).max_rect(inner));
     child.set_clip_rect(banner);
-    child.label(RichText::new("Permission requested").color(p.warning).strong());
+    child.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Permission requested").color(p.warning).strong());
+        // What asks: the tool, unless the command line below is all it is.
+        if request.command.is_some() && !request.tool.is_empty() {
+            ui.label(RichText::new(format!("· {}", request.tool)).color(p.muted));
+        }
+    });
     let mut decided = None;
     let can_decide =
         backend.available(&Command::Decide { session: index, approval: pending.id.clone(), decision: Decision::Deny });
@@ -55,14 +61,27 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
         child.label("Decision pending…");
     }
     egui::ScrollArea::vertical().max_height(child.available_height()).show(&mut child, |ui| {
+        // What the host warns of first (a shared stash entry, whose it is), then the command as it would run,
+        // set apart and wrapped whole: nothing of it is cut.
         if let Some(warning) = &request.warning {
             ui.label(RichText::new(warning).color(p.warning));
         }
-        ui.label(RichText::new(request.command.as_deref().unwrap_or(&request.tool)).monospace());
+        egui::Frame::new()
+            .fill(p.raised)
+            .stroke(egui::Stroke::new(1.0, p.border))
+            .corner_radius(3)
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let command = request.command.as_deref().unwrap_or(&request.tool);
+                ui.add(egui::Label::new(RichText::new(command).monospace().color(p.foreground)).wrap());
+            });
         if !request.cwd.as_os_str().is_empty() {
-            ui.label(format!("cwd: {}", request.cwd.display()));
+            ui.label(RichText::new(format!("in {}", request.cwd.display())).color(p.muted).size(12.0));
         }
-        ui.label(request.reason.as_deref().unwrap_or("Permission requested"));
+        if let Some(reason) = request.reason.as_deref() {
+            ui.label(RichText::new(reason).color(p.foreground));
+        }
     });
     if let Some(decision) = decided
         && client.approval_decisions.insert((pending.session.clone(), pending.id.clone()))

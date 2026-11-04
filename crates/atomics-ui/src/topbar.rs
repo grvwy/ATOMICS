@@ -1,7 +1,7 @@
 //! The top bar's pieces: laying out a row of widgets (measuring it before drawing it, drawing into a
-//! bounded slot), the brand, the notice line, the diff, new-session and plan buttons and the Project menu.
-//! The bar's layout is [`crate::shell::top_bar`], the navigation tabs are in [`crate::tabs`], and the
-//! chief's pill in [`crate::chief`]. A button whose command the backend cannot carry out is not drawn.
+//! bounded slot), the brand, the notice line, the new-session button and the Project menu. The bar's layout
+//! is [`crate::shell::top_bar`], the navigation tabs are in [`crate::tabs`], the view switcher in
+//! [`crate::switcher`] and the chief's pill in [`crate::chief`]. A button whose command the backend cannot carry out is not drawn.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -10,7 +10,8 @@ use atomics_core::config::{AgentKind, KeyConfig};
 use egui::{Rect, RichText, Sense, vec2};
 
 use crate::keys::shortcut_label;
-use crate::{Backend, Client, Command, PanelMode};
+use crate::shell::BrandSize;
+use crate::{Backend, Client, Command};
 
 /// Measure with the same fonts, padding and widgets that will actually be drawn.
 /// The disabled, invisible child cannot activate controls or take space from the bar.
@@ -48,15 +49,19 @@ pub fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Response) {
     }
 }
 
-/// The icon, the name and, if `show_agents`, how many agents run and what the sandbox VMs use.
-pub fn brand(ui: &mut egui::Ui, show_agents: bool, backend: &dyn Backend, client: &mut Client) {
+/// The icon, the name unless `size` is [`BrandSize::Mark`] and, at [`BrandSize::Full`], how many agents run
+/// and what the sandbox VMs use.
+pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: &mut Client) {
     if let Some(icon) = &client.icon {
-        let response = ui.image((icon.id(), vec2(20.0, 20.0)));
+        let response = ui.image((icon.id(), vec2(20.0, 20.0))).on_hover_text("ATOMICS");
         record_item(ui, "icon", &response);
     }
-    let response = ui.label(RichText::new("ATOMICS").strong().size(14.0).color(client.palette.accent).monospace());
-    record_item(ui, "brand", &response);
-    if show_agents {
+    if size != BrandSize::Mark || client.icon.is_none() {
+        let name = RichText::new("ATOMICS").strong().size(14.0).color(client.palette.accent).monospace();
+        let response = ui.label(name);
+        record_item(ui, "brand", &response);
+    }
+    if size == BrandSize::Full {
         let sessions = backend.session_list();
         let agents = sessions.iter().filter(|s| s.kind != AgentKind::Shell).count();
         let response = ui.label(
@@ -97,21 +102,6 @@ pub fn shortcut_tip(
     response.on_hover_text(label)
 }
 
-/// Shows or hides the diff panel.
-pub fn diff_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
-    if !backend.available(&Command::ToggleDiff) {
-        return;
-    }
-    let response = ui.button(if backend.view_hints().diff_open { "Hide diff" } else { "Show diff" });
-    record_item(ui, "diff", &response);
-    if shortcut_tip(response, backend, |keys| &keys.toggle_diff).clicked() {
-        client.send(Command::ToggleDiff);
-        if in_menu {
-            ui.close();
-        }
-    }
-}
-
 /// Opens the new-session dialog.
 pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
     if !backend.available(&Command::NewSession) {
@@ -121,27 +111,6 @@ pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clien
     record_item(ui, "+ New", &response);
     if shortcut_tip(response, backend, |keys| &keys.new_session).clicked() {
         client.send(Command::NewSession);
-        if in_menu {
-            ui.close();
-        }
-    }
-}
-
-/// The selected plan's progress; it shows or hides the plan board.
-pub fn plan_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
-    if !backend.available(&Command::TogglePlan) {
-        return;
-    }
-    let hints = backend.view_hints();
-    let plan = backend.plan_row(hints.selected_plan).expect("a plan is selected");
-    let (done, total, attention) = (plan.done, plan.total, plan.attention);
-    let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
-    let text =
-        RichText::new(label).color(if attention > 0 { client.palette.warning } else { client.palette.foreground });
-    let response = ui.selectable_label(hints.panel == PanelMode::Plan && hints.diff_open, text);
-    record_item(ui, "Plan", &response);
-    if shortcut_tip(response, backend, |keys| &keys.toggle_plan).clicked() {
-        client.send(Command::TogglePlan);
         if in_menu {
             ui.close();
         }
@@ -207,17 +176,18 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if let Some(text) = &state.toast {
         notices.push(text.clone());
     }
+    // Each problem says what to do about it: the hover shows the whole line.
     if let Some(err) = &state.config_error {
-        notices.push(format!("config error: {err}"));
+        notices.push(format!("config error: {err} (the last good config stays in effect; fix the file to reload)"));
     }
     if let Some(problems) = &state.config_problems {
-        notices.push(format!("config: {problems}"));
+        notices.push(format!("config: {problems} (atomics doctor says more)"));
     }
     if let Some(err) = &state.theme_error {
-        notices.push(format!("theme: {err}"));
+        notices.push(format!("theme: {err} (the rest of the theme applies)"));
     }
     if let Some(err) = &state.hook_error {
-        notices.push(format!("hooks offline: {err}"));
+        notices.push(format!("hooks offline: {err} (agents cannot report; run atomics doctor)"));
     }
     if notices.is_empty() {
         return;

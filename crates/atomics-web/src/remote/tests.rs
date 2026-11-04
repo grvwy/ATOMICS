@@ -864,17 +864,9 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     remote.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&remote);
     let has = |label: &str| text.iter().any(|t| t.starts_with(label));
-    for shown in [
-        "ATOMICS",
-        "CHIEF",
-        "Ungrouped · 0",
-        "◆ Parse faster",
-        "Hide diff",
-        "Plan 0/2",
-        "AGENTS",
-        "PLAN",
-        "Approve plan",
-    ] {
+    for shown in
+        ["ATOMICS", "CHIEF", "Ungrouped · 0", "◆ Parse faster", "Diff", "Board 0/2", "AGENTS", "PLAN", "Approve plan"]
+    {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
     for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {

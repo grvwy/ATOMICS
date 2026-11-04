@@ -865,6 +865,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         branch: session.branch.clone(),
         project: None,
         ungrouped: !session.chief && session.task.is_none(),
+        task: session.task.clone(),
         scratch: false,
         sandbox: None,
         outside: false,
@@ -960,7 +961,10 @@ impl Backend for RemoteBackend {
             let s = self.state.borrow();
             let chief = || s.mirror.sessions.values().any(|x| x.chief);
             // The plan's board and button need a plan to show: a host may have none, or none open.
-            let plan = matches!(command, Command::TogglePlan | Command::SetPanel(PanelMode::Plan));
+            let plan = matches!(
+                command,
+                Command::TogglePlan | Command::SetPanel(PanelMode::Plan) | Command::ToggleView(PanelMode::Plan)
+            );
             return desk::carries_out(command, s.wide)
                 && (!desk::window_command(command) || chief())
                 && (!plan || s.mirror.plans.values().nth(s.view.selected_plan).is_some());

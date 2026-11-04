@@ -696,6 +696,8 @@ struct Client {
     /// The Remote devices window (pairing and revoking), and the device whose Revoke asks.
     remote_devices: bool,
     revoke_confirm: Option<atomics_core::noise::PublicKey>,
+    /// Nothing had the keyboard when the last frame ended: an Escape now is no field's or terminal's.
+    keyboard_idle: bool,
     voice_tx: Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
@@ -749,6 +751,7 @@ impl Client {
             connection_url: String::new(),
             show_settings: None,
             remote_devices: false,
+            keyboard_idle: false,
             revoke_confirm: None,
             voice_tx,
             voice_rx,
@@ -1121,6 +1124,12 @@ impl State {
             desktop_split: None,
             desktop_diff_split: None,
             launch_dir,
+        };
+        // The view the window's switcher showed last time; a restart's own state wins below.
+        app.panel = match app.store.panel_view.as_deref() {
+            Some("board") => PanelMode::Plan,
+            Some("tickets") => PanelMode::Tickets,
+            _ => PanelMode::Diff,
         };
         app.refresh_themes();
         app.open_initial_projects(options.projects, options.workspace);
@@ -1595,6 +1604,8 @@ impl Desktop<'_> {
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);
         self.github_modal(&ctx);
+        // egui lets go of a text field on Escape before the next frame's shortcuts see the key.
+        self.client.keyboard_idle = ctx.memory(|m| m.focused().is_none());
     }
 }
 

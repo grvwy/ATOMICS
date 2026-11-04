@@ -1344,7 +1344,7 @@ pub fn changed_files(
         ui.new_child(egui::UiBuilder::new().id_salt("changed-files").max_rect(rect.shrink2(vec2(6.0, 6.0))));
     let ui = &mut child;
     let Some(prepared) = state.prepared.as_ref() else {
-        ui.label(RichText::new("…").color(palette.muted));
+        ui.label(RichText::new("Reading the changes…").color(palette.muted).size(12.0));
         return None;
     };
     let diff = &prepared.diff;
@@ -1385,31 +1385,39 @@ pub fn changed_files(
                     None => ("", path),
                 };
                 painter.text(rect.left_top() + vec2(6.0, 4.0), egui::Align2::LEFT_TOP, badge, mono.clone(), color);
-                let name_color = if selected { palette.accent } else { palette.foreground };
-                painter.text(rect.left_top() + vec2(20.0, 3.0), egui::Align2::LEFT_TOP, name, font.clone(), name_color);
-                painter.text(
-                    rect.left_top() + vec2(20.0, 19.0),
-                    egui::Align2::LEFT_TOP,
-                    dir,
-                    mono.clone(),
-                    palette.muted,
-                );
                 let counts = if file.binary {
                     "bin".to_string()
                 } else {
                     format!("+{} −{}", file.additions(), file.deletions())
                 };
-                painter.text(
-                    rect.right_top() + vec2(-4.0, 4.0),
-                    egui::Align2::RIGHT_TOP,
-                    counts,
-                    mono.clone(),
+                let counts_left = painter
+                    .text(
+                        rect.right_top() + vec2(-4.0, 4.0),
+                        egui::Align2::RIGHT_TOP,
+                        &counts,
+                        mono.clone(),
+                        palette.muted,
+                    )
+                    .left();
+                // A long name or folder ends in "…" before the counts; the hover has the whole path.
+                let room = (counts_left - rect.left() - 26.0).max(0.0);
+                let line = |text: &str, font: &FontId, color, width: f32| {
+                    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font.clone(), color);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+                    painter.layout_job(job)
+                };
+                let name_color = if selected { palette.accent } else { palette.foreground };
+                painter.galley(rect.left_top() + vec2(20.0, 3.0), line(name, &font, name_color, room), name_color);
+                let dir_room = rect.right() - rect.left() - 26.0;
+                painter.galley(
+                    rect.left_top() + vec2(20.0, 19.0),
+                    line(dir, &mono, palette.muted, dir_room),
                     palette.muted,
                 );
                 if response.clicked() {
                     clicked = Some((path.to_string(), first_change(file)));
                 }
-                response.on_hover_text(path);
+                response.on_hover_text(format!("{path}\n{counts}"));
             }
         },
     );
