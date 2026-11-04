@@ -233,6 +233,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
                     &tickets,
                 ));
                 lines.push(ticket_check(&tickets, config.remote.rendezvous.enabled));
+                lines.extend(http_operations_check(&tickets));
                 lines.extend(remote_check(&tickets));
             }
             Ok(_) => {}
@@ -337,7 +338,10 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig, rendezvous: bool) 
         .into_iter()
         .filter(|name| rendezvous || !name.starts_with("rendezvous_"))
         .filter_map(|name| {
-            config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
+            config
+                .operation(name)
+                .filter(|op| op.http.is_none() && !tools.contains(&op.tool))
+                .map(|op| format!("{name} → {}", op.tool))
         })
         .collect();
         if !missing.is_empty() {
@@ -346,7 +350,10 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig, rendezvous: bool) 
         Ok(["search", "semantic_search", "browse", "children", "related", "read", "read_comments"]
             .into_iter()
             .filter_map(|name| {
-                config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
+                config
+                    .operation(name)
+                    .filter(|op| op.http.is_none() && !tools.contains(&op.tool))
+                    .map(|op| format!("{name} → {}", op.tool))
             })
             .collect::<Vec<_>>())
     })();
@@ -369,6 +376,38 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig, rendezvous: bool) 
         &label,
         "check [tickets].server and operations; authenticate a stdio bridge in a terminal first",
     )
+}
+
+/// The operations mapped with `http`, which the tool check above skips: whether their address is
+/// one ATOMICS will call, and whether they may. It sends nothing: their paths need ticket values.
+fn http_operations_check(config: &atomics_core::tickets::TicketConfig) -> Option<String> {
+    let names: Vec<&str> = atomics_core::tickets::HTTP_OPERATIONS
+        .iter()
+        .copied()
+        .filter(|name| config.operation(name).is_some_and(|op| op.http.is_some()))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let names = names.join(", ");
+    let checked = config.http_server().ok_or_else(|| "set [tickets.http] url".to_string()).and_then(|api| {
+        let base = crate::mcp_client::http_base(api.url.as_deref().unwrap_or_default()).map_err(|e| e.to_string())?;
+        let token = crate::mcp_client::shared_token(&config.server, &api, Some(String::new()));
+        let left_out = config.server.bearer_env().is_some() && token.is_none();
+        Ok((base.host_str().unwrap_or("the API").to_string(), left_out))
+    });
+    let cleaner = atomics_core::tickets::Cleaner::of(config, crate::setup::env_var);
+    let label = match &checked {
+        Ok((host, false)) => format!("{} ticket HTTP operations at {host}: {names}", config.system),
+        Ok((host, true)) => format!(
+            "{} ticket HTTP operations at {host}: {names}; note: token_env goes only to server.url's origin, so they send no token",
+            config.system
+        ),
+        Err(error) => {
+            format!("{} ticket HTTP operations ({names}) cannot run: {}", config.system, cleaner.error(error))
+        }
+    };
+    Some(check_line(checked.is_ok(), &label, "check [tickets.http] url"))
 }
 
 /// `[tickets.remote]`, when enabled: reads whoami (a read without side effects) and applies
@@ -533,6 +572,56 @@ mod tests {
         let mut off = config.clone();
         off.remote.enabled = false;
         assert!(remote_check(&off).is_none());
+    }
+
+    #[test]
+    fn http_operations_are_reported_apart_from_the_tool_check() {
+        use crate::mcp_client::tests::{example_profile, fake_state};
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = fake_state(dir.path(), serde_json::json!([]));
+        let mut config = example_profile("meaning-example", &state);
+        assert_eq!(http_operations_check(&config), None);
+        // The tool check does not look for a tool behind an http operation.
+        let call = atomics_core::tickets::HttpCall {
+            method: atomics_core::tickets::HttpMethod::Get,
+            path: "/items/{id}".into(),
+            query: Vec::new(),
+            response_headers: Default::default(),
+        };
+        let read = config.operations.read.as_mut().unwrap();
+        read.tool.clear();
+        read.http = Some(Box::new(call.clone()));
+        let get = config.operations.get.as_mut().unwrap();
+        get.tool.clear();
+        get.http = Some(Box::new(call));
+        let line = ticket_check(&config, false);
+        assert!(line.starts_with('✓') && !line.contains("note:"), "{line}");
+
+        let line = http_operations_check(&config).unwrap();
+        assert!(line.starts_with('✗') && line.contains("read, get"), "{line}");
+        assert!(line.contains("set [tickets.http] url"), "{line}");
+        config.http.url = "http://tickets.example/v1".into();
+        let line = http_operations_check(&config).unwrap();
+        assert!(line.starts_with('✗') && line.contains("must be https"), "{line}");
+        config.http.url = "https://me:password-9f@tickets.example/v1".into();
+        let line = http_operations_check(&config).unwrap();
+        assert!(line.starts_with('✗') && !line.contains("password-9f"), "{line}");
+        config.http.url = "https://tickets.example/v1".into();
+        let line = http_operations_check(&config).unwrap();
+        assert!(line.starts_with('✓') && line.contains("at tickets.example:"), "{line}");
+        assert!(!line.contains("token"), "{line}");
+
+        // A token that stays behind with the MCP server is pointed out.
+        config.server = atomics_core::tickets::McpServer {
+            url: Some("https://mcp.example/mcp".into()),
+            token_env: Some("TICKETS_TOKEN".into()),
+            ..Default::default()
+        };
+        let line = http_operations_check(&config).unwrap();
+        assert!(line.starts_with('✓') && line.contains("send no token"), "{line}");
+        config.server.url = Some("https://tickets.example/mcp".into());
+        let line = http_operations_check(&config).unwrap();
+        assert!(line.starts_with('✓') && !line.contains("send no token"), "{line}");
     }
 
     #[test]

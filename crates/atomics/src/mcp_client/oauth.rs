@@ -499,7 +499,7 @@ fn canonical_resource(url: &Url) -> String {
     url.as_str().trim_end_matches('/').to_string()
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
+pub(super) fn agent(timeout: Duration) -> ureq::Agent {
     // No redirects: metadata URLs come from the server, and a redirect must not lead elsewhere.
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -510,7 +510,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 /// A URL that may carry tokens or metadata: https, or http only to this machine.
-fn parse_secure(text: &str) -> Result<Url, McpError> {
+pub(super) fn parse_secure(text: &str) -> Result<Url, McpError> {
     let url = Url::parse(text).map_err(|_| McpError::Server(format!("{text} is not a URL")))?;
     let local = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

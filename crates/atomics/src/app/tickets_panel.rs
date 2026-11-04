@@ -2439,52 +2439,71 @@ mod tests {
         app.runtime.apply_ticket_config();
     }
 
+    /// The same profile with its reads over HTTP; the guard keeps the fake API running.
+    fn fake_profile_over_http(app: &mut Desktop<'_>, dir: &Path) -> crate::mcp_client::tests::FakeHttp {
+        let state = dir.join("fake.json");
+        let mut config = example_profile("meaning-example", &state);
+        let api = crate::mcp_client::tests::over_http(&mut config, &state);
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        api
+    }
+
     #[test]
     fn the_panel_finds_and_reads_against_the_fake_server() {
         with_app("app::tickets_panel::tests::the_panel_finds_and_reads_against_the_fake_server", |app, ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             fake_profile(app, dir.path());
-            app.runtime.panel = PanelMode::Tickets;
-            app.runtime.diff_open = true;
-            app.runtime.tickets.panel.query = "personal-agent ticket workspace".into();
-            app.runtime.tickets_search();
-            settle(app);
-            let find = &app.runtime.tickets.panel.find;
-            assert!(find.error.is_none(), "{:?}", find.error);
-            assert_eq!(find.results.len(), 5, "{:?}", find.results.iter().map(|c| c.link.label()).collect::<Vec<_>>());
-            assert!(find.results.iter().all(|c| c.score.is_some() && c.snippet.is_some()));
-            assert_eq!(find.ran.as_ref().map(|r| r.1), Some(true));
-            ctx.set_pixels_per_point(1.5);
-            let output = frame(app, ctx, vec![]);
-            let text = texts(&output).join("\n");
-            assert!(text.contains("DEMO-1") && text.contains("5 tickets by meaning"), "{text}");
-            screenshot(app, ctx, "find");
-
-            let epic = app
-                .runtime
-                .tickets
-                .panel
-                .find
-                .results
-                .iter()
-                .find(|c| c.link.label() == "DEMO-1")
-                .unwrap()
-                .link
-                .clone();
-            app.runtime.open_ticket(epic, Nav::Fresh);
-            settle(app);
-            let read = app.runtime.tickets.panel.read.as_ref().unwrap();
-            assert!(read.error.is_none(), "{:?}", read.error);
-            assert!(read.card.body.as_deref().unwrap().contains("## Goal"));
-            assert_eq!(read.card.comments.len(), 1);
-            assert_eq!(read.children.items().len(), 4);
-            assert!(!read.related.items().is_empty());
-            let output = frame(app, ctx, vec![]);
-            screenshot(app, ctx, "read");
-            let text = texts(&output).join("\n");
-            assert!(text.contains("Children (4)") && text.contains("Comments (1)") && text.contains("Goal"), "{text}");
-            assert_eq!(app.runtime.tickets.panel.recent[0].label(), "DEMO-1");
+            finds_and_reads(app, ctx);
         });
+    }
+
+    #[test]
+    fn the_panel_finds_and_reads_over_http() {
+        with_app("app::tickets_panel::tests::the_panel_finds_and_reads_over_http", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let _api = fake_profile_over_http(app, dir.path());
+            finds_and_reads(app, ctx);
+            let state: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.path().join("fake.json")).unwrap()).unwrap();
+            let requests = state["http_requests"].as_array().unwrap();
+            assert!(requests.iter().any(|request| request["target"] == "/v1/tools/find_tickets"), "{requests:?}");
+            assert!(requests.iter().any(|request| request["target"] == "/v1/tools/get_ticket"), "{requests:?}");
+        });
+    }
+
+    fn finds_and_reads(app: &mut Desktop<'_>, ctx: &egui::Context) {
+        app.runtime.panel = PanelMode::Tickets;
+        app.runtime.diff_open = true;
+        app.runtime.tickets.panel.query = "personal-agent ticket workspace".into();
+        app.runtime.tickets_search();
+        settle(app);
+        let find = &app.runtime.tickets.panel.find;
+        assert!(find.error.is_none(), "{:?}", find.error);
+        assert_eq!(find.results.len(), 5, "{:?}", find.results.iter().map(|c| c.link.label()).collect::<Vec<_>>());
+        assert!(find.results.iter().all(|c| c.score.is_some() && c.snippet.is_some()));
+        assert_eq!(find.ran.as_ref().map(|r| r.1), Some(true));
+        ctx.set_pixels_per_point(1.5);
+        let output = frame(app, ctx, vec![]);
+        let text = texts(&output).join("\n");
+        assert!(text.contains("DEMO-1") && text.contains("5 tickets by meaning"), "{text}");
+        screenshot(app, ctx, "find");
+
+        let epic =
+            app.runtime.tickets.panel.find.results.iter().find(|c| c.link.label() == "DEMO-1").unwrap().link.clone();
+        app.runtime.open_ticket(epic, Nav::Fresh);
+        settle(app);
+        let read = app.runtime.tickets.panel.read.as_ref().unwrap();
+        assert!(read.error.is_none(), "{:?}", read.error);
+        assert!(read.card.body.as_deref().unwrap().contains("## Goal"));
+        assert_eq!(read.card.comments.len(), 1);
+        assert_eq!(read.children.items().len(), 4);
+        assert!(!read.related.items().is_empty());
+        let output = frame(app, ctx, vec![]);
+        screenshot(app, ctx, "read");
+        let text = texts(&output).join("\n");
+        assert!(text.contains("Children (4)") && text.contains("Comments (1)") && text.contains("Goal"), "{text}");
+        assert_eq!(app.runtime.tickets.panel.recent[0].label(), "DEMO-1");
     }
 
     fn labels(app: &Desktop<'_>) -> Vec<String> {
@@ -2767,75 +2786,87 @@ mod tests {
             "app::tickets_panel::tests::views_list_recent_switch_tabs_and_chips_narrow_against_the_fake_server",
             |app, ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
-                let state = dir.path().join("fake.json");
                 fake_profile(app, dir.path());
-                app.runtime.toggle_tickets();
-                frame(app, ctx, vec![]);
-                settle(app);
-                // The empty panel shows Recent: newest first, without a query or scores.
-                assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2", "DEMO-1"]);
-                assert!(app.runtime.tickets.panel.find.results.iter().all(|c| c.score.is_none()));
-                let text = texts(&frame(app, ctx, vec![])).join("\n");
-                assert!(text.contains("5 tickets · Recent") && text.contains("Being worked on"), "{text}");
-                assert!(text.contains("Mine"), "{text}");
-                let first = &finds(&state)[0];
-                assert!(first.get("about").is_none() && first.get("status").is_none(), "{first}");
-
-                edit_state(&state, |state| {
-                    let tickets = state["tickets"].as_array_mut().unwrap();
-                    tickets[2]["state"] = "InProgress".into();
-                    tickets[2]["rev"] = 5.into();
-                    tickets[1]["assignee"] = "Someone Else".into();
-                });
-                // → in the list switches to Being worked on.
-                in_list(ctx);
-                frame(app, ctx, vec![key(Key::ArrowRight, NONE)]);
-                settle(app);
-                assert_eq!(app.runtime.tickets.panel.tab, Some(1));
-                assert_eq!(labels(app), ["DEMO-3", "DEMO-2"], "DEMO-2 is Deploying, DEMO-3 newly in progress");
-                assert_eq!(finds(&state).last().unwrap()["status"], serde_json::json!(["active"]));
-                assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("2 tickets · Being worked on"));
-
-                // Alt+1 switches on Mine, which narrows the view.
-                frame(app, ctx, vec![key(Key::Num1, egui::Modifiers::ALT)]);
-                settle(app);
-                assert!(app.runtime.tickets.panel.chips.contains(&0));
-                assert_eq!(labels(app), ["DEMO-3"]);
-                let last = finds(&state).last().unwrap().clone();
-                assert_eq!((&last["status"], &last["assignee"]), (&serde_json::json!(["active"]), &"owner".into()));
-
-                // Typing searches, with the chip the search accepts.
-                ctx.memory_mut(|m| m.request_focus(query_id()));
-                frame(app, ctx, vec![]);
-                frame(app, ctx, vec![egui::Event::Text("ticket workspace".into())]);
-                assert_eq!(app.runtime.tickets.panel.query, "ticket workspace");
-                frame(app, ctx, vec![key(Key::Enter, NONE)]);
-                settle(app);
-                let find = &app.runtime.tickets.panel.find;
-                assert_eq!(find.ran.as_ref().map(|r| r.0.as_str()), Some("ticket workspace"));
-                assert_eq!(labels(app), ["DEMO-1", "DEMO-3", "DEMO-4", "DEMO-5"], "Mine leaves out DEMO-2");
-                let last = finds(&state).last().unwrap().clone();
-                assert_eq!((&last["about"], &last["assignee"]), (&"ticket workspace".into(), &"owner".into()));
-                assert!(last.get("status").is_none(), "the view's arguments stay with the view");
-
-                // Clearing the query returns to the selected view.
-                app.runtime.tickets.panel.query.clear();
-                frame(app, ctx, vec![]);
-                settle(app);
-                assert_eq!(app.runtime.tickets.panel.find.listed, Some(1));
-                assert_eq!(labels(app), ["DEMO-3"]);
-                screenshot(app, ctx, "views");
-
-                // ← back to Recent, and Mine off again.
-                in_list(ctx);
-                frame(app, ctx, vec![key(Key::ArrowLeft, NONE)]);
-                settle(app);
-                assert_eq!(labels(app), ["DEMO-3", "DEMO-5", "DEMO-4", "DEMO-1"]);
-                app.runtime.tickets_chip(0);
-                settle(app);
-                assert_eq!(labels(app).len(), 5);
+                views_and_chips(app, ctx, &dir.path().join("fake.json"));
             },
         );
+    }
+
+    #[test]
+    fn views_tabs_and_chips_list_and_narrow_over_http() {
+        with_app("app::tickets_panel::tests::views_tabs_and_chips_list_and_narrow_over_http", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let _api = fake_profile_over_http(app, dir.path());
+            views_and_chips(app, ctx, &dir.path().join("fake.json"));
+        });
+    }
+
+    fn views_and_chips(app: &mut Desktop<'_>, ctx: &egui::Context, state: &Path) {
+        app.runtime.toggle_tickets();
+        frame(app, ctx, vec![]);
+        settle(app);
+        // The empty panel shows Recent: newest first, without a query or scores.
+        assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2", "DEMO-1"]);
+        assert!(app.runtime.tickets.panel.find.results.iter().all(|c| c.score.is_none()));
+        let text = texts(&frame(app, ctx, vec![])).join("\n");
+        assert!(text.contains("5 tickets · Recent") && text.contains("Being worked on"), "{text}");
+        assert!(text.contains("Mine"), "{text}");
+        let first = &finds(state)[0];
+        assert!(first.get("about").is_none() && first.get("status").is_none(), "{first}");
+
+        edit_state(state, |state| {
+            let tickets = state["tickets"].as_array_mut().unwrap();
+            tickets[2]["state"] = "InProgress".into();
+            tickets[2]["rev"] = 5.into();
+            tickets[1]["assignee"] = "Someone Else".into();
+        });
+        // → in the list switches to Being worked on.
+        in_list(ctx);
+        frame(app, ctx, vec![key(Key::ArrowRight, NONE)]);
+        settle(app);
+        assert_eq!(app.runtime.tickets.panel.tab, Some(1));
+        assert_eq!(labels(app), ["DEMO-3", "DEMO-2"], "DEMO-2 is Deploying, DEMO-3 newly in progress");
+        assert_eq!(finds(state).last().unwrap()["status"], serde_json::json!(["active"]));
+        assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("2 tickets · Being worked on"));
+
+        // Alt+1 switches on Mine, which narrows the view.
+        frame(app, ctx, vec![key(Key::Num1, egui::Modifiers::ALT)]);
+        settle(app);
+        assert!(app.runtime.tickets.panel.chips.contains(&0));
+        assert_eq!(labels(app), ["DEMO-3"]);
+        let last = finds(state).last().unwrap().clone();
+        assert_eq!((&last["status"], &last["assignee"]), (&serde_json::json!(["active"]), &"owner".into()));
+
+        // Typing searches, with the chip the search accepts.
+        ctx.memory_mut(|m| m.request_focus(query_id()));
+        frame(app, ctx, vec![]);
+        frame(app, ctx, vec![egui::Event::Text("ticket workspace".into())]);
+        assert_eq!(app.runtime.tickets.panel.query, "ticket workspace");
+        frame(app, ctx, vec![key(Key::Enter, NONE)]);
+        settle(app);
+        let find = &app.runtime.tickets.panel.find;
+        assert_eq!(find.ran.as_ref().map(|r| r.0.as_str()), Some("ticket workspace"));
+        assert_eq!(labels(app), ["DEMO-1", "DEMO-3", "DEMO-4", "DEMO-5"], "Mine leaves out DEMO-2");
+        let last = finds(state).last().unwrap().clone();
+        assert_eq!((&last["about"], &last["assignee"]), (&"ticket workspace".into(), &"owner".into()));
+        assert!(last.get("status").is_none(), "the view's arguments stay with the view");
+
+        // Clearing the query returns to the selected view.
+        app.runtime.tickets.panel.query.clear();
+        frame(app, ctx, vec![]);
+        settle(app);
+        assert_eq!(app.runtime.tickets.panel.find.listed, Some(1));
+        assert_eq!(labels(app), ["DEMO-3"]);
+        screenshot(app, ctx, "views");
+
+        // ← back to Recent, and Mine off again.
+        in_list(ctx);
+        frame(app, ctx, vec![key(Key::ArrowLeft, NONE)]);
+        settle(app);
+        assert_eq!(labels(app), ["DEMO-3", "DEMO-5", "DEMO-4", "DEMO-1"]);
+        app.runtime.tickets_chip(0);
+        settle(app);
+        assert_eq!(labels(app).len(), 5);
     }
 
     #[test]
@@ -2960,32 +2991,64 @@ mod tests {
             let state = dir.path().join("fake.json");
             let mut config = example_profile("meaning-example", &state);
             config.operations.browse.as_mut().unwrap().arguments.insert("take".into(), 2.into());
-            app.runtime.config.tickets = config;
-            app.runtime.apply_ticket_config();
-            app.runtime.toggle_tickets();
-            frame(app, ctx, vec![]);
+            more_pages(app, ctx, config, &state);
+        });
+    }
+
+    #[test]
+    fn more_follows_the_next_cursor_over_http() {
+        with_app("app::tickets_panel::tests::more_follows_the_next_cursor_over_http", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let mut config = example_profile("meaning-example", &state);
+            config.operations.browse.as_mut().unwrap().arguments.insert("take".into(), 2.into());
+            let _api = crate::mcp_client::tests::over_http(&mut config, &state);
+            more_pages(app, ctx, config, &state);
+        });
+    }
+
+    fn more_pages(app: &mut Desktop<'_>, ctx: &egui::Context, config: TicketConfig, state: &Path) {
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        app.runtime.toggle_tickets();
+        frame(app, ctx, vec![]);
+        settle(app);
+        assert_eq!(labels(app), ["DEMO-5", "DEMO-4"]);
+        assert_eq!(app.runtime.tickets.panel.find.next.as_deref(), Some("2"));
+        assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("More"));
+        // ↓ on the last result reads the next page.
+        in_list(ctx);
+        frame(app, ctx, vec![key(Key::End, NONE)]);
+        frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+        settle(app);
+        assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2"]);
+        assert_eq!(app.runtime.tickets.panel.find.selected, Some(2), "More selects the first new row");
+        assert_eq!(finds(state).last().unwrap()["cursor"], "2");
+        app.runtime.tickets_more();
+        settle(app);
+        assert_eq!(labels(app).len(), 5);
+        assert_eq!(app.runtime.tickets.panel.find.selected, Some(4), "explicit More also selects the first new row");
+        assert!(app.runtime.tickets.panel.find.reveal);
+        assert_eq!(app.runtime.tickets.panel.find.next, None, "the last page has no cursor");
+    }
+
+    #[test]
+    fn a_read_the_api_refuses_shows_its_words() {
+        with_app("app::tickets_panel::tests::a_read_the_api_refuses_shows_its_words", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let _api = fake_profile_over_http(app, dir.path());
+            let state = dir.path().join("fake.json");
+            edit_state(&state, |state| {
+                state["fail"] = serde_json::json!(["find_tickets"]);
+                state["fail_message"] = "the API is shy today".into();
+            });
+            app.runtime.tickets.panel.query = "workspace".into();
+            app.runtime.tickets_search();
             settle(app);
-            assert_eq!(labels(app), ["DEMO-5", "DEMO-4"]);
-            assert_eq!(app.runtime.tickets.panel.find.next.as_deref(), Some("2"));
-            assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("More"));
-            // ↓ on the last result reads the next page.
-            in_list(ctx);
-            frame(app, ctx, vec![key(Key::End, NONE)]);
-            frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
-            settle(app);
-            assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2"]);
-            assert_eq!(app.runtime.tickets.panel.find.selected, Some(2), "More selects the first new row");
-            assert_eq!(finds(&state).last().unwrap()["cursor"], "2");
-            app.runtime.tickets_more();
-            settle(app);
-            assert_eq!(labels(app).len(), 5);
-            assert_eq!(
-                app.runtime.tickets.panel.find.selected,
-                Some(4),
-                "explicit More also selects the first new row"
-            );
-            assert!(app.runtime.tickets.panel.find.reveal);
-            assert_eq!(app.runtime.tickets.panel.find.next, None, "the last page has no cursor");
+            let find = &app.runtime.tickets.panel.find;
+            let error = find.error.as_deref().unwrap();
+            assert!(error.contains("HTTP 400") && error.contains("the API is shy today"), "{error}");
+            assert!(!app.runtime.tickets.panel.signin);
         });
     }
 
