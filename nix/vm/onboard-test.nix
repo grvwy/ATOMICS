@@ -1,4 +1,4 @@
-{ lib, runCommand, atomics-onboard, bash, coreutils, findutils, gawk, gnugrep, git, jq, util-linux
+{ lib, runCommand, atomics-onboard, bash, coreutils, findutils, gawk, gnugrep, git, jq, python3, util-linux
 , name ? "atomics-onboard-test", script ? ./onboard-test.sh, args ? [ ] }:
 
 # atomics-onboard against stub tools: sign-ins once, a second run that skips them, --check without
@@ -8,6 +8,7 @@ runCommand name {
   nativeBuildInputs = [ bash coreutils findutils gawk gnugrep git jq util-linux ];
   ONBOARD_TEST_LIB = ./onboard-test-lib.sh;
 } ''
+  ATOMICS_ONBOARD_UI_BRIDGE=${./onboard-ui.py} PYTHONDONTWRITEBYTECODE=1 ${python3}/bin/python3 ${./onboard-ui-test.py}
   bash ${script} ${atomics-onboard}/bin/atomics-onboard ${lib.escapeShellArgs args}
   touch $out
 ''

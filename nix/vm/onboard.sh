@@ -69,7 +69,7 @@ onboard_step() {
 
 onboard_option() {
   (($# == 3)) || die "onboard_option takes a name, a help text and a handler"
-  [[ $1 =~ $name_pattern && $1 != check && $1 != help ]] || die "option name '$1' is not allowed"
+  [[ $1 =~ $name_pattern && $1 != check && $1 != help && $1 != step && $1 != ui ]] || die "option name '$1' is not allowed"
   [[ -z ${option_handler[$1]+set} ]] || die "option --$1 is defined twice"
   options+=("$1")
   option_help[$1]=$2
@@ -221,10 +221,13 @@ usage() {
   cat <<'EOF'
 Usage: atomics-onboard [OPTION VALUE]...
        atomics-onboard --check
+       atomics-onboard --step NAME [--ui]
 
 Signs in, inside this VM, to everything the ATOMICS chief and agents use. Steps already done are
 skipped, so it is safe to run again.
 
+  --step NAME  run only this item (including items from step files)
+  --ui         guest-only bridge: show browser addresses and device codes, never raw tool output
   --check      report each item as ok, missing or skipped; no sign-in, no prompt, no values
 EOF
   for name in "${options[@]}"; do
@@ -235,10 +238,15 @@ EOF
 }
 
 check=false
+ui=false
+selected=
 given=false
 while (($#)); do
   case $1 in
     --check) check=true ;;
+    --ui) ui=true ;;
+    --step) (($# >= 2)) || die "--step needs a name"; selected=$2; shift ;;
+    --step=*) selected=${1#*=} ;;
     -h | --help)
       usage
       exit 0
@@ -272,6 +280,16 @@ fi
 # Run on the Mac it would sign in there and change ~/.claude.json and ~/.gitconfig.
 [[ $OSTYPE == linux* ]] || die "run this inside the ATOMICS VM: limactl shell atomics atomics-onboard"
 
+if [[ -n $selected ]]; then
+  [[ $selected =~ $name_pattern ]] || die "invalid onboarding step"
+  [[ -n ${labels[$selected]+set} ]] || die "unknown onboarding step"
+fi
+if $ui; then
+  [[ -n $selected ]] && ! $check && ! $given || die "--ui requires --step NAME alone"
+  bridge=${ATOMICS_ONBOARD_UI_BRIDGE:-$(dirname -- "${BASH_SOURCE[0]}")/onboard-ui.py}
+  exec python3 "$bridge" "$0" --step "$selected"
+fi
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 # Sets $state to ok, missing or skipped, and $reason when it is not ok.
@@ -297,16 +315,21 @@ line() {
 if ! $check; then
   # Device code prompts go to the terminal; without one, a credential helper waits unseen.
   [[ -t 0 && -t 2 ]] || warn "no terminal: the sign-ins need one (limactl shell atomics atomics-onboard)"
-  for hook in "${prepare_hooks[@]}"; do "$hook"; done
+  # A single step must never run an unrelated step's interactive preparation.
+  if [[ -z $selected ]]; then
+    for hook in "${prepare_hooks[@]}"; do "$hook"; done
+  fi
 fi
 
 missing=0
 results=()
 for item in "${items[@]}"; do
+  [[ -z $selected || $item == "$selected" ]] || continue
   run_check "$item"
   if ! $check && [[ $state == missing ]]; then
     printf '\n── %s\n' "${labels[$item]}"
     "login_${item//-/_}" || true
+    if [[ -n $selected && $item != private && $item != host ]]; then login_private >/dev/null; fi
     run_check "$item"
   elif ! $check && [[ $state == ok ]]; then
     printf 'done before, skipped: %s\n' "${labels[$item]}"

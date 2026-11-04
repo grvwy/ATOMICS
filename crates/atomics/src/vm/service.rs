@@ -46,7 +46,11 @@ impl Monitor {
     }
     pub fn new(wake: Arc<dyn Fn() + Send + Sync>, in_use: Option<String>) -> Self {
         let (tx, rx) = mpsc::sync_channel(1);
-        let shared = Arc::new(Mutex::new(Snapshot { supported: cfg!(target_os = "macos"), ..Default::default() }));
+        let shared = Arc::new(Mutex::new(Snapshot {
+            supported: cfg!(target_os = "macos"),
+            busy: Some("Checking VM".into()),
+            ..Default::default()
+        }));
         let cancel = Arc::new(AtomicBool::new(false));
         let input = Arc::new(Mutex::new(VecDeque::new()));
         let monitor = Self {
@@ -88,6 +92,7 @@ impl Monitor {
                 input,
             };
             worker.refresh();
+            worker.change(|s| s.busy = None);
             loop {
                 match rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(action) => {
@@ -357,7 +362,7 @@ impl Worker {
                 });
                 Ok(())
             }
-            Action::SignIn(_) => bail!("This guest needs in-app onboarding support"),
+            Action::SignIn(name) => self.sign_in(&name),
             Action::Cancel | Action::UseMac | Action::Select { .. } | Action::SubmitCode(_) => Ok(()),
         }
     }
@@ -468,6 +473,75 @@ impl Worker {
         super::forget(&self.instance);
         Ok(())
     }
+    fn sign_in(&self, name: &str) -> Result<()> {
+        if !self.shared.lock().unwrap().sign_ins.iter().any(|i| i.name == name && i.state == "missing") {
+            bail!("Refresh the sign-in list before starting this step");
+        }
+        let (_, info) = self.bundle().context("Set up the VM first")?;
+        self.change(|s| {
+            s.signing_in = true;
+            s.addresses.clear();
+            s.codes.clear();
+        });
+        self.input.lock().unwrap().clear();
+        let mut pending = String::new();
+        let mut complete = false;
+        let result = process::run_with_input(
+            self.command().args([
+                "shell",
+                &format!("--workdir={}", info.home),
+                &info.instance,
+                "atomics-onboard",
+                "--step",
+                name,
+                "--ui",
+            ]),
+            &self.cancel,
+            Duration::from_secs(900),
+            Some(&self.input),
+            |part| {
+                append(&mut pending, part);
+                while let Some(end) = pending.find('\n') {
+                    let line: String = pending.drain(..=end).collect();
+                    let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    complete |= event["status"].as_str() == Some("complete");
+                    self.change(|s| {
+                        if let Some(address) = event["url"].as_str().filter(|u| safe_sign_in_url(u)) {
+                            if s.addresses.len() < 8 && !s.addresses.iter().any(|u| u == address) {
+                                s.addresses.push(address.into());
+                            }
+                        }
+                        if let Some(code) = event["code"].as_str().filter(|s| {
+                            s.len() >= 6
+                                && s.len() <= 16
+                                && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+                        }) {
+                            if s.codes.len() < 8 && !s.codes.iter().any(|c| c == code) {
+                                s.codes.push(code.into());
+                            }
+                        }
+                    });
+                }
+            },
+        );
+        self.input.lock().unwrap().clear();
+        self.change(|s| {
+            s.signing_in = false;
+            s.addresses.clear();
+            s.codes.clear();
+        });
+        self.check_sign_ins(&info);
+        result?;
+        if !complete || self.shared.lock().unwrap().sign_ins.iter().any(|i| i.name == name && i.state == "missing") {
+            bail!(
+                "Sign-in did not complete. Refresh and retry. Older guests need an image with in-app onboarding support."
+            );
+        }
+        Ok(())
+    }
+
     fn check_sign_ins(&self, info: &BundleInfo) {
         let mut text = String::new();
         let result = process::run(
@@ -715,6 +789,60 @@ esac
         assert!(start.elapsed() < Duration::from_secs(5));
     }
     #[test]
+    fn one_sign_in_accepts_only_guest_ui_events_and_rechecks_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = worker(dir.path(), true);
+        std::fs::create_dir_all(w.source.join("bundle")).unwrap();
+        let info = BundleInfo {
+            version: 1,
+            instance: "test-vm".into(),
+            user: "user".into(),
+            home: "/home/user".into(),
+            mac_user: "user".into(),
+            install_dir: String::new(),
+            host: None,
+        };
+        std::fs::write(w.source.join("bundle/atomics-vm.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+        w.shared.lock().unwrap().sign_ins = parse_sign_ins("missing demo Guest step");
+        script(
+            &w.lima,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}/calls'
+case "$*" in
+  *'--step demo --ui')
+    printf '%s\n' 'raw-secret-canary' '{{"url":"https://example.com/?token=canary"}}' '{{"code":"secret-canary-value"}}' '{{"status":"complete"}}' ;;
+  *'--check') printf 'ok demo Guest step\nok host Host reachable\n' ;;
+  *) exit 9 ;;
+esac
+"#,
+                dir.path().display()
+            ),
+        );
+        w.sign_in("demo").unwrap();
+        let view = w.shared.lock().unwrap();
+        assert!(view.log.is_empty() && view.error.is_none() && view.addresses.is_empty() && view.codes.is_empty());
+        assert!(!view.signing_in && view.sign_ins.iter().all(|i| i.state == "ok"));
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(calls.contains("atomics-onboard --step demo --ui") && calls.contains("atomics-onboard --check"));
+    }
+
+    #[test]
+    fn only_browser_authentication_addresses_can_be_opened() {
+        assert!(safe_sign_in_url("https://example.com/authorize?state=nonce&code_challenge=challenge"));
+        for address in [
+            "http://example.com",
+            "file:///etc/passwd",
+            "https://user:password@example.com",
+            "https://example.com/#token=x",
+            "https://example.com/?access_token=x",
+            "https://example.com/?code=x",
+        ] {
+            assert!(!safe_sign_in_url(address), "{address}");
+        }
+    }
+
+    #[test]
     fn old_port_only_bundles_are_outdated() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
@@ -724,4 +852,24 @@ esac
         script(&script_path, "#!/bin/sh\n# takes a port or an absolute socket path\n");
         assert!(socket_forward(dir.path()));
     }
+}
+
+fn safe_sign_in_url(address: &str) -> bool {
+    if address.len() > 4096 {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(address) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && !url.query_pairs().any(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            ["token", "password", "secret", "api_key"].iter().any(|word| key.contains(word))
+                || key == "code"
+                || key == "code_verifier"
+        })
 }

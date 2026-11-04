@@ -441,6 +441,22 @@ fixed text) and `login_NAME`. `onboard_option NAME HELP HANDLER` adds a `--NAME 
 [`nix/vm/onboard.sh`](../nix/vm/onboard.sh) lists the helpers a step file may use;
 [`nix/examples/dotnet-azure/onboard.sh`](../nix/examples/dotnet-azure/onboard.sh) is a full example.
 
+### Sign in from the panel
+
+The panel lists `atomics-onboard --check`, including installed step files. A missing item's
+**Sign in** runs only `atomics-onboard --step <name> --ui` in the guest. The guest bridge gives
+the tool a terminal and sends only filtered JSON events: HTTPS browser addresses, short device
+codes and fixed completion states. Raw terminal output and the tools' credential files stay in
+the guest. Authentication URLs with embedded credentials, token parameters or fragments are
+refused. **Open in browser** opens the address on the Mac. If the browser supplies a one-time
+code to paste back, the masked field sends it directly to the guest tool without a log.
+
+Cancel closes that sign-in process; a completed step is checked again before showing **ok**.
+Codes and addresses are cleared when the flow ends. `--step` works from a terminal too, skips
+already completed items and fixes credential-file permissions after a login. It does not invoke
+unrelated step files' preparation hooks. Older images still supply the read-only list; rebuild
+the guest image to get `--step --ui`.
+
 ### Trust and secrets
 
 The VM is one trust domain. Every agent, the chief and everything they run (builds, package scripts,

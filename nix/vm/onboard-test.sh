@@ -219,6 +219,18 @@ OSTYPE=darwin25.1.0 run mac --check
 expect "on the Mac it refuses to run" test "$status" -eq 2
 expect "on the Mac it says where to run it" grep -q 'inside the ATOMICS VM' "$logs/mac"
 
+# A selected step never signs in to other tools or runs unrelated preparation.
+rm -f "$HOME/demo-done" "$HOME/demo-name"
+run one-step --step demo --demo-name beta
+expect "one step succeeds" test "$status" -eq 0
+expect "one step runs no other login" test "$(logins one-step)" -eq 0
+expect "one step reports only itself" test "$(grep -Ec '^(ok|missing|skipped) +' "$logs/one-step")" -eq 1
+expect "one step does not run unrelated preparation" test ! -e "$HOME/demo-name"
+run bad-step --step absent
+expect "unknown steps are refused" test "$status" -eq 2
+run bad-ui --ui
+expect "UI mode requires one step" test "$status" -eq 2
+
 # ── 7. Where the canary is, and where it is not ───────────────────────────────
 
 show_runs="first check-host-down"
