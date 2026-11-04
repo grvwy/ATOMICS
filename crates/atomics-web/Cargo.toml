@@ -47,5 +47,8 @@ web-sys = { version = "0.3.106", features = [
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = "3.27.0"
+# The headless screenshots of the views (views/tests.rs), through the desktop's CPU rasterizer.
+anyhow = "1.0.104"
+png = "0.18.1"
 # The headless-browser test's broker (tests/browser.rs).
 tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }

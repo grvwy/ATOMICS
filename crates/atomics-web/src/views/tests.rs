@@ -131,6 +131,27 @@ fn every_tab_draws_over_a_live_host() {
 }
 
 #[test]
+fn the_chiefs_pill_keeps_the_middle_of_the_phones_top_bar_and_opens_the_chiefs_pane() {
+    let (ctx, mut world, mut client, mut view) = live();
+    view.tab = Tab::Diffs;
+    for size in [PHONE, (360.0, 780.0), (430.0, 932.0)] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let width = ctx.content_rect().width();
+        let name = shown.iter().find(|(text, _)| text == "CHIEF").expect("the pill is named on a phone").1;
+        // The name follows the pill's mark, in the middle of the bar.
+        assert!(name.left() > width * 0.4 && name.right() < width * 0.6, "{size:?}: {name:?} in {width}");
+        assert!(name.bottom() <= layout::TOP_BAR + 1.0, "{size:?}: in the top bar");
+        assert!(!has(&shown, "Chief"), "{size:?}: the pane bar has no Chief of its own");
+    }
+    let pill = on(&settled(&ctx, &mut world, &mut client, &mut view, PHONE), "CHIEF");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    assert_eq!(view.tab, Tab::Chief, "a tap opens the chief's pane");
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    assert_eq!(view.tab, Tab::Diffs, "another goes back to the pane it left");
+}
+
+#[test]
 fn opening_a_diff_fetches_it_and_shows_it_in_the_panel() {
     let (ctx, mut world, mut client, mut view) = live();
     world.host.received.clear();
@@ -1608,4 +1629,49 @@ fn a_terminal_taking_the_keyboard_takes_it_from_a_text_box() {
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert_eq!(world.host.terminals["s1"].typed, "ls");
     assert_eq!(client.steer_text, "");
+}
+
+/// What the views draw, as PNGs for a person to look at beside the desktop's QA screenshots: the wide window
+/// and the phone at the browser test's sizes and narrower, over the fake host, through the desktop's CPU
+/// rasterizer. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
+#[test]
+#[ignore]
+fn headless_shots() {
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots: [(&str, (f32, f32), Tab); 7] = [
+        ("wide-1600", WIDE, Tab::Board),
+        ("wide-1100", (1100.0, 800.0), Tab::Board),
+        ("wide-700", (700.0, 800.0), Tab::Board),
+        ("phone-390-board", PHONE, Tab::Board),
+        ("phone-390-diffs", PHONE, Tab::Diffs),
+        ("phone-390-chief", PHONE, Tab::Chief),
+        ("phone-360-agents", (360.0, 780.0), Tab::Agents),
+    ];
+    for (name, (width, height), tab) in shots {
+        let (ctx, mut world, mut client, mut view) = live();
+        view.tab = tab;
+        let mut raster = crate::test_raster::Raster::default();
+        let mut last = None;
+        for _ in 0..6 {
+            view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height))),
+                time: Some(view.now_ms / 1000.0),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        let ppp = output.pixels_per_point;
+        let size = [(width * ppp).round() as usize, (height * ppp).round() as usize];
+        let image = raster.paint(&ctx, output, size, client.palette.background);
+        let path = dir.join(format!("{name}.png"));
+        crate::test_raster::save_png(&path, &image).unwrap();
+        println!("saved {}", path.display());
+    }
 }

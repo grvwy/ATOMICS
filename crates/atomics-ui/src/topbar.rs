@@ -10,6 +10,7 @@ use atomics_core::config::{AgentKind, KeyConfig};
 use egui::{Rect, RichText, Sense, vec2};
 
 use crate::keys::shortcut_label;
+use crate::shell::BrandSize;
 use crate::{Backend, Client, Command, PanelMode};
 
 /// Measure with the same fonts, padding and widgets that will actually be drawn.
@@ -48,15 +49,19 @@ pub fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Response) {
     }
 }
 
-/// The icon, the name and, if `show_agents`, how many agents run and what the sandbox VMs use.
-pub fn brand(ui: &mut egui::Ui, show_agents: bool, backend: &dyn Backend, client: &mut Client) {
+/// The icon, the name unless `size` is [`BrandSize::Mark`] and, at [`BrandSize::Full`], how many agents run
+/// and what the sandbox VMs use.
+pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: &mut Client) {
     if let Some(icon) = &client.icon {
-        let response = ui.image((icon.id(), vec2(20.0, 20.0)));
+        let response = ui.image((icon.id(), vec2(20.0, 20.0))).on_hover_text("ATOMICS");
         record_item(ui, "icon", &response);
     }
-    let response = ui.label(RichText::new("ATOMICS").strong().size(14.0).color(client.palette.accent).monospace());
-    record_item(ui, "brand", &response);
-    if show_agents {
+    if size != BrandSize::Mark || client.icon.is_none() {
+        let name = RichText::new("ATOMICS").strong().size(14.0).color(client.palette.accent).monospace();
+        let response = ui.label(name);
+        record_item(ui, "brand", &response);
+    }
+    if size == BrandSize::Full {
         let sessions = backend.session_list();
         let agents = sessions.iter().filter(|s| s.kind != AgentKind::Shell).count();
         let response = ui.label(

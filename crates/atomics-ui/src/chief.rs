@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use atomics_core::config::{AgentKind, ChiefDock};
 use atomics_core::layout::{LayoutConfig, MIN_DOCK_WIDTH};
+use atomics_core::session::AgentStatus;
 use egui::{Color32, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::keys::shortcut_label;
@@ -37,74 +38,170 @@ pub enum VoiceState {
     Transcribing,
 }
 
-/// The chief's pill: its mark, its status, the selected plan's progress and the last heartbeat; `compact`
-/// leaves out the words. `voice` is what the microphone does, `None` on a platform without one. A click
-/// shows or hides the chief ([`Command::ToggleChief`]); its menu floats or docks it. Where the backend can
-/// do neither, the pill only shows.
-pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend: &dyn Backend, client: &mut Client) {
+/// The pill's padding inside its outline, the chief's mark and the gap between its parts.
+const PILL_PAD: f32 = 12.0;
+const PILL_ICON: f32 = 18.0;
+const PILL_GAP: f32 = 6.0;
+/// The pill's height in the desktop's top bar; on a phone it is a finger's target.
+pub const PILL_HEIGHT: f32 = 24.0;
+
+/// The pill's word and the size of its smaller text.
+const PILL_NAME: &str = "CHIEF";
+const PILL_NAME_SIZE: f32 = 13.0;
+const PILL_SMALL: f32 = 11.5;
+
+/// How much the chief's pill shows, widest first. Each size has a fixed width ([`pill_width`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillSize {
+    /// The mark, the name, the status in a word and the heartbeat or the recording.
+    Full,
+    /// The mark, the name and the status dot.
+    Name,
+    /// The mark and the status dot.
+    Mark,
+}
+
+/// The pill's width at `size`: the same whatever the chief does, so that it never moves and nothing beside
+/// it moves when its status, its heartbeat or the microphone changes. The full pill has room for the longest
+/// status word and the heartbeat, or for the recording.
+pub fn pill_width(ui: &egui::Ui, palette: &Palette, size: PillSize) -> f32 {
+    let width = |text: &str, font: egui::FontId| {
+        ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x)
+    };
+    let mark = PILL_PAD * 2.0 + PILL_ICON + PILL_GAP + 8.0;
+    if size == PillSize::Mark {
+        return mark.ceil();
+    }
+    let name = mark + width(PILL_NAME, palette.ui(PILL_NAME_SIZE)) + PILL_GAP;
+    if size == PillSize::Name {
+        return name.ceil();
+    }
+    let small = palette.ui(PILL_SMALL);
+    let words = ["starting", "idle", "working", "needs you", "turn done", "exited", "start"];
+    let word = words.iter().map(|w| width(w, small.clone())).fold(0.0, f32::max);
+    let heart = width("♥ 59m", small.clone()) + 8.0 + PILL_GAP;
+    let recording = width("● REC 59:59", small);
+    (name + PILL_GAP + (word + PILL_GAP + heart).max(recording)).ceil()
+}
+
+/// How long ago the heartbeat ran, in its shortest words.
+fn heartbeat_age(age: u64) -> String {
+    match age {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", age / 60),
+        3600..86400 => format!("{}h", age / 3600),
+        _ => format!("{}d", age / 86400),
+    }
+}
+
+/// The chief's pill: its mark, its status and the last heartbeat, at a fixed width ([`pill_width`]), so that
+/// the top bar can keep it in one place; a smaller `size` leaves out the words. `voice` is what the microphone does,
+/// `None` on a platform without one. A click, or Enter and Space while it has the keyboard (it shows a focus
+/// ring), shows or hides the chief ([`Command::ToggleChief`]); its menu floats or docks it. Where the backend
+/// can do neither, the pill only shows; a platform that shows the chief otherwise (a phone's pane) reads the
+/// click from the response.
+pub fn pill(
+    ui: &mut egui::Ui,
+    size: PillSize,
+    voice: Option<VoiceState>,
+    backend: &dyn Backend,
+    client: &mut Client,
+) -> egui::Response {
+    let compact = size != PillSize::Full;
     let p = client.palette.clone();
     let chief = backend.chief();
     let status = chief.session.and_then(|index| backend.session_row(index)).map(|row| row.status);
-    let plan = if compact { None } else { backend.plan_row(backend.view_hints().selected_plan) };
     let mut toggle = false;
     let mut dock = chief.dock;
-    let stroke = if chief.open { p.accent } else { lerp(p.border, p.accent, 0.5) };
-    let response = egui::Frame::new()
-        .fill(lerp(p.raised, p.accent, 0.08))
-        .stroke(Stroke::new(1.0, stroke))
-        .corner_radius(13)
-        .inner_margin(egui::Margin::symmetric(14, 3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (icon, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                orbit_icon(ui.painter(), icon, p.accent, p.foreground);
-                ui.label(RichText::new("CHIEF").strong().color(p.accent).size(13.0));
-                match status {
-                    Some(status) => {
-                        let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                        let time = ui.input(|i| i.time);
-                        ui.painter().circle_filled(dot.center(), 3.5, status_dot(status, &p, time));
-                        if !compact {
-                            ui.label(RichText::new(status.label()).color(p.muted).size(11.5));
+    let height = client.touch.map_or(PILL_HEIGHT, |touch| touch.target);
+    let width = pill_width(ui, &p, size);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let hovered = response.hovered();
+        let stroke = if chief.open || hovered { p.accent } else { lerp(p.border, p.accent, 0.5) };
+        let fill = lerp(
+            p.raised,
+            p.accent,
+            if chief.open {
+                0.16
+            } else if hovered {
+                0.12
+            } else {
+                0.08
+            },
+        );
+        let radius = (height / 2.0).min(13.0);
+        painter.rect(rect, radius, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        if response.has_focus() {
+            let ring = ui.visuals().selection.stroke.color;
+            painter.rect_stroke(rect.expand(2.0), radius + 2.0, Stroke::new(2.0, ring), egui::StrokeKind::Outside);
+        }
+        let small = p.ui(PILL_SMALL);
+        let mut x = rect.left() + PILL_PAD;
+        let y = rect.center().y;
+        orbit_icon(
+            painter,
+            Rect::from_center_size(egui::pos2(x + PILL_ICON / 2.0, y), vec2(PILL_ICON, PILL_ICON)),
+            p.accent,
+            p.foreground,
+        );
+        x += PILL_ICON + PILL_GAP;
+        if size != PillSize::Mark {
+            let name = painter.layout_no_wrap(PILL_NAME.into(), p.ui(PILL_NAME_SIZE), p.accent);
+            let name_width = name.size().x;
+            painter.galley(egui::pos2(x, y - name.size().y / 2.0), name, p.accent);
+            x += name_width + PILL_GAP;
+        }
+        let right = rect.right() - PILL_PAD;
+        match status {
+            Some(status) => {
+                let time = ui.input(|i| i.time);
+                painter.circle_filled(egui::pos2(x + 4.0, y), 3.5, status_dot(status, &p, time));
+                if status == AgentStatus::Working {
+                    ui.ctx().request_repaint_after(crate::status::PULSE_STEP);
+                }
+                x += 8.0 + PILL_GAP;
+                if !compact && !matches!(voice, Some(VoiceState::Recording(_))) {
+                    let word = painter.layout_no_wrap(status.label().into(), small.clone(), p.muted);
+                    painter.galley(egui::pos2(x, y - word.size().y / 2.0), word, p.muted);
+                }
+            }
+            None if !compact && backend.available(&Command::ToggleChief) => {
+                let word = painter.layout_no_wrap("start".into(), small.clone(), p.muted);
+                painter.galley(egui::pos2(x, y - word.size().y / 2.0), word, p.muted);
+            }
+            None => {}
+        }
+        if !compact {
+            match voice {
+                Some(VoiceState::Recording(secs)) => {
+                    let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
+                    let galley = painter.layout_no_wrap(text, small.clone(), p.error);
+                    painter.galley(egui::pos2(right - galley.size().x, y - galley.size().y / 2.0), galley, p.error);
+                }
+                Some(VoiceState::Opening | VoiceState::Transcribing) => {
+                    let spin = Rect::from_center_size(egui::pos2(right - 6.0, y), vec2(12.0, 12.0));
+                    egui::Spinner::new().size(12.0).color(p.accent).paint_at(ui, spin);
+                }
+                Some(VoiceState::Idle) | None => {
+                    if let Some(heartbeat) = &chief.heartbeat {
+                        let age = heartbeat.age;
+                        ui.ctx().request_repaint_after(Duration::from_secs(60 - age % 60));
+                        let galley =
+                            painter.layout_no_wrap(format!("♥ {}", heartbeat_age(age)), small.clone(), p.muted);
+                        let at = right - galley.size().x;
+                        painter.galley(egui::pos2(at, y - galley.size().y / 2.0), galley, p.muted);
+                        if heartbeat.findings > 0 {
+                            painter.circle_filled(egui::pos2(at - PILL_GAP - 3.0, y), 3.0, p.error);
                         }
                     }
-                    None if !compact && backend.available(&Command::ToggleChief) => {
-                        ui.label(RichText::new("start").color(p.muted).size(11.5));
-                    }
-                    None => {}
                 }
-                if let Some(plan) = plan.as_ref().filter(|plan| plan.total > 0) {
-                    ui.label(RichText::new(format!("plan {}/{}", plan.done, plan.total)).color(p.muted).size(11.5));
-                }
-                if !compact && let Some(heartbeat) = &chief.heartbeat {
-                    if heartbeat.findings > 0 {
-                        let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 3.0, p.error);
-                    }
-                    let age = heartbeat.age;
-                    let age_text = match age {
-                        0..60 => "now".into(),
-                        60..3600 => format!("{}m", age / 60),
-                        3600..86400 => format!("{}h", age / 3600),
-                        _ => format!("{}d", age / 86400),
-                    };
-                    ui.ctx().request_repaint_after(Duration::from_secs(60 - age % 60));
-                    ui.label(RichText::new(format!("♥ {age_text}")).color(p.muted).size(11.5));
-                }
-                match voice {
-                    Some(VoiceState::Recording(secs)) => {
-                        let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
-                        ui.label(RichText::new(text).color(p.error).strong().size(11.5));
-                    }
-                    Some(VoiceState::Opening | VoiceState::Transcribing) => {
-                        ui.add(egui::Spinner::new().size(12.0).color(p.accent));
-                    }
-                    Some(VoiceState::Idle) | None => {}
-                }
-            });
-        })
-        .response
-        .interact(Sense::click());
+            }
+        } else if let Some(VoiceState::Recording(_)) = voice {
+            painter.circle_filled(egui::pos2(right - 3.0, y), 3.0, p.error);
+        }
+    }
     record_item(ui, "chief", &response);
     let keys = backend.ui_config().keys;
     let hover = match voice {
@@ -132,18 +229,16 @@ pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend
             }
         });
     }
-    if response
-        .on_hover_ui(|ui| {
-            ui.label(hover);
-            if let Some(status) = status {
-                ui.label(status.label());
-            }
-            if let Some(heartbeat) = &chief.heartbeat {
-                ui.label(format!("Last heartbeat: {} (local)\n{} findings", heartbeat.time, heartbeat.findings));
-            }
-        })
-        .clicked()
-    {
+    let response = response.on_hover_ui(|ui| {
+        ui.label(hover);
+        if let Some(status) = status {
+            ui.label(status.label());
+        }
+        if let Some(heartbeat) = &chief.heartbeat {
+            ui.label(format!("Last heartbeat: {} (local)\n{} findings", heartbeat.time, heartbeat.findings));
+        }
+    });
+    if response.clicked() {
         toggle = true;
     }
     if dock != chief.dock {
@@ -152,6 +247,7 @@ pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend
     if toggle && backend.available(&Command::ToggleChief) {
         client.send(Command::ToggleChief);
     }
+    response
 }
 
 /// The chief's mark: a planet with a tilted orbit and a moon.

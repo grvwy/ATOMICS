@@ -294,10 +294,8 @@ mod tests {
                                 text_rects.push((text.galley.text(), rect));
                             }
                         }
-                        if width == 5120.0 {
-                            let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
-                            assert!((chief.center().x - width / 2.0).abs() < 1.0, "wide pill remains centered");
-                        }
+                        let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
+                        assert!((chief.center().x - width / 2.0).abs() < 1.0, "{case}: the pill is centered");
                         if width == 5120.0 {
                             assert!(!items.iter().any(|(n, _)| n == "Tabs"));
                             assert_eq!(items.iter().filter(|(n, _)| n.starts_with("Repos ·")).count(), 1);
@@ -310,6 +308,44 @@ mod tests {
                         }
                         output.drop_without_applying_deltas();
                     }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn the_chief_keeps_its_place_whatever_it_and_the_plans_do() {
+        with_app("app::topbar::tests::the_chief_keeps_its_place_whatever_it_and_the_plans_do", |app, ctx| {
+            for width in [480.0, 700.0, 1100.0, 1600.0, 2400.0] {
+                let mut places = Vec::new();
+                for (count, status, heartbeat, open, toast) in [
+                    (0, None, false, false, false),
+                    (0, Some(AgentStatus::Starting), false, true, false),
+                    (3, Some(AgentStatus::Working), true, true, true),
+                    (6, Some(AgentStatus::NeedsInput), true, false, true),
+                    (6, Some(AgentStatus::Done), false, true, false),
+                ] {
+                    fixture(app, count);
+                    match status {
+                        Some(status) => app.runtime.sessions[0].status = status,
+                        None => app.runtime.sessions.clear(),
+                    }
+                    if !heartbeat {
+                        app.runtime.heartbeat.last = None;
+                    }
+                    if !toast {
+                        app.runtime.toast = None;
+                    }
+                    app.runtime.chief_open = open;
+                    // Twice: the first frame of a menu or a tab measures itself.
+                    render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    let (items, output) = render(app, ctx, width, vec![]);
+                    output.drop_without_applying_deltas();
+                    let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
+                    places.push((chief, format!("plans={count} status={status:?} heartbeat={heartbeat}")));
+                }
+                for (rect, case) in &places[1..] {
+                    assert_eq!(*rect, places[0].0, "width={width}: the pill moved with {case}");
                 }
             }
         });
@@ -392,7 +428,8 @@ mod tests {
                             .clip_rect;
                         assert!(clip.expand(0.5).contains_rect(bounds), "width={width}: important label was clipped");
                     }
-                    if width >= 900.0 {
+                    // The pill keeps the middle, so the plans share the left half of the bar with the brand.
+                    if width >= 1400.0 {
                         assert!(needs_visible, "width={width}: needs-you should fit");
                         assert!(
                             items.iter().any(|(name, _)| name.starts_with("● ")
@@ -495,10 +532,13 @@ mod tests {
             app.runtime.toast = None;
             app.runtime.config_error = None;
             app.runtime.hook_error = None;
-            for width in [480.0, 550.0, 700.0] {
+            for width in [480.0, 550.0, 700.0, 1200.0] {
                 fixture(app, 6);
                 app.client.new_dialog = None;
-                let collapsed = width < 700.0;
+                let (items, output) = render(app, ctx, width, vec![]);
+                output.drop_without_applying_deltas();
+                let collapsed = items.iter().any(|(name, _)| name == "Actions");
+                assert_eq!(collapsed, width < 1000.0, "width={width}: the actions fold beside a centered pill");
                 let was_open = app.runtime.diff_open;
                 if collapsed {
                     click(app, ctx, width, "Actions");

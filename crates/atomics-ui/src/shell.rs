@@ -299,63 +299,134 @@ pub fn sidebar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     }
 }
 
-/// The top bar: the brand, the navigation with the notice line, the chief's pill (centered while there is
-/// room) and the actions. As the bar narrows the brand drops the agent count, the load gauge goes, the pill
-/// drops its words, and then the actions move into a menu; every item keeps its natural width.
+/// How much of the brand the top bar shows, widest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrandSize {
+    /// The mark, the name, how many agents run and what the sandbox VMs use.
+    Full,
+    /// The mark and the name.
+    Name,
+    /// The mark alone.
+    Mark,
+}
+
+/// Where the top bar puts its items in `width` (the bar's inner width): the chief's pill is always in the
+/// middle, at one of its fixed widths ([`chief::pill_width`]), so that it never moves while the window keeps
+/// its size, whatever the chief, the plans or the notices do. The brand and the navigation share the half on
+/// its left, the actions the half on its right. The pill's size follows the bar's width alone: its words go
+/// under [`FULL_PILL_BAR`], its name under [`NAMED_PILL_BAR`]. Around it the load gauge goes first, the
+/// brand's agent count gives way to the plans that need the user, the actions fold into a menu and the brand
+/// keeps only its mark. Every item keeps
+/// its natural width; the navigation folds the plans it has no room for into its own menu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopBarPlan {
+    pub brand: BrandSize,
+    pub chief: chief::PillSize,
+    pub actions_menu: bool,
+    pub show_load: bool,
+}
+
+/// The bar's least inner width for the full pill, and for the pill with its name.
+pub const FULL_PILL_BAR: f32 = 980.0;
+pub const NAMED_PILL_BAR: f32 = 600.0;
+
+/// The widths [`TopBarPlan::choose`] decides by, measured with the fonts the bar draws with.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TopBarWidths {
+    pub width: f32,
+    pub gap: f32,
+    /// The pill at each [`chief::PillSize`], widest first.
+    pub chief: [f32; 3],
+    /// The brand at each [`BrandSize`], widest first.
+    pub brand: [f32; 3],
+    /// The navigation with every plan that needs the user or runs in the row.
+    pub urgent: f32,
+    /// The navigation's least width: its menu, which says how many plans need the user.
+    pub navigation: f32,
+    pub controls: f32,
+    pub controls_with_load: f32,
+    pub actions_menu: f32,
+}
+
+impl TopBarPlan {
+    pub fn choose(w: &TopBarWidths) -> TopBarPlan {
+        use chief::PillSize;
+        // Each side of the pill has the same room: half the bar less half the pill and a gap.
+        let side = |chief: PillSize| (w.width - w.chief[chief as usize]) / 2.0 - w.gap;
+        let left = |brand: BrandSize, navigation: f32, chief: PillSize| {
+            w.brand[brand as usize] + w.gap + navigation <= side(chief)
+        };
+        // The pill's size follows the bar's width alone, so that it never changes while the window keeps its
+        // size: a plan that starts needing the user, or an item the host adds, moves nothing but its neighbours.
+        let chief = if w.width >= FULL_PILL_BAR {
+            PillSize::Full
+        } else if w.width >= NAMED_PILL_BAR {
+            PillSize::Name
+        } else {
+            PillSize::Mark
+        };
+        let actions_menu = w.controls > side(chief);
+        let brand = if left(BrandSize::Full, w.urgent, chief) {
+            BrandSize::Full
+        } else if left(BrandSize::Name, w.navigation, chief) {
+            BrandSize::Name
+        } else {
+            BrandSize::Mark
+        };
+        let show_load = chief == PillSize::Full && w.controls_with_load <= side(chief);
+        TopBarPlan { brand, chief, actions_menu, show_load }
+    }
+}
+
+/// The top bar: the brand and the navigation with the notice line on the left, the chief's pill in the
+/// middle and the actions on the right ([`TopBarPlan`]).
 pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
+    use chief::PillSize;
     let rect = ui.available_rect_before_wrap();
     let gap = ui.spacing().item_spacing.x;
-    let controls = measure(ui, |ui| top_bar_controls(ui, platform, false, false));
-    let controls_with_load = measure(ui, |ui| top_bar_controls(ui, platform, true, false));
-    let full_chief = measure(ui, |ui| chief_pill(ui, platform, false));
-    let compact_chief = measure(ui, |ui| chief_pill(ui, platform, true));
-    let full_brand = measure(ui, |ui| brand(ui, platform, true));
-    let compact_brand = measure(ui, |ui| brand(ui, platform, false));
-    let tabs = measure(ui, |ui| platform.draw(|backend, client, _| tabs::view_tabs(ui, backend, client)));
+    let palette = read(platform, |_, client| client.palette.clone());
     let (urgent_label, urgent_color) = platform.draw(|backend, client, _| tabs::urgent_tabs_label(backend, client));
-    let min_tabs = measure(ui, |ui| {
+    let navigation = measure(ui, |ui| {
         ui.menu_button(RichText::new(&urgent_label).color(urgent_color), |_| {});
     });
-    let protected_navigation =
-        platform.draw(|backend, client, _| tabs::urgent_navigation_width(ui, backend, client)).max(min_tabs);
-
-    // Once even the minimum navigation cannot fit, put the actions in a
-    // menu. All four slots then retain their measured natural minimums.
-    let actions_menu = compact_brand + protected_navigation + compact_chief + controls + gap * 3.0 > rect.width();
-    let show_load = !actions_menu && full_brand + tabs + full_chief + controls_with_load + gap * 3.0 <= rect.width();
-    let controls_width = if actions_menu {
-        measure(ui, |ui| {
+    let widths = TopBarWidths {
+        width: rect.width(),
+        gap,
+        chief: [PillSize::Full, PillSize::Name, PillSize::Mark].map(|size| chief::pill_width(ui, &palette, size)),
+        brand: [BrandSize::Full, BrandSize::Name, BrandSize::Mark]
+            .map(|size| measure(ui, |ui| brand(ui, platform, size))),
+        urgent: platform.draw(|backend, client, _| tabs::urgent_navigation_width(ui, backend, client)).max(navigation),
+        navigation,
+        controls: measure(ui, |ui| top_bar_controls(ui, platform, false, false)),
+        controls_with_load: measure(ui, |ui| top_bar_controls(ui, platform, true, false)),
+        actions_menu: measure(ui, |ui| {
             ui.menu_button("Actions", |_| {});
-        })
-    } else if show_load {
-        controls_with_load
-    } else {
-        controls
+        }),
     };
-    let show_agents = full_brand + protected_navigation + compact_chief + controls_width + gap * 3.0 <= rect.width();
-    let brand_width = if show_agents { full_brand } else { compact_brand };
-    let compact = brand_width + protected_navigation + full_chief + controls_width + gap * 3.0 > rect.width();
-    let chief_width = if compact { compact_chief } else { full_chief };
-    let controls_left = rect.right() - controls_width;
+    let plan = TopBarPlan::choose(&widths);
+    let brand_width = widths.brand[plan.brand as usize];
+    let chief_width = widths.chief[plan.chief as usize];
+    let chief_left = (rect.center().x - chief_width / 2.0).round();
+    let chief_rect = Rect::from_x_y_ranges(chief_left..=chief_left + chief_width, rect.y_range());
+    let actions = Rect::from_x_y_ranges(chief_rect.right() + gap..=rect.right(), rect.y_range());
     let tabs_left = rect.left() + brand_width + gap;
-    // Keep the wide-screen center when navigation fits. Otherwise use the
-    // free space up to the actions before deciding which tabs overflow.
-    let chief_limit = controls_left - gap - chief_width;
-    let desired_navigation = tabs_left + tabs + gap;
-    let navigation_goal = desired_navigation.min(chief_limit);
-    let chief_left =
-        (rect.center().x - chief_width / 2.0).max(navigation_goal).max(tabs_left + min_tabs + gap).min(chief_limit);
-    let navigation = Rect::from_x_y_ranges(tabs_left..=chief_left - gap, rect.y_range());
-    slot(ui, "brand", rect.with_max_x(rect.left() + brand_width), |ui| brand(ui, platform, show_agents));
-    slot(ui, "chief", rect.with_min_x(chief_left).with_max_x(chief_left + chief_width), |ui| {
-        chief_pill(ui, platform, compact);
-    });
-    slot(ui, "actions", rect.with_min_x(controls_left), |ui| {
-        if actions_menu {
+    let navigation = Rect::from_x_y_ranges(tabs_left..=(chief_rect.left() - gap).max(tabs_left), rect.y_range());
+    slot(ui, "brand", rect.with_max_x(rect.left() + brand_width), |ui| brand(ui, platform, plan.brand));
+    slot(ui, "chief", chief_rect, |ui| chief_pill(ui, platform, plan.chief));
+    // The actions keep to the bar's right end, and so does their menu.
+    let used = if plan.actions_menu {
+        widths.actions_menu
+    } else if plan.show_load {
+        widths.controls_with_load
+    } else {
+        widths.controls
+    };
+    slot(ui, "actions", actions.with_min_x((actions.right() - used).max(actions.left())), |ui| {
+        if plan.actions_menu {
             let response = ui.menu_button("Actions", |ui| top_bar_controls(ui, platform, false, true)).response;
             record_item(ui, "Actions", &response);
         } else {
-            top_bar_controls(ui, platform, show_load, false);
+            top_bar_controls(ui, platform, plan.show_load, false);
         }
     });
     slot(ui, "navigation", navigation, |ui| {
@@ -365,13 +436,15 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     ui.allocate_rect(rect, Sense::hover());
 }
 
-fn brand(ui: &mut egui::Ui, platform: &mut impl Platform, show_agents: bool) {
-    platform.draw(|backend, client, _| topbar::brand(ui, show_agents, backend, client));
+fn brand(ui: &mut egui::Ui, platform: &mut impl Platform, size: BrandSize) {
+    platform.draw(|backend, client, _| topbar::brand(ui, size, backend, client));
 }
 
-fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, compact: bool) {
+fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, size: chief::PillSize) {
     let voice = platform.voice_state();
-    platform.draw(|backend, client, _| chief::pill(ui, compact, voice, backend, client));
+    platform.draw(|backend, client, _| {
+        chief::pill(ui, size, voice, backend, client);
+    });
 }
 
 /// The bar's actions, in the order a row shows them: diff, `+ New`, Plan, the host's items, Project, the
@@ -441,4 +514,53 @@ pub fn welcome(ui: &mut egui::Ui, rect: Rect, byline: Option<&str>, backend: &dy
         };
         ui.label(RichText::new(hint).color(p.muted).size(12.0));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chief::PillSize;
+
+    /// What a bar holds, measured roughly as the desktop draws it, with plans that need the user.
+    fn widths(width: f32) -> TopBarWidths {
+        TopBarWidths {
+            width,
+            gap: 7.0,
+            chief: [214.0, 98.0, 56.0],
+            brand: [164.0, 99.0, 33.0],
+            urgent: 453.0,
+            navigation: 138.0,
+            controls: 366.0,
+            controls_with_load: 445.0,
+            actions_menu: 65.0,
+        }
+    }
+
+    #[test]
+    fn the_bar_folds_in_one_order_as_it_narrows_and_the_pill_follows_the_width_alone() {
+        let rank = |plan: &TopBarPlan| {
+            (plan.chief as u8, plan.brand as u8, u8::from(plan.actions_menu), u8::from(!plan.show_load))
+        };
+        let mut last = TopBarPlan::choose(&widths(6000.0));
+        assert_eq!(
+            last,
+            TopBarPlan { brand: BrandSize::Full, chief: PillSize::Full, actions_menu: false, show_load: true }
+        );
+        for width in (460..6000).rev().step_by(5).map(|w| w as f32) {
+            let plan = TopBarPlan::choose(&widths(width));
+            let (before, now) = (rank(&last), rank(&plan));
+            assert!(now.0 >= before.0 && now.1 >= before.1 && now.2 >= before.2, "{width}: {last:?} -> {plan:?}");
+            // Whatever the bar holds, the pill's size is the width's.
+            let empty = TopBarWidths { urgent: 0.0, navigation: 40.0, controls: 100.0, ..widths(width) };
+            assert_eq!(TopBarPlan::choose(&empty).chief, plan.chief, "{width}");
+            // What is drawn beside the pill fits its half.
+            let side = (width - widths(width).chief[plan.chief as usize]) / 2.0 - 7.0;
+            let actions = if plan.actions_menu { 65.0 } else { 366.0 };
+            assert!(actions <= side, "{width}: actions {actions} in {side}");
+            assert!(widths(width).brand[plan.brand as usize] + 7.0 + 138.0 <= side, "{width}: {plan:?}");
+            last = plan;
+        }
+        assert_eq!(last.chief, PillSize::Mark);
+        assert!(last.actions_menu && last.brand == BrandSize::Mark);
+    }
 }

@@ -34,6 +34,10 @@ pub mod web;
 
 #[cfg(test)]
 mod fake_host;
+/// The desktop's CPU rasterizer, for the views' headless screenshots.
+#[cfg(test)]
+#[path = "../../atomics/src/test_raster.rs"]
+mod test_raster;
 #[cfg(test)]
 mod world;
 
