@@ -927,8 +927,10 @@ For example, `cmd+p` is Ctrl+Shift+P on Linux. `cmd+shift+space` becomes Ctrl+Sh
 before a focused terminal or editor. Its letter follows the keyboard layout. On Linux that takes Claude Code's own Ctrl+G
 (edit the prompt in an editor), so bind `github` elsewhere, for example `cmd+g`, to keep it. A `github` binding that
 collides with another one, or with Ctrl/Command+1…9, is reported in the top bar and falls back to `primary+g`.
-Switching agents uses **Ctrl+1…9 on Linux** and **Command+1…9 on macOS**, including while a terminal has focus.
-The digits follow the physical keys, leaving Shift+digits available for symbols such as `!`.
+Switching agents uses **Ctrl+1…9 on Linux** and **Command+1…9 on macOS**, including while a terminal has focus,
+on the desktop, in a browser and on a `--connect` client alike; each agent's row in the sidebar shows its number
+([docs/navigation.md](docs/navigation.md)). The digits follow the physical keys, leaving Shift+digits available for
+symbols such as `!`.
 Tooltips and the settings menu show the actual platform chord, including custom bindings.
 
 | Key | |

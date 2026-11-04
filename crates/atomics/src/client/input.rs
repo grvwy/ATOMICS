@@ -3,10 +3,13 @@
 //! the terminal's share of each frame's raw input before egui sees it and hands it to the pane as the
 //! overlay would ([`TermInput`]). A click on the cells focuses them and asks for the lease, keys and text
 //! typed while they have the keyboard go to the terminal, and a click anywhere else, or a text box taking
-//! the keyboard, lets go. Command on macOS and Ctrl+Shift elsewhere stay the window's.
+//! the keyboard, lets go. Command on macOS and Ctrl+Shift elsewhere stay the window's, and so do the keys every client
+//! takes before a terminal (`atomics_ui::window_keys`).
 
+use atomics_ui::window_keys::before_terminal;
 use atomics_web::gesture::{Kind, Phase, Pointer};
 use atomics_web::term_pane::{Overlay, TermInput};
+use egui::os::OperatingSystem;
 use egui::{Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, vec2};
 
 /// How far one wheel line scrolls, in points.
@@ -214,6 +217,7 @@ impl Keyboard {
                 true
             }
             Event::Key { modifiers, .. } if shortcut(*modifiers) => false,
+            event if before_terminal(event, OperatingSystem::from_target_os(), overlay.editor) => false,
             Event::Key { key, pressed, modifiers, .. } => {
                 if *pressed {
                     let name = key_name(*key)
@@ -360,6 +364,75 @@ mod tests {
         let (inputs, kept) = route(&mut keyboard, &overlay(), vec![key(Key::D, modifiers)]);
         assert_eq!(inputs, vec![TermInput::Key { name: "d".into(), mods: modifiers }]);
         assert!(kept.is_empty(), "Ctrl+Shift still belongs to the terminal on a Mac");
+    }
+
+    /// The window's agent chord on this platform.
+    fn agent_chord() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE }
+        } else {
+            Modifiers { ctrl: true, command: true, ..Modifiers::NONE }
+        }
+    }
+
+    #[test]
+    fn the_windows_keys_stay_in_the_window_for_the_shared_handler_and_no_byte_reaches_the_terminal() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        let overlay = overlay();
+        for code in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
+        {
+            let event = key(code, agent_chord());
+            let (inputs, kept) = route(&mut keyboard, &overlay, vec![event.clone()]);
+            assert!(inputs.is_empty(), "{code:?} must never become terminal input");
+            assert_eq!(kept, vec![event], "egui keeps it, for `window_keys`");
+        }
+        for code in [Key::ArrowDown, Key::ArrowUp] {
+            let event = key(code, Modifiers::SHIFT);
+            let (inputs, kept) = route(&mut keyboard, &overlay, vec![event.clone()]);
+            assert!(inputs.is_empty(), "{code:?} with Shift walks the diff's files");
+            assert_eq!(kept, vec![event]);
+        }
+        assert!(keyboard.focused, "the key itself moves no keyboard: the handler does, with the frame");
+
+        // And the handler gets them: the digit picks the agent, whatever the layout types there.
+        let ctx = egui::Context::default();
+        let (_, kept) = route(&mut keyboard, &overlay, vec![key(Key::Num3, agent_chord())]);
+        let mut picked = Vec::new();
+        let mut output = ctx.run_ui(RawInput { events: kept, ..RawInput::default() }, |ui| {
+            picked = atomics_ui::window_keys::take_agents(ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert_eq!(picked, vec![2]);
+    }
+
+    #[test]
+    fn an_editor_keeps_shift_with_the_arrows_and_a_terminal_its_page_keys() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        let editor = Overlay { editor: true, ..overlay() };
+        let (inputs, kept) = route(&mut keyboard, &editor, vec![key(Key::ArrowDown, Modifiers::SHIFT)]);
+        assert_eq!(inputs, vec![TermInput::Key { name: "ArrowDown".into(), mods: Modifiers::SHIFT }]);
+        assert!(kept.is_empty());
+        let (inputs, kept) = route(&mut keyboard, &editor, vec![key(Key::Num2, agent_chord())]);
+        assert!(inputs.is_empty() && kept.len() == 1, "an agent chord leaves an editor too");
+
+        let (inputs, kept) = route(&mut keyboard, &overlay(), vec![key(Key::PageDown, Modifiers::NONE)]);
+        assert_eq!(inputs, vec![TermInput::Key { name: "PageDown".into(), mods: Modifiers::NONE }]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn a_digit_with_ctrl_that_is_no_agent_chord_types_nothing() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        let modes = atomics_core::screen::Modes::default();
+        // Ctrl+0 on every platform, and Ctrl with any digit on a Mac, where the chord is Command's.
+        let digits: &[Key] = if cfg!(target_os = "macos") { &[Key::Num0, Key::Num1, Key::Num3] } else { &[Key::Num0] };
+        for code in digits {
+            let (inputs, _) = route(&mut keyboard, &overlay(), vec![key(*code, Modifiers::CTRL)]);
+            for input in inputs {
+                let TermInput::Key { name, mods } = input else { panic!("{input:?}") };
+                assert_eq!(atomics_web::term_pane::key_text(&name, mods, (false, false), &modes), None, "{code:?}");
+            }
+        }
     }
 
     #[test]

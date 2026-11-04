@@ -48,6 +48,8 @@ pub struct Desk {
     pub chief: ChiefWindow,
     /// The docked chief had room in the last frame's layout.
     pub dock_fits: bool,
+    /// The last frame's diff covered the terminals entirely.
+    pub diff_fills: bool,
     /// The terminal last clicked into while it is not the active session's (the chief's), by id. The
     /// terminal input goes there, else to the active session's.
     pub typing_in: Option<String>,
@@ -72,6 +74,7 @@ impl Default for Desk {
             selected: 0,
             chief: ChiefWindow { open: true, dock: ChiefDock::Docked, width: None },
             dock_fits: true,
+            diff_fills: false,
             typing_in: None,
             pick: true,
         }

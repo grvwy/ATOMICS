@@ -12,7 +12,7 @@ use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
 use atomics_core::store::SessionRecord;
-use atomics_core::tickets::TicketConfig;
+use atomics_core::tickets::{TicketConfig, TicketLink};
 use egui::Color32;
 
 use crate::Command;
@@ -427,6 +427,24 @@ pub trait Backend {
 
     /// Every session, in the host's order. The UI addresses a session by its position in this list.
     fn session_list(&self) -> Vec<SessionRow>;
+
+    /// The ticket a session works on, for the reader to follow: its task's or that task's plan's, among the open
+    /// plans, else the selected plan's. It names the ticket system.
+    fn session_ticket(&self, session: &str) -> Option<TicketLink> {
+        let open = self.plan_list().into_iter().enumerate().filter(|(_, row)| row.status == PlanStatus::Open);
+        let of_task = open.filter_map(|(index, _)| self.board(index)).find_map(|board| {
+            let task = board.plan.tasks.iter().find(|task| task.session.as_deref() == Some(session))?;
+            Some(task.ticket.clone().or_else(|| board.plan.ticket.clone()))
+        });
+        let mut link =
+            of_task.flatten().or_else(|| self.board(self.view_hints().selected_plan).and_then(|b| b.plan.ticket))?;
+        if link.system.is_empty()
+            && let Some(info) = self.tickets()
+        {
+            link.system = info.system;
+        }
+        Some(link)
+    }
 
     /// One session of [`session_list`](Backend::session_list), without building the others.
     fn session_row(&self, index: usize) -> Option<SessionRow>;

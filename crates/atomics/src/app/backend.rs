@@ -97,6 +97,10 @@ impl Backend for Local<'_> {
         Some(self.0.launch_dir.clone())
     }
 
+    fn session_ticket(&self, session: &str) -> Option<atomics_core::tickets::TicketLink> {
+        self.0.stamp_system(self.0.session_ticket(session))
+    }
+
     fn ticket_tree(&self, plan: usize) -> Option<atomics_core::ticket_ui::TicketTree> {
         self.0.plans.get(plan).and_then(|plan| self.0.ticket_tree(plan))
     }

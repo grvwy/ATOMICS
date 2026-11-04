@@ -442,8 +442,9 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   client's size is in force) and **Take back**, which ends the lease as typing in the pane does
   (`TerminalView::holder_pill`). The pill floats over the cells, so the pane keeps its size.
 - **Encoding.** Keys, typed text, a paste and mouse reports are encoded by `atomics_ui::terminal::encode` from the
-  screen's published modes, on the desktop and in the browser alike; only the browser turns Ctrl with `2`-`8` and
-  some punctuation into control bytes (the module's notes say why). A program's clipboard escape (OSC 52) never
+  screen's published modes, on the desktop and in the browser alike; only the browser turns Ctrl with some
+  punctuation, and the key bar's sticky Ctrl with `2`-`8`, into control bytes (the module's notes say why). A
+  keyboard's Ctrl with a digit reaches no terminal on any client. A program's clipboard escape (OSC 52) never
   reaches a browser's clipboard: there is no opt-in yet.
 
 Keystroke echo on loopback (2026-11-02, `protocol::echo_bench`, ignored by default; release build, shared 18-core
@@ -675,9 +676,10 @@ a launcher).
   frame's raw input before egui sees it: a click on the cells gives the terminal the keyboard (and asks for the
   lease, as a tap does), keys and text go to it while it has the keyboard, a click anywhere else or a text box
   taking the keyboard lets go, the wheel over the cells scrolls this client's history, Copy copies the
-  selection, and Command on macOS or Ctrl+Shift elsewhere stays the window's. Plain Ctrl still goes to the
-  terminal. Reserved chords remain in egui's input; the client has no general `[keys]` handlers, so an unhandled
-  chord does nothing and sends nothing to the terminal.
+  selection, and Command on macOS or Ctrl+Shift elsewhere stays the window's. So do the keys that move around the
+  window (Ctrl+1 to 9, Shift+↑/↓; docs/navigation.md), which do here what they do on every client. Plain Ctrl with a
+  letter still goes to the terminal. Reserved chords remain in egui's input; the client has no general `[keys]`
+  handlers, so an unhandled chord does nothing and sends nothing to the terminal.
 - **Closing the window** ends only the connection: the host's agents, terminals, plans and approvals go on, and
   a window opened again finds them as they are. The client takes no lock on the home and starts no runtime.
 - **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop
@@ -1078,7 +1080,8 @@ box ends it too.
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
   from `keydown` (Ctrl+V and Cmd stay the browser's), a soft keyboard's Return and Backspace from `beforeinput`
-  where its `keydown` names no key, and pastes. The field has autocorrect, autocapitalisation, autocomplete and
+  where its `keydown` names no key, and pastes. The keys that move around the window (docs/navigation.md) go to the
+  app instead, wherever the keyboard is on the page. The field has autocorrect, autocapitalisation, autocomplete and
   spellcheck off. A touch on it is handled by the client: a tap focuses it from the touch's own handler (which
   opens the keyboard), and the browser's loupe, callout and page zoom never start. It takes the pointer only where
   egui would give the terminal the pointer: a floating window over the terminal is cut out of it with a `clip-path`,
@@ -1102,9 +1105,10 @@ box ends it too.
 - **Typing needs the lease.** Only the field gaining the focus asks for a free lease, by a tap, a click, or a pick
   or the chief's notice that moves it there; text typed meanwhile waits for the grant (16 KiB at most, this
   connection only), and a lease state sent before the host read the request leaves it standing. The input moving to
-  another terminal or to none, or the keyboard moving to a text box the page draws, releases the lease (a grant still
-  on its way goes back when it comes), and a click back asks again at once, even before the host has answered. A field
-  that only loses the focus, to another window or to a button, keeps the lease until it runs out, since nothing renews
+  another terminal or to none, or the keyboard moving to a text box the page draws or to the panel, releases the lease
+  (a grant still on its way goes back when it comes), and a click back asks again at once, even before the host has
+  answered. A field that only loses the focus, to another window or to a button, keeps the lease until it runs out,
+  since nothing renews
   it. Typing never asks for the lease: text, keys and pastes count only while the field has the focus and this client
   holds the lease or is asking for it, and anything else is dropped, never kept. Another client typing makes the field
   read-only, with **Take over**. The lease is renewed every 10 s while the field has the focus. Losing it (the desktop

@@ -5,9 +5,7 @@ use std::path::Path;
 use atomics_core::config::ThemeConfig;
 use atomics_core::theme::{Resolved, ThemeMode, ThemeTokens};
 
-pub use atomics_ui::keys::{
-    consume_chord, consume_physical_shortcut, is_app_chord, is_digit, shortcut, shortcut_label,
-};
+pub use atomics_ui::keys::{consume_chord, is_app_chord, is_digit, shortcut, shortcut_label};
 pub use atomics_ui::theme::{Fonts, Palette};
 pub use fonts::SystemFonts;
 

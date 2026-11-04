@@ -23,6 +23,8 @@ pub struct Client {
     pub pr_view: Option<(String, DiffState)>,
     pub editor_id: Option<egui::Id>,
     pub focus_editor: bool,
+    /// The file each worktree's editor last had open, by root, for when it starts again.
+    pub editor_file: HashMap<PathBuf, String>,
     /// The colors and fonts to draw with, made by the platform from the host's theme.
     pub palette: Arc<Palette>,
     /// What the user asked for while this UI drew, oldest first. The platform takes them after each
@@ -80,6 +82,7 @@ impl Default for Client {
             pr_view: None,
             editor_id: None,
             focus_editor: false,
+            editor_file: HashMap::new(),
             palette: Arc::new(Palette::new(&tokens, Fonts::default())),
             commands: Vec::new(),
             tickets: crate::tickets::Tickets::default(),

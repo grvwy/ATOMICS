@@ -241,6 +241,11 @@ impl RemoteBackend {
     }
 
     /// Changed files open at their hunks; unchanged files use the host's bounded whole-file preview.
+    /// The diff view moved to another file or hunk: no file of `root` shows whole any more.
+    pub fn leave_file(&self, root: &Path) {
+        self.state.borrow_mut().files.remove(root.to_string_lossy().as_ref());
+    }
+
     pub fn open_file(&self, root: &Path, path: &str) -> bool {
         let mut s = self.state.borrow_mut();
         let worktree = root.to_string_lossy().into_owned();

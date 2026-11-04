@@ -16,6 +16,9 @@ const LAYOUT_KEY = "atomics.layout";
 const VIEW_KEY = "atomics.view";
 
 let report = null;
+let commandChords = false;
+// A key with a modifier was pressed: a real keyboard is there, even on a touch screen.
+let hardKeyboard = false;
 let ta = null;
 let bar = null;
 let chip = null;
@@ -35,6 +38,46 @@ const vv = window.visualViewport;
 const send = (event) => queueMicrotask(() => report && report(event));
 const mods = (e) => (e.shiftKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.ctrlKey ? 4 : 0) | (e.metaKey ? 8 : 0);
 const px = (value) => parseFloat(value) || 0;
+
+// The app's agent chords: Ctrl+1 to 9, Command on a Mac (`atomics_ui::window_keys`), by the physical key.
+function agentDigit(e) {
+  if (e.shiftKey || e.altKey || (commandChords ? !e.metaKey || e.ctrlKey : !e.ctrlKey || e.metaKey)) return null;
+  const digit = /^(?:Digit|Numpad)([1-9])$/.exec(e.code || "Digit" + e.key);
+  return digit && digit[1];
+}
+
+// The keyboard is on nothing on this page, as when it has just opened: the app reads the canvas's keys from here on.
+// A hosting page that has the keyboard keeps it.
+function toCanvas() {
+  if (document.activeElement !== document.body || !document.hasFocus()) return;
+  const canvas = document.getElementById("atomics");
+  if (canvas) canvas.focus({ preventScroll: true });
+}
+
+// The window's keys, wherever the keyboard is on the page: the canvas, a text box or this input. A page that takes
+// Ctrl+1 to 9 keeps them from the browser's tabs. Capture comes first, so nothing on the page sees them too. The app
+// decides what they do.
+function windowKeys(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) hardKeyboard = true;
+  if (composing || e.isComposing) return;
+  const digit = agentDigit(e);
+  if (digit) {
+    e.preventDefault();
+    e.stopPropagation();
+    toCanvas();
+    if (!e.repeat) send({ kind: "key", text: digit, mods: mods(e) });
+  } else if (e.target === document.body && e.shiftKey && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+    e.preventDefault();
+    toCanvas();
+    send({ kind: "key", text: e.key, mods: mods(e) });
+  }
+}
+
+// Letting go of the input leaves the keyboard on the canvas, so the app keeps reading keys there.
+function leaveInput() {
+  ta.blur();
+  toCanvas();
+}
 
 function viewport() {
   const insets = probe ? getComputedStyle(probe) : null;
@@ -210,6 +253,8 @@ function buildOverlay() {
     if (NAMED.has(e.key)) {
       e.preventDefault();
       send({ kind: "key", text: e.key, mods: mods(e) });
+    } else if (e.ctrlKey && /^(?:Digit|Numpad)[0-9]$/.test(e.code)) {
+      // Never a terminal's, whatever the layout types there (`windowKeys` has the agent chords).
     } else if (e.ctrlKey && !e.shiftKey && !e.altKey && [...e.key].length === 1 && e.key.toLowerCase() !== "v") {
       // Ctrl with a character is the terminal's (Ctrl+V stays the browser's paste).
       e.preventDefault();
@@ -271,9 +316,12 @@ function buildOverlay() {
   for (const type of ["gesturestart", "gesturechange", "gestureend"]) ta.addEventListener(type, (e) => e.preventDefault());
 }
 
-/** Build the overlay and the key bar (`keys`: the app's rows, as JSON) and report to `callback`. */
-export function install(keys, callback) {
+/** Build the overlay and the key bar (`keys`: the app's rows, as JSON) and report to `callback`. The agent chords use
+    Command when `command`, else Ctrl. */
+export function install(keys, command, callback) {
   report = callback;
+  commandChords = command;
+  addEventListener("keydown", windowKeys, true);
   probe = document.createElement("div");
   probe.id = "atomics-insets";
   document.body.append(probe);
@@ -311,7 +359,7 @@ export function setClip(clip) {
 
 /** No terminal shows. */
 export function hide() {
-  if (document.activeElement === ta) ta.blur();
+  if (document.activeElement === ta) leaveInput();
   ta.hidden = true;
 }
 
@@ -319,17 +367,18 @@ export function hide() {
 export function setWritable(on) {
   writable = on;
   ta.readOnly = !on;
-  if (!on && document.activeElement === ta) ta.blur();
+  if (!on && document.activeElement === ta) leaveInput();
 }
 
 export function blurInput() {
-  if (document.activeElement === ta) ta.blur();
+  if (document.activeElement === ta) leaveInput();
 }
 
-/** A click picked the terminal under the input: type there. Only for a mouse or a pen; a finger taps the
-    input itself, in its own touch handler, which is what opens the keyboard. */
+/** A click picked the terminal under the input, or the keyboard came back to it: type there. Only for a mouse, a pen
+    or a real keyboard; a finger taps the input itself, in its own touch handler, which is what opens the soft one. */
 export function focusInput() {
-  if (!coarse.matches && writable && !ta.hidden && document.activeElement !== ta) ta.focus({ preventScroll: true });
+  const keyboard = !coarse.matches || hardKeyboard;
+  if (keyboard && writable && !ta.hidden && document.activeElement !== ta) ta.focus({ preventScroll: true });
 }
 
 /** Light the key bar's sticky Ctrl and Alt. */

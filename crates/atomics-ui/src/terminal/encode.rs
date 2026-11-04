@@ -5,11 +5,11 @@
 //!
 //! The browser sends more in one place. A character typed with Ctrl (a hardware keyboard's
 //! Ctrl+character, or the key bar's sticky Ctrl, both of which arrive as characters) becomes xterm's
-//! control byte through [`ctrl_char`], so Ctrl with `2`-`8`, `@`, `` ` ``, `^`, `~`, `_`, `/`, `-` or
-//! `?` sends one there; on a phone the key bar is the only way to type them. The desktop reads egui's
-//! keys and sends Ctrl only with a letter, Space, `[`, `\` or `]` ([`ctrl_key`]), its bytes since
-//! before the browser: Ctrl+1-9 are its own shortcuts (an agent, on Linux and Windows), and it sends
-//! nothing for the rest.
+//! control byte through [`ctrl_char`], so Ctrl with `@`, `` ` ``, `^`, `~`, `_`, `/`, `-` or `?` sends
+//! one there, and so does the sticky Ctrl with `2`-`8`; on a phone the key bar is the only way to type
+//! them. A keyboard's Ctrl with a digit is the window's on every client and never comes here
+//! (`crate::window_keys`). The desktop reads egui's keys and sends Ctrl only with a letter, Space, `[`,
+//! `\` or `]` ([`ctrl_key`]), its bytes since before the browser, and it sends nothing for the rest.
 //!
 //! Keys are xterm's. The cursor keys follow application-cursor mode while no modifier is held, and
 //! carry xterm's modifier code when one is; Shift or Alt with Return sends ESC CR, a newline in
