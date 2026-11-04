@@ -149,16 +149,21 @@ pub(crate) fn login_shell_var(name: &str) -> Option<String> {
 }
 
 /// The variable `name` as `shell`, started as an interactive login shell, prints it, or why it
-/// did not. The shell runs in a session of its own, without a terminal, so job control and
-/// prompts in its startup files cannot stop it; after `timeout` its process group is stopped.
-/// Output goes to an unlinked file: nothing left running can keep this waiting.
+/// did not. After `timeout` the shell's process group is stopped.
 fn login_shell_output(shell: &str, name: &str, timeout: Duration) -> Result<String, String> {
-    use std::io::{Read, Seek};
+    let (child, stdout) = start_login_shell(shell, name)?;
+    finish_login_shell(child, stdout, name, timeout)
+}
+
+/// `shell` started as an interactive login shell that prints the variable `name`, and the file
+/// its output goes to. The shell runs in a session of its own, without a terminal, so job control
+/// and prompts in its startup files cannot stop it. Output goes to an unlinked file: nothing left
+/// running can keep a reader waiting.
+fn start_login_shell(shell: &str, name: &str) -> Result<(std::process::Child, std::fs::File), String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::time::Instant;
 
-    let mut stdout = tempfile::tempfile().map_err(|err| format!("no file for its output: {err}"))?;
+    let stdout = tempfile::tempfile().map_err(|err| format!("no file for its output: {err}"))?;
     let mut command = Command::new(shell);
     command
         .args(["-l", "-i", "-c", &format!("printf '{MARKER}%s{MARKER}' \"${name}\"")])
@@ -174,7 +179,21 @@ fn login_shell_output(shell: &str, name: &str, timeout: Duration) -> Result<Stri
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|err| format!("it did not start: {err}"))?;
+    let child = command.spawn().map_err(|err| format!("it did not start: {err}"))?;
+    Ok((child, stdout))
+}
+
+/// The variable a shell from [`start_login_shell`] printed, or why it did not. A shell still
+/// running `timeout` from now is stopped with its whole process group.
+fn finish_login_shell(
+    mut child: std::process::Child,
+    mut stdout: std::fs::File,
+    name: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::io::{Read, Seek};
+    use std::time::Instant;
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -494,8 +513,8 @@ mod tests {
         assert_eq!((found.added, merged), (Some(0), None));
         assert!(found.describe().1.contains("which has all of login shell"));
 
-        // One that hangs is stopped in time, with what it started.
-        let hangs = shell("hangs", "sleep 30 &\necho $! > \"${0%/*}/started\"\nwait");
+        // One that hangs is stopped in time, however far it got.
+        let hangs = shell("hangs", "exec sleep 30");
         let (started, timeout) = (Instant::now(), crate::test_support::scaled_timeout(Duration::from_secs(1)));
         let (found, merged) = LoginPath::read(hangs, "/usr/bin:/bin", timeout);
         assert!(started.elapsed() < timeout + Duration::from_secs(10));
@@ -503,7 +522,24 @@ mod tests {
         assert_eq!(merged, None);
         let (ok, text) = found.describe();
         assert!(!ok && text.contains("(warning)"), "{text}");
-        let sleeper: i32 = std::fs::read_to_string(dir.path().join("started")).unwrap().trim().parse().unwrap();
+
+        // What a stopped shell started stops with it. Its deadline starts only once it has started
+        // its child, however long a loaded machine takes to get there.
+        let starts = shell(
+            "starts",
+            "sleep 30 &\necho $! > \"${0%/*}/started.new\"\nmv \"${0%/*}/started.new\" \"${0%/*}/started\"\nwait",
+        );
+        let (child, stdout) = start_login_shell(&starts, "PATH").unwrap();
+        let guard = Instant::now() + crate::test_support::CHILD_TIMEOUT;
+        let sleeper: i32 = loop {
+            if let Ok(pid) = std::fs::read_to_string(dir.path().join("started")) {
+                break pid.trim().parse().unwrap();
+            }
+            assert!(Instant::now() < guard, "the shell never started its child");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stopped = finish_login_shell(child, stdout, "PATH", Duration::ZERO).unwrap_err();
+        assert!(stopped.contains("did not finish within"), "{stopped}");
         let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
         // SAFETY: signal 0 only checks that the process exists.
         while unsafe { libc::kill(sleeper, 0) } == 0 {
