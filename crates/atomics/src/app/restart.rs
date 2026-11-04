@@ -314,6 +314,7 @@ mod tests {
                         warning: None,
                     },
                     native: None,
+                    stash: Default::default(),
                 });
                 refused(app, "approval or question");
                 app.runtime.sessions[0].approvals.clear();

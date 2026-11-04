@@ -124,8 +124,22 @@ pub fn claude_settings(atomics_exe: &Path) -> Value {
 /// Claude permission rules that make a Claude agent ATOMICS starts on this machine ask before it drops
 /// entries of the stash every worktree shares, whatever else its settings allow. Claude asks in its own
 /// terminal: its permission prompts do not reach ATOMICS's approval policy, which handles Codex's.
-pub const CLAUDE_STASH_ASK: [&str; 4] =
-    ["Bash(git stash drop:*)", "Bash(git stash pop:*)", "Bash(git stash clear:*)", "Bash(git stash branch:*)"];
+/// A `:*` rule matches the command's start; for git's own options before `stash` (`git -C ../app`,
+/// `--no-pager`), a `*` matches any text, and only a rule's one trailing ` *` may match nothing.
+pub const CLAUDE_STASH_ASK: [&str; 12] = [
+    "Bash(git stash drop:*)",
+    "Bash(git stash pop:*)",
+    "Bash(git stash clear:*)",
+    "Bash(git stash branch:*)",
+    "Bash(git * stash drop)",
+    "Bash(git * stash drop *)",
+    "Bash(git * stash pop)",
+    "Bash(git * stash pop *)",
+    "Bash(git * stash clear)",
+    "Bash(git * stash clear *)",
+    "Bash(git * stash branch)",
+    "Bash(git * stash branch *)",
+];
 
 /// Session-local handlers carry their destination without exporting it to the agent.
 pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bool) -> Value {
@@ -629,5 +643,53 @@ mod tests {
             assert!(!is_cox_hook(&json!({"type": "command", "command": command})), "{command}");
         }
         assert!(!is_cox_hook(&json!({"type": "prompt", "command": "cox hook"})));
+    }
+
+    /// Whether Claude's rule `Bash(<rule>)` matches `command`: `:*` at the end matches the command's
+    /// start; otherwise each `*` matches any text, and a rule's one `*`, after a space at its end, also
+    /// matches nothing at all (`git *` matches `git`).
+    fn claude_rule_matches(rule: &str, command: &str) -> bool {
+        let rule = rule.strip_prefix("Bash(").and_then(|rule| rule.strip_suffix(')')).unwrap();
+        if let Some(prefix) = rule.strip_suffix(":*") {
+            return command.starts_with(prefix);
+        }
+        if rule.matches('*').count() == 1
+            && let Some(head) = rule.strip_suffix(" *")
+            && command == head
+        {
+            return true;
+        }
+        let pieces: Vec<&str> = rule.split('*').collect();
+        let [first, middle @ .., last] = &pieces[..] else { return command == rule };
+        let Some(mut rest) = command.strip_prefix(first) else { return false };
+        for piece in middle {
+            let Some(at) = rest.find(piece) else { return false };
+            rest = &rest[at + piece.len()..];
+        }
+        rest.len() >= last.len() && rest.ends_with(last)
+    }
+
+    #[test]
+    fn claude_asks_before_every_shared_stash_drop_atomics_finds() {
+        for command in [
+            "git stash drop",
+            "git stash drop stash@{1}",
+            "git stash pop 2",
+            "git stash clear",
+            "git stash branch rescue stash@{1}",
+            "git -C ../other stash drop",
+            "git -C ../other stash drop stash@{1}",
+            "git --no-pager -c color.ui=never stash pop",
+            "git -C x stash clear",
+            "git -C x -C y stash branch rescue",
+        ] {
+            assert!(!crate::stash::drops(command).is_empty(), "ATOMICS finds {command}");
+            assert!(CLAUDE_STASH_ASK.iter().any(|rule| claude_rule_matches(rule, command)), "{command}");
+        }
+        for command in
+            ["git stash list", "git -C x stash list", "git stash apply 1", "git -C x stash show -p", "git status"]
+        {
+            assert!(!CLAUDE_STASH_ASK.iter().any(|rule| claude_rule_matches(rule, command)), "{command}");
+        }
     }
 }

@@ -175,7 +175,7 @@ fn expiry_refreshes_then_invalid_grant_signs_out_and_the_worker_does_not_back_of
         st.refresh.clear();
     }
     let error = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap();
-    assert!(matches!(error, McpError::SignInRequired(_)), "{error:?}");
+    assert!(matches!(error, McpError::SignInRefused(_)), "{error:?}");
     assert_eq!(SignState::of(&oauth, &server), SignState::SignedOut);
 
     // Through the worker: the job says sign-in required at once, twice, and after the person signs in

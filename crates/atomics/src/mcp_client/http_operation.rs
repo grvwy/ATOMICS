@@ -147,7 +147,7 @@ impl HttpClient {
                 .send(call.method, &url, body.as_deref())
                 .map_err(|err| McpError::request_error(format!("{label} failed"), err))?;
             // The server no longer accepts the token (revoked or expired early): refresh once and
-            // retry. A refresh that fails is SignInRequired, so this cannot loop.
+            // retry. A refresh that fails needs a sign-in, so this cannot loop.
             if response.status().as_u16() == 401
                 && !retried
                 && let Some(oauth) = &mut self.oauth

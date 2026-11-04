@@ -357,6 +357,7 @@ mod tests {
             },
             reply: None,
             native: None,
+            stash: Default::default(),
         }
     }
 

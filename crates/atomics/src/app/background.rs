@@ -637,9 +637,10 @@ impl State {
 
         // A command that drops shared stash entries says whose, for whoever decides. A sandboxed
         // session's requests are not ATOMICS's to answer.
-        let stash_warning = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
+        let (stash_warning, stash) = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
             .then(|| self.stash_warning(index, &ApprovalRequest::from_event(&event)))
-            .flatten();
+            .flatten()
+            .unzip();
         let session = &mut self.sessions[index];
         if session.sandbox.is_some() {
             if let Some(reply) = message.approval_reply {
@@ -673,6 +674,7 @@ impl State {
                 request,
                 reply: message.approval_reply,
                 native: None,
+                stash: stash.unwrap_or_default(),
             });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {

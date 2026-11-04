@@ -535,6 +535,7 @@ fn signing_in_discovers_registers_proves_pkce_and_uses_the_bearer() {
     let unsigned = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap();
     assert!(matches!(&unsigned, McpError::SignInRequired(_)), "{unsigned:?}");
     assert!(is_sign_in_required(&unsigned.to_string()));
+    assert!(!is_sign_in_refused(&unsigned.to_string()), "nothing was saved to refuse: {unsigned}");
 
     sign_in(&oauth, &server).unwrap();
     assert_eq!(oauth.status(&server), SignInStatus::SignedIn);
@@ -684,13 +685,16 @@ fn a_revoked_refresh_token_needs_a_new_sign_in_and_is_not_retried() {
         st.refresh.clear();
     }
     let error = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap();
-    assert!(matches!(&error, McpError::SignInRequired(_)), "{error:?}");
+    // The saved sign-in was refused, which the error says apart from having none.
+    assert!(matches!(&error, McpError::SignInRefused(m) if m.contains("refused the saved sign-in")), "{error:?}");
     assert!(error.to_string().starts_with(SIGN_IN_REQUIRED));
+    assert!(is_sign_in_required(&error.to_string()) && is_sign_in_refused(&error.to_string()), "{error}");
     assert_eq!(oauth.status(&server), SignInStatus::NeedsSignIn);
     assert_eq!((items(dir.path(), "tokens"), items(dir.path(), "access")), (0, 0));
-    // Asking again goes straight to SignInRequired without another refresh attempt.
+    // Asking again goes straight to SignInRequired without another refresh attempt: nothing is saved now.
     let again = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap();
-    assert!(matches!(again, McpError::SignInRequired(_)));
+    assert!(matches!(again, McpError::SignInRequired(_)), "{again:?}");
+    assert!(!is_sign_in_refused(&again.to_string()), "{again}");
     let refreshes =
         fake.state.lock().unwrap().token_requests.iter().filter(|r| r["grant_type"] == "refresh_token").count();
     assert_eq!(refreshes, 1);
@@ -1363,7 +1367,7 @@ fn a_refresh_the_server_refuses_for_its_own_resource_ends_the_further_tokens_too
         st.expires_in = 3600;
     }
     let error = McpClient::connect_with(&server, TIMEOUT, |_| None, Some(&oauth)).err().unwrap();
-    assert!(matches!(error, McpError::SignInRequired(_)), "{error:?}");
+    assert!(matches!(error, McpError::SignInRefused(_)), "{error:?}");
     assert_eq!((items(dir.path(), "tokens"), items(dir.path(), "access")), (0, 0));
 }
 

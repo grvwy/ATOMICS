@@ -239,7 +239,8 @@ follows the standards:
    a slow or silent client cannot hold the listener.
 4. **Tokens.** The code is exchanged, and the access token is sent as the bearer on every MCP call. It is refreshed
    before it expires and once after a `401`; the refresh token rotates when the server rotates it. A refusal
-   clears the saved sign-in and the call fails with `sign-in required: …`. It is never retried in a loop. A
+   clears the saved sign-in and the call fails with `sign-in required again: …`, which says it apart from a server
+   with nothing saved (`sign-in required: …`). It is never retried in a loop. A
    refresh holds a per-server lock file next to the config (`mcp-oauth-<key>.lock`), so several ATOMICS processes
    never spend one rotating refresh token twice. Once it has the lock, a process reads the keychain again and uses
    the new access token if another process has already refreshed. Saving a sign-in and signing out take the same lock.
@@ -294,12 +295,17 @@ not a failure: the worker does not back off from it, and the next job after a si
 Needing a sign-in shows wherever the tickets do, each time with a button that runs the sign-in: an open plan's
 board (above its tickets), the sidebar above AGENTS while no plan is open, the Tickets panel (`cmd+k`;
 Ctrl+Shift+K on Linux/Windows), and the top bar's **Sign in to <system>** item, whose popup holds the same steps
-(in the Actions menu when the bar is narrow). The Tickets entry carries a dot meanwhile. Never signed in here, the
-button reads **Sign in to <system>**; once a job answered `sign-in required` (the server or a resource the
-sign-in stands for refused the saved one), or the sign-in does not cover a resource the profile now reads from, it
-reads **Reconnect** and the reason shows under "<system> needs you to sign in again". It is the one sign-in below,
-for the server and the ticket API alike; a refusal that the sign-in already turned into an ordinary error stays
-one, so nothing brings the banner back by itself. Desktop, browser and phone draw the same banner (`atomics-ui`'s
+(in the Actions menu when the bar is narrow). The Tickets entry carries a dot meanwhile. With no saved sign-in
+(never signed in here, or signed out), the button reads **Sign in to <system>**, even after a job answered
+`sign-in required`, as the `whoami` job does at start-up. Only once the server refused the saved sign-in, or it ran
+out with nothing to refresh it (a job answered `sign-in required again`), it reads **Reconnect** and the reason shows
+under "<system> needs you to sign in again". The jobs after a refusal find the sign-in cleared and leave
+**Reconnect** as it is. A sign-in that does not cover a resource the profile now reads from (its ticket API, say)
+stays signed in for what it does cover: the banner reads "<system> needs one more sign-in", names the hosts it does
+not cover, and offers **Sign in to <system>**, which signs in for all of them. On the desktop it also offers **Try
+again**, which puts the banner away, and **Sign out**, since the signed-in chip does not show. It is the one sign-in
+below, for the server and the ticket API alike; a refusal that the sign-in already turned into an ordinary error
+stays one, so nothing brings the banner back by itself. Desktop, browser and phone draw the same banner (`atomics-ui`'s
 `signin`).
 
 1. **Sign in** runs the host's sign-in job. On the desktop it opens the default browser (`open` on macOS, `xdg-open`

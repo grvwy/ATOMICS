@@ -164,7 +164,7 @@ impl ProfileIssuer {
             Ok(result) => Ok(tool_output(&result)),
             Err(error) => {
                 let failure = self.failure(config, error.clone(), secrets);
-                if matches!(error, McpError::Transport { .. } | McpError::SignInRequired(_)) {
+                if matches!(error, McpError::Transport { .. }) || error.needs_sign_in() {
                     self.client = None;
                 }
                 Err(failure)
@@ -176,7 +176,9 @@ impl ProfileIssuer {
         let errors = &config.rendezvous.errors;
         let message = self.cleaner(config, secrets).error(&error.to_string());
         let refusal = match &error {
-            McpError::SignInRequired(_) => return IssueError::new(IssueKind::SignIn, message),
+            McpError::SignInRequired(_) | McpError::SignInRefused(_) => {
+                return IssueError::new(IssueKind::SignIn, message);
+            }
             McpError::Tool { message, details } => errors.classify(&format!("{message} {details}")),
             McpError::Server(message) => errors.classify(message),
             McpError::Transport { .. } => None,

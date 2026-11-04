@@ -549,14 +549,19 @@ then belong to that instance. Sign in separately in those provider homes when ne
 All worktrees of a repository share one git stash, so `stash@{1}` names whichever entry is second when git runs,
 possibly another agent's. A Codex request to run `git stash drop`, `pop`, `branch` or `clear` always waits for the
 chief or you, whatever `allow` says, including inside chains, pipes, substitutions and `sh -c`. It carries a `warning` that lists
-the entries the command would drop as git lists them now, each with whose it is: this agent's own, another session's
+the entries the command would drop as git lists them now, in the repository its `cd`s, `git -C`, `--git-dir` or
+`GIT_DIR` lead to, each with whose it is: this agent's own, another session's
 or task's (by the branch it was stashed on, or the task id it was stashed with), or one ATOMICS cannot tell. The
 banner shows the warning above the command and offers no **Allow always**; `allow_always` from the chief answers once
-and is not remembered, because the same index names another entry once anyone stashes. Every brief tells agents
+and is not remembered, because the same index names another entry once anyone stashes. For the same reason an
+answer that lets the command run lists the stash again first: when a drop would now take other entries than its
+warning named (someone stashed or dropped while it waited), nothing is answered. The request waits on under a new
+ID with the warning as it reads now, and the decision is refused (`stale_revision`) saying whose entries the
+command would drop now. A denial needs no second look. Every brief tells agents
 to stash with `git stash push -m <task id>`, to find their entry by that message and restore it with
 `git stash apply <commit>`, and to drop, pop or clear nothing without approval. Claude agents ATOMICS starts on this
-machine ask in their own terminal before these commands (`permissions.ask` in their session settings), even where
-their settings allow git; sandboxed agents run unattended and have only the brief. `atomics doctor` lists every
+machine ask in their own terminal before these commands (`permissions.ask` in their session settings), also with
+git options before `stash` such as `git -C ../app stash drop`, even where their settings allow git; sandboxed agents run unattended and have only the brief. `atomics doctor` lists every
 repository's stash.
 
 ## The chief agent
