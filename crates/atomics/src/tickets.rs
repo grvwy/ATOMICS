@@ -533,10 +533,8 @@ impl Worker {
     fn trace_cleaner(&self, config: &TicketConfig) -> Result<tickets::Cleaner, String> {
         let mut secrets = Vec::new();
         if let Some(oauth) = &self.oauth {
+            // The API's token is one of the sign-in's, so this one read covers both.
             secrets = oauth.secrets(&config.server).map_err(|err| err.to_string())?;
-            if let Some(api) = config.http_server().filter(McpServer::uses_oauth) {
-                secrets.extend(oauth.secrets(&api).map_err(|err| err.to_string())?);
-            }
         }
         Ok(self.cleaner.clone().with(secrets))
     }
@@ -1038,6 +1036,12 @@ impl Worker {
         {
             return Err(format!("{} is unavailable: {error}", config.system));
         }
+        // The API's token, which this server must never see: `call_http` holds the API to the same.
+        if let Some((_, _, http)) = &self.http
+            && tickets::Cleaner::new(http.oauth_token().map(str::to_string)).holds_secret(&arguments.to_string())
+        {
+            return Err(format!("operations.{name}: the request holds a credential; it was not sent"));
+        }
         for attempt in 0..=1 {
             if self.client.as_ref().is_none_or(|(server, used, _)| *server != config.server || *used != self.token) {
                 self.client = None;
@@ -1108,11 +1112,14 @@ impl Worker {
             return Err(format!("{} is unavailable: {error}", config.system));
         }
         let token = shared_token(&config.server, &api, self.token.clone());
-        if self.http.as_ref().is_none_or(|(resource, used, _)| *resource != api || *used != token) {
+        let current = |(resource, used, client): &(McpServer, Option<String>, HttpClient)| {
+            *resource == api && *used == token && client.signs_in_with(&config.server)
+        };
+        if !self.http.as_ref().is_some_and(current) {
             self.http = None;
             let timeout = Duration::from_secs(config.timeout_secs.max(1));
             let oauth = api.uses_oauth().then_some(()).and(self.oauth.as_ref());
-            match HttpClient::connect(&api, token.clone(), timeout, oauth) {
+            match HttpClient::connect(&api, token.clone(), timeout, oauth.map(|oauth| (oauth, &config.server))) {
                 Ok(client) => self.http = Some((api.clone(), token, client)),
                 Err(err) => return Err(self.http_broken(config, &api, err)),
             }
@@ -3286,5 +3293,122 @@ pub(crate) mod tests {
         stale.save(home, "stale").unwrap();
         open(&mut worker, "current", true);
         assert_eq!(RemoteState::load(home, "current").unwrap().cursor, Some(json!(1)), "the server's cursor");
+    }
+
+    /// `read` and `search` over the API, a comment over MCP, all under one sign-in.
+    fn api_profile(fake: &crate::mcp_client::FakeOAuthServer) -> TicketConfig {
+        let mut config: TicketConfig = toml::from_str(
+            r#"
+            system = "echo"
+            [operations.comment]
+            tool = "note"
+            arguments = { body = "{body}" }
+            [operations.read]
+            http = { method = "GET", path = "/items/{id}" }
+            result = { id = "id", key = "key", title = "title", state = "state" }
+            [operations.search]
+            http = { method = "GET", path = "/items" }
+            arguments = { q = "{query}" }
+            items = "items"
+            result = { id = "id", key = "key", title = "title", state = "state" }
+            "#,
+        )
+        .unwrap();
+        config.server = fake.server();
+        config.http.url = fake.api_url.clone();
+        config
+    }
+
+    fn signed_in_worker(config: &TicketConfig) -> (crate::test_support::TempDir, Worker, OAuth) {
+        let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+        let open = crate::mcp_client::oauth_test_open;
+        oauth.sign_in_via(&config.sign_in_server(), Duration::from_secs(10), &open).unwrap();
+        (dir, Worker { oauth: Some(oauth.clone()), ..Worker::default() }, oauth)
+    }
+
+    #[test]
+    fn one_sign_in_reads_over_the_api_and_writes_over_mcp_and_neither_sees_the_others_token() {
+        let fake = crate::mcp_client::FakeOAuthServer::start();
+        let config = api_profile(&fake);
+        let (_dir, mut worker, _oauth) = signed_in_worker(&config);
+        let link = TicketLink { id: "DEMO-1".into(), ..TicketLink::default() };
+
+        // The same worker reads over the API, then writes over MCP, each with its own token.
+        let Ok(TicketOutput::Card(card)) = job(&mut worker, &config, TicketOp::ReadCard(link.clone())) else {
+            panic!("the read failed");
+        };
+        assert_eq!(card.link.title.as_deref(), Some("Read over the API"));
+        assert!(job(&mut worker, &config, TicketOp::Comment(link.clone(), "Hi".into())).is_ok());
+        let (api_token, mcp_token) = {
+            let st = fake.state.lock().unwrap();
+            (st.api_auth.last().unwrap().clone(), st.mcp_auth.last().unwrap().clone())
+        };
+        assert_ne!(api_token, mcp_token);
+
+        // A request holding the other's token is not sent, in either direction.
+        let (api_seen, mcp_seen) = {
+            let st = fake.state.lock().unwrap();
+            (st.api_requests.len(), st.mcp_bodies.len())
+        };
+        let holding_api = TicketOp::Comment(link.clone(), format!("see {api_token}"));
+        let error = job(&mut worker, &config, holding_api).err().unwrap();
+        assert!(error.contains("holds a credential") && !error.contains(&api_token), "{error}");
+        let holding_mcp = TicketOp::Search { query: mcp_token.clone(), semantic: false };
+        let error = job(&mut worker, &config, holding_mcp).err().unwrap();
+        assert!(error.contains("holds a credential") && !error.contains(&mcp_token), "{error}");
+
+        let st = fake.state.lock().unwrap();
+        assert_eq!((st.api_requests.len(), st.mcp_bodies.len()), (api_seen, mcp_seen), "neither was sent");
+        for token in &st.mcp_auth {
+            assert_eq!(st.audience.get(token), Some(&fake.mcp_url));
+        }
+        for token in &st.api_auth {
+            assert_eq!(st.audience.get(token), Some(&fake.api_url));
+        }
+        assert!(st.mcp_bodies.iter().all(|body| !body.contains(&api_token)));
+        assert!(st.api_requests.iter().all(|request| !request.contains(&mcp_token)));
+    }
+
+    #[test]
+    fn a_trace_job_masks_every_token_and_reads_only_the_keychain_heads_each_time() {
+        let fake = crate::mcp_client::FakeOAuthServer::start();
+        let config = api_profile(&fake);
+        let (dir, mut worker, _oauth) = signed_in_worker(&config);
+        let link = TicketLink { id: "DEMO-1".into(), ..TicketLink::default() };
+        assert!(job(&mut worker, &config, TicketOp::ReadCard(link.clone())).is_ok());
+        assert!(job(&mut worker, &config, TicketOp::Comment(link, "Hi".into())).is_ok());
+        let tokens: Vec<String> = fake.state.lock().unwrap().access.iter().cloned().collect();
+        assert_eq!(tokens.len(), 2);
+
+        let Ok(TicketOutput::TraceCleaner(cleaner)) = job(&mut worker, &config, TicketOp::TraceCleaner) else {
+            panic!("no cleaner");
+        };
+        for token in &tokens {
+            assert_eq!(cleaner.redacted(token), "***");
+        }
+
+        // Every job after the first compares the three heads and reads nothing else.
+        let argv = dir.path().join("keychain-argv");
+        std::fs::write(&argv, "").unwrap();
+        for _ in 0..3 {
+            worker.prepare(&config);
+            assert!(worker.trace_cleaner(&config).is_ok());
+        }
+        let calls = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(calls.lines().filter(|line| *line == "lookup").count(), 9, "{calls}");
+    }
+
+    #[test]
+    fn an_http_client_does_not_outlive_a_change_of_the_server_that_signed_it_in() {
+        let (one, two) = (crate::mcp_client::FakeOAuthServer::start(), crate::mcp_client::FakeOAuthServer::start());
+        let config = api_profile(&one);
+        let (_dir, mut worker, oauth) = signed_in_worker(&config);
+        let link = TicketLink { id: "DEMO-1".into(), ..TicketLink::default() };
+        assert!(job(&mut worker, &config, TicketOp::ReadCard(link.clone())).is_ok());
+        // The same API behind another MCP server has no sign-in yet: the old token is not reused.
+        let moved = TicketConfig { server: two.server(), ..config.clone() };
+        assert_eq!(oauth.status(&moved.sign_in_server()), crate::mcp_client::SignInStatus::NeedsSignIn);
+        let error = job(&mut worker, &moved, TicketOp::ReadCard(link)).err().unwrap();
+        assert!(crate::mcp_client::is_sign_in_required(&error), "{error}");
     }
 }

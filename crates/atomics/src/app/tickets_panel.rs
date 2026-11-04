@@ -672,7 +672,7 @@ impl State {
         use crate::ticket_signin::SignState;
         let state = match self.tickets.sign.state() {
             Some(state) => state.clone(),
-            None => SignState::of(&self.tickets.sign.oauth(), &config.server),
+            None => SignState::of(&self.tickets.sign.oauth(), &config.sign_in_server()),
         };
         self.tickets.panel.signin || state != SignState::SignedIn
     }
@@ -736,10 +736,10 @@ impl State {
         let result = result.map_err(|error| (crate::mcp_client::is_sign_in_required(&error), self.scrub(&error)));
         let mut restart = false;
         let mut advance = None;
-        let panel = &mut self.tickets.panel;
         if let Err((true, _)) = &result {
-            panel.signin = true;
+            self.ask_sign_in();
         }
+        let panel = &mut self.tickets.panel;
         match job {
             Job::Find | Job::More if panel.find.seq == seq => {
                 let find = &mut panel.find;
@@ -3685,6 +3685,144 @@ mod tests {
                     assert!(open(app, url, None).is_err(), "{url}");
                 }
                 assert!(app.runtime.chief_draft.is_none() && sent_to_chief(app).is_empty());
+            },
+        );
+    }
+
+    /// `read` over the API under the fake's sign-in, through the worker the app starts itself.
+    fn read_over_the_api(
+        app: &mut Desktop<'_>,
+        fake: &crate::mcp_client::FakeOAuthServer,
+    ) -> (crate::test_support::TempDir, crate::mcp_client::OAuth) {
+        let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+        let mut config: TicketConfig = toml::from_str(
+            r#"
+            system = "echo"
+            [operations.read]
+            http = { method = "GET", path = "/items/{id}" }
+            result = { id = "id", key = "key", title = "title", state = "state" }
+            "#,
+        )
+        .unwrap();
+        config.server = fake.server();
+        config.http.url = fake.api_url.clone();
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        app.runtime.tickets.sign.override_oauth(oauth.clone());
+        app.runtime.tickets.sign.headless = true;
+        (dir, oauth)
+    }
+
+    /// The banner's button, then the browser coming back.
+    fn sign_in_from_the_banner(app: &mut Desktop<'_>) {
+        app.runtime.start_sign_in();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+        let url = loop {
+            app.runtime.poll_signin();
+            if let Some(url) = app.runtime.tickets.sign.job.as_ref().and_then(|job| job.progress.url.clone()) {
+                break url;
+            }
+            assert!(Instant::now() < deadline, "no sign-in address");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            url::Url::parse(&url).unwrap().query_pairs().filter(|(key, _)| key == "resource").count(),
+            2,
+            "the banner's sign-in asks for the API too"
+        );
+        crate::mcp_client::oauth_test_browse(&url);
+        while app.runtime.tickets.sign.job.is_some() {
+            app.runtime.poll_signin();
+            assert!(Instant::now() < deadline, "the sign-in did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn read_the_ticket(app: &mut Desktop<'_>) {
+        let link = TicketLink { id: "DEMO-1".into(), key: Some("DEMO-1".into()), ..TicketLink::default() };
+        app.runtime.open_ticket(link, Nav::Fresh);
+        settle(app);
+        app.runtime.poll_signin();
+    }
+
+    #[test]
+    fn after_the_banners_sign_in_a_read_over_the_api_works() {
+        with_app("app::tickets_panel::tests::after_the_banners_sign_in_a_read_over_the_api_works", |app, ctx| {
+            use crate::ticket_signin::SignState;
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (_dir, oauth) = read_over_the_api(app, &fake);
+
+            // A sign-in from before the profile read over the API: the banner asks for one more.
+            oauth.sign_in_via(&fake.server(), Duration::from_secs(10), &crate::mcp_client::oauth_test_open).unwrap();
+            app.runtime.poll_signin();
+            assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::Partial));
+            assert!(app.runtime.tickets.panel.signin);
+            app.runtime.panel = PanelMode::Tickets;
+            app.runtime.diff_open = true;
+            let text = texts(&frame(app, ctx, vec![])).join("\n");
+            assert!(text.contains("echo needs one more sign-in") && text.contains("127.0.0.1"), "{text}");
+            assert!(text.contains("Sign in with the browser") && text.contains("Sign out"), "{text}");
+
+            // Reading first changes nothing: the banner again, and no token asked for.
+            read_the_ticket(app);
+            assert!(app.runtime.tickets.panel.signin);
+            assert!(app.runtime.tickets.panel.read.as_ref().unwrap().error.is_none());
+            assert!(fake.state.lock().unwrap().api_auth.is_empty());
+            assert!(fake.state.lock().unwrap().token_requests.iter().all(|r| r["grant_type"] != "refresh_token"));
+
+            // One sign-in later the same read comes back, with the banner gone.
+            sign_in_from_the_banner(app);
+            assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedIn));
+            assert!(!app.runtime.tickets.panel.signin);
+            read_the_ticket(app);
+            let read = app.runtime.tickets.panel.read.as_ref().unwrap();
+            assert!(read.error.is_none(), "{:?}", read.error);
+            assert_eq!(read.card.link.title.as_deref(), Some("Read over the API"));
+            assert!(!app.runtime.tickets.panel.signin);
+            let text = texts(&frame(app, ctx, vec![])).join("\n");
+            assert!(!text.contains("one more sign-in") && !text.contains("is not signed in"), "{text}");
+        });
+    }
+
+    #[test]
+    fn a_sign_in_the_api_keeps_refusing_is_offered_once_and_then_says_why() {
+        with_app(
+            "app::tickets_panel::tests::a_sign_in_the_api_keeps_refusing_is_offered_once_and_then_says_why",
+            |app, ctx| {
+                use crate::ticket_signin::SignState;
+                let fake = crate::mcp_client::FakeOAuthServer::start();
+                let (_dir, _oauth) = read_over_the_api(app, &fake);
+                app.runtime.poll_signin();
+                assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedOut));
+                sign_in_from_the_banner(app);
+                fake.state.lock().unwrap().refuse_api_tokens = true;
+
+                // Refused: the sign-in is offered once more, for what the refusal might be about.
+                read_the_ticket(app);
+                assert!(app.runtime.tickets.panel.signin, "the first refusal offers a sign-in");
+                assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::Partial));
+                assert!(app.runtime.tickets.panel.read.as_ref().unwrap().error.is_none());
+                sign_in_from_the_banner(app);
+                assert!(!app.runtime.tickets.panel.signin);
+
+                // Refused again: no banner, however often the person reads, and the reason shows.
+                for _ in 0..3 {
+                    read_the_ticket(app);
+                    assert!(!app.runtime.tickets.panel.signin, "a second sign-in was offered");
+                    let error = app.runtime.tickets.panel.read.as_ref().unwrap().error.clone().unwrap();
+                    assert!(error.contains("signing in again did not change that"), "{error}");
+                    assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedIn));
+                }
+                let text = texts(&frame(app, ctx, vec![])).join("\n");
+                assert!(!text.contains("Sign in with the browser"), "{text}");
+                assert_eq!(fake.state.lock().unwrap().reused, 0);
+
+                // The server allows it after all: the same sign-in reads.
+                fake.state.lock().unwrap().refuse_api_tokens = false;
+                read_the_ticket(app);
+                let read = app.runtime.tickets.panel.read.as_ref().unwrap();
+                assert!(read.error.is_none(), "{:?}", read.error);
+                assert_eq!(read.card.link.title.as_deref(), Some("Read over the API"));
             },
         );
     }

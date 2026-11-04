@@ -405,6 +405,11 @@ pub struct McpServer {
     /// keychain, never in the config. Ignored when `token_env` is set.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub oauth: bool,
+    /// Further resources a browser sign-in to `url` asks for (RFC 8707), each with a token of its
+    /// own. Not a config key: `TicketConfig::sign_in_server` fills it from `[tickets.http] url`, so
+    /// one address cannot be named two ways. It is no part of the sign-in's identity.
+    #[serde(skip)]
+    pub resources: Vec<String>,
 }
 
 impl McpServer {
@@ -1806,8 +1811,9 @@ impl TicketConfig {
         })
     }
 
-    /// The resource `http` operations reach: `[tickets.http] url`, with its own OAuth sign-in when
-    /// the MCP server signs in that way. A token belongs to one resource, so the two are never shared.
+    /// The resource `http` operations reach: `[tickets.http] url`. With `oauth` it has no sign-in of
+    /// its own: its token comes from `server`'s, which `sign_in_server` asks for this resource too.
+    /// A token belongs to one resource, so the two tokens are never shared.
     pub fn http_server(&self) -> Option<McpServer> {
         let url = self.http.url.trim();
         (!url.is_empty()).then(|| McpServer {
@@ -1815,6 +1821,18 @@ impl TicketConfig {
             oauth: self.server.uses_oauth(),
             ..McpServer::default()
         })
+    }
+
+    /// `server` as a browser sign-in sees it: the API of any `http` operation is one of its resources,
+    /// so one sign-in covers both. Everything that signs in, or asks whether that is done, uses this.
+    pub fn sign_in_server(&self) -> McpServer {
+        let mut server = self.server.clone();
+        let api = self.http.url.trim();
+        let mapped = HTTP_OPERATIONS.iter().any(|name| self.operation(name).is_some_and(|op| op.http.is_some()));
+        if server.uses_oauth() && !api.is_empty() && mapped {
+            server.resources.push(api.to_string());
+        }
+        server
     }
 
     pub fn operation(&self, name: &str) -> Option<&Operation> {
@@ -4125,6 +4143,23 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
             McpServer { url: Some("https://a.example/v1".into()), ..McpServer::default() }
         );
         assert_eq!(TicketConfig::default().http_server(), None);
+
+        // One sign-in covers the API, and only a sign-in with something to read over it.
+        assert!(config.sign_in_server().resources.is_empty(), "no OAuth, no resources");
+        let mut signing = config.clone();
+        signing.server = McpServer { url: Some("https://a.example/mcp".into()), oauth: true, ..McpServer::default() };
+        let server = signing.sign_in_server();
+        assert_eq!(server.resources, ["https://a.example/v1"]);
+        assert_eq!(server.url, signing.server.url);
+        assert!(signing.http_server().unwrap().uses_oauth());
+        signing.operations.read = None;
+        assert!(signing.sign_in_server().resources.is_empty(), "no operation uses the API");
+
+        // The list is derived: a config can neither set it nor find it written.
+        let listed: McpServer =
+            toml::from_str("url = 'https://a.example/mcp'\nresources = ['https://b.example']").unwrap();
+        assert!(listed.resources.is_empty());
+        assert!(!toml::to_string(&server).unwrap().contains("resources"));
 
         // A config round-trips through its serialized form, and an unset [http] stays out of it.
         let again: TicketConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();

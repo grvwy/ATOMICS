@@ -63,9 +63,16 @@ fn url_of(server: &McpServer) -> String {
 }
 
 impl State {
-    /// The configured server when it signs in with OAuth.
+    /// The configured server when it signs in with OAuth, with what its sign-in also asks for.
     pub(super) fn sign_server(&self) -> Option<McpServer> {
-        self.tickets.config.as_ref().map(|c| c.server.clone()).filter(McpServer::uses_oauth)
+        self.tickets.config.as_ref().map(|config| config.sign_in_server()).filter(McpServer::uses_oauth)
+    }
+
+    /// A job said a sign-in is required: the banner shows, and the state is read again, since a
+    /// sign-in can stop covering a resource and still be there.
+    pub(super) fn ask_sign_in(&mut self) {
+        self.tickets.panel.signin = true;
+        self.tickets.sign.state = None;
     }
 
     /// Reads the sign-in state once per server, and collects a finished sign-in or sign-out. Called
@@ -114,7 +121,7 @@ impl State {
         let checking = self.tickets.sign.job.is_none() && self.tickets.sign.out.is_none();
         if checking && self.tickets.sign.state.as_ref().is_none_or(|(url, _)| *url != url_of(&server)) {
             let state = SignState::of(&self.tickets.sign.oauth(), &server);
-            if state == SignState::SignedOut {
+            if matches!(state, SignState::SignedOut | SignState::Partial) {
                 self.tickets.panel.signin = true;
             }
             self.tickets.sign.state = Some((url_of(&server), state));
@@ -207,8 +214,15 @@ impl Desktop<'_> {
             self.signing_in(ui, p);
             return;
         }
-        ui.label(RichText::new(format!("{} is not signed in", config.system)).strong().color(p.warning));
-        ui.label(format!("Sign in to {} to search, read and plan from its tickets.", config.system));
+        let partial = self.runtime.tickets.sign.state() == Some(&SignState::Partial);
+        if partial {
+            let hosts = ticket_signin::resource_hosts(&config.sign_in_server());
+            ui.label(RichText::new(format!("{} needs one more sign-in", config.system)).strong().color(p.warning));
+            ui.label(format!("This sign-in does not cover {hosts}, which {} reads tickets from.", config.system));
+        } else {
+            ui.label(RichText::new(format!("{} is not signed in", config.system)).strong().color(p.warning));
+            ui.label(format!("Sign in to {} to search, read and plan from its tickets.", config.system));
+        }
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Sign in with the browser").clicked() {
@@ -228,8 +242,13 @@ impl Desktop<'_> {
         }
         ui.add_space(6.0);
         ui.label(RichText::new(format!("system: {}  ·  {host}", config.system)).size(11.5).color(p.muted));
-        if self.runtime.tickets.sign.state() == Some(&SignState::SignedIn) && ui.small_button("Try again").clicked() {
+        let signed_in = partial || self.runtime.tickets.sign.state() == Some(&SignState::SignedIn);
+        if signed_in && ui.small_button("Try again").clicked() {
             self.runtime.tickets.panel.signin = false;
+        }
+        // The chip is for a sign-in that covers everything; this one still holds tokens to forget.
+        if partial && ui.small_button("Sign out").clicked() {
+            self.runtime.start_sign_out();
         }
     }
 

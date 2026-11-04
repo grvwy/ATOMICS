@@ -244,7 +244,8 @@ follows the standards:
    never spend one rotating refresh token twice. Once it has the lock, a process reads the keychain again and uses
    the new access token if another process has already refreshed. Saving a sign-in and signing out take the same lock.
 5. **Storage.** Tokens and the `client_id` are OS-keychain items only (service `atomics-mcp-oauth-v1`, one item per
-   server or authorization server), never in the config, a file, the log or an error. They are separate from the
+   server or authorization server, plus one access token per [further resource](#one-sign-in-a-token-per-resource),
+   `access-<key>-<16 hex digits of the resource's digest>`), never in the config, a file, the log or an error. They are separate from the
    credential catalog because macOS's `security` takes 4 KiB per write: a few signed-in servers would crowd out the
    catalog, and every refresh would rewrite it. A value over 1 KiB of JSON (a JWT access token can pass 2 KiB) is
    split into numbered chunk items `<slot>-a0…` or `<slot>-b0…`, up to 16 KiB of JSON per slot. The slot's own
@@ -253,6 +254,34 @@ follows the standards:
    reader sees either the old value or the new one, never a mix; a mix fails the digest and is read again. Leftover
    chunks are deleted on every write and on sign-out. Values reach `security` and `secret-tool` on standard
    input, never on a command line.
+
+#### One sign-in, a token per resource
+
+With `oauth = true`, `[tickets.http] url` and an operation mapped with `http`, the same sign-in covers that API. There is
+nothing else to set: the address is named once, and it is the API's resource identifier, exactly as the API's metadata
+declares it. An operation's `path` goes below it.
+
+1. **Before the browser opens,** the API's protected-resource metadata is read with a `GET` (RFC 9728). Its `resource`
+   must be that address and its `authorization_servers` must hold the issuer in use. Otherwise the sign-in stops there
+   and says why, and a sign-in already saved stays as it was.
+2. **The authorization request** has one `resource` parameter per resource and no `scope`, since a server may require a
+   scope for every resource named. A sign-in with one resource still sends the scope the server's `401` asked for.
+3. **The code** is exchanged for the server's own token, because a code works once. The API's token comes from the saved
+   refresh token, at the saved token endpoint, the first time a read needs it. Each token names one audience.
+4. **One refresh token.** Every resource's refresh spends and replaces the same refresh token, in one keychain item,
+   under the lock above. A server may end the whole sign-in when a rotated token is used twice, so nothing spends it
+   outside that lock, and the new one is stored before anything else.
+5. **Only what the person consented to.** The sign-in records the resources it asked for. A resource outside that record
+   gets no token and nothing is sent: a sign-in made before the profile named the API, for one, answers
+   `sign-in required`, and the banner says "needs one more sign-in". A saved sign-in is never widened without the browser.
+6. **A refused resource leaves the sign-in in place.** When the token endpoint refuses the API, or the API answers `401`
+   to a token just refreshed, the server's own sign-in stays and keeps working. The first refusal offers one more
+   sign-in. A refusal after that sign-in is an ordinary error that says signing in again did not change it, and the
+   banner stays down: no sign-in can fix a resource the server will not grant. The first answer the API accepts ends
+   this, and so does signing out.
+
+Everything else follows the sign-in: each token is masked in anything ATOMICS shows or saves, a request holding the
+other resource's token is not sent, and signing out revokes and forgets them all.
 
 **The ticket worker never opens a browser:** a job against a server that is not signed in fails with
 `sign-in required: <url> needs a sign-in`, and the UI offers the sign-in. A server with `oauth` unset that answers
@@ -275,8 +304,8 @@ the Tickets entry says the same.
    paste that address (or just its query) and press **Use it**. ATOMICS checks `state` (and the issuer) before it
    exchanges the code. A wrong address is refused with a short reason and the sign-in keeps waiting. No port
    forwarding is needed. On a machine with a browser the same box appears under **No browser here?**.
-3. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh and
-   access tokens (RFC 7009) when its metadata has a `revocation_endpoint`, then deletes the saved sign-in and drops
+3. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh
+   token and every resource's access token (RFC 7009) when its metadata has a `revocation_endpoint`, then deletes the saved sign-in and drops
    the worker's connection. A revocation that fails is shown; the local sign-out always completes.
 4. **Expiry.** The access token is refreshed 60 seconds before it expires and once after a `401`; the refresh token is
    stored again whenever the server rotates it. When the server refuses the saved sign-in (`invalid_grant`) or gave no
@@ -292,7 +321,8 @@ atomics tickets logout   # revoke where the server allows it, then forget the si
 
 Both read `[tickets.server]` of the config (add `--workspace NAME` for a workspace's). `atomics doctor` lists
 `✓ credential MCP sign-in (<host>): present; OS keychain → ATOMICS → that server only (values hidden)`, or says it is
-absent. No command, line of output, error, log or plan file ever holds a token, a client id or an endpoint.
+absent. With an API it names the API's host too, and says when the sign-in does not cover it yet or the API refuses it.
+No command, line of output, error, log or plan file ever holds a token, a client id or an endpoint.
 
 #### One sign-in or two
 
@@ -525,13 +555,12 @@ What a request can do is fixed, whatever a config or a server says:
 - **A token stays with its resource.** It goes only in the `Authorization` header, only to its own origin. `token_env`
   goes only when `[tickets.http] url` has the origin of `server.url`; otherwise requests carry no token. A request that
   holds a token ATOMICS is using, in its address or body, is not sent. There are no configurable request headers.
-  With `server.oauth = true` the API has a sign-in of its own, because a token belongs to one resource: an MCP token is
-  never sent to a REST API. The sign-in does not ask for that resource yet, so until it does such a read answers
-  "sign-in required".
+  With `server.oauth = true` the API's token comes from the server's [one sign-in](#one-sign-in-a-token-per-resource)
+  and names the API alone: an MCP token is never sent to a REST API, nor the API's to the MCP server.
 - **Bounded answers.** The answer must be JSON, at most 8 MiB. Of a refusal, 300 characters show, cleaned of credentials.
 
-A 401 with a sign-in refreshes once and tries again; a second 401 asks for a sign-in. With a `token_env` token it says to
-check the token. Only a lost connection, a timeout, a 429 or a 5xx backs off, and the API's backoff is separate from the
+A 401 with a sign-in refreshes once and tries again; a second 401 [offers one more sign-in, once](#one-sign-in-a-token-per-resource).
+With a `token_env` token it says to check the token. Only a lost connection, a timeout, a 429 or a 5xx backs off, and the API's backoff is separate from the
 MCP server's. A 404 is one missing ticket.
 
 ### Display result paths
@@ -1606,7 +1635,7 @@ disabled.
 | Credential | Kept | Used by |
 | --- | --- | --- |
 | A stdio server's own sign-in, such as the Linear bridge's | Wherever that server keeps it, on this machine | The server ATOMICS starts |
-| Native OAuth access/refresh tokens and client registration | OS keychain on this machine | ATOMICS's MCP client, for the configured resource only |
+| Native OAuth access/refresh tokens and client registration | OS keychain on this machine | ATOMICS's ticket clients, each access token for its own resource only |
 | A `token_env` bearer token | An environment variable of ATOMICS or your login shell | ATOMICS's MCP client, sent only to `url` |
 | sbx's Linear authorization | sbx, on this machine | sbx's MCP gateway, for sandboxes with `mcp = ["linear"]` |
 | A Linear API key stored with `atomics setup --credential linear` | The OS keychain | The credential relay, for sessions granted it |
