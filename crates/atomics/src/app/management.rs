@@ -90,6 +90,7 @@ impl State {
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
             }),
             remote,
+            themes: self.themes.clone(),
         }
     }
 
@@ -136,6 +137,7 @@ impl State {
                     )
                     .map_err(rejected);
             }
+            HostAction::SelectTheme { name, host } => self.select_theme(&name, host).map_err(rejected)?,
             HostAction::ConfigDecide { id, apply, note } => {
                 if !self.proposals.iter().any(|p| p.id == id) {
                     return Err(WireError::new(ErrorCode::NotFound, "proposal is no longer pending"));
@@ -248,6 +250,11 @@ impl State {
                     let _ = actions.send(Box::new(move |state| state.toast(message)));
                 });
             }
+            SettingsTool::SetAzure { enabled } => {
+                // The reload takes back what the relay granted when the setting goes off.
+                write_azure_enabled(&self.config_path, enabled).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+                self.reload_config();
+            }
             tool => {
                 if self.credential_busy {
                     return Err(WireError::new(ErrorCode::Conflict, "A credential operation is already running"));
@@ -267,13 +274,41 @@ impl State {
                     let result = credential_tool(&relay, tool);
                     let _ = actions.send(Box::new(move |state| {
                         state.credential_busy = false;
-                        state.credential_status = result.unwrap_or_else(|error| json!({ "lines": [error] }));
+                        match result {
+                            Ok(status) => state.credential_status = status,
+                            // What was read last stays beside why this failed.
+                            Err(error) => {
+                                if !state.credential_status.is_object() {
+                                    state.credential_status = json!({});
+                                }
+                                state.credential_status["error"] = json!(error);
+                            }
+                        }
                     }));
                 });
             }
         }
         Ok(json!({ "accepted": true }))
     }
+}
+
+/// Sets `[isolation.sandbox.azure] enabled` in `file` as an applied config change is written: comments kept, a
+/// backup, an atomic replace.
+pub(super) fn write_azure_enabled(file: &Path, enabled: bool) -> Result<(), String> {
+    let before = match std::fs::read_to_string(file) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("Cannot read user config; fix it before changing Azure access".into()),
+    };
+    let after = atomics_core::selfconfig::edit(
+        before.as_deref().unwrap_or(""),
+        &format!("[isolation.sandbox.azure]\nenabled = {enabled}"),
+        &[],
+    )
+    .map_err(|_| "Cannot edit invalid user config; fix it in Edit config first".to_string())?;
+    atomics_core::selfconfig::write(file, before.as_deref(), &after, atomics_core::store::now())
+        .map_err(|_| "Could not save Azure setting; reload config and retry".to_string())?;
+    Ok(())
 }
 
 fn credential_tool(
@@ -290,9 +325,7 @@ fn credential_tool(
             } else {
                 crate::credentials::KINDS.iter().find(|(id, _, _)| *id == kind).unwrap().1.into()
             };
-            relay
-                .edit(&label, |store| store.put(&kind, &value, host.as_deref()))
-                .map_err(|_| "Could not store credential".to_string())?;
+            relay.edit(&label, |store| store.put(&kind, &value, host.as_deref())).map_err(|error| error.to_string())?;
         }
         SettingsTool::RemoveCredential { kind, host } => {
             let key = match kind.as_str() {
@@ -307,29 +340,38 @@ fn credential_tool(
             } else {
                 crate::credentials::KINDS.iter().find(|(id, _, _)| *id == kind).unwrap().1.into()
             };
-            relay.edit(&label, |store| store.remove(&key)).map_err(|_| "Could not remove credential".to_string())?;
+            relay.edit(&label, |store| store.remove(&key)).map_err(|error| error.to_string())?;
         }
-        SettingsTool::CleanCredentials => {
-            store.remove_invalid().map_err(|_| "Could not clean credentials".to_string())?
-        }
+        SettingsTool::CleanCredentials => store.remove_invalid().map_err(|error| error.to_string())?,
         _ => unreachable!("credential tool"),
     }
-    let snapshot = store.snapshot().map_err(|_| "Cannot read OS credential store".to_string())?;
-    let mut lines = snapshot.lines();
-    for entry in &snapshot.entries {
-        let (last, sessions) = relay.usage(&entry.label);
-        lines.push(format!(
-            "{} — last used: {}; sessions: {}",
-            entry.label,
-            last.map(|s| crate::relay::utc(std::time::UNIX_EPOCH + Duration::from_secs(s)))
-                .unwrap_or_else(|| "never".into()),
-            if sessions.is_empty() { "none".into() } else { sessions.join(", ") }
-        ));
-    }
+    let snapshot = store.snapshot().map_err(|error| error.to_string())?;
+    let entries: Vec<_> = snapshot
+        .entries
+        .iter()
+        .map(|entry| {
+            let (last, sessions) = relay.usage(&entry.label);
+            let (kind, host) = entry.editable().unzip();
+            json!({
+                "label": entry.label,
+                "present": entry.present,
+                "route": entry.route,
+                "kind": kind,
+                "host": host.flatten(),
+                "last_used": last.map(|s| crate::relay::utc(std::time::UNIX_EPOCH + Duration::from_secs(s))),
+                "sessions": sessions,
+            })
+        })
+        .collect();
     let status = crate::relay::azure::status(if cfg!(test) { None } else { crate::setup::find_program("az") });
-    Ok(
-        json!({ "lines": lines, "invalid": snapshot.invalid, "azure": format!("az found: {}; logged in: {}", status.found, status.logged_in) }),
-    )
+    let (_, sessions) = relay.usage("Azure CLI");
+    let azure = format!(
+        "az found: {}; logged in: {}; sessions: {}",
+        status.found,
+        status.logged_in,
+        if sessions.is_empty() { "none".into() } else { sessions.join(", ") }
+    );
+    Ok(json!({ "entries": entries, "invalid": snapshot.invalid, "azure": azure }))
 }
 
 #[cfg(test)]
@@ -386,6 +428,84 @@ mod tests {
             assert!(state.diff_open);
             assert_eq!(state.toast.as_ref().unwrap().0, format!("Opened {}", paths::display(&other)));
         });
+    }
+
+    #[test]
+    fn the_azure_switch_goes_at_once_with_no_proposal_and_keeps_the_rest_of_the_file() {
+        use atomics_core::ops::SettingsTool;
+        with_state(
+            "app::management::tests::the_azure_switch_goes_at_once_with_no_proposal_and_keeps_the_rest_of_the_file",
+            |mut state, _| {
+                std::fs::write(&state.config_path, "# keep my config\n[voice]\napi_key = 'PRIVATE-value'\n").unwrap();
+                state.reload_config();
+                for enabled in [true, false] {
+                    state.manage(HostAction::SettingsTool { tool: SettingsTool::SetAzure { enabled } }).unwrap();
+                    assert_eq!(state.effective_isolation().sandbox.azure.enabled, enabled);
+                    assert!(state.proposals.is_empty(), "the user's own switch is not proposed");
+                    let values = state.management_info().config;
+                    assert_eq!(values["values"]["isolation.sandbox.azure.enabled"]["value"], enabled);
+                }
+                let written = std::fs::read_to_string(&state.config_path).unwrap();
+                assert!(written.starts_with("# keep my config") && written.contains("PRIVATE-value"), "{written}");
+            },
+        );
+    }
+
+    #[test]
+    fn credential_status_names_each_entry_and_never_a_value_and_a_failure_says_why() {
+        use atomics_core::ops::SettingsTool;
+        let (dir, keychain, _store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+        let relay = crate::relay::Service::transient(dir.path().join("state"), keychain);
+        let registry = |status: &serde_json::Value| {
+            status["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["label"] == "Private registry (registry.example.com)")
+                .cloned()
+        };
+        let put = SettingsTool::PutCredential {
+            kind: "registry".into(),
+            value: "PRIVATE-typed-value".into(),
+            host: Some("registry.example.com".into()),
+        };
+        let status = credential_tool(&relay, put).unwrap();
+        assert!(!status.to_string().contains("PRIVATE-typed-value"), "{status}");
+        let entry = registry(&status).expect("the entry is listed");
+        assert_eq!(entry["present"], true);
+        assert_eq!(entry["kind"], "registry");
+        assert_eq!(entry["host"], "registry.example.com");
+        assert_eq!(entry["last_used"], serde_json::Value::Null);
+        let claude = status["entries"].as_array().unwrap().iter().find(|e| e["label"] == "Claude subscription");
+        assert_eq!(claude.unwrap()["present"], false);
+        assert_eq!(claude.unwrap()["kind"], "claude");
+
+        let bad = SettingsTool::PutCredential {
+            kind: "registry".into(),
+            value: "PRIVATE-second-value".into(),
+            host: Some("not a host".into()),
+        };
+        let refused = credential_tool(&relay, bad).unwrap_err();
+        assert!(refused.contains("value hidden") && !refused.contains("PRIVATE"), "says why: {refused}");
+
+        let remove =
+            SettingsTool::RemoveCredential { kind: "registry".into(), host: Some("registry.example.com".into()) };
+        assert!(registry(&credential_tool(&relay, remove).unwrap()).is_none());
+    }
+
+    #[test]
+    fn a_failed_credential_read_keeps_what_was_read_last_beside_why() {
+        use atomics_core::ops::SettingsTool;
+        with_state(
+            "app::management::tests::a_failed_credential_read_keeps_what_was_read_last_beside_why",
+            |mut state, _| {
+                let refused = state.manage(HostAction::SettingsTool {
+                    tool: SettingsTool::PutCredential { kind: "nope".into(), value: "x".into(), host: None },
+                });
+                assert_eq!(refused.unwrap_err().code, ErrorCode::Malformed, "an unknown kind goes nowhere");
+                assert!(!state.credential_busy);
+            },
+        );
     }
 
     #[test]
@@ -462,7 +582,8 @@ mod tests {
             .unwrap();
             assert_eq!(store.token("claude").unwrap().as_deref(), Some(value));
             assert!(!status.to_string().contains(value));
-            assert!(status.to_string().contains("Claude subscription: present"));
+            let entries = status["entries"].as_array().unwrap();
+            assert!(entries.iter().any(|entry| entry["label"] == "Claude subscription" && entry["present"] == true));
             credential_tool(&relay, SettingsTool::RemoveCredential { kind: "claude".into(), host: None }).unwrap();
             assert!(store.token("claude").unwrap().is_none());
         }

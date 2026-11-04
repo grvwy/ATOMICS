@@ -181,7 +181,7 @@ Agents can query Application Insights and Azure Resource Manager through your ho
 an Azure credential in the VM. It is off until you turn it on:
 
 1. Install the Azure CLI (2.54 or newer) and run `az login` on the host.
-2. Turn on **Enable Azure CLI relay** in Settings → Credentials, or set `[isolation.sandbox.azure]
+2. Turn on **Enable Azure CLI access** in Settings → Credentials, or set `[isolation.sandbox.azure]
    enabled = true` in `config.toml` or this machine's `config.d/<host>.toml`.
 3. `atomics doctor` should say `✓ Azure CLI relay: enabled, az found, logged in`.
 4. Run the read-only check with an Application Insights application ID you choose:

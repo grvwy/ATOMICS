@@ -83,6 +83,20 @@ pub struct Snapshot {
     pub invalid: usize,
 }
 
+impl Status {
+    /// The kind and host Settings adds or removes this entry as; `None` for an entry something else owns, such as
+    /// an MCP server's environment.
+    pub fn editable(&self) -> Option<(&str, Option<&str>)> {
+        if let Some(host) = self.id.strip_prefix("registry:") {
+            return Some(("registry", Some(host)));
+        }
+        if let Some(host) = self.id.strip_prefix("github-app:") {
+            return Some((GITHUB_APP, Some(host)));
+        }
+        KINDS.iter().find(|kind| kind.0 == self.id).map(|kind| (kind.0, None))
+    }
+}
+
 impl Snapshot {
     pub fn lines(&self) -> Vec<String> {
         let mut lines: Vec<_> = self

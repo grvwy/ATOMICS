@@ -82,14 +82,14 @@ After its secret steps, setup reads sbx's listing again through doctor's own cre
 stops at the first failed check, except for an explicitly declined OpenAI credential, which remains
 visible as missing. It then verifies
 every sandbox check and finishes by running `atomics doctor`. Doctor and
-Settings → Sandbox show the same readiness checks. Doctor also includes independent host/workspace diagnostics
+Settings → Agents show the same readiness checks. Doctor also includes independent host/workspace diagnostics
 (running ATOMICS, optional editors, hook trust and repository cleanup); setup does not claim to
 have resolved those warnings. Start a new sandbox after changing credentials.
 
 ## Check sandbox setup
 
-`atomics doctor` (when sandbox mode is configured) and **Settings → Sandbox** share the same
-read-only checks. Settings checks run in the background; use **Refresh sandbox checks** after
+`atomics doctor` (when sandbox mode is configured) and **Settings → Agents** share the same
+read-only checks. Settings runs them in the background as the section opens; use **Check again** after
 changing sbx. They check the installed minimum version and Docker sign-in, global network policy,
 model credential names, registered MCP servers and their authorization, and SSH forwarding.
 An unrelated failed `sbx diagnose` check, such as SSH client configuration, does not hide a
@@ -188,7 +188,7 @@ stuck request cannot hold up the app.
 
 **Without a stored subscription**, sandboxed Claude uses sbx's own `anthropic` secret, which must be an
 Anthropic API key (`sk-ant-api…`) that sbx's proxy sends as `x-api-key`. Setup stores one when you paste
-an API key instead of a setup token. Doctor and Settings → Sandbox say which route Claude takes. To run
+an API key instead of a setup token. Doctor and Settings → Agents say which route Claude takes. To run
 Claude agents on this machine instead, set the claude agent's `isolation = "bare"`. A config written while
 Claude ran bare by default may still have that line; remove it to sandbox Claude again. Codex sandboxes use
 sbx's `openai` secret, OAuth or API key; use sbx's interactive `sbx secret set openai` to change it.
@@ -441,8 +441,8 @@ Redirects are never followed. Each request uses the existing per-agent `relay.lo
 path and status, with no bearer, query string or body.
 
 Azure is off by default: no Azure placeholder or `ATOMICS_AZURE_*` environment is granted until
-explicitly enabled. Settings → Credentials has an **Enable Azure CLI relay** switch that writes
-`[isolation.sandbox.azure] enabled` in the user config. It shows whether `az` is found, whether it is
+explicitly enabled. Settings → Credentials has an **Enable Azure CLI access** switch that writes
+`[isolation.sandbox.azure] enabled` in the user config at once, with no proposal. It shows whether `az` is found, whether it is
 logged in, and which sessions hold Azure grants, without account identifiers or token values.
 Disabling the switch revokes current Azure placeholders. Doctor and setup report Azure as off
 until enabled. Host/workspace overrides can take precedence over the user config.
@@ -975,11 +975,13 @@ its encryption and access control. Oversized catalogs are rejected before writin
 catalog exists and migrates it on the first edit, then deletes the legacy entry.
 
 Settings → Credentials adds, replaces and removes entries, shows presence, last relay use and the
-sessions with active placeholders, and never reads stored values into an edit field. New input is
-masked. Refresh updates this status. Replacing/removing an entry revokes its active placeholders;
-restart those sessions to obtain new placeholders. Unknown or misfiled entries are counted with
-names and values hidden, and can be removed together. An unreadable catalog is reported without
-quoting it and is never silently overwritten. Keychain operations run off the UI thread.
+sessions with active placeholders, and never reads stored values into an edit field. The section reads
+this status as it opens; Refresh reads it again. New input is masked, and a value typed and never saved
+goes when Settings closes. Replacing or removing an entry cannot be undone, so it asks first, and it
+revokes the entry's active placeholders; restart those sessions to obtain new placeholders. Unknown or
+misfiled entries are counted with names and values hidden, and can be removed together, after asking.
+An unreadable catalog is reported without quoting it and is never silently overwritten. Keychain
+operations run off the UI thread.
 
 | Credential | Relay destination | Allowed requests |
 | --- | --- | --- |

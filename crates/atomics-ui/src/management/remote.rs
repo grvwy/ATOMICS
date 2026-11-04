@@ -4,7 +4,7 @@ use egui::{Color32, Rect, Vec2};
 
 pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
     let remote = &info.remote;
-    ui.label(&remote.status);
+    ui.add(egui::Label::new(RichText::new(&remote.status).color(client.palette.muted)).wrap());
     for problem in &remote.problems {
         ui.colored_label(client.palette.warning, problem);
     }
@@ -59,7 +59,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         }
     });
     ui.separator();
-    ui.heading("Paired devices");
+    ui.label(RichText::new("Paired devices").strong());
     if remote.devices.is_empty() {
         ui.label("No device is paired with this host.");
     }
@@ -72,7 +72,11 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         ));
         ui.add_enabled_ui(enabled, |ui| {
             if client.management.revoke.as_deref() == Some(&device.id) {
-                ui.horizontal(|ui| {
+                ui.colored_label(
+                    client.palette.warning,
+                    format!("Revoke {}? It must pair again to reach this host.", device.name),
+                );
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Revoke").clicked() {
                         client.send(Command::Manage(HostAction::RevokeDevice { id: device.id.clone() }));
                         client.management.revoke = None;

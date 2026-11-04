@@ -1914,6 +1914,101 @@ fn headless_shots() {
     }
 }
 
+/// Settings and the ticket reader, each section open, at the wide window's size and on a phone's, through the same
+/// rasterizer. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
+#[test]
+#[ignore]
+fn headless_settings_shots() {
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+
+    /// A client over a fake host with a rasterizer that has seen every frame, and so the fonts.
+    struct Shots {
+        ctx: egui::Context,
+        world: World,
+        client: Client,
+        view: View,
+        raster: crate::test_raster::Raster,
+        size: (f32, f32),
+    }
+    impl Shots {
+        fn new((ctx, world, client, view): (egui::Context, World, Client, View), size: (f32, f32)) -> Self {
+            Self { ctx, world, client, view, raster: Default::default(), size }
+        }
+        fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(self.size.0, self.size.1))),
+                time: Some(self.view.now_ms / 1000.0),
+                events,
+                ..egui::RawInput::default()
+            };
+            let Self { ctx, world, client, view, raster, .. } = self;
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, client, view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            output
+        }
+        fn settle(&mut self) -> egui::FullOutput {
+            for _ in 0..12 {
+                self.frame(Vec::new());
+            }
+            self.frame(Vec::new())
+        }
+        /// Opens or closes a section of the Settings window.
+        fn toggle(&mut self, label: &str) {
+            let output = self.settle();
+            let shown: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                    _ => None,
+                })
+                .collect();
+            self.frame(click(row(&shown, label).center()));
+        }
+        fn save(&mut self, file: PathBuf) {
+            let output = self.settle();
+            let ppp = output.pixels_per_point;
+            let size = [(self.size.0 * ppp).round() as usize, (self.size.1 * ppp).round() as usize];
+            let image = self.raster.paint(&self.ctx, output, size, self.client.palette.background);
+            crate::test_raster::save_png(&file, &image).unwrap();
+            println!("saved {}", file.display());
+        }
+    }
+
+    for (name, size) in [("wide-1600", WIDE), ("phone-390", PHONE), ("phone-320", (320.0, 640.0))] {
+        let out = |part: &str| dir.join(format!("settings-{name}-{part}.png"));
+        let mut shots = Shots::new(live_with(fake_host::management()), size);
+        shots.client.management.settings = true;
+        shots.save(out("opened"));
+        shots.toggle("Theme");
+        for (part, label) in [
+            ("shortcuts", "Shortcuts"),
+            ("agents", "Agents"),
+            ("connections", "Connections"),
+            ("remote", "Remote devices"),
+            ("credentials", "Credentials"),
+            ("advanced", "Advanced"),
+        ] {
+            shots.toggle(label);
+            shots.save(out(part));
+            shots.toggle(label);
+        }
+
+        let mut shots = Shots::new(viewing(fake_host::management()), size);
+        shots.client.management.settings = true;
+        shots.save(out("view-only"));
+
+        let mut shots = Shots::new(live_with(fake_host::ticket_reader()), size);
+        shots.settle();
+        shots.client.send(Command::OpenTicket(fake_host::ticket_card("ENG-123").link));
+        shots.save(dir.join(format!("reader-{name}.png")));
+    }
+}
+
 /// The address a browser ends on after signing in, with a code nothing but the frame to the host may hold.
 const ENDED_ON: &str = "http://127.0.0.1:53682/callback?code=c0de&state=s1";
 
@@ -2223,8 +2318,12 @@ fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
         client.management.settings = true;
-        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         assert!(has(&shown, "Effective configuration") && has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
+        section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
+        section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         client.management.settings = false;
         client.management.remote = true;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
@@ -2264,9 +2363,20 @@ fn view_only_clients_read_settings_and_devices_but_cannot_change_them() {
         let (ctx, mut world, mut client, mut view) = viewing(fake_host::management());
         client.management.settings = true;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "midnight")));
+        assert!(has(&shown, "View only: settings changes"), "{size:?}: {shown:?}");
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
+        assert!(has(&shown, "Effective configuration"), "{size:?}: {shown:?}");
+        section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
+        for opened in ["Agents", "Connections", "Credentials"] {
+            let shown = section(&ctx, &mut world, &mut client, &mut view, size, opened);
+            assert!(!shown.is_empty());
+            section(&ctx, &mut world, &mut client, &mut view, size, opened);
+        }
         assert!(
-            has(&shown, "Effective configuration") && has(&shown, "View only: settings changes"),
-            "{size:?}: {shown:?}"
+            world.sent().iter().all(|m| !matches!(m, Message::HostCommand(_))),
+            "a viewer picks no theme and asks the host for nothing: {:?}",
+            world.sent()
         );
         client.management.settings = false;
         client.management.remote = true;
@@ -2278,6 +2388,321 @@ fn view_only_clients_read_settings_and_devices_but_cannot_change_them() {
             "a disabled action must send nothing"
         );
         assert!(!world.driver.remote.available(&Command::PickProject));
+    }
+}
+
+/// The rectangle of the Settings section whose row starts with `label`. The rows come after the window's title: a
+/// phone's Agents tab has the same name as its section, drawn behind it.
+fn row(shown: &[(String, Rect)], label: &str) -> Rect {
+    let title = shown.iter().rposition(|(text, _)| text == "Settings").expect("the window's title is drawn");
+    let found = shown[title..].iter().find(|(text, _)| text.starts_with(label));
+    found.unwrap_or_else(|| panic!("{label} is not drawn: {shown:?}")).1
+}
+
+/// Opens or closes the section of the Settings window whose row starts with `label`; the text once it has moved.
+fn section(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+    label: &str,
+) -> Vec<(String, Rect)> {
+    let shown = settled(ctx, world, client, view, size);
+    drawn(ctx, world, client, view, size, click(row(&shown, label).center()));
+    for _ in 0..8 {
+        drawn(ctx, world, client, view, size, Vec::new());
+    }
+    drawn(ctx, world, client, view, size, Vec::new())
+}
+
+/// The settings tools sent so far.
+fn tools_sent(world: &World) -> Vec<atomics_core::ops::SettingsTool> {
+    world
+        .host
+        .host_commands
+        .iter()
+        .filter_map(|action| match action {
+            HostAction::SettingsTool { tool } => Some(tool.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_it_opens() {
+    use atomics_core::ops::SettingsTool;
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let mut last = 0.0;
+        for label in ["Theme", "Shortcuts", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"] {
+            let top = row(&shown, label).top();
+            assert!(top > last, "{label} comes in order on {size:?}: {shown:?}");
+            last = top;
+        }
+        assert!(has(&shown, "midnight") && has(&shown, "yours"), "the swatches: {shown:?}");
+        assert!(has(&shown, "Only this host (config.d/host.toml)"), "a remote client's words: {shown:?}");
+        assert!(!has(&shown, "Effective configuration"), "under Advanced: {shown:?}");
+        assert!(tools_sent(&world).is_empty(), "nothing is read before it is opened");
+
+        for (label, expected, content) in [
+            ("Agents", Some(SettingsTool::CheckSandbox), "Docker Sandboxes"),
+            ("Connections", Some(SettingsTool::RefreshConnections), "linear"),
+            ("Credentials", Some(SettingsTool::RefreshCredentials), "Claude subscription"),
+            ("Remote devices", None, "Paired devices"),
+            ("Advanced", None, "Effective configuration"),
+        ] {
+            let before = tools_sent(&world).len();
+            let shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
+            assert!(has(&shown, content), "{label} shows {content} on {size:?}: {shown:?}");
+            settled(&ctx, &mut world, &mut client, &mut view, size);
+            let sent = tools_sent(&world);
+            assert_eq!(&sent[before..], expected.as_slice(), "{label} reads once, by itself, on {size:?}");
+            section(&ctx, &mut world, &mut client, &mut view, size, label);
+        }
+
+        // Closing Settings forgets what it read; opening it reads again.
+        drawn(&ctx, &mut world, &mut client, &mut view, size, press(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(!client.management.settings, "Escape closes it");
+        client.management.settings = true;
+        section(&ctx, &mut world, &mut client, &mut view, size, "Credentials");
+        let reads = tools_sent(&world).iter().filter(|tool| **tool == SettingsTool::RefreshCredentials).count();
+        assert_eq!(reads, 2, "{size:?}");
+    }
+}
+
+#[test]
+fn the_shortcut_list_and_edit_config_say_what_a_remote_client_gets() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Shortcuts");
+        assert!(has(&shown, "The desktop app on the host also has these"), "{size:?}: {shown:?}");
+        assert!(shown.iter().any(|(text, _)| text.ends_with("previous or next changed file")), "{size:?}: {shown:?}");
+        assert!(shown.iter().any(|(text, _)| text.ends_with("open a file")), "{size:?}: {shown:?}");
+        assert!(shown.iter().any(|(text, _)| text.ends_with("that agent, with its diff")), "{size:?}: {shown:?}");
+        section(&ctx, &mut world, &mut client, &mut view, size, "Shortcuts");
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
+        assert!(has(&shown, "Edit config opens the file in an editor on the host"), "{size:?}: {shown:?}");
+        assert!(!shown.iter().any(|(text, _)| text == "Edit config"), "no button for what it cannot do: {shown:?}");
+        assert!(has(&shown, "main: ~/.config/atomics/config.toml"), "{size:?}: {shown:?}");
+    }
+}
+
+#[test]
+fn picking_a_theme_applies_at_once_and_only_the_users_own_choice_goes_to_the_host() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "midnight")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "dusk")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "claude")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let sent: Vec<_> = world.host.host_commands.iter().collect();
+        assert_eq!(
+            sent,
+            [
+                &HostAction::SelectTheme { name: "midnight".into(), host: false },
+                &HostAction::SelectTheme { name: "dusk".into(), host: false },
+            ],
+            "two picks, no proposal, and the theme in use is not picked again"
+        );
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Only this host")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "midnight")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert_eq!(
+            world.host.host_commands.last(),
+            Some(&HostAction::SelectTheme { name: "midnight".into(), host: true })
+        );
+    }
+}
+
+#[test]
+fn a_host_whose_own_file_picks_a_theme_gets_the_pick_there_so_that_it_shows() {
+    let mut host = fake_host::management();
+    host.board.host.management.as_mut().unwrap().themes.host_picks = true;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.management.settings = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "config.d/host.toml picks"), "nothing to warn of yet: {shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "midnight")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.host_commands.last(), Some(&HostAction::SelectTheme { name: "midnight".into(), host: true }));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Only this host")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "config.d/host.toml picks"), "unticked, it would not show: {shown:?}");
+}
+
+#[test]
+fn a_proposal_from_the_chief_opens_above_settings_and_keeps_its_apply() {
+    let proposal = atomics_core::projection::ConfigProposalInfo {
+        id: "config-1".into(),
+        file: "config.toml".into(),
+        scope: "main".into(),
+        from: "the chief".into(),
+        reason: None,
+        diff: "+[layout]".into(),
+        risks: vec![],
+        warnings: vec![],
+        preview: None,
+    };
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+    client.management.settings = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let mut host = world.host.board.host.clone();
+    host.management.as_mut().unwrap().proposals = vec![proposal];
+    let frames = world.host.publish_host(host);
+    world.deliver(frames);
+    // A click inside Settings raises it; the proposal stays above it all the same.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Shortcuts")));
+    view.now_ms += 1000.0;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let apply = exactly(&shown, "Apply");
+    let layer = ctx.layer_id_at(apply).expect("a window is there");
+    assert_eq!(layer.id, egui::Id::NULL.with("config-proposal"), "above Settings");
+    assert_eq!(world.host.host_commands, [], "a proposal asks before it writes");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(apply));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(
+        world
+            .host
+            .host_commands
+            .iter()
+            .any(|action| matches!(action, HostAction::ConfigDecide { id, apply: true, .. } if id == "config-1")),
+        "{:?}",
+        world.host.host_commands
+    );
+}
+
+#[test]
+fn only_what_cannot_be_undone_asks_first() {
+    use atomics_core::ops::SettingsTool;
+    // With every control of the section in view, without scrolling.
+    for size in [WIDE, (390.0, 2400.0)] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Credentials");
+        // The Azure switch can be undone, and goes at once, with no proposal.
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Enable Azure CLI access")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert_eq!(tools_sent(&world).last(), Some(&SettingsTool::SetAzure { enabled: true }));
+
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Remove…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Remove Claude subscription? The stored value is gone"), "{size:?}: {shown:?}");
+        let removing =
+            |world: &World| tools_sent(world).iter().any(|tool| matches!(tool, SettingsTool::RemoveCredential { .. }));
+        assert!(!removing(&world), "it asks first");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Keep")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!removing(&world), "Keep keeps it");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Remove…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Remove")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert_eq!(
+            tools_sent(&world).last(),
+            Some(&SettingsTool::RemoveCredential { kind: "claude".into(), host: None }),
+            "{size:?}"
+        );
+
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Remove unknown entries…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(tools_sent(&world).last() != Some(&SettingsTool::CleanCredentials), "it asks first");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Remove them")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert_eq!(tools_sent(&world).last(), Some(&SettingsTool::CleanCredentials));
+
+        section(&ctx, &mut world, &mut client, &mut view, size, "Credentials");
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Remote devices");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Revoke…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Revoke A phone?"), "{size:?}: {shown:?}");
+        let revoking = |world: &World| {
+            world.host.host_commands.iter().any(|action| matches!(action, HostAction::RevokeDevice { .. }))
+        };
+        assert!(!revoking(&world), "it asks first");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Revoke")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(revoking(&world));
+    }
+}
+
+#[test]
+fn a_typed_credential_stays_masked_replacing_asks_and_closing_settings_forgets_it() {
+    use atomics_core::ops::SettingsTool;
+    const SECRET: &str = "sk-typed-secret";
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+    client.management.settings = true;
+    let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Credentials");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "New value (hidden)")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text(SECRET.into())]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.management.credential_value, SECRET);
+    assert!(!shown.iter().any(|(text, _)| text.contains(SECRET)), "masked: {shown:?}");
+
+    // Claude's entry is set, so saving over it asks; the value stays masked in its field meanwhile.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Save, replacing the old value…")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Replace Claude subscription?"), "{shown:?}");
+    assert!(!tools_sent(&world).iter().any(|tool| matches!(tool, SettingsTool::PutCredential { .. })));
+    // The question's button comes last: the entry's own row has a Replace too.
+    let answer = shown.iter().rev().find(|(text, _)| text == "Replace").unwrap().1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(answer));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(
+        tools_sent(&world).last(),
+        Some(&SettingsTool::PutCredential { kind: "claude".into(), value: SECRET.into(), host: None })
+    );
+    assert_eq!(client.management.credential_value, "", "it travelled once");
+
+    // An unset entry saves at once, and closing Settings takes a value never saved with it.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(exactly(&shown, "Add")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.management.credential_kind, "openai");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("typed-and-left".into())]);
+    assert_eq!(client.management.credential_value, "typed-and-left", "Add gave the field the keyboard");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Escape, egui::Modifiers::NONE));
+    assert!(!client.management.settings);
+    assert_eq!(client.management.credential_value, "", "gone with the window");
+}
+
+#[test]
+fn every_settings_section_fits_a_narrow_screen() {
+    for size in [PHONE, (320.0, 640.0), (600.0, 500.0)] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let mut shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        for label in ["Theme", "Shortcuts", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"] {
+            if label != "Theme" {
+                shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
+            }
+            let window = shown.iter().rposition(|(text, _)| text == "Settings").expect("its title");
+            for (text, rect) in shown[window..].iter().filter(|(text, _)| !text.is_empty()) {
+                assert!(
+                    rect.left() >= 0.0 && rect.right() <= size.0,
+                    "{label} on {size:?}: {text} runs off the screen at {rect:?}"
+                );
+                let font = egui::FontId::proportional(13.0);
+                assert!(
+                    ctx.fonts_mut(|fonts| fonts.has_glyphs(&font, &text.replace('\n', ""))),
+                    "{label}: a browser has only egui's fonts, and they cannot draw {text}"
+                );
+            }
+            section(&ctx, &mut world, &mut client, &mut view, size, label);
+            shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        }
     }
 }
 
@@ -2482,7 +2907,8 @@ fn settings_tickets_resources_trace_explorer_and_panels_share_one_host() {
         assert!(has(&shown, label), "{label} missing from the combined frame: {shown:?}");
     }
     client.management.settings = true;
-    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    let shown = section(&ctx, &mut world, &mut client, &mut view, BOARD, "Advanced");
     assert!(has(&shown, "Effective configuration"));
     client.management.settings = false;
     client.send(Command::OpenTicket(fake_host::ticket_card("ENG-123").link));

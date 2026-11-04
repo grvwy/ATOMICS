@@ -256,7 +256,7 @@ impl Local<'_> {
                     Err(error) => state.client_events.push(ClientEvent::VoiceFailed { text, error }),
                 })
             }
-            Command::SelectTheme { name, host } => state.post(move |state| state.select_theme(&name, host)),
+            Command::EditConfig => state.post(State::edit_config),
             Command::CheckSandbox => state.post(|state| state.check_sandbox()),
             Command::RefreshConnections => state.post(|state| state.refresh_connections()),
             Command::ImportConnections => state.post(|state| state.import_connections()),

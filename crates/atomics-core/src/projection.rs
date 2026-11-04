@@ -229,6 +229,36 @@ pub struct ManagementInfo {
     pub remote: RemoteInfo,
     #[serde(default)]
     pub tools: serde_json::Value,
+    #[serde(default)]
+    pub themes: ThemesInfo,
+}
+
+/// What Settings offers to pick a theme from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemesInfo {
+    /// The built-in themes, then the theme files.
+    pub choices: Vec<ThemeChoice>,
+    /// This host's own config file, as `config.d/<host>.toml`.
+    pub host_file: String,
+    /// That file names a theme, which wins over `config.toml`.
+    pub host_picks: bool,
+    /// The tokens `[theme]` sets inline, which show over any theme.
+    pub inline: Vec<String>,
+    /// What could not be applied of the theme in use.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeChoice {
+    pub name: String,
+    /// The theme in use.
+    pub selected: bool,
+    /// `themes/<name>.toml`, which may replace the built-in theme of that name.
+    pub file: bool,
+    /// As `#rrggbb`: background, panel, foreground, accent, then red, green and blue from its ANSI colors.
+    pub swatches: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

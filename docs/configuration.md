@@ -171,9 +171,30 @@ a `hint` when it failed and whether it is only a `warning`, and `facts` such as 
 files. `ok` is true when the required checks pass: git, and a config that loads; every other failed check is a
 `warning`.
 
+## The Settings window
+
+Settings is one window, the same on the desktop and in a browser, and it fits a phone. Its sections lead with what
+people change, and each reads what it shows as it opens:
+
+| Section | What is in it |
+| --- | --- |
+| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
+| Agents | The configured agents, whether they run sandboxed, the [sandbox checks](isolation.md#check-sandbox-setup), the Claude hooks and `atomics setup`. |
+| Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
+| Remote devices | Pairing and paired devices, as in the Remote window. |
+| Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
+| Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
+
+What can be undone acts at once: picking a theme, the Azure CLI switch, connecting and disconnecting a server. Only what
+cannot asks first: removing or replacing a credential, removing unknown entries, revoking a device. **Edit config**
+opens the file in an editor on the host, so only a window on the host has it; a remote client proposes a change under
+Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
+chief's, wait for you as proposals.
+
 ## Reviewing a proposal
 
-The oldest proposal opens in the ATOMICS window. It shows the file and scope, who proposed it and why, and a
+The oldest proposal opens in the ATOMICS window, above Settings if that is open. It shows the file and scope, who proposed it and why, and a
 unified diff of the whole file. Settings that can make ATOMICS do more than look different are labeled above the
 diff:
 

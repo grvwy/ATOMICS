@@ -821,6 +821,10 @@ fn an_agent_chord_with_settings_holding_the_keyboard_still_switches_the_agent() 
             app.client.ui.management.settings = true;
             run(app, ctx, vec![]);
             run(app, ctx, vec![]);
+            click_on(app, ctx, "Advanced");
+            for _ in 0..8 {
+                run(app, ctx, vec![]);
+            }
             click_on(app, ctx, "Find a setting");
             typed(app, ctx, "x");
             assert_eq!(app.client.ui.management.filter, "x", "its field has the keyboard");
@@ -1019,6 +1023,43 @@ fn holds_the_next_keys(app: &mut Desktop<'_>, ctx: &egui::Context, root: &Path, 
     let mut expected = before.to_vec();
     expected.extend_from_slice(b"\x1b[A\x1b[A\t");
     assert_eq!(read_up_to(root, "end"), expected, "the terminal lost keys");
+}
+
+#[test]
+fn the_desktops_settings_offer_edit_config_and_name_this_machine() {
+    with_app("app::key_tests::the_desktops_settings_offer_edit_config_and_name_this_machine", |app, ctx| {
+        app.client.ui.management.settings = true;
+        run(app, ctx, vec![]);
+        let draws = |app: &mut Desktop<'_>, ctx: &egui::Context, label: &str| {
+            let output = frame(app, ctx, vec![]);
+            let found = output
+                .shapes
+                .iter()
+                .any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with(label)));
+            output.drop_without_applying_deltas();
+            found
+        };
+        assert!(draws(app, ctx, "This machine only (config.d/"));
+        assert!(draws(app, ctx, "claude"), "the themes are listed");
+        for _ in 0..3 {
+            run(app, ctx, vec![]);
+        }
+        click_on(app, ctx, "Shortcuts");
+        for _ in 0..8 {
+            run(app, ctx, vec![]);
+        }
+        assert!(!draws(app, ctx, "The desktop app on the host also has these"), "this is it");
+        click_on(app, ctx, "Shortcuts");
+        for _ in 0..8 {
+            run(app, ctx, vec![]);
+        }
+        click_on(app, ctx, "Advanced");
+        for _ in 0..8 {
+            run(app, ctx, vec![]);
+        }
+        assert!(draws(app, ctx, "Edit config"));
+        assert!(!draws(app, ctx, "Edit config opens the file"), "that is a remote client's note");
+    });
 }
 
 #[test]

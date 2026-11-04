@@ -254,7 +254,14 @@ pub enum HostAction {
         apply: bool,
         note: String,
     },
-    /// Host setup and credential-store operations. Config edits still use proposals.
+    /// Show a theme and save its name, in `config.toml` or, with `host`, in this host's own file. The user's own
+    /// pick, undone by picking another, so no proposal.
+    SelectTheme {
+        name: String,
+        #[serde(default)]
+        host: bool,
+    },
+    /// Host setup and credential-store operations.
     SettingsTool {
         tool: SettingsTool,
     },
@@ -277,12 +284,31 @@ pub enum SettingsTool {
     CheckSandbox,
     RefreshConnections,
     ImportConnections,
-    Connect { name: String, store_env: bool },
-    Disconnect { name: String },
-    AddConnection { name: String, url: String },
+    Connect {
+        name: String,
+        store_env: bool,
+    },
+    Disconnect {
+        name: String,
+    },
+    AddConnection {
+        name: String,
+        url: String,
+    },
     RefreshCredentials,
-    PutCredential { kind: String, value: String, host: Option<String> },
-    RemoveCredential { kind: String, host: Option<String> },
+    PutCredential {
+        kind: String,
+        value: String,
+        host: Option<String>,
+    },
+    /// Turn the Azure CLI relay on or off, in `config.toml`. The user's own switch, so no proposal.
+    SetAzure {
+        enabled: bool,
+    },
+    RemoveCredential {
+        kind: String,
+        host: Option<String>,
+    },
     CleanCredentials,
 }
 
@@ -578,6 +604,9 @@ impl HostCommand {
             }
             HostAction::ConfigDecide { id, note, .. } => {
                 bounds.id("proposal", Some(id)).text("note", Some(note));
+            }
+            HostAction::SelectTheme { name, .. } => {
+                bounds.id("theme", Some(name));
             }
             HostAction::DecidePairing { code, .. } => {
                 bounds.id("code", Some(code));
