@@ -103,6 +103,13 @@ scripts/macos-app.sh
 open -a ATOMICS --args --workspace backend
 ```
 
+The Dock, Spotlight and a Linux desktop launcher start ATOMICS with a bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`).
+At startup ATOMICS asks your login shell (`$SHELL -l -i -c`) for its `PATH`, once and for at most five seconds, and
+adds the folders it lacks. Everything ATOMICS runs itself then finds what a terminal would: git with its LFS filters
+and hooks, the Codex version check, MCP and ticket servers and queued commands. A `PATH` that already has those
+folders, as one from a terminal does, is left alone; a shell that gives none in time leaves the `PATH` ATOMICS was
+started with. `atomics doctor` says which happened.
+
 On Linux, install the build dependencies first (Debian/Ubuntu example), then install or update from this checkout.
 For a new desktop, [Fresh start on Linux](docs/fresh-start-linux.md) lists every prerequisite and check:
 
@@ -390,7 +397,8 @@ Run `atomics doctor` to check git, Claude Code, Codex, the configured editor, th
 It also checks Codex hook support (0.165+), reports hook trust as unverified with `/hooks` instructions, reads plan files,
 warns about cargo entries in `[approvals].allow`, and lists merged worktrees safe to review for cleanup. It changes nothing.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
-agents, Helix, a running ATOMICS or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
+agents, Helix, a running ATOMICS or hooks do not affect the exit code. Tools are checked on your login-shell PATH; the
+first line says where `PATH` came from: the login shell's folders added, already there, or (a warning) not given in time.
 
 ## Usage
 
@@ -409,7 +417,8 @@ project-local settings keep their usual precedence. Without a custom command it 
 Claude agents that ATOMICS starts get its hooks through `--settings`. Codex 0.165+ gets inline
 `-c hooks.<Event>=...` settings; older versions keep `busy_text` status tracking.
 Version detection runs in the background with a 30-second limit. Successful results are shared;
-failed or timed-out probes are retried on the next start.
+failed or timed-out probes are retried on the next start. Until one answers, hook support is unknown: Codex starts
+without hook flags (an older Codex refuses them), and its tile warns that its approvals stay in its terminal.
 
 On the first Codex launch from an ATOMICS install, review and trust the ATOMICS hooks in Codex's
 startup prompt (or `/hooks`). Their definitions stay identical across panes, so this is a
@@ -688,6 +697,9 @@ ordinary ext4), cross-filesystem clones and unsupported files skip warming and l
 partial cache, and ATOMICS never retries it as a full copy. Use `atomics doctor` to check the actual filesystem pair.
 Each worktree then owns its cache independently; builds cannot change the main checkout's cache. A successful
 clone shows **warm cache from main** in a toast. Existing worktrees are left alone when retrying a launch.
+When creating a worktree fails (a filter or hook git runs is missing, say), ATOMICS removes the worktree git began
+and deletes the branch it made while that still points at the base, so a retry starts over. A retry uses a branch
+that already exists while it is still at the base, and refuses one that has moved.
 `atomics doctor` probes CoW cloning between the repository and configured worktree folders, using temporary files
 that it removes afterwards.
 

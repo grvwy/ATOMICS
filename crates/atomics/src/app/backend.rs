@@ -183,6 +183,7 @@ impl Backend for Local<'_> {
                 .map(|usage| usage.label()),
             sandbox_error: sandboxes.error.clone(),
             queue_note,
+            warning: session.warning.clone(),
             connect: match session.sandbox {
                 Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
                 None => Vec::new(),

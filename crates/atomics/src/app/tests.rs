@@ -31,6 +31,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         scratch: None,
         naming: Naming::Folder,
         mcp_needed: Vec::new(),
+        warning: None,
     }
 }
 
@@ -43,6 +44,25 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Co
 }
 
 pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
+    run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
+}
+
+/// [`with_state`] in a child that also has the variables `env` gives, which is called in the
+/// parent with the child's home folder. The child takes on its login shell's PATH before the
+/// app starts, as `main` does.
+pub(super) fn with_login_state(
+    name: &str,
+    env: impl FnOnce(&Path) -> Vec<(&'static str, std::ffi::OsString)>,
+    test: impl FnOnce(State, &egui::Context),
+) {
+    run_state(name, Some(env), test);
+}
+
+fn run_state(
+    name: &str,
+    env: Option<impl FnOnce(&Path) -> Vec<(&'static str, std::ffi::OsString)>>,
+    test: impl FnOnce(State, &egui::Context),
+) {
     if std::env::var_os("ATOMICS_APP_TEST_CHILD").is_none() {
         let dir = crate::test_support::tempdir().unwrap();
         use std::os::unix::fs::DirBuilderExt;
@@ -65,7 +85,8 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
                 .env("XDG_RUNTIME_DIR", runtime)
                 // A login shell such as zsh would run its first-run wizard in the fresh HOME.
                 .env("SHELL", "/bin/sh")
-                .env_remove("ATOMICS_PANE"),
+                .env_remove("ATOMICS_PANE")
+                .envs(env.map(|env| env(dir.path())).unwrap_or_default()),
         );
         assert!(
             output.status.success(),
@@ -74,6 +95,11 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
             String::from_utf8_lossy(&output.stderr)
         );
         return;
+    }
+    if env.is_some() {
+        // SAFETY: the test harness's own threads only wait for this test; nothing reads the
+        // environment while it changes.
+        unsafe { crate::setup::adopt_login_path() };
     }
     // Agents run bare in tests unless a test sets up a fake sbx; State never reaches the real one.
     let config = paths::config_file();

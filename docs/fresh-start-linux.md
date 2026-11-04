@@ -64,7 +64,9 @@ atomics --version
 
 The installer builds a release binary for the native target and atomically replaces `~/.local/bin/atomics`,
 even while ATOMICS runs. It installs a desktop entry and icon under `~/.local/share`, then runs
-`atomics setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so.
+`atomics setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so. Started from the desktop entry,
+ATOMICS adds your login shell's `PATH` to the bare one the launcher gives, so set `PATH` in your shell's startup
+files as usual; `atomics doctor` says where `PATH` came from.
 `scripts/linux-install.sh --uninstall` removes the binary, desktop entry and icon, and keeps config and state.
 
 ## 3. Run `atomics setup`

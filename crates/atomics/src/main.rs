@@ -258,6 +258,23 @@ fn main() -> eframe::Result {
         }
         migration_errors = migration.errors;
     }
+    // What ATOMICS runs itself gets the login shell's PATH: git (with its LFS filters and hooks),
+    // version probes, MCP and ticket servers, a queued command. What agents call per tool use
+    // (hooks, the status line, MCP) runs with their PATH, which ATOMICS gave them, and must stay quick.
+    if matches!(
+        cli.command,
+        Some(
+            Command::Host { .. }
+                | Command::Doctor
+                | Command::Setup { .. }
+                | Command::Sandbox { .. }
+                | Command::Tickets { .. }
+                | Command::Queue { .. }
+        )
+    ) {
+        // SAFETY: no other thread exists yet.
+        unsafe { setup::adopt_login_path() };
+    }
     match cli.command {
         Some(Command::Setup { credential: Some(kind), registry_host }) => {
             if let Err(error) = sandbox::setup::credential_setup(&kind, registry_host.as_deref()) {
@@ -392,6 +409,9 @@ fn main() -> eframe::Result {
     {
         std::process::exit(code);
     }
+    // After a link is forwarded, which needs no shell, and before the desktop starts any thread.
+    // SAFETY: no other thread exists yet.
+    unsafe { setup::adopt_login_path() };
     // Shared, so desktops still run side by side; refused only while a headless host owns the home.
     let _instance = match instance::Lock::desktop(&atomics_core::paths::atomics_home()) {
         Ok(lock) => Some(lock),

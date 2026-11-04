@@ -116,6 +116,13 @@ fn sandboxes_wanted(config: &Config, workspace: Option<&str>) -> bool {
 
 fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Report {
     let mut lines = Vec::new();
+    // What every check below runs with, and every program ATOMICS starts.
+    let (path_ok, path) = crate::setup::login_path().describe();
+    lines.push(check_line(
+        path_ok,
+        &path,
+        "make your login shell print its PATH quickly when started with -l -i -c, or set SHELL to one that does",
+    ));
     let git_version = Command::new(resolve_program("git"))
         .arg("--version")
         .output()
