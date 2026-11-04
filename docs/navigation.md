@@ -2,7 +2,8 @@
 
 How a user moves around ATOMICS: between plans, their tasks, agent sessions, the chief, settings and a session's
 diff. The first part is the audit of how it worked before this change; the second is what changed. The UI is drawn
-once in `atomics-ui`, so the desktop and the browser's wide layout behave the same; the phone has its own pane bar.
+once in `atomics-ui`, so the desktop and the browser's wide layout behave the same; the phone has its own pane bar. The
+keys are the last section.
 
 ## Audit (before)
 
@@ -43,8 +44,36 @@ once in `atomics-ui`, so the desktop and the browser's wide layout behave the sa
 - **The sidebar** groups the sessions under the plan they work for (the heading shows the plan's tab), then those
   outside plans. A session that needs the user has a warning bar and its state in the warning color, with the number
   of permission requests waiting; the active one keeps the accent fill.
+- **Each agent's row shows its number**, under its status dot: Ctrl+N goes to that row, whatever order the plan groups
+  put it in. The tile strip lists the agents in that order too.
 - **Keyboard focus is visible** on the custom controls: the pill, the switcher's segments, the location's arrows and
   links, the sidebar's rows and the task cards draw a focus ring in the theme's selection color.
 
 The phone keeps its panes: each pane's header says where it is (the board's plan, the tile's session), and the
 browser's own Back stays the page's.
+
+## The keys that move around, on every client
+
+The desktop, a browser and `--connect` decide these in one place, `atomics_ui::window_keys`. Each only says which keys
+never reach a terminal.
+
+| Key | Does | Terminal |
+| --- | --- | --- |
+| Ctrl+1 to 9, Command on a Mac | The Nth agent of the tab, the number on its row, with its diff against main. The keyboard stays with the diff. Past the last agent, nothing. | Never gets it, nor any other Ctrl+digit |
+| Shift+↓/↑ | The next and previous changed file, from anywhere but a text field or the editor. | Never gets it |
+| PageDown/PageUp | The next and previous hunk across files, while the diff has the keyboard. | Keeps them while it has the keyboard, for its programs' own scrolling |
+| ↑/↓ | Scroll the diff by lines, while it has the keyboard. | Keeps them |
+| Typing, Escape | From the diff: the keyboard goes back to the active agent's terminal, with the key typed. | |
+| Ctrl with a letter | Nothing here. | Always the terminal's |
+
+Two exceptions are deliberate: with Tickets open the reader follows the agent and no diff comes up, and in editor mode
+the agent's editor takes the keyboard. A phone with a keyboard takes the same keys for its Agents and Diffs panes and
+keeps its panes otherwise; the key bar's sticky Ctrl still types a control byte, digits included, since a phone has no
+other way to.
+
+**What a browser keeps.** A page can take Ctrl+1 to 9 from the browser, so a browser needs no other keys. Checked in
+Chrome 156 on Linux with real X11 keys: in a tab, where a page that leaves them alone switches tabs and this one does
+not, in a frame of a hosting page, and in an app window (`--app`), the same kind of window as an installed app. Keys
+Chrome keeps for itself, such as Ctrl+T and Ctrl+W, never reach a page, and a key pressed while the keyboard is on the
+hosting page's own controls, not in the frame, is the browser's. On a Mac, an iPad or an iPhone the page asks for
+Command; Safari and Firefox were not checked.

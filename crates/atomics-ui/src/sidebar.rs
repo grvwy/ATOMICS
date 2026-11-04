@@ -20,7 +20,15 @@ pub fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.add_space(1.0);
 }
 
-fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, selected: bool) -> egui::Response {
+/// A session's row; `number` is the N of its Ctrl+N, for the first nine of the tab.
+fn session_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    s: &SessionRow,
+    active: bool,
+    selected: bool,
+    number: Option<usize>,
+) -> egui::Response {
     let height = 38.0;
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
@@ -46,6 +54,11 @@ fn session_row(ui: &mut egui::Ui, p: &Palette, s: &SessionRow, active: bool, sel
     }
     let now = ui.input(|i| i.time);
     painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
+    // What Ctrl+N goes to, whatever the groups' order: under the dot, where it moves nothing else.
+    if let Some(number) = number {
+        let at = pos2(rect.left() + 10.0, rect.top() + 21.0);
+        painter.text(at, egui::Align2::CENTER_TOP, number.to_string(), FontId::monospace(10.5), p.muted);
+    }
     let clip = painter.with_clip_rect(rect.shrink2(vec2(2.0, 0.0)));
     // The diff stats keep their corner; a long title is cut before them.
     let stats_left = match s.changes {
@@ -157,7 +170,8 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             }
         }
         let active = active_id.as_deref() == Some(session.id.as_str());
-        let row = session_row(ui, &p, session, active, client.selected.contains(&session.id));
+        let number = visible.iter().position(|&shown| shown == index).map(|at| at + 1).filter(|&n| n <= 9);
+        let row = session_row(ui, &p, session, active, client.selected.contains(&session.id), number);
         if row.clicked() {
             clicked = Some(session.id.clone());
         }

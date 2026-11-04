@@ -28,7 +28,7 @@
 //!   then (keys of that frame, a word the keyboard commits as the overlay is blurred, a Paste whose clipboard read
 //!   finishes late) neither types nor asks for the lease again. A word being composed when the user clicks away
 //!   commits first, so it is typed, with no Return. The input leaving a terminal lets go of its lease, and so
-//!   does the keyboard going to a text box.
+//!   does the keyboard going to a text box or the panel.
 //! - **Offline** the screen shows as it was, marked disconnected, and nothing is typed.
 
 use std::collections::HashMap;
@@ -36,10 +36,12 @@ use std::collections::HashMap;
 use atomics_core::lease::{GridSize, MAX_CELL_PIXELS};
 use atomics_core::ops::Grant;
 use atomics_core::screen::{self as grid, Modes, Screen};
+use atomics_ui::Backend;
 use atomics_ui::terminal::{self as painter, Metrics, Point, Selection, encode};
 use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::Palette;
 use atomics_ui::touch::{self, Touch};
+use atomics_ui::window_keys;
 use egui::{Align2, Key, LayerId, Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::gesture::{Gesture, Kind, Phase, Pointer, Recognizer};
@@ -107,6 +109,8 @@ pub struct Overlay {
     /// Give it the focus where a pointer that is not a finger picked this terminal: a click into it types
     /// there, as on the desktop. A finger taps the overlay itself, which opens the keyboard.
     pub focus: bool,
+    /// The terminal is an editor's, which keeps Shift with the arrows ([`atomics_ui::window_keys`]).
+    pub editor: bool,
 }
 
 /// One line and column of the terminal: `line` is a line ID (history below the screen's first).
@@ -164,6 +168,8 @@ pub struct TermPane {
     blur_next: bool,
     /// The overlay is to take the focus at the next draw ([`Overlay::focus`]).
     pub focus_next: bool,
+    /// What was typed while the panel had the keyboard, which goes to this terminal at the next draw.
+    handed: Vec<TermInput>,
     /// Where the cells were last painted.
     painted: Option<Frame>,
     /// The layer the terminal was last drawn in.
@@ -195,6 +201,7 @@ impl Default for TermPane {
             touch: None,
             blur_next: false,
             focus_next: false,
+            handed: Vec::new(),
             painted: None,
             layer: LayerId::background(),
         }
@@ -268,6 +275,11 @@ pub fn named_key(name: &str) -> Option<Key> {
 
 /// What a key from the overlay sends, with the sticky modifiers added to its own.
 pub fn key_text(name: &str, mods: Modifiers, (ctrl, alt): (bool, bool), modes: &Modes) -> Option<String> {
+    // A keyboard's Ctrl with a digit is the window's, on every client (`atomics_ui::window_keys`): Ctrl+3 would be
+    // Escape here. The key bar's sticky Ctrl types its control byte as text.
+    if mods.ctrl && name.len() == 1 && name.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
     let mods = Modifiers { ctrl: mods.ctrl || ctrl, alt: mods.alt || alt, ..mods };
     if let Some(key) = named_key(name) {
         return encode::key(key, mods, modes).and_then(|bytes| String::from_utf8(bytes).ok());
@@ -294,6 +306,33 @@ impl TermPane {
             self.inputs.clear();
             self.let_go();
         }
+    }
+
+    /// Takes from what the overlay forwarded the keys that are the window's, as the input events they are: the overlay
+    /// has the page's keyboard, but they never reach a terminal.
+    pub fn window_keys(&mut self, os: egui::os::OperatingSystem) -> Vec<egui::Event> {
+        let editor = self.overlay.editor;
+        let mut keys = Vec::new();
+        self.inputs.retain(|input| {
+            let TermInput::Key { name, mods } = input else { return true };
+            let key = named_key(name).or_else(|| Key::from_name(name).filter(|key| atomics_ui::keys::is_digit(*key)));
+            let Some(key) = key else { return true };
+            let event =
+                egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: *mods };
+            let windows = window_keys::before_terminal(&event, os, editor);
+            if windows {
+                keys.push(event);
+            }
+            !windows
+        });
+        keys
+    }
+
+    /// The panel gave the keyboard back to this terminal: the overlay takes it at the next draw, and `typed`, what was
+    /// typed in the panel to do that, reaches the terminal instead of being lost.
+    pub fn hand_back(&mut self, typed: Vec<TermInput>) {
+        self.focus_next = true;
+        self.handed = typed;
     }
 
     /// The keyboard moved to something else the page draws: the overlay gives it up on the next frame.
@@ -330,9 +369,11 @@ impl TermPane {
             if let Some(rect) = self.overlay.rect {
                 self.overlay.covered = covered(ctx, self.layer, rect);
             }
-            // The keyboard is in a text box the page draws: another browser would see the lease held until it
-            // expires, by someone who has moved on. A click back asks again.
-            if self.held && !self.focused && ctx.output(|output| output.ime.is_some()) {
+            // The keyboard is in a text box the page draws or in the panel: another browser would see the lease held
+            // until it expires, by someone who has moved on. A click back asks again.
+            let elsewhere = ctx.output(|output| output.ime.is_some())
+                || ctx.memory(|m| m.has_focus(atomics_ui::panel_nav::focus_id()));
+            if self.held && !self.focused && elsewhere {
                 if let Some(session) = &self.session {
                     remote.release(session);
                 }
@@ -344,6 +385,7 @@ impl TermPane {
             remote.release(last);
         }
         self.drop_inputs();
+        self.handed.clear();
         self.preedit.clear();
         let blur = std::mem::take(&mut self.focused);
         self.overlay = Overlay { blur, ..Overlay::default() };
@@ -434,6 +476,19 @@ impl TermPane {
         for input in std::mem::take(&mut self.inputs) {
             self.input(input, &frame, &modes, &lease, lost, remote, session, &mut typed, now_ms);
         }
+        // The first key after the panel had the keyboard: the overlay takes the focus after this frame, and the lease
+        // is asked for now, so this key waits for it like one typed right after a click.
+        let handed = std::mem::take(&mut self.handed);
+        if !handed.is_empty() && live && may_type && (lease.yours || lease.holder.is_none()) {
+            if !lease.yours {
+                remote.acquire(session, false);
+            }
+            self.focused = true;
+            self.active_ms = now_ms;
+            for input in handed {
+                self.input(input, &frame, &modes, &lease, lost, remote, session, &mut typed, now_ms);
+            }
+        }
         // The overlay takes the pointer before egui sees it: a text box that had the keyboard learns here.
         if self.focused && !was_focused {
             ui.memory_mut(|m| m.focused().into_iter().for_each(|id| m.surrender_focus(id)));
@@ -495,6 +550,7 @@ impl TermPane {
             copy,
             blur: lost || std::mem::take(&mut self.blur_next) || (self.focused && !(writable && typing)),
             focus: std::mem::take(&mut self.focus_next) && writable,
+            editor: remote.editors().iter().any(|e| e.terminal == session),
         };
         if self.overlay.blur {
             self.focused = false;

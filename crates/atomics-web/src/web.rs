@@ -49,7 +49,7 @@ extern "C" {
 
 #[wasm_bindgen(module = "/web/terminal.js")]
 extern "C" {
-    fn install(keys: &str, callback: &Closure<dyn FnMut(JsValue)>);
+    fn install(keys: &str, command_chords: bool, callback: &Closure<dyn FnMut(JsValue)>);
     fn place(x: f32, y: f32, width: f32, height: f32);
     #[wasm_bindgen(js_name = setClip)]
     fn set_clip(clip: &str);
@@ -255,7 +255,7 @@ impl App {
                 }
             })
         };
-        install(&layout::keybar_json().to_string(), &page);
+        install(&layout::keybar_json().to_string(), atomics_ui::window_keys::command_chords(ctx.os()), &page);
         set_theme(&theme_colors(&client.palette));
         let layout = LayoutMode::named(&load_layout());
         let mut view = View::default();

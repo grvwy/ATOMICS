@@ -2732,3 +2732,436 @@ fn focus_moved_on_a_frame_with_no_input_asks_for_the_frame_that_settles_it() {
     output.drop_without_applying_deltas();
     assert!(asked, "the field's lock on its own keys takes hold on the next frame, which no input will draw");
 }
+
+// ── The keys every client takes the same way (`atomics_ui::window_keys`) ─────────────────────────────────────────
+
+const CHORD: egui::Modifiers = egui::Modifiers::CTRL;
+
+/// A host with three agents on the All tab: `s0` and `s2` outside plans, each with a worktree and a diff of its own,
+/// and `s1` on its plan's task. So the sidebar lists `s1` first, under its plan, though Ctrl+1 is `s0`.
+fn agents() -> fake_host::FakeHost {
+    let mut host = fake_host::working();
+    for (id, root, file) in [("s0", "/w/zero", "src/zero.rs"), ("s2", "/w/two", "src/two.rs")] {
+        let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
+        host.board.sessions.push(atomics_core::projection::SessionInfo {
+            id: id.into(),
+            title: format!("Agent {id}"),
+            task: None,
+            worktree: Some(root.into()),
+            branch: Some(format!("atomics/{id}")),
+            cwd: root.into(),
+            ..base
+        });
+        host.terminals.insert(id.into(), fake_host::FakeTerminal::new(80, 12, "$ "));
+        let mut diff = host.board.diffs[0].clone();
+        diff.worktree = root.into();
+        diff.files.truncate(1);
+        diff.files[0].old_path = Some(file.into());
+        diff.files[0].new_path = Some(file.into());
+        host.board.diffs.push(diff);
+        host.files.insert((root.into(), file.into()), fake_host::file_diff(file, 6));
+    }
+    host
+}
+
+/// [`agents`] on the All tab of a window `size` large, with the keyboard in the first agent's terminal.
+fn at_a_terminal(host: fake_host::FakeHost, size: (f32, f32)) -> (egui::Context, World, Client, View) {
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.send(Command::SetView(None));
+    settled(&ctx, &mut world, &mut client, &mut view, size);
+    if !view.compact {
+        view.term.inputs.push(term_pane::TermInput::Focus(true));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(view.term.typing(), "the terminal has the keyboard");
+    }
+    (ctx, world, client, view)
+}
+
+fn typed_in(world: &World, session: &str) -> String {
+    world.host.terminals[session].typed.clone()
+}
+
+fn no_bytes(world: &World) {
+    for (id, terminal) in &world.host.terminals {
+        assert_eq!(terminal.typed, "", "{id} got keys");
+    }
+}
+
+/// What the overlay forwards for a key pressed while it has the keyboard, and a frame.
+fn forwarded(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    name: &str,
+    mods: egui::Modifiers,
+) {
+    view.term.inputs.push(term_pane::TermInput::Key { name: name.into(), mods });
+    let size = if view.compact { PHONE } else { WIDE };
+    sized(ctx, world, client, view, size, Vec::new());
+}
+
+fn panel_has_the_keys(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.has_focus(atomics_ui::panel_nav::focus_id()))
+}
+
+fn focused_file(client: &Client, root: &str) -> Option<String> {
+    client.diff_views.get(Path::new(root)).and_then(|state| state.focused.clone())
+}
+
+fn diff_asked(world: &World, root: &str) -> bool {
+    world.sent().iter().any(|m| matches!(m, Message::DiffGet { worktree, .. } if worktree == root))
+}
+
+#[test]
+fn ctrl_n_from_a_terminal_shows_the_nth_agents_diff_and_no_byte_reaches_a_terminal() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    forwarded(ctx, world, client, view, "3", CHORD);
+    assert_eq!(view.desk.active.as_deref(), Some("s2"), "the third of s0, s1 and s2");
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert!(view.desk.diff_open);
+    assert_eq!(view.desk.diff_target(&world.driver.remote).as_deref(), Some(Path::new("/w/two")));
+    assert!(panel_has_the_keys(ctx), "the diff holds the keyboard");
+    assert!(!view.term.typing() && !view.term.focus_next, "and the input does not");
+    sized(ctx, world, client, view, WIDE, Vec::new());
+    assert!(diff_asked(world, "/w/two"), "its diff against main is fetched");
+    no_bytes(world);
+
+    // From the panel too, and through the canvas, as a page's keys arrive with the input elsewhere.
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Num1, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s0"));
+    assert!(panel_has_the_keys(ctx));
+
+    // Past the last agent nothing changes.
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Num9, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s0"));
+    no_bytes(world);
+}
+
+#[test]
+fn every_digit_with_ctrl_stays_out_of_a_terminal_and_plain_ctrl_with_a_letter_reaches_it() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(fake_host::working(), WIDE);
+    assert_eq!(view.term.session(), Some("s1"));
+    for digit in 0..=9 {
+        // Ctrl+3 would be Escape, which interrupts an agent. A digit that picks an agent takes the keyboard away, so it
+        // comes back for the next.
+        view.term.inputs.push(term_pane::TermInput::Focus(true));
+        view.term.inputs.push(term_pane::TermInput::Key { name: digit.to_string(), mods: CHORD });
+        sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    }
+    no_bytes(&world);
+
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    view.term.inputs.push(term_pane::TermInput::Key { name: "d".into(), mods: CHORD });
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(typed_in(&world, "s1"), "\x04", "Ctrl+D is the terminal's");
+    assert!(!panel_has_the_keys(&ctx));
+}
+
+#[test]
+fn shift_arrows_walk_the_files_from_a_terminal_and_page_keys_walk_the_hunks_in_the_diff() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(fake_host::working(), WIDE);
+    let root = fake_host::WORKTREE;
+    let shift = egui::Modifiers::SHIFT;
+    // The page keys are the terminal's while it has the keyboard, for its programs' own scrolling.
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    forwarded(ctx, world, client, view, "PageDown", egui::Modifiers::NONE);
+    settled(ctx, world, client, view, WIDE);
+    assert_eq!(typed_in(world, "s1"), "\x1b[6~");
+    assert!(!panel_has_the_keys(ctx));
+
+    // Shift+↓ takes it to the diff, which shows, at its first file.
+    let typed_before = typed_in(world, "s1");
+    forwarded(ctx, world, client, view, "ArrowDown", shift);
+    settled(ctx, world, client, view, WIDE);
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert!(panel_has_the_keys(ctx), "the diff holds the keyboard");
+    assert!(!view.term.typing());
+    assert_eq!(view.desk.active.as_deref(), Some("s1"), "the agent stays");
+    assert_eq!(focused_file(client, root).as_deref(), Some("src/a.rs"));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::ArrowDown, shift));
+    assert_eq!(focused_file(client, root).as_deref(), Some("src/b.rs"));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::ArrowUp, shift));
+    assert_eq!(focused_file(client, root).as_deref(), Some("src/a.rs"));
+
+    // The page keys go on to the next file's hunk from here, and the arrows only scroll.
+    sized(ctx, world, client, view, WIDE, press(egui::Key::PageDown, egui::Modifiers::NONE));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::PageDown, egui::Modifiers::NONE));
+    assert_eq!(focused_file(client, root).as_deref(), Some("src/b.rs"));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::PageUp, egui::Modifiers::NONE));
+    assert_eq!(focused_file(client, root).as_deref(), Some("src/a.rs"));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::ArrowDown, egui::Modifiers::NONE));
+    assert_eq!(focused_file(client, root).as_deref(), Some("src/a.rs"));
+    assert!(panel_has_the_keys(ctx));
+    assert_eq!(typed_in(world, "s1"), typed_before, "no walking key reached the terminal");
+}
+
+#[test]
+fn shift_arrows_stay_in_a_text_box_and_an_agent_chord_leaves_it_with_its_text() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), WIDE);
+    client.focus_steer = true;
+    client.steer_text = "half a thought".into();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(ctx.text_edit_focused(), "the steer bar has the keyboard");
+    let panel = view.desk.panel;
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::ArrowDown, egui::Modifiers::SHIFT));
+    assert_eq!(view.desk.panel, panel, "it stays with the text box");
+    assert!(!panel_has_the_keys(&ctx));
+
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num3, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert_eq!(client.steer_text, "half a thought");
+    assert!(panel_has_the_keys(&ctx));
+    no_bytes(&world);
+}
+
+#[test]
+fn typing_or_escape_in_the_diff_hands_the_keyboard_back_to_the_agents_terminal() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    forwarded(ctx, world, client, view, "3", CHORD);
+    settled(ctx, world, client, view, WIDE);
+    assert!(panel_has_the_keys(ctx));
+    no_bytes(world);
+
+    // The first key goes to the terminal, and the input takes the keyboard for the next.
+    sized(ctx, world, client, view, WIDE, vec![egui::Event::Text("y".into())]);
+    assert!(!panel_has_the_keys(ctx), "the panel let go");
+    assert!(view.term.overlay.focus, "the input takes the keyboard");
+    settled(ctx, world, client, view, WIDE);
+    assert_eq!(typed_in(world, "s2"), "y", "the key that moved the keyboard is not lost");
+    assert_eq!(typed_in(world, "s1"), "");
+
+    // Escape goes back the same way, and reaches no terminal: an agent would take it for an interrupt.
+    view.term.inputs.push(term_pane::TermInput::Focus(false));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Num2, CHORD));
+    settled(ctx, world, client, view, WIDE);
+    assert!(panel_has_the_keys(ctx));
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Escape, egui::Modifiers::NONE));
+    assert!(view.term.overlay.focus);
+    assert!(!panel_has_the_keys(ctx));
+    settled(ctx, world, client, view, WIDE);
+    assert_eq!(typed_in(world, "s1"), "");
+}
+
+#[test]
+fn a_viewer_moves_around_with_the_keys_and_types_nothing() {
+    let (ctx, mut world, mut client, mut view) = viewing(agents());
+    client.send(Command::SetView(None));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num3, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("y".into())]);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    no_bytes(&world);
+    assert!(!view.term.overlay.focus);
+}
+
+#[test]
+fn with_tickets_open_the_reader_follows_the_agent_and_no_diff_comes_up() {
+    let mut host = fake_host::ticket_reader();
+    host.board.plans[0].tasks[1].session = Some("s2".into());
+    host.board.plans[0].tasks[1].ticket = Some("ENG-42".into());
+    let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
+    host.board.sessions.push(atomics_core::projection::SessionInfo { id: "s2".into(), ..base });
+    host.terminals.insert("s2".into(), fake_host::FakeTerminal::new(80, 12, "$ "));
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.send(Command::SetView(None));
+    client.send(Command::ToggleView(PanelMode::Tickets));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.tickets.active(), "the reader shows");
+    let link = |key: &str| atomics_core::tickets::TicketLink {
+        system: "tracker".into(),
+        id: key.into(),
+        key: Some(key.into()),
+        ..Default::default()
+    };
+    // Find stays in Find.
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num2, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    assert!(client.tickets.read.is_none());
+    assert_eq!(view.desk.panel, PanelMode::Tickets, "open Tickets keeps its place");
+
+    client.tickets.open(link("OTHER-1"), false, 0.0, &mut client.commands);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    fn reads(client: &Client) -> Option<String> {
+        client.tickets.read.as_ref().map(|read| read.link.label().to_string())
+    }
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num1, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+    assert_eq!(reads(&client).as_deref(), Some("ENG-41"), "the reader follows the agent");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num2, CHORD));
+    assert_eq!(reads(&client).as_deref(), Some("ENG-42"));
+    assert_eq!(view.desk.panel, PanelMode::Tickets, "no diff comes up");
+    assert!(panel_has_the_keys(&ctx), "the panel has the keys");
+    no_bytes(&world);
+}
+
+#[test]
+fn in_editor_mode_the_nth_agents_editor_takes_the_keyboard() {
+    let mut host = fake_host::panels_host();
+    let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
+    host.board.sessions.push(atomics_core::projection::SessionInfo {
+        id: "s2".into(),
+        task: None,
+        worktree: Some("/w/two".into()),
+        cwd: "/w/two".into(),
+        ..base
+    });
+    host.terminals.insert("s2".into(), fake_host::FakeTerminal::new(80, 12, "$ "));
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(host, WIDE);
+    client.send(Command::Edit { root: fake_host::WORKTREE.into(), path: None, line: None });
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(view.desk.panel, PanelMode::Editor);
+    let asked = |world: &World, root: &str| {
+        world.sent().iter().any(|m| {
+            matches!(m, Message::HostCommand(c)
+                if matches!(&c.action, HostAction::Edit { root: r, .. } if r == root))
+        })
+    };
+
+    // The second agent's editor starts on demand, and the keyboard goes there, not to the panel.
+    view.term.inputs.push(term_pane::TermInput::Key { name: "2".into(), mods: CHORD });
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    assert_eq!(view.desk.panel, PanelMode::Editor, "it stays in the editor");
+    assert!(asked(&world, "/w/two"), "its editor starts");
+    assert!(!panel_has_the_keys(&ctx));
+    assert!(view.term.overlay.focus || view.term.focus_next, "typing goes to the editor");
+    no_bytes(&world);
+
+    // An editor that runs keeps Shift with the arrows, to select text.
+    view.term.overlay.editor = true;
+    view.term.inputs.push(term_pane::TermInput::Key { name: "ArrowDown".into(), mods: egui::Modifiers::SHIFT });
+    assert!(view.term.window_keys(ctx.os()).is_empty(), "the editor keeps it");
+    assert_eq!(view.term.inputs.len(), 1);
+    view.term.inputs.clear();
+    view.term.inputs.push(term_pane::TermInput::Key { name: "1".into(), mods: CHORD });
+    assert_eq!(view.term.window_keys(ctx.os()).len(), 1, "an agent chord leaves it");
+}
+
+#[test]
+fn a_phone_with_a_keyboard_takes_the_same_keys_where_it_has_the_agents() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), PHONE);
+    view.tab = Tab::Agents;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "Agent s0"), "{shown:?}");
+
+    // Ctrl+3: the third of every agent, on the Diffs pane.
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, press(egui::Key::Num3, CHORD));
+    assert_eq!(view.tab, Tab::Diffs);
+    assert_eq!(view.diff.as_deref(), Some(Path::new("/w/two")));
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "src/two.rs"), "{shown:?}");
+
+    // Shift+↓ walks the diff on screen, and no key does anything else.
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, press(egui::Key::ArrowDown, egui::Modifiers::SHIFT));
+    assert_eq!(focused_file(&client, "/w/two").as_deref(), Some("src/two.rs"));
+    assert_eq!(view.tab, Tab::Diffs);
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, vec![egui::Event::Text("y".into())]);
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, press(egui::Key::Escape, egui::Modifiers::NONE));
+    assert_eq!(view.tab, Tab::Diffs, "a phone keeps its panes");
+    no_bytes(&world);
+
+    // From the terminal's pane, Shift+↓ goes to the worktree of the agent it shows.
+    view.tab = Tab::Terminal;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    client.send(Command::Activate { session: "s0".into(), open_diff: false });
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    view.tab = Tab::Terminal;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, press(egui::Key::ArrowDown, egui::Modifiers::SHIFT));
+    assert_eq!(view.tab, Tab::Diffs);
+    assert_eq!(view.diff.as_deref(), Some(Path::new("/w/zero")));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+}
+
+#[test]
+fn a_window_with_no_room_for_the_diff_and_the_terminal_gives_the_terminal_back_by_closing_the_diff() {
+    // Wide layout, small: the diff covers the terminals.
+    const SMALL: (f32, f32) = (640.0, 300.0);
+    let (ctx, mut world, mut client, mut view) = live_with(agents());
+    view.layout = layout::LayoutMode::Desktop;
+    client.send(Command::SetView(None));
+    settled(&ctx, &mut world, &mut client, &mut view, SMALL);
+    sized(&ctx, &mut world, &mut client, &mut view, SMALL, press(egui::Key::Num3, CHORD));
+    settled(&ctx, &mut world, &mut client, &mut view, SMALL);
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    assert!(view.desk.diff_open);
+    if view.desk.diff_fills {
+        assert!(panel_has_the_keys(&ctx));
+        sized(&ctx, &mut world, &mut client, &mut view, SMALL, press(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(!view.desk.diff_open, "or the terminal would not show");
+        assert!(!panel_has_the_keys(&ctx));
+    }
+    settled(&ctx, &mut world, &mut client, &mut view, SMALL);
+    no_bytes(&world);
+}
+
+#[test]
+fn a_rows_number_is_the_key_that_goes_to_it_though_the_groups_order_it_differently() {
+    let (ctx, mut world, mut client, mut view) = live_with(agents());
+    client.send(Command::SetView(None));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    let row_of = |title: &str| on(&shown, title);
+    let number_by = |row: egui::Pos2| {
+        shown
+            .iter()
+            .filter(|(text, rect)| {
+                text.len() == 1
+                    && text.chars().all(|c| c.is_ascii_digit())
+                    && rect.left() < row.x
+                    && (rect.center().y - row.y).abs() < 28.0
+            })
+            .map(|(text, rect)| (text.clone(), rect.center().x))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(text, _)| text)
+    };
+    let (first, planned, last) = (row_of("Agent s0"), row_of("Fix the parser"), row_of("Agent s2"));
+    assert!(planned.y < first.y, "the plan's group comes first: {shown:?}");
+    assert_eq!(number_by(first).as_deref(), Some("1"), "{shown:?}");
+    assert_eq!(number_by(planned).as_deref(), Some("2"));
+    assert_eq!(number_by(last).as_deref(), Some("3"));
+
+    sized(&ctx, &mut world, &mut client, &mut view, BOARD, press(egui::Key::Num1, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s0"), "what you see is what you press");
+}
+
+#[test]
+fn a_changed_files_click_scrolls_the_diff_in_place_and_keeps_the_agent() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+    client.send(Command::ToggleView(PanelMode::Diff));
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    let before = world.sent().len();
+    let root = fake_host::WORKTREE;
+    client.send(Command::OpenFile { root: root.into(), path: "src/b.rs".into() });
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert_eq!(view.desk.active.as_deref(), Some("s1"), "the agent stays the active one");
+    assert_eq!(focused_file(&client, root).as_deref(), Some("src/b.rs"));
+    assert_eq!(world.sent().len(), before, "and nothing goes to the host: {:?}", &world.sent()[before..]);
+
+    // A file of a worktree that is not on screen shows that worktree, which may be nobody's.
+    client.send(Command::OpenFile { root: "/w/other".into(), path: "src/c.rs".into() });
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert_eq!(view.desk.active, None);
+    assert_eq!(view.desk.diff_target(&world.driver.remote).as_deref(), Some(Path::new("/w/other")));
+}
+
+#[test]
+fn closing_settings_gives_the_keyboard_back_to_the_terminal() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    client.management.settings = true;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    client.management.settings = false;
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    assert!(client.focus_terminal.is_none());
+    assert!(view.term.overlay.focus, "the input takes it back");
+}

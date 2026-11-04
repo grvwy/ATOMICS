@@ -65,6 +65,13 @@
 //! `a_click_back_within_a_round_trip_types_at_once` and `a_finished_plan_picked_on_a_phone_shows_in_the_strip` say
 //! what they do. Their screenshots are saved in
 //! `target/actions-shots/`.
+//!
+//! The keys every client takes the same way (`atomics_ui::window_keys`), as the page reads them from a real keyboard
+//! event. `ctrl_n_from_a_terminal_shows_that_agents_diff_and_no_byte_reaches_it`: Ctrl+N with a terminal focused takes
+//! the keyboard to the Nth agent's diff, past the browser's own use of the key; typing there goes back to the agent, and
+//! plain Ctrl+D still reaches the terminal. `shift_arrows_and_page_keys_walk_the_diff`: from a terminal, Shift+↓ walks
+//! the changed files, and PageDown the hunks once the diff has the keyboard. DevTools' keys skip the browser's own
+//! shortcuts, so whether a tab would have switched was checked by hand with real X11 keys (docs/navigation.md).
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -678,6 +685,19 @@ impl DevTools {
             "Input.dispatchKeyEvent",
             json!({ "type": "keyUp", "key": key, "code": key, "windowsVirtualKeyCode": code }),
         );
+    }
+
+    /// A key pressed and let go with `modifiers` held (1 Alt, 2 Ctrl, 4 Meta, 8 Shift): `key` is what it types, `code`
+    /// the physical key.
+    fn chord(&mut self, modifiers: u32, key: &str, code: &str, virtual_code: u32) {
+        let event = |kind: &str| {
+            json!({
+                "type": kind, "modifiers": modifiers, "key": key, "code": code,
+                "windowsVirtualKeyCode": virtual_code,
+            })
+        };
+        self.call("Input.dispatchKeyEvent", event("rawKeyDown"));
+        self.call("Input.dispatchKeyEvent", event("keyUp"));
     }
 }
 
@@ -2534,6 +2554,144 @@ fn a_row_steers_and_a_review_column_acts() {
     keep(&mut page, "wide-changed-files-picked");
     eprintln!("messages after the file-row click: {:#?}", &host.lock().unwrap().received[before..]);
     assert_eq!(host.lock().unwrap().received.len(), before, "nothing went to the host");
+}
+
+/// [`another`] on the plan's tab with a worktree and a diff of its own.
+fn agent_with_a_diff(board: &mut FakeHost, id: &str, title: &str, file: &str) {
+    another(board, id, "claude", title);
+    board.board.sessions.last_mut().expect("the agent").task =
+        Some(atomics_core::projection::TaskLink { plan: "p1".into(), task: "t3".into() });
+    let root = format!("/w/{id}");
+    let mut diff = board.board.diffs[0].clone();
+    diff.worktree.clone_from(&root);
+    diff.files.truncate(1);
+    diff.files[0].old_path = Some(file.into());
+    diff.files[0].new_path = Some(file.into());
+    board.board.diffs.push(diff);
+    board.files.insert((root, file.into()), fake_host::file_diff(file, 6));
+}
+
+/// A click puts the keyboard in the first agent's terminal.
+fn at_the_first_terminal(frame: &mut DevTools, page: &mut DevTools, log: &Log) {
+    log.wait("subscribe s1", 1);
+    terminal_input(frame);
+    let input = input_rect(frame);
+    page.click((f64::from(input.center().x), f64::from(input.center().y)));
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input after a click", FOCUSED);
+}
+
+/// The keyboard is on the canvas, where the app reads it, and not on the terminal's input.
+const ON_THE_CANVAS: &str = "document.activeElement === document.getElementById('atomics')";
+
+fn diff_asked(host: &FakeHost, root: &str) -> bool {
+    host.received.iter().any(|m| matches!(m, Message::DiffGet { worktree, .. } if worktree == root))
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn ctrl_n_from_a_terminal_shows_that_agents_diff_and_no_byte_reaches_it() {
+    let mut board = fake_host::working();
+    agent_with_a_diff(&mut board, "s2", "Agent two", "src/two.rs");
+    agent_with_a_diff(&mut board, "s3", "Agent three", "src/three.rs");
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    log.wait("hello new", 1);
+    at_the_first_terminal(&mut frame, &mut page, &log);
+    keep(&mut page, "keys-terminal");
+    let agents = ["s1", "s2", "s3"];
+
+    // Ctrl+3 with the terminal focused: the third agent's diff is fetched, and the keyboard left the input. In a
+    // terminal Ctrl+3 is Escape, which would interrupt the agent.
+    page.chord(2, "3", "Digit3", 51);
+    frame.wait("the keyboard on the canvas", ON_THE_CANVAS);
+    wait_host(&host, "the third agent's diff", |h| diff_asked(h, "/w/s3"));
+    keep(&mut page, "keys-ctrl-3");
+    for session in agents {
+        assert_eq!(typed(&host, session), "", "{session}: no byte");
+    }
+
+    // With the keyboard on the canvas too, and past the last agent nothing moves.
+    page.chord(2, "2", "Digit2", 50);
+    wait_host(&host, "the second agent's diff", |h| diff_asked(h, "/w/s2"));
+    page.chord(2, "9", "Digit9", 57);
+    keep(&mut page, "keys-ctrl-9");
+    frame.wait("the keyboard still on the canvas", ON_THE_CANVAS);
+
+    // A layout that types a symbol on the key: the physical key is what counts, and it picks the agent again.
+    page.chord(2, "\"", "Digit3", 51);
+    keep(&mut page, "keys-ctrl-3-another-layout");
+    for session in agents {
+        assert_eq!(typed(&host, session), "", "{session}: no byte");
+    }
+
+    // Typing in the diff goes to the agent on screen, the key that moved the keyboard too, and the input has the rest.
+    page.chord(0, "y", "KeyY", 89);
+    frame.wait("the keyboard back on the input", FOCUSED);
+    wait_host(&host, "\"y\" typed into the third agent", |h| h.terminals["s3"].typed == "y");
+    keep(&mut page, "keys-typed-back");
+
+    // Plain Ctrl with a letter is the terminal's.
+    page.chord(2, "d", "KeyD", 68);
+    wait_host(&host, "Ctrl+D typed into the third agent", |h| h.terminals["s3"].typed == "y\u{4}");
+    frame.wait("the keyboard still on the input", FOCUSED);
+    assert_eq!(typed(&host, "s1"), "");
+    assert_eq!(typed(&host, "s2"), "");
+}
+
+/// The first added lines on screen are a short file's, or those of the long one, which fill the panel.
+fn diff_shows(page: &mut DevTools, palette: &Palette, long: bool) {
+    let region = Rect::from_min_max(pos2(WIDE.0 / 2.0, 90.0), pos2(WIDE.0, WIDE.1 - 40.0));
+    let what = if long { "the long file at the top of the diff" } else { "the short file at the top of the diff" };
+    until_on(page, WIDE, &actions_dir(), what, |page| {
+        let mut bands: Vec<_> = boxes(page, palette.added, 2, region, 1000.0)
+            .into_iter()
+            .filter(|r| r.width() > 200.0 && r.height() > 10.0)
+            .collect();
+        bands.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        bands.first().filter(|first| (first.height() > 300.0) == long).copied()
+    });
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn shift_arrows_and_page_keys_walk_the_diff() {
+    let mut board = fake_host::working();
+    // Long enough that going to the second file scrolls the first one away.
+    board.files.insert((fake_host::WORKTREE.into(), "src/b.rs".into()), fake_host::file_diff("src/b.rs", 200));
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(board, WIDE, false);
+    log.wait("hello new", 1);
+    at_the_first_terminal(&mut frame, &mut page, &log);
+    let typed_before = typed(&host, "s1");
+
+    // Shift+↓ from the terminal brings the diff up, at its first file, and the keyboard goes with it.
+    page.chord(8, "ArrowDown", "ArrowDown", 40);
+    frame.wait("the keyboard on the canvas", ON_THE_CANVAS);
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    diff_shows(&mut page, &palette, false);
+    keep(&mut page, "keys-first-file");
+
+    // On to the next file, and back.
+    page.chord(8, "ArrowDown", "ArrowDown", 40);
+    diff_shows(&mut page, &palette, true);
+    keep(&mut page, "keys-second-file");
+    page.chord(8, "ArrowUp", "ArrowUp", 38);
+    diff_shows(&mut page, &palette, false);
+    keep(&mut page, "keys-first-file-again");
+
+    // PageDown stops at the first file's hunk, and then goes on to the second file's.
+    page.chord(0, "PageDown", "PageDown", 34);
+    keep(&mut page, "keys-first-hunk");
+    page.chord(0, "PageDown", "PageDown", 34);
+    diff_shows(&mut page, &palette, true);
+    keep(&mut page, "keys-next-hunk");
+
+    // The plain arrows scroll lines, and none of it reached the terminal.
+    page.chord(0, "ArrowDown", "ArrowDown", 40);
+    frame.wait("the keyboard still on the canvas", ON_THE_CANVAS);
+    assert_eq!(typed(&host, "s1"), typed_before, "no byte");
 }
 
 #[test]

@@ -34,6 +34,7 @@ use atomics_ui::shell::{self, Platform};
 use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
 use atomics_ui::touch::{self, Touch};
+use atomics_ui::window_keys as keys;
 use atomics_ui::{
     Backend, Client, Command, PanelMode, PlanRow, approvals, board, chief, diff_panel, fleet, sidebar, switcher, topbar,
 };
@@ -45,7 +46,7 @@ use crate::dialogs::{self, Picker};
 use crate::driver::{Driver, Status};
 use crate::layout::{self, LayoutMode, Viewport};
 use crate::remote::RemoteBackend;
-use crate::term_pane::{TermPane, Terminals};
+use crate::term_pane::{TermInput, TermPane, Terminals};
 
 /// The phone layout's panes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -257,6 +258,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     view.looks.apply(ui.ctx(), client, view.compact);
     view.term.touch = client.touch;
     sync(ui.ctx(), driver, client, view);
+    window_keys(ui.ctx(), driver, client, view);
     if view.compact {
         phone(ui, screen, driver, client, view);
     } else {
@@ -270,6 +272,79 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     want(&driver.remote, client, view);
     driver.flush();
     atomics_ui::panel_nav::settle_focus(ui.ctx());
+}
+
+/// The keys that move around the window, as every client takes them ([`keys`]); those the terminal's input
+/// forwarded come in with the rest. What a key records is carried out before the frame draws what it asked for. The
+/// terminal pane stands in for the keyboard here: the keyboard goes to the panel by letting go of the overlay, and
+/// back by the overlay taking it, with the key typed to do that.
+fn window_keys(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    let forwarded = view.term.window_keys(ctx.os());
+    ctx.input_mut(|i| i.events.extend(forwarded));
+    let remote = &driver.remote;
+    let hints = remote.view_hints();
+    let mut moved = None;
+    let mut walked = None;
+    if let Some(step) = keys::take_walk(ctx, client, &hints) {
+        moved = keys::walk(ctx, remote, client, step);
+        walked = hints.diff_target;
+    }
+    for n in keys::take_agents(ctx) {
+        if let Some(picked) = keys::pick_agent(ctx, remote, client, n) {
+            moved = Some(picked.keyboard);
+            walked = None;
+        }
+    }
+    carry_out(driver, client, view);
+    let remote = &driver.remote;
+    // A phone's Diffs pane is what the panel is on a wide screen: a row's tap goes to the terminal, these keys there,
+    // to the worktree they are about.
+    if view.compact && moved.is_some() {
+        view.tab = Tab::Diffs;
+        view.diff = walked.or_else(|| view.desk.diff_target(remote));
+    }
+    match moved {
+        Some(keys::Keyboard::Panel) => {
+            keys::Keyboard::Panel.settle(ctx, client);
+            view.term.focus_next = false;
+            view.term.let_go();
+        }
+        // The input has the keyboard over a terminal, an editor's too: picking the agent moved it there.
+        Some(keys::Keyboard::Editor) => {
+            keys::Keyboard::Editor.settle(ctx, client);
+            client.focus_editor = false;
+        }
+        None => {}
+    }
+    let remote = &driver.remote;
+    // Only the wide layout has a terminal beside the panel to hand the keyboard to.
+    if !view.compact && keys::hand_back(ctx, remote, client, view.desk.diff_fills) {
+        let typed = ctx.input_mut(|i| {
+            let mut typed = Vec::new();
+            i.events.retain(|event| match event {
+                egui::Event::Text(text) if !text.is_empty() => {
+                    typed.push(TermInput::Text(text.clone()));
+                    false
+                }
+                egui::Event::Paste(text) if !text.is_empty() => {
+                    typed.push(TermInput::Paste(text.clone()));
+                    false
+                }
+                _ => true,
+            });
+            typed
+        });
+        if client.focus_terminal.take().is_some() {
+            view.desk.typing_in = None;
+            view.term.hand_back(typed);
+        }
+        carry_out(driver, client, view);
+    }
+    // What gave the keyboard back to the active terminal; a tile would only give it egui's focus.
+    if client.focus_terminal.is_some() && client.focus_terminal == view.desk.active {
+        client.focus_terminal = None;
+        view.term.focus_next |= !view.compact;
+    }
 }
 
 /// The boot's ticket key, once the board is in: its plan on the board, or the board the page opens on when no
@@ -349,6 +424,10 @@ fn hint(remote: &RemoteBackend, view: &View) {
     let mut hints = view.desk.hints(remote);
     if view.compact {
         (hints.plan_view, hints.ungrouped) = (false, false);
+        // The Diffs pane shows a worktree of its own.
+        if view.tab == Tab::Diffs && view.diff.is_some() {
+            hints.diff_target.clone_from(&view.diff);
+        }
     }
     remote.set_view(hints);
     remote.set_chief_window(view.desk.chief, !view.compact);
@@ -394,6 +473,7 @@ impl Platform for Web<'_> {
 
     fn laid_out(&mut self, layout: &Grid) {
         self.view.desk.dock_fits = layout.dock_width > 0.0;
+        self.view.desk.diff_fills = layout.diff == DiffPlacement::Full;
     }
 
     /// Where the desktop has its Tickets, GitHub and Remote items: how this page's connection is.
@@ -487,10 +567,13 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
             Command::CloseSession(id) if dialogs::may_be_scratch(remote, &id) => client.confirm_close = Some(id),
             Command::ClosePlanTab(plan) => client.confirm_plan_close = dialogs::plan_to_close(remote, plan),
             Command::NewSession => view.picker = Some(Picker::default()),
-            // The changed files' column names files the page has the hunks of: the diff scrolls to them.
+            // The changed files' column names files the page has the hunks of: the diff scrolls to them, and the
+            // agent whose diff it is stays the active one. A file of another worktree shows that worktree.
             Command::OpenFile { root, path } => {
                 let whole = remote.open_file(&root, &path);
-                view.desk.apply(Command::ShowRoot(root.clone()), remote);
+                if view.desk.diff_target(remote).as_deref() != Some(root.as_path()) {
+                    view.desk.apply(Command::ShowRoot(root.clone()), remote);
+                }
                 view.desk.panel = PanelMode::Diff;
                 view.desk.diff_open = true;
                 if view.compact {
@@ -500,6 +583,7 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
                 remote.want_diff(&root);
                 client.diff_views.entry(root).or_default().open_resolved(&path, whole);
             }
+            Command::LeaveFile(root) => remote.leave_file(&root),
             Command::Edit { root, path, line } => {
                 remote.send(Command::Edit { root: root.clone(), path, line });
                 view.desk.diff_open = true;

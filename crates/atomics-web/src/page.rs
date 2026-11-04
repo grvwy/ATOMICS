@@ -20,7 +20,13 @@ pub enum PageEvent {
 
 /// The modifier bits the script sends: 1 Shift, 2 Alt, 4 Ctrl, 8 Meta.
 pub fn modifiers(bits: u64) -> Modifiers {
-    Modifiers { shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, mac_cmd: false, command: bits & 8 != 0 }
+    Modifiers {
+        shift: bits & 1 != 0,
+        alt: bits & 2 != 0,
+        ctrl: bits & 4 != 0,
+        mac_cmd: bits & 8 != 0,
+        command: bits & 8 != 0,
+    }
 }
 
 pub fn read(event: &Value, zoom: f32) -> Option<PageEvent> {
@@ -94,6 +100,11 @@ mod tests {
         assert_eq!(
             input(json!({ "kind": "key", "text": "c", "mods": 4 })),
             TermInput::Key { name: "c".into(), mods: Modifiers::CTRL }
+        );
+        assert_eq!(
+            input(json!({ "kind": "key", "text": "2", "mods": 8 })),
+            TermInput::Key { name: "2".into(), mods: Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE } },
+            "Command, as a native window reads it"
         );
         assert_eq!(input(json!({ "kind": "focus", "on": true })), TermInput::Focus(true));
         assert_eq!(

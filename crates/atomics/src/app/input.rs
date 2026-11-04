@@ -1,3 +1,5 @@
+use atomics_ui::window_keys;
+
 use super::*;
 
 impl State {
@@ -81,68 +83,20 @@ impl Desktop<'_> {
         self.github_focus(ctx);
         self.github_keys(ctx);
         // Shift+↓/↑ walk changed files; PageDown/PageUp walk hunks in the focused diff.
-        let editor_focused = self.client.ui.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
-        if !ctx.text_edit_focused() && !editor_focused {
-            let diff_focused = self.runtime.diff_open
-                && self.runtime.panel == PanelMode::Diff
-                && ctx.memory(|m| m.has_focus(diff_view::focus_id()));
-            let (step, hunk) = ctx.input_mut(|i| {
-                let down = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::ArrowDown);
-                let up = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::ArrowUp);
-                let page_down = egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::PageDown);
-                let page_up = egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::PageUp);
-                if crate::theme::consume_physical_shortcut(i, &down) {
-                    (1, false)
-                } else if crate::theme::consume_physical_shortcut(i, &up) {
-                    (-1, false)
-                } else if diff_focused && crate::theme::consume_physical_shortcut(i, &page_down) {
-                    (1, true)
-                } else if diff_focused && crate::theme::consume_physical_shortcut(i, &page_up) {
-                    (-1, true)
-                } else {
-                    (0, false)
-                }
-            });
-            if step != 0
-                // A pull request diff on screen takes the same keys.
-                && self.runtime.panel == PanelMode::Diff
-                && self.client.ui.pr_view.is_some()
-                && let Some((_, state)) = self.client.ui.pr_view.as_mut()
+        let hints = self.runtime.backend().view_hints();
+        if let Some(step) = window_keys::take_walk(ctx, &self.client.ui, &hints) {
+            let walked = if self.runtime.panel == PanelMode::Tickets
+                && self.runtime.diff_open
+                && !self.client.ui.tickets.active()
             {
-                if hunk {
-                    state.step_hunk(step);
-                } else {
-                    state.step(step);
-                }
-                self.send(Command::OpenDiff);
-                self.client.focus_terminal = None;
-                self.client.ui.focus_editor = false;
-                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-            } else if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
-                // The Tickets panel takes Shift+↓/↑; it pages with PageUp/PageDown itself.
-                self.client.focus_terminal = None;
-                self.client.ui.focus_editor = false;
-                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                if self.client.ui.tickets.active() {
-                    let ui = &mut self.client.ui;
-                    ui.tickets.step(step, ctx.input(|i| i.time), &mut ui.commands);
-                } else {
-                    self.runtime.tickets_step(step);
-                }
-            } else if step != 0
-                && let Some(root) = self.runtime.diff_target()
-            {
-                self.send(Command::OpenDiff);
-                self.send(Command::SetPanel(PanelMode::Diff));
-                self.client.focus_terminal = None;
-                self.client.ui.focus_editor = false;
-                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                let state = self.client.diff_views.entry(root.clone()).or_default();
-                let target = if hunk { state.step_hunk(step) } else { state.step(step) };
-                if target.is_some() {
-                    // Keep the host in diff mode without reopening the file over the jump.
-                    self.send(Command::LeaveFile(root));
-                }
+                // The panel that predates the shared reader.
+                self.runtime.tickets_step(step.delta);
+                Some(window_keys::Keyboard::Panel)
+            } else {
+                self.draw(|backend, client| window_keys::walk(ctx, backend, client, step))
+            };
+            if let Some(keyboard) = walked {
+                keyboard.settle(ctx, &mut self.client.ui);
             }
         }
         if pressed(&keys.toggle_plan) {
@@ -249,102 +203,18 @@ impl Desktop<'_> {
         {
             self.client.confirm_close = Some(id);
         }
-        for (n, key) in
-            [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
-                .into_iter()
-                .enumerate()
-        {
-            let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
-            let chord = egui::KeyboardShortcut::new(modifiers, key);
-            // Command+N on macOS, Ctrl+N elsewhere: focus the Nth agent's diff or editor.
-            let visible = self.runtime.visible_sessions();
-            if ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
-                && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
-            {
-                // Only an open Tickets panel keeps its place; activating opens the panel, so ask first.
-                let tickets_open = self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open;
-                self.send(Command::Activate { session: id.clone(), open_diff: true });
-                self.client.focus_terminal = None;
-                if self.runtime.panel == PanelMode::Editor {
-                    self.client.ui.focus_editor = true;
-                    // A worktree's editor is started lazily. Selecting it in editor mode
-                    // must not leave the previous agent's terminal holding the keys.
-                    ctx.memory_mut(|m| {
-                        if let Some(id) = m.focused() {
-                            m.surrender_focus(id);
-                        }
-                    });
-                    if let Some(root) = self.runtime.diff_target()
-                        && !self.runtime.editors.get(&root).is_some_and(|editor| !editor.exited())
-                    {
-                        let path = self.client.editor_file.get(&root).cloned().or_else(|| {
-                            self.client.diff_views.get(&root).and_then(|state| {
-                                state.focused.clone().or_else(|| {
-                                    state
-                                        .prepared
-                                        .as_ref()
-                                        .and_then(|p| p.diff.files.first().map(|f| f.path().to_string()))
-                                })
-                            })
-                        });
-                        self.send(Command::Edit { root, path, line: None });
-                    }
-                } else if tickets_open {
-                    // Find stays in Find; Read shows the agent's ticket.
-                    self.client.ui.focus_editor = false;
-                    if self.client.ui.tickets.active() {
-                        self.reader_retarget(&id, ctx.input(|i| i.time));
-                    } else {
-                        self.runtime.tickets_retarget(&id);
-                    }
-                    ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                } else {
-                    self.client.ui.focus_editor = false;
-                    self.send(Command::SetPanel(PanelMode::Diff));
-                    ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+        // Command+N on macOS, Ctrl+N elsewhere: focus the Nth agent's diff or editor.
+        for n in window_keys::take_agents(ctx) {
+            if let Some(picked) = self.draw(|backend, client| window_keys::pick_agent(ctx, backend, client, n)) {
+                if picked.tickets_open && !self.client.ui.tickets.active() {
+                    self.runtime.tickets_retarget(&picked.session);
                 }
+                picked.keyboard.settle(ctx, &mut self.client.ui);
             }
         }
-        // The reader's dialog holds the keyboard, and the reader takes Escape in a ticket itself.
-        let reader =
-            self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open && self.client.ui.tickets.active();
-        if ctx.memory(|m| m.has_focus(diff_view::focus_id())) && !(reader && self.client.ui.tickets.dialog) {
-            let escape = !(reader && self.client.ui.tickets.read.is_some())
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
-            let typing = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .any(|e| matches!(e, egui::Event::Text(text) | egui::Event::Paste(text) if !text.is_empty()))
-            });
-            if self.client.ui.focus_editor {
-                ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
-            } else if escape
-                || typing
-                || !self.runtime.diff_open
-                || !matches!(self.runtime.panel, PanelMode::Diff | PanelMode::Tickets)
-            {
-                ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
-                self.client.focus_terminal = self.runtime.active.clone();
-                // At the smallest window size the diff covers the terminal entirely.
-                if self.runtime.last_layout.is_some_and(|l| l.diff == DiffPlacement::Full) {
-                    self.send(Command::CloseDiff);
-                }
-            }
-        }
-    }
-
-    /// Ctrl/Cmd+1…9 with a ticket open in the reader: show the selected agent's ticket.
-    fn reader_retarget(&mut self, session: &str, now: f64) {
-        let Some(read) = &self.client.ui.tickets.read else { return };
-        match self.runtime.session_ticket(session) {
-            Some(link) if read.link.same_ticket(&link) => {}
-            Some(link) => {
-                let Some(link) = self.runtime.stamp_system(Some(link)) else { return };
-                let ui = &mut self.client.ui;
-                ui.tickets.open(link, false, now, &mut ui.commands);
-            }
-            None => self.runtime.toast("That agent has no ticket"),
-        }
+        // At the smallest window size the diff covers the terminal entirely.
+        let diff_fills = self.runtime.last_layout.is_some_and(|l| l.diff == DiffPlacement::Full);
+        self.draw(|backend, client| window_keys::hand_back(ctx, backend, client, diff_fills));
     }
 
     /// Opens the New session dialog. A new session works in a scratch folder of its own unless
