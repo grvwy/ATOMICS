@@ -155,7 +155,10 @@ echo "an agent started through the forward runs in $stub_folder (pid $stub_pid)"
 
 # Through the forward, only a paired token or this start's gets in.
 refused() { ! echo "$hello" | client "$1" -1 >/dev/null 2>&1; }
-refused "${token%?}0" || fail "a wrong token got in"
+# The paired token with its last digit changed: always writing 0 left it unchanged one time in 16.
+case $token in *0) wrong=${token%?}1 ;; *) wrong=${token%?}0 ;; esac
+[ "$wrong" != "$token" ] || fail "the wrong token is the paired one"
+refused "$wrong" || fail "a wrong token got in"
 local_token=$(jq -r .token "$ATOMICS_HOME/protocol.json")
 echo "$hello" | client "$local_token" -1 | jq -e 'select(.kind == "welcome")' >/dev/null || fail "this start's token was refused"
 "$atomics" ctl '{"cmd":"unpair_client","name":"Mac"}' >/dev/null
