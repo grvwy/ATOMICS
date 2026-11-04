@@ -1835,7 +1835,7 @@ fn the_keyboard_in_a_text_box_lets_go_of_the_terminals_lease() {
     let held = |host: &Mutex<FakeHost>| host.lock().unwrap().terminals["s1"].lease.is_some();
 
     // A card's open types in its agent, as picking it from the sidebar does.
-    page.click((1369.0, 247.0));
+    page.click((1369.0, 289.0));
     log.wait("acquire s1", 1);
     frame.wait("the focus on the input", FOCUSED);
     page.call("Input.insertText", json!({ "text": "a" }));
@@ -2183,7 +2183,7 @@ fn a_board_and_a_tile_act_in_a_wide_window() {
     keep(&mut page, "wide-board");
 
     // A card's start starts that task; Dispatch ready, then, the other one that is ready.
-    page.click((1086.5, 304.0));
+    page.click((1086.5, 325.0));
     wait_host(&host, "t3 started", |h| task(h, "t3").status == TaskStatus::Running);
     assert_eq!(task(&host.lock().unwrap(), "t7").status, TaskStatus::Planned);
     thread::sleep(Duration::from_millis(300));
@@ -2298,13 +2298,13 @@ fn a_row_steers_and_a_review_column_acts() {
     // The divider dragged left, as far as the agent's tile lets it, brings the board's fourth column on screen.
     page.mouse_drag((1877.0, 600.0), (1000.0, 600.0));
     keep(&mut page, "wide-board-wider");
-    page.click((2265.0, 227.0));
+    page.click((2265.0, 248.0));
     wait_host(&host, "t6 unblocked", |h| task(h, "t6").status == TaskStatus::Running);
     thread::sleep(Duration::from_millis(300));
-    page.click((2709.4, 228.5));
+    page.click((2709.4, 249.5));
     wait_host(&host, "t4 integrated", |h| task(h, "t4").integrated.is_some());
     thread::sleep(Duration::from_millis(300));
-    page.click((2547.5, 228.5));
+    page.click((2547.5, 249.5));
     wait_host(&host, "t4 accepted", |h| task(h, "t4").status == TaskStatus::Done);
     thread::sleep(Duration::from_millis(300));
     page.click((1948.9, 112.5));
@@ -2342,10 +2342,10 @@ fn a_phone_acts_by_touch() {
     keep(&mut page, "phone-board");
 
     // The board's buttons, each a tap.
-    page.tap(at(210.6, 413.4));
+    page.tap(at(210.6, 435.8));
     wait_host(&host, "t4 integrated", |h| task(h, "t4").integrated.is_some());
     thread::sleep(Duration::from_millis(300));
-    page.tap(at(51.0, 413.8));
+    page.tap(at(51.0, 436.2));
     wait_host(&host, "t4 accepted", |h| task(h, "t4").status == TaskStatus::Done);
     keep(&mut page, "phone-accepted");
     page.tap(at(50.0, 273.9));
