@@ -72,7 +72,7 @@ impl BundleInfo {
 
 /// Where the Mac bundle is installed (the module's default `installDir`).
 pub fn installed_dir() -> PathBuf {
-    atomics_core::paths::env_override("ATOMICS_VM_BUNDLE")
+    atomics_core::paths::env_override("VM_BUNDLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| atomics_core::paths::home().join(".local/share/atomics-vm"))
 }
