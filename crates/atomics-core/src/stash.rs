@@ -136,14 +136,38 @@ fn target(name: &str) -> Target {
 }
 
 /// The shell's simple commands in `command`, as unquoted words: split at `;`, `&`, `|`, newlines,
-/// parentheses, backquotes and `$(`.
+/// parentheses, backquotes and `$(`. A redirection is no word of its command: `2>&1`, `>/dev/null`,
+/// `&> log` and `<<EOF` go, file descriptor and target alike.
 fn segments(command: &str) -> Vec<Vec<String>> {
+    // A word just ended: it is the command's, unless it is where a redirection goes.
+    fn finish(words: &mut Vec<String>, word: &mut Option<String>, redirect: &mut bool) {
+        if let Some(done) = word.take()
+            && !std::mem::take(redirect)
+        {
+            words.push(done);
+        }
+    }
     let mut segments = Vec::new();
     let mut words = Vec::new();
     let mut word: Option<String> = None;
     let mut quote = None;
+    // The next word is a redirection's target.
+    let mut redirect = false;
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
+        if quote.is_none() && (matches!(c, '>' | '<') || (c == '&' && chars.peek() == Some(&'>'))) {
+            // Digits just before `>` or `<` are the file descriptor it redirects: `2>`, `1>>`.
+            if c != '&'
+                && word.as_deref().is_some_and(|word| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))
+            {
+                word = None;
+            }
+            finish(&mut words, &mut word, &mut redirect);
+            // The rest of the operator: `>>`, `>&`, `>|`, `<<`, `<<<`, `<&`, `<>`, `&>>`.
+            while chars.next_if(|next| matches!(next, '>' | '<' | '&' | '|' | '-')).is_some() {}
+            redirect = true;
+            continue;
+        }
         let boundary =
             matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '\n') || (c == '$' && chars.peek() == Some(&'('));
         match (quote, c) {
@@ -161,16 +185,17 @@ fn segments(command: &str) -> Vec<Vec<String>> {
                 Some(next) => word.get_or_insert_default().push(next),
             },
             (None, _) if boundary => {
-                words.extend(word.take());
+                finish(&mut words, &mut word, &mut redirect);
+                redirect = false;
                 if !words.is_empty() {
                     segments.push(std::mem::take(&mut words));
                 }
             }
-            (None, c) if c.is_whitespace() => words.extend(word.take()),
+            (None, c) if c.is_whitespace() => finish(&mut words, &mut word, &mut redirect),
             (None, c) => word.get_or_insert_default().push(c),
         }
     }
-    words.extend(word);
+    finish(&mut words, &mut word, &mut redirect);
     if !words.is_empty() {
         segments.push(words);
     }
@@ -329,6 +354,17 @@ mod tests {
             ("eval git stash clear", vec![(Clear, All)]),
             ("eval 'git stash pop'", vec![(Pop, Index(0))]),
             ("git stash drop 1 && git stash drop 0", vec![(Drop, Index(1)), (Drop, Index(0))]),
+            // A redirection is neither the entry nor the end of the command.
+            ("git stash drop 2>&1", vec![(Drop, Index(0))]),
+            ("git stash drop stash@{1} 2>&1 | tail -1", vec![(Drop, Index(1))]),
+            ("git stash pop >/dev/null 2>&1 && git stash drop 3", vec![(Pop, Index(0)), (Drop, Index(3))]),
+            ("git stash drop > out.txt 2", vec![(Drop, Index(2))]),
+            ("git stash drop 1>/dev/null", vec![(Drop, Index(0))]),
+            ("git stash drop 1 >/dev/null", vec![(Drop, Index(1))]),
+            ("git stash drop &>/dev/null", vec![(Drop, Index(0))]),
+            ("git stash pop 2>> log 4", vec![(Pop, Index(4))]),
+            ("git stash drop <<< 'y' 1", vec![(Drop, Index(1))]),
+            ("git stash branch rescue 2>/dev/null stash@{1}", vec![(Branch, Index(1))]),
         ] {
             assert_eq!(found(command), expected, "{command}");
         }
