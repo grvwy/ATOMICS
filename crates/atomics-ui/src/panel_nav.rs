@@ -9,6 +9,16 @@ pub fn focus_id() -> egui::Id {
     egui::Id::NULL.with("diff-keyboard")
 }
 
+/// Asks for the frame that settles focus moved in this one; every client calls it as its frame ends. A widget's focus
+/// lock takes hold from its second frame with the focus, and egui reads it before that frame's keys. Without another
+/// frame the next key would be that one: an arrow would move the focus and Escape would drop it. An idle window draws
+/// no frame of its own, and egui follows only a frame that had input.
+pub fn settle_focus(ctx: &egui::Context) {
+    if ctx.memory(|m| m.focused().is_some_and(|id| !m.had_focus_last_frame(id))) {
+        ctx.request_repaint();
+    }
+}
+
 /// Makes `rect` the keyboard target and keeps the arrows and Escape out of egui's own
 /// focus movement while it has the focus.
 pub fn focusable(ui: &egui::Ui, rect: egui::Rect) -> egui::Response {

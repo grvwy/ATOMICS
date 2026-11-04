@@ -636,7 +636,9 @@ whose tools are absent produce doctor notes; they do not make an otherwise usabl
 
 `cmd+k` (Ctrl+Shift+K elsewhere; `cmd+j` already jumps to the next agent that needs you) shows the Tickets
 panel in the diff's slot. It appears when `[tickets]` is configured and has two modes, Find and Read. The key is
-`[keys] toggle_tickets`.
+`[keys] toggle_tickets`. Opening the panel gives it the keyboard, in the query box on Find and on the ticket on Read,
+so a query never lands in an agent's terminal; closing it gives the keyboard back to the terminal. On a phone the
+keyboard stays down until you tap the box.
 
 **Find** has a query box and, when both `search` and `semantic_search` are mapped, a *meaning / keyword*
 toggle (`Tab` in the box, or a click). Changing the mode searches again when the box holds a query. When the
@@ -675,7 +677,7 @@ Opening a child or related ticket adds it to the breadcrumbs.
 | Keys | In Find | In Read |
 | --- | --- | --- |
 | `cmd+k` | open / close the panel | same |
-| `Ctrl+1…9` (`Cmd+1…9`) | select agent N; Find stays in Find | select agent N and show its task's ticket (the chief and untasked agents show the plan's) |
+| `Ctrl+1…9` (`Cmd+1…9`) | select agent N; Find stays in Find | select agent N and show its task's ticket (the chief and untasked agents show the plan's). With the panel closed, the agent's diff, as anywhere else |
 | `Shift+↓` / `Shift+↑` | next / previous result | next / previous ticket: the following result, or on a trail of opened tickets (`↑` only) the one before. Ignored in a text field and in the editor |
 | `↑` `↓` | move the selection (`↓` in the box enters the list; on the last result, **More**) | scroll a line; at the top / bottom, read the previous / next ticket of the list in place (loading More at the last loaded ticket); the list's selection follows. On a trail of opened tickets, or for a ticket not in the list, scroll a line |
 | `←` `→` (in the list) | previous / next view; from search results, back to the selected view | |
@@ -747,8 +749,9 @@ until you search. Doctor notes a mapped `browse` tool the server does not offer.
 
 The **Plan with chief** button in Read (or `cmd+enter`, `[keys] plan_with_chief`, while the panel has the focus) hands
 the ticket to the chief. A small dialog names the ticket and the mode it will get, offers *one plan for this ticket
-only (ticket mode)* when the ticket has children, and takes optional extra instructions (up to 4 KB). Enter plans,
-Esc cancels. Then ATOMICS:
+only (ticket mode)* when the ticket has children, and takes optional extra instructions (up to 4 KB). It opens in the
+middle of the window and holds the keyboard. Enter plans, once, and Esc cancels and leaves the keyboard on the ticket.
+Then ATOMICS:
 
 1. **Checks the sign-in.** If the ticket system needs one, the panel shows its "not signed in" state and nothing is
    created or sent.

@@ -17,7 +17,12 @@ impl Platform for Desktop<'_> {
     ) -> R {
         // ctl and atomics:// links still address the desktop's navigation adapter. Import a new
         // request once; ordinary reader selection and history remain in the shared client.
-        let panel = &self.runtime.tickets.panel;
+        let panel = &mut self.runtime.tickets.panel;
+        if self.runtime.panel == PanelMode::Tickets
+            && (std::mem::take(&mut panel.focus_query) | std::mem::take(&mut panel.focus))
+        {
+            self.client.ui.tickets.take_keyboard();
+        }
         if self.runtime.panel == PanelMode::Tickets && panel.seq != self.client.ui.tickets.external_revision {
             let ui = &mut self.client.ui;
             match panel.view {

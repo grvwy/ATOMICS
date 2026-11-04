@@ -1246,6 +1246,7 @@ impl State {
             }
             if s.terminal.is_some() {
                 self.focus_terminal = Some(id.to_string());
+                self.window.request_repaint();
             }
         }
     }
@@ -1588,6 +1589,7 @@ impl Desktop<'_> {
         self.github_modal(&ctx);
         // egui lets go of a text field on Escape before the next frame's shortcuts see the key.
         self.client.keyboard_idle = ctx.memory(|m| m.focused().is_none());
+        atomics_ui::panel_nav::settle_focus(&ctx);
     }
 }
 
@@ -1596,6 +1598,9 @@ mod tests;
 
 #[cfg(test)]
 mod board_tests;
+
+#[cfg(test)]
+mod key_tests;
 
 #[cfg(test)]
 mod host_tests;

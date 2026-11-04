@@ -414,6 +414,8 @@ impl Desktop<'_> {
         self.runtime.diff_open |= open_diff;
         if self.runtime.sessions.iter().any(|s| s.id == id && s.terminal.is_some()) {
             self.client.focus_terminal = Some(id.to_string());
+            // The terminal takes the keyboard as the next frame draws it, and this may be on no input.
+            self.client.ctx.request_repaint();
         }
         self.send(Command::SeeSession(id.to_string()));
     }

@@ -47,6 +47,7 @@ impl Desktop<'_> {
             self.client.voice = Voice::Idle;
             self.runtime.toast("Voice: recording cancelled");
         }
+        self.draw(|backend, client| atomics_ui::management::begin_frame(ctx, backend, client));
         if pressed(&keys.toggle_diff) {
             self.send(Command::ToggleView(PanelMode::Diff));
         }
@@ -158,9 +159,10 @@ impl Desktop<'_> {
         if self.runtime.panel == PanelMode::Tickets
             && self.runtime.diff_open
             && self.client.ui.tickets.read.is_some()
+            && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
             && pressed(&keys.plan_with_chief)
         {
-            self.client.ui.tickets.dialog = true;
+            self.client.ui.tickets.open_plan_dialog();
         }
         // Plan with chief, from a ticket the panel is reading.
         if self.runtime.panel == PanelMode::Tickets
@@ -173,16 +175,7 @@ impl Desktop<'_> {
             self.runtime.open_plan_dialog();
         }
         if pressed(&keys.toggle_tickets) && self.runtime.ticket_config().is_some() {
-            self.runtime.toggle_tickets();
-            if self.runtime.panel == PanelMode::Tickets {
-                self.client.focus_terminal = None;
-                self.client.ui.focus_editor = false;
-                if self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read {
-                    ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                }
-            } else {
-                self.client.focus_terminal = self.runtime.active.clone();
-            }
+            self.send(Command::ToggleView(PanelMode::Tickets));
         }
         // Alt+← goes back along the tickets read, only while the panel holds the keys.
         if self.runtime.panel == PanelMode::Tickets
@@ -268,6 +261,8 @@ impl Desktop<'_> {
             if ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
+                // Only an open Tickets panel keeps its place; activating opens the panel, so ask first.
+                let tickets_open = self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open;
                 self.send(Command::Activate { session: id.clone(), open_diff: true });
                 self.client.focus_terminal = None;
                 if self.runtime.panel == PanelMode::Editor {
@@ -294,10 +289,14 @@ impl Desktop<'_> {
                         });
                         self.send(Command::Edit { root, path, line: None });
                     }
-                } else if self.runtime.panel == PanelMode::Tickets {
+                } else if tickets_open {
                     // Find stays in Find; Read shows the agent's ticket.
                     self.client.ui.focus_editor = false;
-                    self.runtime.tickets_retarget(&id);
+                    if self.client.ui.tickets.active() {
+                        self.reader_retarget(&id, ctx.input(|i| i.time));
+                    } else {
+                        self.runtime.tickets_retarget(&id);
+                    }
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 } else {
                     self.client.ui.focus_editor = false;
@@ -306,8 +305,12 @@ impl Desktop<'_> {
                 }
             }
         }
-        if ctx.memory(|m| m.has_focus(diff_view::focus_id())) {
-            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        // The reader's dialog holds the keyboard, and the reader takes Escape in a ticket itself.
+        let reader =
+            self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open && self.client.ui.tickets.active();
+        if ctx.memory(|m| m.has_focus(diff_view::focus_id())) && !(reader && self.client.ui.tickets.dialog) {
+            let escape = !(reader && self.client.ui.tickets.read.is_some())
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
             let typing = ctx.input(|i| {
                 i.events
                     .iter()
@@ -327,6 +330,20 @@ impl Desktop<'_> {
                     self.send(Command::CloseDiff);
                 }
             }
+        }
+    }
+
+    /// Ctrl/Cmd+1…9 with a ticket open in the reader: show the selected agent's ticket.
+    fn reader_retarget(&mut self, session: &str, now: f64) {
+        let Some(read) = &self.client.ui.tickets.read else { return };
+        match self.runtime.session_ticket(session) {
+            Some(link) if read.link.same_ticket(&link) => {}
+            Some(link) => {
+                let Some(link) = self.runtime.stamp_system(Some(link)) else { return };
+                let ui = &mut self.client.ui;
+                ui.tickets.open(link, false, now, &mut ui.commands);
+            }
+            None => self.runtime.toast("That agent has no ticket"),
         }
     }
 

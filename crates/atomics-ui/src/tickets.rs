@@ -9,6 +9,9 @@ use egui::{Color32, Key, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::{Backend, Client, Command, PanelMode, markdown, panel_nav, signin, touch};
 
+/// The height of one result.
+const ROW_H: f32 = 58.0;
+
 #[derive(Default)]
 pub struct Tickets {
     /// The last legacy desktop navigation request imported by that client.
@@ -34,6 +37,9 @@ pub struct Tickets {
     context: Option<(String, Option<String>)>,
     focus_query: bool,
     focus_panel: bool,
+    focus_extra: bool,
+    /// Bring the selected result into view on the next frame.
+    reveal: bool,
     searched: Option<(String, bool, usize, Vec<usize>)>,
     children: Vec<TicketCard>,
     related: Vec<TicketCard>,
@@ -82,9 +88,29 @@ impl Tickets {
         self.context.is_some()
     }
 
+    /// Gives the panel the keyboard where it next draws: the search field on Find, the panel on a ticket.
+    pub fn take_keyboard(&mut self) {
+        if self.read.is_some() {
+            self.focus_panel = true;
+        } else {
+            self.focus_query = true;
+        }
+    }
+
+    /// Asks to plan the ticket being read: a new draft, with the keyboard in its field.
+    pub fn open_plan_dialog(&mut self) {
+        if self.read.is_some() && !self.dialog {
+            self.dialog = true;
+            self.extra.clear();
+            self.ticket_only = false;
+            self.focus_extra = true;
+        }
+    }
+
     pub fn step(&mut self, delta: i32, now: f64, commands: &mut Vec<Command>) {
         if self.read.is_none() {
             self.selected = panel_nav::step_index(self.selected, self.results.len(), delta);
+            self.reveal = true;
         } else if !self.crumbs.is_empty() {
             if delta < 0 {
                 self.back(now, commands);
@@ -111,6 +137,20 @@ impl Tickets {
         } else {
             self.show_find(false);
         }
+    }
+
+    /// Escape in a ticket: to the results with it selected and in view, or to the board it was opened from.
+    fn back_to_list(&mut self, now: f64, commands: &mut Vec<Command>) {
+        if self.from_board && self.crumbs.is_empty() {
+            return self.back(now, commands);
+        }
+        if let Some(read) = &self.read
+            && let Some(at) = self.results.iter().position(|card| card.link.same_ticket(&read.link))
+        {
+            self.selected = Some(at);
+            self.reveal = true;
+        }
+        self.show_find(false);
     }
 
     fn busy(&self, part: Part) -> bool {
@@ -234,6 +274,7 @@ impl Tickets {
                 Part::Related => self.related = reply.cards.clone(),
                 Part::Plan => {
                     self.dialog = false;
+                    self.focus_panel = true;
                     if let Some(plan) = &reply.plan {
                         if let Some(index) = backend.plan_list().iter().position(|row| &row.id == plan) {
                             commands.push(Command::ShowPlan(index));
@@ -305,12 +346,22 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
     let Some(info) = backend.tickets() else { return };
     panel_nav::focusable(ui, rect);
     let now = ui.input(|i| i.time);
+    let waiting = client.commands.len();
     client.tickets.sync(backend, &info, now, &mut client.commands);
+    // A reply can come on a frame no input drew; what it asks for shows on the next one.
+    if client.commands.len() > waiting {
+        ui.ctx().request_repaint();
+    }
     let p = client.palette.clone();
     let active = can(backend);
     let mut panel = std::mem::take(&mut client.tickets);
-    if std::mem::take(&mut panel.focus_panel) {
+    // Asking again while it has the keys would reset the focus lock that keeps Escape for the panel.
+    if std::mem::take(&mut panel.focus_panel) && !ui.memory(|m| m.has_focus(panel_nav::focus_id())) {
         ui.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+    }
+    // The open dialog holds the keyboard: what moved it to the panel behind must not start reading its keys.
+    if panel.dialog && client.touch.is_none() && ui.memory(|m| m.has_focus(panel_nav::focus_id())) {
+        ui.memory_mut(|m| m.request_focus(plan_extra_id()));
     }
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt("tickets-panel"), |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -379,7 +430,7 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
                     query_id,
-                    egui::EventFilter { tab: true, vertical_arrows: true, escape: true, ..Default::default() },
+                    egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
                 )
             });
         }
@@ -488,10 +539,17 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
                         panel.results.len(),
                         if key == Key::ArrowDown { 1 } else { -1 },
                     );
+                    panel.reveal = true;
                 }
             }
-            Key::Home => panel.selected = (!panel.results.is_empty()).then_some(0),
-            Key::End => panel.selected = panel.results.len().checked_sub(1),
+            Key::Home => {
+                panel.selected = (!panel.results.is_empty()).then_some(0);
+                panel.reveal = true;
+            }
+            Key::End => {
+                panel.selected = panel.results.len().checked_sub(1);
+                panel.reveal = true;
+            }
             Key::Enter => {
                 open = panel.selected.and_then(|index| panel.results.get(index)).map(|card| card.link.clone())
             }
@@ -499,7 +557,30 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
             _ => {}
         }
     }
-    egui::ScrollArea::vertical().id_salt("tickets-find").auto_shrink([false, false]).show(ui, |ui| {
+    let scroll_id = ui.make_persistent_id(egui::IdSalt::new("tickets-find"));
+    let mut jump = None;
+    if std::mem::take(&mut panel.reveal)
+        && let Some(selected) = panel.selected
+    {
+        let current = egui::scroll_area::State::load(ui.ctx(), scroll_id).map_or(0.0, |s| s.clamped_offset().y);
+        let (top, bottom) = (selected as f32 * ROW_H, (selected + 1) as f32 * ROW_H);
+        let height = ui.available_height();
+        jump = Some(if top < current {
+            top
+        } else if bottom > current + height {
+            bottom - height
+        } else {
+            current
+        });
+    }
+    let jump =
+        panel_nav::keyboard_scroll(ui, scroll_id, ROW_H, 0..panel.results.len(), &[Key::PageUp, Key::PageDown], jump);
+    let mut area = egui::ScrollArea::vertical().id_salt("tickets-find").auto_shrink([false, false]);
+    if let Some(offset) = jump {
+        area = area.vertical_scroll_offset(offset);
+    }
+    area.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
         let range = score_range(&panel.results);
         for (index, card) in panel.results.iter().enumerate() {
             let response = find_row(ui, card, panel.selected == Some(index), range, &info.states, &client.palette);
@@ -509,10 +590,11 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
                 ui.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
             }
         }
-        if panel.next.is_some()
-            && ui.add_enabled(active && !busy, touch::sized(egui::Button::new("More"), client.touch)).clicked()
-        {
-            panel.search(info, true, now, &mut client.commands);
+        if panel.next.is_some() {
+            ui.add_space(4.0);
+            if ui.add_enabled(active && !busy, touch::sized(egui::Button::new("More"), client.touch)).clicked() {
+                panel.search(info, true, now, &mut client.commands);
+            }
         }
     });
     if let Some(ticket) = open {
@@ -558,9 +640,7 @@ fn read(
             )
             .clicked()
         {
-            panel.dialog = true;
-            panel.extra.clear();
-            panel.ticket_only = false;
+            panel.open_plan_dialog();
         }
         ui.menu_button("Link to plan", |ui| {
             for plan in
@@ -581,13 +661,20 @@ fn read(
             open = Some((card.link.clone(), false));
         }
     });
-    let keys = panel_nav::take_keys(ui, &[Key::Escape]);
-    back |= keys.contains(&Key::Escape);
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, Key::ArrowLeft)) {
+    if panel_nav::take_keys(ui, &[Key::Escape]).contains(&Key::Escape) {
+        panel.back_to_list(now, &mut client.commands);
+        ui.ctx().request_repaint();
+        return;
+    }
+    // Alt+← is the panel's while it has the keyboard; in a terminal it is the terminal's.
+    if ui.memory(|m| m.has_focus(panel_nav::focus_id()))
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, Key::ArrowLeft))
+    {
         back = true;
     }
     if back {
         panel.back(now, &mut client.commands);
+        ui.ctx().request_repaint();
         return;
     }
     ui.label(panel.crumbs.iter().map(|link| link.label()).chain([card.link.label()]).collect::<Vec<_>>().join(" › "));
@@ -733,6 +820,27 @@ fn read(
     }
 }
 
+/// The keyboard's place in the Plan with chief dialog.
+fn plan_extra_id() -> egui::Id {
+    egui::Id::NULL.with("tickets-plan-extra")
+}
+
+/// Takes a bare Return out of the input, whether held or not; whether it was a new press. A Return still held
+/// from the chord that opened the dialog must not start the plan.
+fn take_return(ui: &egui::Ui) -> bool {
+    let mut pressed = false;
+    ui.input_mut(|i| {
+        i.events.retain(|event| match event {
+            egui::Event::Key { key: Key::Enter, pressed: true, modifiers, repeat, .. } if modifiers.is_none() => {
+                pressed |= !repeat;
+                false
+            }
+            _ => true,
+        })
+    });
+    pressed
+}
+
 fn plan_dialog(
     ctx: &egui::Context,
     client: &mut Client,
@@ -746,6 +854,7 @@ fn plan_dialog(
         return;
     };
     let mut go = false;
+    let mut cancel = false;
     let mode = if panel.ticket_only {
         TicketMode::Ticket
     } else if info.mode != TicketMode::Auto {
@@ -758,9 +867,17 @@ fn plan_dialog(
     egui::Window::new(format!("Plan {} with the chief?", card.link.label()))
         .collapsible(false)
         .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .default_width(320.0)
         .show(ctx, |ui| {
             ui.set_max_width((ctx.content_rect().width() - 32.0).min(440.0));
+            let ready = active && !panel.busy(Part::Children) && !panel.busy(Part::Plan);
+            // Return and Escape are the dialog's, taken before its field can see them, unless a click gave the
+            // keyboard to something else: a terminal behind it, or one of its own buttons.
+            if ui.memory(|m| m.focused().is_none() || m.has_focus(plan_extra_id())) {
+                go |= take_return(ui) && ready;
+                cancel |= panel_nav::consume_bare(ui, Key::Escape);
+            }
             ui.label(card.link.title.as_deref().unwrap_or(card.link.label()));
             ui.label(if mode == TicketMode::Board {
                 format!("{} child tickets will become tasks (board).", panel.children.len())
@@ -771,29 +888,32 @@ fn plan_dialog(
                 ui.checkbox(&mut panel.ticket_only, "one plan for this ticket only (ticket mode)");
             }
             ui.label("Extra instructions for the chief (optional)");
-            ui.add(
+            let extra = ui.add(
                 egui::TextEdit::singleline(&mut panel.extra)
+                    .id(plan_extra_id())
                     .char_limit(atomics_core::tickets::PLAN_EXTRA_MAX)
                     .desired_width(f32::INFINITY),
             );
+            // After the field is added: a new window sizes itself first, with its widgets disabled, and a disabled
+            // widget lets go of the focus. A phone's keyboard stays down until its field is tapped.
+            if std::mem::take(&mut panel.focus_extra) && client.touch.is_none() {
+                extra.request_focus();
+            }
             ui.label("The chief reads the ticket, proposes a plan and waits for your approval.");
             if let Some(error) = &panel.error {
                 ui.label(error);
             }
             ui.horizontal_wrapped(|ui| {
-                let ready = active && !panel.busy(Part::Children) && !panel.busy(Part::Plan);
                 go |=
                     ui.add_enabled(ready, touch::sized(egui::Button::new("Plan with chief ⏎"), client.touch)).clicked();
-                go |= ready && ui.input(|i| i.key_pressed(Key::Enter));
-                if touch::small_button(ui, client.touch, "Cancel").clicked() {
-                    panel.dialog = false;
-                }
-                if ui.input(|i| i.key_pressed(Key::Escape)) {
-                    panel.dialog = false;
-                }
+                cancel |= touch::small_button(ui, client.touch, "Cancel").clicked();
             });
         });
-    if go {
+    if cancel {
+        panel.dialog = false;
+        ctx.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+        ctx.request_repaint();
+    } else if go {
         panel.request(
             TicketAction::Plan { ticket: card.link, mode, extra: panel.extra.clone() },
             Part::Plan,
@@ -868,7 +988,7 @@ pub fn find_row(
     states: &atomics_core::tickets::StateMap,
     p: &Palette,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     if selected {
         painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, lerp(p.raised, p.accent, 0.18));

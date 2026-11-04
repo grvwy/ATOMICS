@@ -20,7 +20,10 @@ impl State {
         }
         self.diff_open = true;
         if view == PanelMode::Tickets {
-            self.tickets.panel.focus_query = self.tickets.panel.view == super::tickets_panel::TicketsView::Find;
+            // The panel takes the keyboard where it opens. The window hands this on to the reader it draws.
+            let panel = &mut self.tickets.panel;
+            panel.focus_query = panel.view == super::tickets_panel::TicketsView::Find;
+            panel.focus = !panel.focus_query;
         }
         let name = match view {
             PanelMode::Plan => "board",
