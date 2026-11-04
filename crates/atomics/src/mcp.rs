@@ -279,7 +279,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_approve",
-            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, answers only a visible matching native menu; retry if it is not visible yet.",
+            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, or the agent runs without hooks, answers only a visible matching Codex or Claude command menu with that agent's keys; retry if it is not visible yet. The result echoes the command answered. Other menus (edits, questions) are not approvals: answer them with atomics_send raw.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -398,7 +398,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_send",
-            "description": "Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected. Use atomics_approve to answer permission menus.",
+            "description": "Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },

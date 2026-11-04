@@ -612,6 +612,7 @@ mod tests {
                     input: json!({}),
                 },
                 reply: None,
+                native: None,
             };
             let mut asking = session("asking", AgentKind::Claude, AgentStatus::NeedsInput, dir.path());
             asking.title = "Asking".into();

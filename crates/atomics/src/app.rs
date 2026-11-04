@@ -129,6 +129,9 @@ pub struct Session {
     held: Vec<String>,
     approval_hold: bool,
     menu_absent_since: Option<Instant>,
+    /// The command menu just answered with keys, and when: still on screen until the agent redraws,
+    /// it is not asked again.
+    answered_menu: Option<(atomics_core::approvals::NativeMenu, Instant)>,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
@@ -171,6 +174,9 @@ struct PendingApproval {
     id: String,
     request: ApprovalRequest,
     reply: Option<Arc<ipc::ApprovalReply>>,
+    /// The command menu the agent drew with no hook asking; only its keys answer it, and only
+    /// while the screen still shows it.
+    native: Option<atomics_core::approvals::NativeMenu>,
 }
 
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.

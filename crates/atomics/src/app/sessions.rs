@@ -40,6 +40,7 @@ impl Session {
             held: Vec::new(),
             approval_hold: false,
             menu_absent_since: None,
+            answered_menu: None,
             chief,
             pending: None,
             sandbox: None,
@@ -799,6 +800,7 @@ impl State {
         let mut finished = Vec::new();
         let mut credential_errors = Vec::new();
         let mut ref_checks = Vec::new();
+        let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let Some(terminal) = &session.terminal else { continue };
             if !session.approvals.is_empty() {
@@ -814,6 +816,21 @@ impl State {
                 session.last_message = Some(reason);
                 session.activity.observe(session.status);
                 continue;
+            }
+            // A command menu drawn with no hook asking is the session's pending approval.
+            if session.is_agent()
+                && session.sandbox.is_none()
+                && !terminal.exited()
+                && matches!(
+                    session.status,
+                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+                )
+            {
+                let screen = terminal.screen_text(60);
+                if atomics_core::approvals::native_menu(&screen).is_some() {
+                    menus.push((index, screen));
+                    continue;
+                }
             }
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
@@ -871,6 +888,9 @@ impl State {
                 self.pending_questions.remove(&session.id);
             }
             session.activity.observe(session.status);
+        }
+        for (index, screen) in menus {
+            self.sync_native(index, &screen, Instant::now());
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();

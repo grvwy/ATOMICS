@@ -23,6 +23,8 @@ impl State {
             "scratch": s.scratch,
             "last_prompt": s.last_prompt,
             "approval": s.approvals.first().map(|p| &p.request),
+            // The agent's own menu, answered with its keys, when no hook asked.
+            "approval_menu": s.approvals.first().and_then(|p| p.native.as_ref()).map(|menu| menu.kind.label()),
             "queue": s.terminal.as_ref().and_then(|t| {
                 let (running, waiting) = self.governor.snapshot();
                 queue_note(t.process_id(), &running, &waiting)
@@ -111,11 +113,23 @@ impl State {
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {
-                    let approval =
-                        self.sessions[index].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default();
-                    done(match self.approve(index, &approval, decision, message.as_deref()) {
-                        Ok(()) => ControlResponse::ok(json!({"answered":true})),
-                        Err(error) => ControlResponse::error(error.message),
+                    // What the screen shows now decides, not what the last poll saw.
+                    self.approvable(index);
+                    let approval = self.sessions[index].approvals.first().map(|pending| pending.id.clone());
+                    let menu = self.sessions[index].approval_hold
+                        || self.sessions[index]
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(60)));
+                    done(match approval {
+                        None if menu => ControlResponse::error(
+                            "the menu on screen is not a command approval; read it and answer with atomics_send raw keys",
+                        ),
+                        None => ControlResponse::error("no pending permission request"),
+                        Some(approval) => match self.approve(index, &approval, decision, message.as_deref()) {
+                            Ok(answered) => ControlResponse::ok(answered.json()),
+                            Err(error) => ControlResponse::error(error.message),
+                        },
                     })
                 }
                 None => missing(&session),
@@ -538,13 +552,10 @@ impl State {
             }
             ControlRequest::Send { session, text, raw } => match self.find(&session) {
                 None => missing(&session),
-                Some(index)
-                    if raw && (self.sessions[index].approval_hold || !self.sessions[index].approvals.is_empty()) =>
-                {
-                    done(ControlResponse::error(
-                        "raw input is blocked while permission is pending; use atomics_approve",
-                    ))
-                }
+                // Only while atomics_approve can answer: any other menu takes keys.
+                Some(index) if raw && self.approvable(index) => done(ControlResponse::error(
+                    "raw input is blocked while permission is pending; use atomics_approve",
+                )),
                 Some(index) if raw => match &self.sessions[index].terminal {
                     Some(terminal) => {
                         terminal.write(unescape(&text).into_bytes());

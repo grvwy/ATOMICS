@@ -320,6 +320,87 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
+/// The chief's two tools as `atomics mcp` serves them, one call each, in order.
+fn mcp_calls(instance: &Instance, calls: &[(&str, Value)]) -> Vec<Value> {
+    let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut stdin = mcp.child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}})
+    )
+    .unwrap();
+    for (id, (name, arguments)) in calls.iter().enumerate() {
+        let call =
+            json!({"jsonrpc":"2.0", "id":id + 1, "method":"tools/call", "params":{"name":name, "arguments":arguments}});
+        writeln!(stdin, "{call}").unwrap();
+    }
+    drop(stdin);
+    let output = mcp.wait_output().unwrap();
+    assert!(output.status.success());
+    let replies: Vec<Value> = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (1..=calls.len()).map(|id| replies.iter().find(|reply| reply["id"] == id).unwrap()["result"].clone()).collect()
+}
+
+#[test]
+fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() {
+    let instance = Instance::new(Some(0));
+    // An agent with no hooks that stops on Codex's recorded command menu.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+    let screen =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures/codex-0.165-approval-screen.txt");
+    let mut config = std::fs::OpenOptions::new().append(true).open(instance.dir.path().join("config.toml")).unwrap();
+    let agent = json!([script, screen]);
+    write!(config, "\n[[agents]]\nname = \"menu\"\ncommand = {agent}\nkind = \"generic\"\n").unwrap();
+    drop(config);
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let started = instance.ctl(json!({"cmd":"start", "agent":"menu", "isolation":"bare"}));
+    let session = started["id"].as_str().unwrap().to_string();
+    let command = "atomics queue --class test -- ./check.sh";
+
+    // ctl and the board both hold the menu as the session's one pending approval.
+    eventually("the native approval", || {
+        let list = instance.ctl(json!({"cmd":"list"}));
+        list["sessions"][0]["approval_menu"] == "codex" && list["sessions"][0]["approval"]["command"] == command
+    });
+    let mirror = board(&instance.home(), |mirror| mirror.approvals.values().any(|a| a.session == session));
+    let approval = mirror.approvals.values().find(|a| a.session == session).unwrap();
+    assert_eq!(approval.command.as_deref(), Some(command));
+    assert_eq!(mirror.sessions[&session].pending_approvals, 1);
+
+    // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu and echoes it.
+    let results = mcp_calls(
+        &instance,
+        &[
+            ("atomics_send", json!({"session":session, "text":"y", "raw":true})),
+            ("atomics_approve", json!({"session":session, "decision":"allow"})),
+        ],
+    );
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    assert!(results[0]["content"][0]["text"].as_str().unwrap().contains("use atomics_approve"), "{}", results[0]);
+    assert_eq!(results[1]["isError"], false, "{}", results[1]);
+    let answered = results[1]["content"][0]["text"].as_str().unwrap();
+    assert!(answered.contains(command) && answered.contains("codex"), "{answered}");
+    eventually("the menu's keys", || {
+        instance.ctl(json!({"cmd":"read", "session":session, "lines":40}))["screen"]
+            .as_str()
+            .is_some_and(|screen| screen.contains("Keys: 31 0d"))
+    });
+    board(&instance.home(), |mirror| {
+        mirror.approvals.is_empty() && mirror.sessions.get(&session).is_some_and(|s| s.pending_approvals == 0)
+    });
+
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
 #[test]
 fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
     let instance = Instance::new(None);

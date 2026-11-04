@@ -305,6 +305,7 @@ mod tests {
                         reason: None,
                         input: json!({}),
                     },
+                    native: None,
                 });
                 refused(app, "approval or question");
                 app.runtime.sessions[0].approvals.clear();

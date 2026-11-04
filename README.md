@@ -480,10 +480,21 @@ Codex prefix rule. A denial message can only be supplied while the hook is waiti
 Truncated commands match their visible prefix. If a long reason hides the command, `atomics_approve`
 expands it with Ctrl+A and asks for a retry so the command is checked before selecting a choice.
 
+An agent started without hooks still asks in its own menu. When a Codex command menu ("Would you like
+to run the following command?") or a Claude one ("Bash command … Do you want to proceed?") is on screen
+and no hook request exists, that menu becomes the session's pending permission request: its header,
+the board, `atomics_list` and remote clients show it, and `atomics_approve` answers it with that agent's
+keys (Codex: the numbered Yes, or Esc to deny; Claude: Enter on the focused Yes, or Esc). It presses them only
+while the screen still shows the very command that was reviewed, and its result echoes the command
+(`command`, `reason`, `menu`). `allow_always` answers such a menu once; only hook requests are remembered.
+Other menus, such as Codex's edit and terminal-input prompts or Claude's file edits, are not command
+approvals: answer them with raw keys.
+
 While a permission request is pending, `atomics_send` holds plain messages and returns `held: true`.
 It releases these messages after a lifecycle event confirms the request has finished, or after the
 menu has been absent for one second. This also covers requests answered directly in the terminal.
-Raw input is rejected with an error pointing to `atomics_approve`.
+Raw input is rejected with an error pointing to `atomics_approve` while `atomics_approve` can answer the
+request; while any other menu waits, raw keys go through, so there is always one way to answer.
 
 Codex sends wait for the complete message to appear in the transcript or visible queue, or for its
 prompt hook. ATOMICS retries unconfirmed input and returns an error if delivery cannot be confirmed;

@@ -21,6 +21,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         held: Vec::new(),
         approval_hold: false,
         menu_absent_since: None,
+        answered_menu: None,
         chief: false,
         pending: None,
         sandbox: None,

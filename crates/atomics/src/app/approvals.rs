@@ -36,6 +36,7 @@ impl State {
                     id: uuid::Uuid::new_v4().to_string(),
                     request: approval.request,
                     reply: Some(approval.reply),
+                    native: None,
                 });
                 session.status = AgentStatus::NeedsInput;
                 self.last_status.remove(&session.id);
@@ -74,6 +75,9 @@ impl State {
                 continue;
             }
             let screen = session.terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
+            self.sync_native(index, &screen, now);
+            let session = &mut self.sessions[index];
+            let pending = session.approval_hold || !session.approvals.is_empty();
             let menu = atomics_core::approvals::menu_visible(&screen);
             if menu {
                 // A native menu means Codex has already stopped waiting for the hook.
@@ -118,6 +122,78 @@ impl State {
         }
     }
 
+    /// Bring a session's approvals in line with the command menu its agent drew with no hook asking:
+    /// one pending approval for the menu on screen, under one ID while it stays, so `atomics_approve`,
+    /// raw keys, the tile, the board and every client go by the same list. A hook request comes
+    /// first; the screen only stands in for a missing one. Another menu replacing the command menu
+    /// withdraws its approval at once; a screen with no menu leaves it to the quiet period.
+    pub(super) fn sync_native(&mut self, index: usize, screen: &str, now: Instant) {
+        let session = &mut self.sessions[index];
+        if session.sandbox.is_some() || !session.is_agent() || session.terminal.is_none() {
+            return;
+        }
+        let visible = atomics_core::approvals::native_menu(screen);
+        if let Some((answered, at)) = &session.answered_menu
+            && (now.saturating_duration_since(*at) >= ANSWERED_MENU_LINGER
+                || !visible.as_ref().is_some_and(|visible| visible.same(answered)))
+        {
+            session.answered_menu = None;
+        }
+        let shown = match session.approvals.first() {
+            None => None,
+            Some(pending) => match &pending.native {
+                Some(menu) => Some(menu),
+                None => return,
+            },
+        };
+        match (shown, &visible) {
+            (Some(shown), Some(visible)) if shown.same(visible) => return,
+            (Some(_), None) if !atomics_core::approvals::menu_visible(screen) => return,
+            (None, None) => return,
+            _ => {}
+        }
+        // Withdrawn: a decision still naming it finds it no longer pending.
+        session.approvals.clear();
+        let asked = visible
+            .filter(|visible| !session.answered_menu.as_ref().is_some_and(|(answered, _)| answered.same(visible)));
+        if let Some(menu) = asked {
+            session.approvals.push(PendingApproval {
+                id: uuid::Uuid::new_v4().to_string(),
+                request: ApprovalRequest {
+                    tool: "Bash".into(),
+                    command: menu.command.clone(),
+                    cwd: session.cwd.clone(),
+                    reason: menu.reason.clone(),
+                    input: json!({}),
+                },
+                reply: None,
+                native: Some(menu),
+            });
+            session.status = AgentStatus::NeedsInput;
+            session.approval_hold = true;
+            session.menu_absent_since = None;
+            // A new event carries the request to waiters even when the session already needed input.
+            self.last_status.remove(&session.id);
+        }
+    }
+
+    /// Whether `atomics_approve` can answer the session's permission prompt now, read afresh: a hook
+    /// waits for its reply, or the agent's menu for the first request is on screen. Raw keys are
+    /// refused only then, so whoever decides always has one way to answer.
+    pub(super) fn approvable(&mut self, index: usize) -> bool {
+        let screen =
+            self.sessions[index].terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
+        self.sync_native(index, &screen, Instant::now());
+        let Some(pending) = self.sessions[index].approvals.first() else { return false };
+        if pending.reply.as_ref().is_some_and(|reply| !reply.expired()) {
+            return true;
+        }
+        [Decision::Allow, Decision::Deny].into_iter().any(|decision| match &pending.native {
+            Some(menu) => atomics_core::approvals::native_key(&screen, menu, decision).is_some(),
+            None => atomics_core::approvals::menu_key(&screen, pending.request.command.as_deref(), decision).is_some(),
+        })
+    }
+
     /// Answer the approval with this ID, in whichever session it waits. Its ID belongs to that one
     /// request, so a decision made for it never answers the next one. Protocol clients, the
     /// desktop and ctl all decide on this thread, one at a time: the first decision wins, and a
@@ -144,7 +220,7 @@ impl State {
                 ErrorCode::Rejected,
                 "an earlier permission request in that session waits for an answer first",
             )),
-            Some((index, _)) => self.approve(index, approval, decision, message).map(|()| disposition(decision)),
+            Some((index, _)) => self.approve(index, approval, decision, message).map(|_| disposition(decision)),
         }
     }
 
@@ -160,13 +236,15 @@ impl State {
         }
     }
 
+    /// Answer the session's first approval, through its hook or with the keys of the menu on screen,
+    /// and say what was answered.
     pub(super) fn approve(
         &mut self,
         index: usize,
         approval: &str,
         decision: Decision,
         message: Option<&str>,
-    ) -> Result<(), WireError> {
+    ) -> Result<Answered, WireError> {
         let rejected = |message: &str| WireError::new(ErrorCode::Rejected, message);
         self.expire_approvals(Instant::now());
         let session = &mut self.sessions[index];
@@ -191,21 +269,35 @@ impl State {
             let Some(terminal) = &session.terminal else {
                 return Err(rejected("the permission hook has returned; answer in the agent terminal"));
             };
-            let Some(key) = atomics_core::approvals::menu_key(
-                &terminal.screen_text(60),
-                pending.request.command.as_deref(),
-                decision,
-            ) else {
-                return Err(rejected("the permission menu is not visible; retry or answer in the terminal"));
+            let screen = terminal.screen_text(60);
+            let key = match &pending.native {
+                Some(menu) => atomics_core::approvals::native_key(&screen, menu, decision).ok_or_else(|| {
+                    let shown = atomics_core::approvals::native_menu(&screen).is_some_and(|shown| shown.same(menu));
+                    if shown {
+                        rejected("the menu on screen offers no such choice now; answer it in the agent terminal")
+                    } else {
+                        WireError::new(
+                            ErrorCode::StaleRevision,
+                            "the permission menu changed; review the current request",
+                        )
+                    }
+                })?,
+                None => atomics_core::approvals::menu_key(&screen, pending.request.command.as_deref(), decision)
+                    .ok_or_else(|| rejected("the permission menu is not visible; retry or answer in the terminal"))?,
             };
             terminal.write(key.as_bytes().to_vec());
             if key == "\x01" {
                 return Err(rejected("expanded the permission command; retry approval once it is visible"));
             }
+            if let Some(menu) = &pending.native {
+                session.answered_menu = Some((menu.clone(), Instant::now()));
+            }
         }
         let pending = session.approvals.remove(0);
         let id = pending.id.clone();
-        if decision == Decision::AllowAlways && !azure {
+        let answered = Answered { request: pending.request.clone(), menu: pending.native.map(|menu| menu.kind) };
+        // A menu read off the screen answers only itself; a hook's exact request may be allowed again.
+        if decision == Decision::AllowAlways && !azure && answered.menu.is_none() {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
@@ -213,7 +305,30 @@ impl State {
             self.last_status.remove(&session.id);
         }
         self.record_resolution(id, disposition(decision));
-        Ok(())
+        Ok(answered)
+    }
+}
+
+/// How long a menu just answered with keys may stay on screen before it counts as asked again.
+const ANSWERED_MENU_LINGER: Duration = Duration::from_secs(3);
+
+/// A permission request just answered, and the agent's own menu when its keys answered it.
+#[derive(Debug)]
+pub(super) struct Answered {
+    pub request: ApprovalRequest,
+    pub menu: Option<atomics_core::approvals::MenuKind>,
+}
+
+impl Answered {
+    /// What `atomics_approve` echoes, so whoever decided sees the command the answer let through.
+    pub(super) fn json(&self) -> serde_json::Value {
+        json!({
+            "answered": true,
+            "tool": self.request.tool,
+            "command": self.request.command,
+            "reason": self.request.reason,
+            "menu": self.menu.map(|menu| menu.label()),
+        })
     }
 }
 
@@ -229,6 +344,222 @@ fn disposition(decision: Decision) -> Disposition {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    /// A hookless agent drawing the recorded screens in `screens`, in order, whose terminal then
+    /// lists the keys it got (see tests/fixtures/approval-menu).
+    fn menu_agent(app: &Desktop<'_>, screens: &[&Path]) -> Terminal {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+        let args = screens.iter().map(|screen| screen.to_string_lossy().into_owned()).collect();
+        let terminal = Terminal::spawn(
+            app.runtime.wake.clone(),
+            app.runtime.theme.terminal_colors(),
+            script.to_string_lossy().into_owned(),
+            args,
+            &app.runtime.launch_dir,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        shows(&terminal, "1. Yes");
+        terminal
+    }
+
+    fn shows(terminal: &Terminal, text: &str) {
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while !terminal.screen_text(60).contains(text) {
+            assert!(Instant::now() < deadline, "{text:?} never showed:\n{}", terminal.screen_text(60));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn recorded(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures").join(name)
+    }
+
+    /// Lets the next poll read the screen, past the quiet period of a menu that went away.
+    fn poll_after_quiet(app: &mut Desktop<'_>) {
+        for absent in [None, Some(Instant::now() - APPROVAL_MENU_GRACE)] {
+            if absent.is_some() {
+                app.runtime.sessions[0].menu_absent_since = absent;
+            }
+            app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.runtime.expire_approvals(Instant::now());
+        }
+    }
+
+    #[test]
+    fn recorded_native_menus_are_the_one_pending_approval_for_approve_send_and_tiles() {
+        with_app(
+            "app::approvals::tests::recorded_native_menus_are_the_one_pending_approval_for_approve_send_and_tiles",
+            |app, _ctx| {
+                let codex = "atomics queue --class test -- ./check.sh";
+                let claude = "Create the fixture file the test expects\ntouch fixture";
+                for (screen, kind, command, decision, keys) in [
+                    ("codex-0.165-approval-screen.txt", "codex", codex, Decision::Allow, "31 0d"),
+                    ("codex-0.165-approval-screen.txt", "codex", codex, Decision::Deny, "1b"),
+                    ("claude-2.1-approval-screen.txt", "claude", claude, Decision::Allow, "0d"),
+                    ("claude-2.1-approval-screen.txt", "claude", claude, Decision::Deny, "1b"),
+                ] {
+                    let terminal = menu_agent(app, &[&recorded(screen)]);
+                    // An agent without hooks whose turn ended on its own menu: no hook request exists.
+                    let mut worker = session("worker", AgentKind::Generic, AgentStatus::Done, &app.runtime.launch_dir);
+                    worker.terminal = Some(terminal);
+                    app.runtime.sessions = vec![worker];
+                    app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                    app.runtime.track_busy();
+                    let worker = &app.runtime.sessions[0];
+                    assert_eq!(worker.status, AgentStatus::NeedsInput, "{kind}");
+                    assert_eq!(worker.approvals.len(), 1, "{kind}");
+                    assert!(worker.approval_hold);
+                    let id = worker.approvals[0].id.clone();
+                    assert_eq!(worker.approvals[0].request.command.as_deref(), Some(command));
+
+                    // The tile's banner, its session row, ctl and every protocol client show that one request.
+                    let backend = app.runtime.backend();
+                    assert_eq!(backend.session_approval(0).map(|row| row.id), Some(id.clone()));
+                    assert_eq!(backend.session_row(0).unwrap().pending_approvals, 1);
+                    let projections = atomics_core::projection::Projections::default();
+                    app.runtime.publish_projections(
+                        &projections,
+                        &mut super::super::projection::DiffSummaries::default(),
+                        &super::super::projection::DiffBodies::default(),
+                    );
+                    let loaded = projections.load();
+                    assert_eq!(loaded.approvals.data.len(), 1);
+                    assert_eq!(loaded.approvals.data[0].id, id);
+                    assert_eq!(loaded.approvals.data[0].command.as_deref(), Some(command));
+                    assert_eq!(loaded.sessions.data[0].pending_approvals, 1);
+                    let listed = request(app, json!({"cmd":"list"})).result;
+                    assert_eq!(listed["sessions"][0]["approval"]["command"], command);
+                    assert_eq!(listed["sessions"][0]["approval_menu"], kind);
+
+                    // Polling keeps its ID; raw keys wait for atomics_approve, which can answer it.
+                    poll_after_quiet(app);
+                    assert_eq!(app.runtime.sessions[0].approvals.iter().map(|p| &p.id).collect::<Vec<_>>(), [&id]);
+                    let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"y"}));
+                    assert!(raw.error.unwrap().contains("atomics_approve"), "{kind}");
+
+                    let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":decision}));
+                    assert!(answered.ok, "{kind} {decision:?}: {answered:?}");
+                    assert_eq!(answered.result["command"], command);
+                    assert_eq!(answered.result["menu"], kind);
+                    assert_eq!(answered.result["tool"], "Bash");
+                    shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), &format!("Keys: {keys}\n"));
+                    assert_eq!(app.runtime.resolution(&id), Some(disposition(decision)));
+                    assert!(app.runtime.sessions[0].allowed.is_empty(), "a menu answers only itself");
+
+                    // The menu is gone: nothing waits, the tile has no banner and raw keys reach the agent.
+                    poll_after_quiet(app);
+                    assert!(app.runtime.sessions[0].approvals.is_empty());
+                    assert!(!app.runtime.sessions[0].approval_hold);
+                    assert!(app.runtime.backend().session_approval(0).is_none());
+                    let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"z"}));
+                    assert!(raw.ok, "{raw:?}");
+                    shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), &format!("Keys: {keys} 7a"));
+                    let again = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                    assert_eq!(again.error.as_deref(), Some("no pending permission request"));
+                    app.runtime.sessions.clear();
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn menus_that_are_not_command_approvals_take_raw_keys() {
+        with_app("app::approvals::tests::menus_that_are_not_command_approvals_take_raw_keys", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let edits = dir.path().join("edits.txt");
+            std::fs::write(
+                &edits,
+                "Allow these edits?\n› 1. Yes, proceed\n  2. No\nPress enter to confirm or esc to cancel",
+            )
+            .unwrap();
+            let terminal = menu_agent(app, &[&edits]);
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::Done, &app.runtime.launch_dir);
+            worker.terminal = Some(terminal);
+            app.runtime.sessions = vec![worker];
+            app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+            app.runtime.track_busy();
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+            // Before any poll holds input for it, atomics_approve already reads the menu on screen.
+            app.runtime.needs_input_checked = Instant::now();
+            let approve = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+            assert!(approve.error.unwrap().contains("atomics_send raw"));
+            app.runtime.needs_input_checked = Instant::now() - NEEDS_INPUT_CHECK_INTERVAL;
+            poll_after_quiet(app);
+            // The agent waits on a menu, and typed messages still wait for it...
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+            assert!(app.runtime.sessions[0].approval_hold);
+            assert!(app.runtime.sessions[0].approvals.is_empty());
+            assert_eq!(app.runtime.deliver(0, "steer later"), Delivery::Held);
+            // ...but atomics_approve cannot answer it, so the keys that do are not refused.
+            let approve = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+            assert!(approve.error.unwrap().contains("atomics_send raw"));
+            let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"1"}));
+            assert!(raw.ok, "{raw:?}");
+            shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 31\n");
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn a_hidden_native_command_is_shown_before_it_is_approved_and_a_hook_replaces_the_screen() {
+        with_app(
+            "app::approvals::tests::a_hidden_native_command_is_shown_before_it_is_approved_and_a_hook_replaces_the_screen",
+            |app, _ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let hidden = dir.path().join("hidden.txt");
+                std::fs::write(&hidden, "Would you like to run the following command?\n\nReason: A long explanation of why access is needed\n  [… 9 lines] ⌃a view all\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel").unwrap();
+                let terminal = menu_agent(app, &[&hidden, &recorded("codex-0.165-approval-screen.txt")]);
+                let mut worker = session("worker", AgentKind::Generic, AgentStatus::Done, &app.runtime.launch_dir);
+                worker.terminal = Some(terminal);
+                app.runtime.sessions = vec![worker];
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+                let first = app.runtime.sessions[0].approvals[0].id.clone();
+                assert_eq!(app.runtime.sessions[0].approvals[0].request.command, None);
+                assert_eq!(
+                    app.runtime.sessions[0].approvals[0].request.reason.as_deref(),
+                    Some("A long explanation of why access is needed")
+                );
+                let expanded = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                assert!(expanded.error.unwrap().contains("expanded"));
+                shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "$ atomics queue");
+                // The command now shows: a new request under a new ID, and the one decided unseen is gone.
+                poll_after_quiet(app);
+                let second = app.runtime.sessions[0].approvals[0].id.clone();
+                assert_ne!(first, second);
+                assert_eq!(
+                    app.runtime.sessions[0].approvals[0].request.command.as_deref(),
+                    Some("atomics queue --class test -- ./check.sh")
+                );
+                let stale = app.runtime.decide(&first, Decision::Allow, None).unwrap_err();
+                assert_eq!(stale.code, ErrorCode::NotFound);
+
+                // A hook request is the request itself: the screen's stand-in gives way to it.
+                let reply = Arc::new(ipc::ApprovalReply::default());
+                let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":"PermissionRequest", "session_id":"worker", "tool_name":"Bash",
+                    "tool_input":{"command":"atomics queue --class test -- ./check.sh"}
+                }))
+                .unwrap();
+                app.runtime.on_hook(HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    event,
+                    delivered: 0,
+                    approval_reply: Some(reply.clone()),
+                });
+                assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+                assert!(app.runtime.sessions[0].approvals[0].native.is_none());
+                assert_eq!(app.runtime.decide(&second, Decision::Allow, None).unwrap_err().code, ErrorCode::NotFound);
+                let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                assert_eq!(answered.result["menu"], serde_json::Value::Null);
+                assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                app.runtime.sessions.clear();
+            },
+        );
+    }
 
     #[test]
     fn approval_errors_keep_their_specific_guidance() {
@@ -264,6 +595,7 @@ mod tests {
                         input: json!({}),
                     },
                     reply: None,
+                    native: None,
                 });
                 app.runtime.sessions = vec![worker];
                 app.runtime.approvals_checked = Instant::now();
@@ -372,6 +704,7 @@ mod tests {
                         input: json!({}),
                     },
                     reply: Some(reply),
+                    native: None,
                 });
             }
             let mut time = 0.0;
@@ -521,6 +854,7 @@ mod tests {
                             input: json!({}),
                         },
                         reply: Some(reply.clone()),
+                        native: None,
                     });
                     let text = frame(app, vec![]);
                     for expected in ["Permission requested", "touch banner-fixture", "Verify permission controls"] {
@@ -610,6 +944,7 @@ mod tests {
                     id: uuid::Uuid::new_v4().to_string(),
                     request: ApprovalRequest::from_event(&permission),
                     reply: Some(reply.clone()),
+                    native: None,
                 });
                 assert!(
                     app.runtime
@@ -663,6 +998,7 @@ mod tests {
                     id: uuid::Uuid::new_v4().to_string(),
                     request: ApprovalRequest::from_event(&permission),
                     reply: Some(reply.clone()),
+                    native: None,
                 });
                 app.runtime.sessions[0].status = AgentStatus::NeedsInput;
                 let event = atomics_core::hook::HookEvent::from_payload(&json!({
@@ -700,6 +1036,7 @@ mod tests {
                 id: uuid::Uuid::new_v4().to_string(),
                 request: ApprovalRequest::from_event(&permission),
                 reply: Some(reply.clone()),
+                native: None,
             });
             let raw = request(app, json!({"cmd":"send", "session":"stale", "raw":true, "text":"y"}));
             assert!(!raw.ok);
@@ -749,6 +1086,7 @@ mod tests {
                 id: uuid::Uuid::new_v4().to_string(),
                 request: ApprovalRequest::from_event(&permission),
                 reply: Some(reply),
+                native: None,
             });
             assert_eq!(app.runtime.deliver(0, "held while editing"), Delivery::Held);
             let before = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
