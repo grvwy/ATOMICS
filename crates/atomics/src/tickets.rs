@@ -939,6 +939,7 @@ impl Worker {
     /// that really is down or signed out.
     fn key_hit(&mut self, config: &TicketConfig, query: &str) -> Option<TicketCard> {
         let typed = query.trim();
+        let typed = typed.strip_prefix('#').unwrap_or(typed).trim_end_matches(['.', ',', ':', ';']);
         if !tickets::looks_like_key(typed) {
             return None;
         }
@@ -947,18 +948,37 @@ impl Worker {
             .find(|name| config.operation(name).is_some_and(|operation| !operation.uses_placeholder("uuid")))?;
         let upper = typed.to_ascii_uppercase();
         let spellings = if upper == typed { vec![typed] } else { vec![typed, upper.as_str()] };
-        spellings.into_iter().find_map(|key| {
+        let down = self.down.clone();
+        let mut hit = None;
+        for key in spellings {
             let link = TicketLink {
                 system: config.system.clone(),
                 id: key.to_string(),
                 key: Some(key.to_string()),
                 ..TicketLink::default()
             };
-            let output = self.call(config, name, &Vars::new(&config.system).ticket(&link)).ok()?;
-            let card = config.operation(name)?.card(&output, &config.system).ok()?;
+            let output = match self.call(config, name, &Vars::new(&config.system).ticket(&link)) {
+                Ok(output) => output,
+                Err(_) => {
+                    if self.down != down {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(card) = config.operation(name).and_then(|op| op.card(&output, &config.system).ok()) else {
+                continue;
+            };
             let row = TicketCard { body: None, comments: Vec::new(), links: Vec::new(), ..card };
-            row.link.named_by_key(typed).then(|| config.card_url(row).ok()).flatten()
-        })
+            if row.link.named_by_key(typed) {
+                hit = config.card_url(row).ok();
+                if hit.is_some() {
+                    break;
+                }
+            }
+        }
+        self.down = down;
+        hit
     }
 
     /// The ticket right after a push, so the card shows what the system now says.
@@ -2043,6 +2063,41 @@ pub(crate) mod tests {
                 "read":read, "get":get_mapping
             }
         })).unwrap()
+    }
+
+    #[test]
+    fn tickets_key_lookup_timeout_leaves_search_and_the_next_job_working() {
+        for query in ["DEMO-3", "demo-3"] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = dir.path().join("demo.json");
+            let mut config = card_profile("find", &path);
+            config.timeout_secs = 1;
+            let mut worker = Worker::default();
+            worker.prepare(&config);
+            // Start the fixture and obtain the search's own rows before hanging the lookup.
+            let search = || TicketOp::Search { query: query.into(), semantic: false };
+            let TicketOutput::Cards(expected) = worker.run(&config, search()).unwrap() else { panic!("cards") };
+            let mut state = server(&path);
+            state["hang"] = json!(["get_ticket"]);
+            state["calls"] = json!([]);
+            std::fs::write(&path, state.to_string()).unwrap();
+            worker.prepare(&config);
+            let TicketOutput::Cards(rows) = worker.run(&config, search()).unwrap() else { panic!("cards") };
+            assert_eq!(
+                rows.iter().map(|row| &row.link.id).collect::<Vec<_>>(),
+                expected.iter().map(|row| &row.link.id).collect::<Vec<_>>()
+            );
+            assert!(!rows.is_empty());
+            let state = server(&path);
+            assert_eq!(
+                state["calls"].as_array().unwrap().iter().filter(|call| call["tool"] == "get_ticket").count(),
+                1
+            );
+            assert!(worker.down.is_none());
+            worker.prepare(&config);
+            worker.run(&config, TicketOp::Search { query: "browser OAuth".into(), semantic: false }).unwrap();
+            assert!(worker.down.is_none(), "the next job is not in backoff");
+        }
     }
 
     #[test]

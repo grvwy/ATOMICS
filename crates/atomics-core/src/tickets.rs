@@ -70,19 +70,16 @@ impl TicketLink {
         self.matches(Some(&other.system), Some(&other.id), other.key.as_deref())
     }
 
-    /// Whether this is the ticket a key-shaped query names: in any letter case, or by number
-    /// when one side is only a number. A system may address tickets by number alone, so `UTF-8`
-    /// can bring back ticket 8 under another prefix, which is not what was asked for. A ticket
-    /// that shows no key has nothing to contradict the query.
+    /// Whether the query matches the id or a non-empty key in any letter case, or a
+    /// bare number exactly matches the number at the end of the key.
     pub fn named_by_key(&self, query: &str) -> bool {
-        let number = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
-        let names = |name: &str| {
-            name.eq_ignore_ascii_case(query)
-                || ((number(query) || number(name))
-                    && key_number(name).is_some()
-                    && key_number(name) == key_number(query))
-        };
-        names(&self.id) || self.key.as_deref().filter(|key| !key.is_empty()).is_none_or(names)
+        self.id.eq_ignore_ascii_case(query)
+            || self.key.as_deref().filter(|key| !key.is_empty()).is_some_and(|key| {
+                key.eq_ignore_ascii_case(query)
+                    || (!query.is_empty()
+                        && query.bytes().all(|b| b.is_ascii_digit())
+                        && key_number(key) == Some(query))
+            })
     }
 
     /// Takes the fields a ticket operation returned. The id stays what the link was
@@ -3060,10 +3057,14 @@ mod tests {
             assert!(!ticket.named_by_key(query), "{query}");
         }
         assert!(link("ABC-12", None).named_by_key("abc-12"), "the id can hold the key");
-        assert!(link("id", Some("12")).named_by_key("ABC-12"), "a system may show only the number");
+        assert!(!link("id", Some("12")).named_by_key("ABC-12"));
         assert!(!link("id", Some("13")).named_by_key("ABC-12"));
-        assert!(link("id", None).named_by_key("ABC-12"), "no key to contradict the query");
-        assert!(link("id", Some("")).named_by_key("ABC-12"), "an empty key is no key");
+        assert!(!link("id", None).named_by_key("ABC-12"));
+        assert!(!link("id", Some("")).named_by_key("ABC-12"));
+        assert!(!link("8", Some("DEMO-8")).named_by_key("UTF-8"));
+        assert!(!link("11973", Some("RELAY-11973")).named_by_key("FOO-11973"));
+        assert!(!link("8", Some("8")).named_by_key("UTF-8"));
+        assert!(link("8", Some("8")).named_by_key("8"));
     }
 
     #[test]

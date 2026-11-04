@@ -526,10 +526,11 @@ A query shaped like a ticket key finds that ticket whichever search runs: a pref
 is unmapped or only takes a `{uuid}`, as typed and then with its letters upper-cased. The ticket goes first
 and the normal search still runs, with its results below and without the same ticket twice; the filter
 chips narrow the search but not the ticket a key names. A ticket that comes back under another key is not
-a hit (a system that addresses by `{key_number}` answers `XYZ-3` with its ticket 3). A key that does not
-exist, a lookup that fails, or a profile without `get` and `read` gives the normal search, with no error. If
-the search fails after a hit, the ticket still shows. `{key_number}` or a `get` that accepts bare numbers
-is what makes a bare number find its ticket.
+a hit: a prefixed key must match the ticket's key or id, in any letter case. A bare number matches
+exactly the number at the end of a key. Pasted `#KEY` and trailing `.`, `,`, `:` or `;` are fine.
+A key that does not exist, a lookup that fails or times out, or a profile without `get` and `read` gives
+the normal search, with no error. If the search fails after a hit, the ticket still shows. `{key_number}`
+or a `get` that accepts bare numbers is what makes a bare number find its ticket.
 
 With [views](#views-and-filters), Find opens on the default view instead of an empty box: its tabs sit beside
 the query box, the profile's filter chips below it, and the status line names the view (`25 tickets ·
