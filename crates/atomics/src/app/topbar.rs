@@ -646,13 +646,13 @@ mod tests {
             app.runtime.toast = None;
             app.runtime.config_error = None;
             app.runtime.hook_error = None;
-            for width in [480.0, 550.0, 700.0, 1200.0] {
+            for width in [480.0, 550.0, 700.0, 1200.0, 1700.0] {
                 fixture(app, 6);
                 app.client.new_dialog = None;
                 let (items, output) = render(app, ctx, width, vec![]);
                 output.drop_without_applying_deltas();
                 let collapsed = items.iter().any(|(name, _)| name == "Actions");
-                assert_eq!(collapsed, width < 1000.0, "width={width}: the actions fold beside a centered pill");
+                assert_eq!(collapsed, width < 1700.0, "width={width}: the actions fold beside a centered pill");
                 // The switcher's segments are in the bar at every width: one shows its view, again hides it.
                 for (segment, view) in [("view:Diff", PanelMode::Diff), ("view:Board", PanelMode::Plan)] {
                     app.runtime.panel = PanelMode::Tickets;
