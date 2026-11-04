@@ -200,6 +200,22 @@ fn refresh_fetches_again_and_what_names_nothing_says_so() {
 }
 
 #[test]
+fn a_board_maps_the_ticket_keys_the_projection_carries_and_nothing_else() {
+    let remote = connected(Role::Controller);
+    let board = remote.board(0).unwrap();
+    let keys = |ticket: &Option<TicketLink>| ticket.as_ref().map(|link| link.label().to_string());
+    assert_eq!(keys(&board.plan.ticket).as_deref(), Some("ENG-40"));
+    assert_eq!(keys(&board.plan.tasks[0].ticket).as_deref(), Some("ENG-41"));
+    assert_eq!(board.plan.tasks[1].ticket, None);
+    let link = board.plan.ticket.unwrap();
+    assert_eq!(link, TicketLink { id: "ENG-40".into(), ..TicketLink::default() }, "no address and no system");
+
+    let read = Command::OpenTicket(link);
+    assert_eq!(read.remote(&remote, &mut String::new), atomics_ui::Remote::Client, "nothing for atomics.v1");
+    assert!(!remote.available(&read), "a page has no reader");
+}
+
+#[test]
 fn archive_finished_is_not_sent_as_unconditional_archive() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();
@@ -551,14 +567,14 @@ fn a_steer_some_targets_missed_names_them_and_only_one_all_missed_comes_back() {
 }
 
 #[test]
-fn a_steer_missed_by_a_session_gone_from_the_mirror_says_closed_and_not_its_id() {
+fn a_steer_missed_by_a_session_gone_from_the_mirror_names_its_title() {
     let steer = |sessions: &[&str]| Command::Steer {
         sessions: sessions.iter().map(|s| s.to_string()).collect(),
         text: "go on".into(),
     };
     let no = || Outcome::refused(WireError::new(ErrorCode::Rejected, "session exited"));
     let yes = || Outcome::done(serde_json::Value::Null);
-    let closed = "Missed by a closed session. The host refused: session exited";
+    let missed = "Missed by Fix the parser. The host refused: session exited";
     let remote = connected(Role::Controller);
 
     // The board comes back without s1 while the steer is on its way, as after a reset.
@@ -580,15 +596,42 @@ fn a_steer_missed_by_a_session_gone_from_the_mirror_says_closed_and_not_its_id()
     assert_eq!(remote.session_list().len(), 1, "s1 has left the mirror");
     result(&remote, "op-1", yes());
     result(&remote, "op-2", no());
-    assert_eq!(remote.notice().as_deref(), Some(closed));
+    assert_eq!(remote.notice().as_deref(), Some(missed));
+}
 
-    // Two of them read as one.
-    remote.dismiss_notice();
-    remote.send(steer(&["chief", "s1", "s2"]));
-    result(&remote, "op-3", yes());
-    result(&remote, "op-4", no());
-    result(&remote, "op-5", no());
-    assert_eq!(remote.notice().as_deref(), Some(closed));
+#[test]
+fn an_expired_steer_after_a_reset_names_its_target_before_the_snapshot() {
+    let remote = connected(Role::Controller);
+    remote.send(Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into() });
+    result(&remote, "op-1", Outcome::done(serde_json::Value::Null));
+    remote.disconnected();
+    remote.set_now(10_000 + u64::from(ops::OP_TTL_SECS) * 1000);
+    remote.receive(welcome(Role::Controller));
+    assert!(remote.session_list().is_empty(), "reset cleared the mirror");
+    assert_eq!(
+        remote.notice().as_deref(),
+        Some(
+            "Missed by Fix the parser. Some earlier actions may not have reached the host. Check the board before trying again."
+        )
+    );
+    assert_eq!(remote.take_unsent(), None, "the chief already received it");
+    remote.receive(snapshot());
+    assert!(remote.session_list().iter().any(|s| s.id == "s1"), "the agent is still live");
+}
+
+#[test]
+fn a_steer_result_before_the_snapshot_names_its_target() {
+    let remote = connected(Role::Controller);
+    remote.send(Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into() });
+    result(&remote, "op-1", Outcome::done(serde_json::Value::Null));
+    remote.disconnected();
+    remote.receive(welcome(Role::Controller));
+    assert!(remote.session_list().is_empty(), "reset cleared the mirror");
+    result(&remote, "op-2", Outcome::refused(WireError::new(ErrorCode::Rejected, "too busy")));
+    assert_eq!(remote.notice().as_deref(), Some("Missed by Fix the parser. The host refused: too busy"));
+    assert_eq!(remote.take_unsent(), None, "the chief already received it");
+    remote.receive(snapshot());
+    assert!(remote.session_list().iter().any(|s| s.id == "s1"), "the agent is still live");
 }
 
 #[test]

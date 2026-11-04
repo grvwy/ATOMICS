@@ -332,6 +332,10 @@ impl Desktop<'_> {
                     }
                 }
             }
+            Command::OpenTicket(link) => {
+                self.runtime.open_ticket(link, tickets_panel::Nav::Fresh);
+                self.runtime.tickets.panel.from_board = true;
+            }
             Command::EditingPlan => self.runtime.plan_edit_open = true,
             Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
             Command::NewSession => self.open_new_dialog(None),

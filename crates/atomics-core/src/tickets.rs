@@ -1,7 +1,8 @@
 //! Generic ticket links. A plan or task can carry a ticket from an external ticket
-//! system that ATOMICS reaches over MCP. Nothing here knows any particular system: ids
-//! and states are opaque strings, and the workspace's `[tickets]` config says which
-//! MCP tool implements each operation and where its result keeps the ticket's fields.
+//! system that ATOMICS reaches over MCP, and for reads optionally over a REST API. Nothing here
+//! knows any particular system: ids and states are opaque strings, and the workspace's `[tickets]`
+//! config says which MCP tool or HTTP request implements each operation and where its result keeps
+//! the ticket's fields.
 
 use std::collections::BTreeMap;
 
@@ -70,19 +71,16 @@ impl TicketLink {
         self.matches(Some(&other.system), Some(&other.id), other.key.as_deref())
     }
 
-    /// Whether this is the ticket a key-shaped query names: in any letter case, or by number
-    /// when one side is only a number. A system may address tickets by number alone, so `UTF-8`
-    /// can bring back ticket 8 under another prefix, which is not what was asked for. A ticket
-    /// that shows no key has nothing to contradict the query.
+    /// Whether the query matches the id or a non-empty key in any letter case, or a
+    /// bare number exactly matches the number at the end of the key.
     pub fn named_by_key(&self, query: &str) -> bool {
-        let number = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
-        let names = |name: &str| {
-            name.eq_ignore_ascii_case(query)
-                || ((number(query) || number(name))
-                    && key_number(name).is_some()
-                    && key_number(name) == key_number(query))
-        };
-        names(&self.id) || self.key.as_deref().filter(|key| !key.is_empty()).is_none_or(names)
+        self.id.eq_ignore_ascii_case(query)
+            || self.key.as_deref().filter(|key| !key.is_empty()).is_some_and(|key| {
+                key.eq_ignore_ascii_case(query)
+                    || (!query.is_empty()
+                        && query.bytes().all(|b| b.is_ascii_digit())
+                        && key_number(key) == Some(query))
+            })
     }
 
     /// Takes the fields a ticket operation returned. The id stays what the link was
@@ -227,9 +225,12 @@ pub struct TicketConfig {
     pub branch: Option<String>,
     /// Fills a missing result URL using the ticket placeholders.
     pub link_url: Option<String>,
-    /// Longest wait for one MCP request.
+    /// Longest wait for one MCP or HTTP request.
     pub timeout_secs: u64,
     pub server: McpServer,
+    /// `[tickets.http]`: the REST API that operations mapped with `http` call.
+    #[serde(skip_serializing_if = "HttpApi::is_unset")]
+    pub http: HttpApi,
     /// The system's state names for ATOMICS's task statuses. Unmapped statuses are not pushed.
     pub states: StateMap,
     pub operations: Operations,
@@ -281,6 +282,7 @@ impl Default for TicketConfig {
             link_url: None,
             timeout_secs: 30,
             server: McpServer::default(),
+            http: HttpApi::default(),
             states: StateMap::default(),
             operations: Operations::default(),
             remote: RemoteConfig::default(),
@@ -288,6 +290,20 @@ impl Default for TicketConfig {
             views: Vec::new(),
             filters: Vec::new(),
         }
+    }
+}
+
+/// `[tickets.http]`: the one address `http` operations reach. Every request goes to this URL plus
+/// an operation's path; nothing a server answers can change where a request goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpApi {
+    pub url: String,
+}
+
+impl HttpApi {
+    fn is_unset(&self) -> bool {
+        self.url.trim().is_empty()
     }
 }
 
@@ -389,6 +405,11 @@ pub struct McpServer {
     /// keychain, never in the config. Ignored when `token_env` is set.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub oauth: bool,
+    /// Further resources a browser sign-in to `url` asks for (RFC 8707), each with a token of its
+    /// own. Not a config key: `TicketConfig::sign_in_server` fills it from `[tickets.http] url`, so
+    /// one address cannot be named two ways. It is no part of the sign-in's identity.
+    #[serde(skip)]
+    pub resources: Vec<String>,
 }
 
 impl McpServer {
@@ -478,61 +499,61 @@ impl StateMap {
 pub struct Operations {
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
     pub whoami: Option<Operation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub conversation_open: Option<Operation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub conversation_post: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
     pub conversation_read: Option<Operation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub conversation_ack: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
     pub conversation_steerers: Option<Operation>,
     /// Keyword search; {query} is substituted as literal text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub search: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub semantic_search: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub children: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub related: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub read: Option<Operation>,
     /// The comments of a read, for systems that list them with a tool of their own; only its
     /// `comments` paths are read. Placeholders: {id}, {key}, {key_number}, {uuid}.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub read_comments: Option<Operation>,
     /// Read one ticket. Placeholders: {id}, {key}, {system}.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub get: Option<Operation>,
     /// The tickets on a board, for board mode. Placeholders: {board}, {board_key}.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub list: Option<Operation>,
     /// Tickets without a query, for the Tickets panel's views; `items` selects the array.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "read_operation")]
+    #[serde(deserialize_with = "http_read_operation")]
     pub browse: Option<Operation>,
     /// Placeholders: {id}, {key}, {uuid}, {state}, {nonce}.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub update_state: Option<Operation>,
     /// Placeholders: {id}, {key}, {uuid}, {body}, {nonce}.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub comment: Option<Operation>,
     /// Optional. Placeholders: {title}, {body}, {board}, {board_key}, {nonce}.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub create: Option<Operation>,
     /// `[remote.rendezvous]`: register this host's public device keys. Placeholders: {nonce},
     /// {signing_key}, {noise_key}, {host_name}, {protocol_major}. `result` maps `host_id`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "write_operation")]
     pub rendezvous_register: Option<Operation>,
     /// A fresh challenge to sign for a pass. Placeholders: {host_id}. `result` maps `challenge`.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
@@ -543,13 +564,19 @@ pub struct Operations {
     pub rendezvous_pass: Option<Operation>,
 }
 
-/// One generic operation: which tool to call, its arguments, and where its result
+/// One generic operation: which tool or HTTP request to make, its arguments, and where its result
 /// keeps the ticket's fields.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Operation {
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub tool: String,
-    /// Tool arguments. Strings may contain placeholders such as {id}.
+    /// The HTTP request to make instead of a tool, for reads against `[tickets.http]`. Boxed for
+    /// the same reason as `result`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http: Option<Box<HttpCall>>,
+    /// Tool arguments, or the query string of a GET and the JSON body of a POST. Strings may
+    /// contain placeholders such as {id}.
     pub arguments: Map<String, Value>,
     /// For `list`: the JSON path of the ticket array in the result.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -568,6 +595,9 @@ pub struct Operation {
     /// For lists: how the Tickets panel's "More" asks for the next page.
     #[serde(skip_serializing_if = "Paging::is_empty")]
     pub paging: Paging,
+    /// For `semantic_search`: how an answer says it came from keyword search instead.
+    #[serde(skip_serializing_if = "Fallback::is_empty")]
+    pub fallback: Fallback,
 }
 
 /// Cursor paging: the argument that takes a cursor, and the result path of the next one.
@@ -582,6 +612,153 @@ impl Paging {
     pub fn is_empty(&self) -> bool {
         self.cursor.is_empty() && self.next.is_empty()
     }
+}
+
+/// Where an answer keeps a status, and the values of it that mean a meaning search was answered
+/// by keyword. Any other value, or none, is an ordinary answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fallback {
+    pub path: String,
+    pub values: Vec<String>,
+}
+
+impl Fallback {
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty() && self.values.is_empty()
+    }
+}
+
+/// The operations `http` may implement: reads only. A write's retry and idempotency rules are
+/// MCP's, and agents' tools stay on MCP.
+pub const HTTP_OPERATIONS: &[&str] =
+    &["browse", "search", "semantic_search", "read", "read_comments", "get", "children", "related", "list"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    Get,
+    Post,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+        }
+    }
+}
+
+/// How an operation reads over HTTP. There are no request headers to configure: a request carries
+/// only ATOMICS's own, and its credential goes only to its own resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpCall {
+    pub method: HttpMethod,
+    /// Below `[tickets.http] url`. Placeholders fill whole or partial path segments.
+    pub path: String,
+    /// For a POST: the arguments that go in the query string rather than the JSON body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query: Vec<String>,
+    /// Response headers to read, by the name their values take. With any, the result paths read
+    /// from `{"body": <the JSON answer>, "headers": {<name>: <value>}}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response_headers: BTreeMap<String, String>,
+}
+
+/// One request an `http` operation makes: its path with values encoded, its query pairs, and for
+/// a POST its JSON body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub body: Option<Value>,
+}
+
+impl HttpCall {
+    /// Whether the path stays below the base whatever fills it: it starts with a slash, and has no
+    /// empty, dot or encoded separator segment, no scheme, query or fragment, and only known
+    /// placeholders. Checked as written and once decoded.
+    fn check(&self) -> Result<(), String> {
+        let path = self.path.as_str();
+        let decoded = percent_decode(path);
+        let plain = [path, decoded.as_str()].into_iter().all(|text| {
+            text.starts_with('/')
+                && !text.contains("//")
+                && !text.contains("..")
+                && !text.contains(['?', '#', '\\'])
+                && !text.contains(char::is_control)
+                && !text.split('/').any(|segment| segment == ".")
+        });
+        if !plain {
+            return Err(format!(
+                "http.path {path:?} must start with / and hold no //, .., ?, #, a backslash or a scheme"
+            ));
+        }
+        // Rendering with values that are always fit leaves braces only where a name is unknown.
+        let known = PLACEHOLDERS.iter().fold(Vars::default(), |vars, name| vars.typed(name, Value::from("x")));
+        if known.render(path)?.contains(['{', '}']) {
+            return Err(format!("http.path {path:?} has an unknown placeholder or a stray brace"));
+        }
+        Ok(())
+    }
+
+    /// The path with each value encoded as part of its segment, or why a value does not fit.
+    fn rendered_path(&self, vars: &Vars) -> Result<String, String> {
+        vars.render_with(&self.path, path_value)
+    }
+}
+
+/// A placeholder's value as part of one path segment: percent-encoded, or refused when it would
+/// change the path. Encoded forms are looked through, since a server or proxy on the way may decode
+/// them again; `;` starts path parameters on some servers, and an empty value would drop the segment.
+fn path_value(value: &str) -> Result<String, String> {
+    let moves = |text: &str| {
+        let trimmed = text.trim();
+        trimmed.is_empty()
+            || trimmed.bytes().all(|byte| byte == b'.')
+            || text.contains(['/', '\\', ';'])
+            || text.contains(char::is_control)
+    };
+    let mut current = value.to_string();
+    for _ in 0..4 {
+        if moves(&current) {
+            return Err("is not a single path segment".into());
+        }
+        let next = percent_decode(&current);
+        if next == current {
+            return Ok(value.bytes().fold(String::with_capacity(value.len()), |mut out, byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                    out.push(byte as char);
+                } else {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+                out
+            }));
+        }
+        current = next;
+    }
+    Err("is not a single path segment".into())
+}
+
+/// One argument as query pairs: an array repeats the key, null is left out, an object has no form.
+fn query_pairs(name: &str, value: &Value, pairs: &mut Vec<(String, String)>) -> Result<(), String> {
+    match value {
+        Value::Null => {}
+        Value::Object(_) => return Err(format!("argument {name} is an object, which a query string cannot carry")),
+        Value::Array(items) => {
+            for item in items {
+                if item.is_array() {
+                    return Err(format!("argument {name} nests arrays, which a query string cannot carry"));
+                }
+                query_pairs(name, item, pairs)?;
+            }
+        }
+        Value::String(text) => pairs.push((name.to_string(), text.clone())),
+        other => pairs.push((name.to_string(), other.to_string())),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,6 +815,16 @@ pub fn card_reply(card: &TicketCard) -> Value {
 
 pub fn cards_reply(cards: &[TicketCard]) -> Value {
     serde_json::json!({"cards": cards})
+}
+
+/// A search's reply: its cards, which mode ran, and why when a meaning search came back by keyword.
+pub fn search_reply(cards: &[TicketCard], semantic: bool, fell_back: Option<&str>) -> Value {
+    let mut reply = cards_reply(cards);
+    reply["mode"] = Value::from(if semantic { "meaning" } else { "keyword" });
+    if let Some(why) = fell_back {
+        reply["fell_back"] = Value::from(why);
+    }
+    reply
 }
 
 pub fn reply_cards(reply: &Value) -> Result<Vec<TicketCard>, String> {
@@ -1097,7 +1284,7 @@ impl Operation {
 
     pub fn conversation(&self, value: &Value) -> Result<Conversation, String> {
         let id = mapped_field(value, &self.result.id).filter(|id| !id.is_empty()).ok_or_else(|| {
-            format!("{} returned no conversation id at {:?}: {}", self.tool, self.result.id, snippet(value))
+            format!("{} returned no conversation id at {:?}: {}", self.label(), self.result.id, snippet(value))
         })?;
         let cursor = (!self.result.cursor.trim().is_empty())
             .then(|| json_path(value, &self.result.cursor).cloned())
@@ -1119,7 +1306,7 @@ impl Operation {
     pub fn steering(&self, value: &Value, conversation: &str) -> Result<Vec<SteeringItem>, String> {
         let items = match json_path(value, &self.items) {
             Some(Value::Array(items)) => items,
-            _ => return Err(format!("{} returned no item list at {:?}: {}", self.tool, self.items, snippet(value))),
+            _ => return Err(format!("{} returned no item list at {:?}: {}", self.label(), self.items, snippet(value))),
         };
         let paths = &self.result;
         Ok(items
@@ -1497,6 +1684,11 @@ impl Vars {
     /// Fills placeholders in one pass over the template, so text a value brings in,
     /// such as a brief mentioning `{title}`, is never substituted again.
     pub fn render(&self, text: &str) -> Result<String, String> {
+        self.render_with(text, |value| Ok(value.to_string()))
+    }
+
+    /// `render`, with each value passed through `fill` on its way in.
+    fn render_with(&self, text: &str, fill: impl Fn(&str) -> Result<String, String>) -> Result<String, String> {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(start) = rest.find('{') {
@@ -1505,11 +1697,12 @@ impl Vars {
             let name = after.find('}').map(|end| &after[..end]).filter(|name| PLACEHOLDERS.contains(name));
             match name {
                 Some(name) => {
-                    match self.get(name) {
-                        Some(Value::String(value)) => out.push_str(value),
-                        Some(value) => out.push_str(&value.to_string()),
+                    let filled = match self.get(name) {
+                        Some(Value::String(value)) => fill(value),
+                        Some(value) => fill(&value.to_string()),
                         None => return Err(format!("needs {{{name}}}, which is unknown here")),
-                    }
+                    };
+                    out.push_str(&filled.map_err(|why| format!("{{{name}}} {why}"))?);
                     rest = &after[name.len() + 1..];
                 }
                 None => {
@@ -1629,7 +1822,7 @@ impl TicketConfig {
     pub fn unfit_id(&self, operation: &str, link: &TicketLink) -> Option<String> {
         let op = self.operation(operation)?;
         (op.uses_placeholder("uuid") && uuid::Uuid::parse_str(&link.id).is_err())
-            .then(|| format!("{} needs the ticket's UUID, but {} is linked by {}", op.tool, link.label(), link.id))
+            .then(|| format!("{} needs the ticket's UUID, but {} is linked by {}", op.label(), link.label(), link.id))
     }
 
     /// Whether any operation that addresses a ticket can't use this link's id.
@@ -1644,6 +1837,30 @@ impl TicketConfig {
         (!self.accepts(link)).then(|| {
             format!("{} belongs to {}, but [tickets] is set up for {}", link.label(), link.system, self.system)
         })
+    }
+
+    /// The resource `http` operations reach: `[tickets.http] url`. With `oauth` it has no sign-in of
+    /// its own: its token comes from `server`'s, which `sign_in_server` asks for this resource too.
+    /// A token belongs to one resource, so the two tokens are never shared.
+    pub fn http_server(&self) -> Option<McpServer> {
+        let url = self.http.url.trim();
+        (!url.is_empty()).then(|| McpServer {
+            url: Some(url.to_string()),
+            oauth: self.server.uses_oauth(),
+            ..McpServer::default()
+        })
+    }
+
+    /// `server` as a browser sign-in sees it: the API of any `http` operation is one of its resources,
+    /// so one sign-in covers both. Everything that signs in, or asks whether that is done, uses this.
+    pub fn sign_in_server(&self) -> McpServer {
+        let mut server = self.server.clone();
+        let api = self.http.url.trim();
+        let mapped = HTTP_OPERATIONS.iter().any(|name| self.operation(name).is_some_and(|op| op.http.is_some()));
+        if server.uses_oauth() && !api.is_empty() && mapped {
+            server.resources.push(api.to_string());
+        }
+        server
     }
 
     pub fn operation(&self, name: &str) -> Option<&Operation> {
@@ -1671,7 +1888,7 @@ impl TicketConfig {
             "rendezvous_pass" => self.operations.rendezvous_pass.as_ref(),
             _ => None,
         }
-        .filter(|op| !op.tool.trim().is_empty())
+        .filter(|op| !op.tool.trim().is_empty() || op.http.is_some())
     }
 
     /// Whether the Tickets panel lists tickets without a query: views and `browse` are mapped.
@@ -1776,7 +1993,8 @@ impl TicketConfig {
         let mut text =
             format!("Tickets: this workspace tracks its work in {system}, which ATOMICS reaches over MCP.\n");
         text.push_str(
-            "Use ATOMICS's chief ticket tools: atomics_ticket_search (query, optional semantic and take; \
+            "Use ATOMICS's chief ticket tools: atomics_ticket_search (query, optional take, and semantic: true for meaning, false for keyword; \
+             a profile with one search uses it either way and the reply's mode says which ran; \
              a ticket key or its bare number finds that ticket first), \
              atomics_ticket_read (ticket key or link, including description and comments), \
              atomics_ticket_children (direct children) and atomics_ticket_related (related tickets). \
@@ -1838,16 +2056,83 @@ impl TicketConfig {
     }
 }
 
+/// A read that only a tool can implement.
 fn read_operation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Operation>, D::Error> {
+    checked_operation(deserializer, true, false)
+}
+
+/// A read that a tool or an HTTP request can implement.
+fn http_read_operation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Operation>, D::Error> {
+    checked_operation(deserializer, true, true)
+}
+
+/// A write, which only a tool can implement.
+fn write_operation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Operation>, D::Error> {
+    checked_operation(deserializer, false, false)
+}
+
+fn checked_operation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    read: bool,
+    http: bool,
+) -> Result<Option<Operation>, D::Error> {
     let operation = Option::<Operation>::deserialize(deserializer)?;
-    if operation.as_ref().is_some_and(|op| op.uses_placeholder("nonce")) {
-        return Err(serde::de::Error::custom("{nonce} is only allowed in write operations"));
+    if let Some(operation) = &operation {
+        if read && operation.uses_placeholder("nonce") {
+            return Err(serde::de::Error::custom("{nonce} is only allowed in write operations"));
+        }
+        operation.check_kind(http).map_err(serde::de::Error::custom)?;
     }
     Ok(operation)
 }
 
 impl Operation {
-    /// Whether an argument template contains this placeholder, including nested values.
+    /// How the operation names itself in messages: its tool, or its HTTP request.
+    pub fn label(&self) -> String {
+        match &self.http {
+            Some(http) => format!("{} {}", http.method.as_str(), http.path),
+            None => self.tool.clone(),
+        }
+    }
+
+    fn check_kind(&self, http_allowed: bool) -> Result<(), String> {
+        let Some(http) = &self.http else { return Ok(()) };
+        if !http_allowed {
+            return Err(format!("http is only for {}", HTTP_OPERATIONS.join(", ")));
+        }
+        if !self.tool.trim().is_empty() {
+            return Err("set tool or http, not both".into());
+        }
+        http.check()
+    }
+
+    /// The HTTP request behind operation `name`, if it has one. Parsing a config already refuses
+    /// what this does; it also holds for configs built in code.
+    pub fn http_call(&self, name: &str) -> Result<Option<&HttpCall>, String> {
+        self.check_kind(HTTP_OPERATIONS.contains(&name)).map_err(|why| format!("operations.{name}: {why}"))?;
+        Ok(self.http.as_deref())
+    }
+
+    /// The request to make with these arguments, which `arguments_with` filled in. A GET's arguments
+    /// are its query string. A POST's are its JSON body, except those `http.query` names.
+    pub fn http_request(&self, http: &HttpCall, vars: &Vars, arguments: Value) -> Result<HttpRequest, String> {
+        let failed = |why: String| format!("{}: {why}", self.label());
+        let path = http.rendered_path(vars).map_err(failed)?;
+        let Value::Object(arguments) = arguments else { return Err(failed("arguments must be an object".into())) };
+        let mut query = Vec::new();
+        let mut body = Map::new();
+        for (name, value) in arguments {
+            if http.method == HttpMethod::Get || http.query.contains(&name) {
+                query_pairs(&name, &value, &mut query).map_err(failed)?;
+            } else {
+                body.insert(name, value);
+            }
+        }
+        let body = (http.method == HttpMethod::Post).then_some(Value::Object(body));
+        Ok(HttpRequest { path, query, body })
+    }
+
+    /// Whether an argument template or the HTTP path contains this placeholder, including nested values.
     pub fn uses_placeholder(&self, name: &str) -> bool {
         fn contains(value: &Value, placeholder: &str) -> bool {
             match value {
@@ -1859,6 +2144,7 @@ impl Operation {
         }
         let placeholder = format!("{{{name}}}");
         self.arguments.values().any(|value| contains(value, &placeholder))
+            || self.http.as_ref().is_some_and(|http| http.path.contains(&placeholder))
     }
 
     /// Parse mapped display data. Callers apply their job's Cleaner before exposing it.
@@ -1918,9 +2204,12 @@ impl Operation {
     pub fn comment_list(&self, result: &Value) -> Result<Vec<Comment>, String> {
         match json_path(result, &self.comments.items) {
             Some(Value::Array(items)) => Ok(self.comment_items(Some(items))),
-            _ => {
-                Err(format!("{} returned no comment list at {:?}: {}", self.tool, self.comments.items, snippet(result)))
-            }
+            _ => Err(format!(
+                "{} returned no comment list at {:?}: {}",
+                self.label(),
+                self.comments.items,
+                snippet(result)
+            )),
         }
     }
 
@@ -1934,7 +2223,7 @@ impl Operation {
                 })
                 .map(|item| self.card(item, system))
                 .collect(),
-            _ => Err(format!("{} returned no ticket list at {:?}: {}", self.tool, self.items, snippet(result))),
+            _ => Err(format!("{} returned no ticket list at {:?}: {}", self.label(), self.items, snippet(result))),
         }
     }
 
@@ -1972,6 +2261,11 @@ impl Operation {
             return None;
         }
         mapped_field(result, &self.paging.next).filter(|cursor| !cursor.is_empty())
+    }
+
+    /// The status that says this answer came from keyword search, when `fallback` finds one.
+    pub fn fell_back(&self, result: &Value) -> Option<String> {
+        mapped_field(result, &self.fallback.path).filter(|status| self.fallback.values.contains(status))
     }
 
     /// The tool arguments with `extra` replacing any of the same name and placeholders filled in.
@@ -2014,7 +2308,7 @@ impl Operation {
                 other => other.clone(),
             })
         }
-        fill(&Value::Object(self.arguments.clone()), vars).map_err(|err| format!("{}: {err}", self.tool))
+        fill(&Value::Object(self.arguments.clone()), vars).map_err(|err| format!("{}: {err}", self.label()))
     }
 
     /// The ticket a tool result describes. Fails when none of the paths match, which
@@ -2024,7 +2318,7 @@ impl Operation {
         if link == (TicketLink { system: system.to_string(), ..TicketLink::default() }) {
             return Err(format!(
                 "{} returned no ticket fields at the configured result paths: {}",
-                self.tool,
+                self.label(),
                 snippet(result)
             ));
         }
@@ -2039,7 +2333,7 @@ impl Operation {
                 .map(|item| self.result.read(item, system))
                 .filter(|link| !link.id.is_empty() || link.key.is_some())
                 .collect()),
-            _ => Err(format!("{} returned no ticket list at {:?}: {}", self.tool, self.items, snippet(result))),
+            _ => Err(format!("{} returned no ticket list at {:?}: {}", self.label(), self.items, snippet(result))),
         }
     }
 }
@@ -2345,7 +2639,7 @@ impl Cleaner {
 
     /// Whether a known secret shows once percent-encoding and JSON escapes are undone and
     /// whitespace is removed.
-    fn holds_secret(&self, text: &str) -> bool {
+    pub fn holds_secret(&self, text: &str) -> bool {
         let normalized = normalize(text);
         self.secrets.iter().any(|secret| normalized.contains(&normalize(secret)))
     }
@@ -3060,10 +3354,14 @@ mod tests {
             assert!(!ticket.named_by_key(query), "{query}");
         }
         assert!(link("ABC-12", None).named_by_key("abc-12"), "the id can hold the key");
-        assert!(link("id", Some("12")).named_by_key("ABC-12"), "a system may show only the number");
+        assert!(!link("id", Some("12")).named_by_key("ABC-12"));
         assert!(!link("id", Some("13")).named_by_key("ABC-12"));
-        assert!(link("id", None).named_by_key("ABC-12"), "no key to contradict the query");
-        assert!(link("id", Some("")).named_by_key("ABC-12"), "an empty key is no key");
+        assert!(!link("id", None).named_by_key("ABC-12"));
+        assert!(!link("id", Some("")).named_by_key("ABC-12"));
+        assert!(!link("8", Some("DEMO-8")).named_by_key("UTF-8"));
+        assert!(!link("11973", Some("RELAY-11973")).named_by_key("FOO-11973"));
+        assert!(!link("8", Some("8")).named_by_key("UTF-8"));
+        assert!(link("8", Some("8")).named_by_key("8"));
     }
 
     #[test]
@@ -3844,6 +4142,176 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
         assert!(comment.arguments(&Vars::new("alpha").ticket(&ticket)).unwrap_err().contains("{body}"));
         assert!(config.operation("update_state").is_none());
         assert!(!TicketConfig::default().is_configured());
+    }
+
+    fn http_config(operations: &str) -> Result<TicketConfig, String> {
+        let text =
+            format!("system = 'x'\nserver = {{ command = ['x'] }}\n[http]\nurl = 'https://a.example/v1'\n{operations}");
+        toml::from_str(&text).map_err(|error: toml::de::Error| error.to_string())
+    }
+
+    #[test]
+    fn an_operation_is_a_tool_or_an_http_request_and_only_a_read_may_be_http() {
+        let config = http_config(
+            r#"
+            [operations.read]
+            http = { method = "GET", path = "/items/{id}" }
+            arguments = { expand = "comments" }
+            result = { id = "id", key = "key", title = "title" }
+            paging = { cursor = "cursor", next = "next" }
+            [operations.search]
+            tool = "find"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.http.url, "https://a.example/v1");
+        let read = config.operation("read").unwrap();
+        assert!(read.tool.is_empty());
+        assert_eq!(read.label(), "GET /items/{id}");
+        assert!(read.uses_placeholder("id") && !read.uses_placeholder("uuid"));
+        assert_eq!(config.operation("search").unwrap().label(), "find");
+        assert!(config.operation("search").unwrap().http.is_none());
+        assert!(read.ticket(&json!({"other":1}), "x").unwrap_err().starts_with("GET /items/{id} returned no ticket"));
+        assert_eq!(
+            config.http_server().unwrap(),
+            McpServer { url: Some("https://a.example/v1".into()), ..McpServer::default() }
+        );
+        assert_eq!(TicketConfig::default().http_server(), None);
+
+        // One sign-in covers the API, and only a sign-in with something to read over it.
+        assert!(config.sign_in_server().resources.is_empty(), "no OAuth, no resources");
+        let mut signing = config.clone();
+        signing.server = McpServer { url: Some("https://a.example/mcp".into()), oauth: true, ..McpServer::default() };
+        let server = signing.sign_in_server();
+        assert_eq!(server.resources, ["https://a.example/v1"]);
+        assert_eq!(server.url, signing.server.url);
+        assert!(signing.http_server().unwrap().uses_oauth());
+        signing.operations.read = None;
+        assert!(signing.sign_in_server().resources.is_empty(), "no operation uses the API");
+
+        // The list is derived: a config can neither set it nor find it written.
+        let listed: McpServer =
+            toml::from_str("url = 'https://a.example/mcp'\nresources = ['https://b.example']").unwrap();
+        assert!(listed.resources.is_empty());
+        assert!(!toml::to_string(&server).unwrap().contains("resources"));
+
+        // A config round-trips through its serialized form, and an unset [http] stays out of it.
+        let again: TicketConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again, config);
+        assert!(!toml::to_string(&TicketConfig::default()).unwrap().contains("http"));
+
+        for name in HTTP_OPERATIONS {
+            let mapped = http_config(&format!("[operations.{name}]\nhttp = {{ method = 'POST', path = '/x' }}"));
+            let mapped = mapped.unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(mapped.operation(name).is_some(), "{name}");
+        }
+        for name in [
+            "whoami",
+            "update_state",
+            "comment",
+            "create",
+            "conversation_open",
+            "conversation_post",
+            "conversation_read",
+            "conversation_ack",
+            "conversation_steerers",
+            "rendezvous_register",
+            "rendezvous_challenge",
+            "rendezvous_pass",
+        ] {
+            let error =
+                http_config(&format!("[operations.{name}]\nhttp = {{ method = 'POST', path = '/x' }}")).unwrap_err();
+            assert!(error.contains("http is only for browse"), "{name}: {error}");
+            assert!(http_config(&format!("[operations.{name}]\ntool = 't'")).is_ok(), "{name}");
+        }
+
+        let error = http_config("[operations.read]\ntool = 't'\nhttp = { method = 'GET', path = '/x' }").unwrap_err();
+        assert!(error.contains("set tool or http, not both"), "{error}");
+        let nonce = "[operations.read]\nhttp = { method = 'GET', path = '/x/{nonce}' }";
+        assert!(http_config(nonce).unwrap_err().contains("{nonce} is only allowed in write operations"));
+        for refused in [
+            "http = { method = 'PUT', path = '/x' }",
+            "http = { method = 'get', path = '/x' }",
+            "http = { path = '/x' }",
+            "http = { method = 'GET' }",
+            // No configurable request headers, nor a token or address of its own.
+            "http = { method = 'GET', path = '/x', headers = { Authorization = 'Bearer y' } }",
+            "http = { method = 'GET', path = '/x', url = 'https://b.example' }",
+        ] {
+            assert!(http_config(&format!("[operations.read]\n{refused}")).is_err(), "{refused}");
+        }
+        let error = toml::from_str::<TicketConfig>("[http]\nurl = 'https://a.example'\nheaders = { a = 'b' }");
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn an_http_path_stays_below_the_base_whatever_is_written() {
+        for path in [
+            "items",
+            "",
+            "//evil.example/x",
+            "https://evil.example/x",
+            "/a//b",
+            "/../x",
+            "/a/../b",
+            "/a/..",
+            "/./x",
+            "/a/.",
+            "/%2e%2e/x",
+            "/%2E%2E/x",
+            "/%2f%2fevil.example",
+            "/a%2f..%2fb",
+            "/x?token=y",
+            "/x#y",
+            "/a\\b",
+            "/a\nb",
+            "/{unknown}",
+            "/{id",
+            "/id}",
+        ] {
+            let config = http_config(&format!("[operations.read]\nhttp = {{ method = 'GET', path = {path:?} }}"));
+            assert!(config.is_err(), "{path} was accepted");
+        }
+        for path in ["/", "/items", "/items/{id}", "/a.b/{key}-x/{uuid}", "/v1.2/items/{key_number}/comments"] {
+            let config = http_config(&format!("[operations.read]\nhttp = {{ method = 'GET', path = {path:?} }}"));
+            assert!(config.is_ok(), "{path}: {:?}", config.err());
+        }
+    }
+
+    #[test]
+    fn an_http_request_splits_its_arguments_by_method() {
+        let operation = |method: &str, query: Value| -> Operation {
+            serde_json::from_value(json!({
+                "http":{"method":method, "path":"/items/{key}", "query":query},
+                "arguments":{"a":"{query}", "b":[1, null, "two"], "c":null, "d":{"nested":true}},
+            }))
+            .unwrap()
+        };
+        let vars = Vars::new("x").with("key", Some("AB 1")).with("query", Some("words"));
+        let request = |operation: &Operation, arguments: Value| {
+            operation.http_request(operation.http.as_deref().unwrap(), &vars, arguments)
+        };
+        let post = operation("POST", json!(["a", "b"]));
+        let arguments = post.arguments(&vars).unwrap();
+        assert_eq!(
+            request(&post, arguments).unwrap(),
+            HttpRequest {
+                path: "/items/AB%201".into(),
+                query: vec![("a".into(), "words".into()), ("b".into(), "1".into()), ("b".into(), "two".into())],
+                body: Some(json!({"c":null, "d":{"nested":true}})),
+            }
+        );
+        let get = operation("GET", json!([]));
+        let arguments = get.arguments(&vars).unwrap();
+        assert!(request(&get, arguments).unwrap_err().contains("argument d is an object"));
+        let arguments = json!({"a":"x", "n":null, "t":true, "f":1.5});
+        let fine = request(&get, arguments).unwrap();
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        assert_eq!(fine.query, [pair("a", "x"), pair("f", "1.5"), pair("t", "true")]);
+        assert_eq!(fine.body, None);
+        let unknown = Vars::new("x");
+        let needs = get.http_request(get.http.as_deref().unwrap(), &unknown, json!({})).unwrap_err();
+        assert_eq!(needs, "GET /items/{key}: needs {key}, which is unknown here");
     }
 
     #[test]

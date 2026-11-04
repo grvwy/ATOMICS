@@ -189,7 +189,13 @@ fn the_wide_layout_alone_carries_out_the_chiefs_window() {
     for command in [Command::HideChief, Command::ToggleChief, Command::SetChiefDock(ChiefDock::Docked)] {
         assert!(window_command(&command) && carries_out(&command, true) && !carries_out(&command, false));
     }
-    for host in [Command::NewSession, Command::PickProject, Command::SetView(None), Command::Rename("s1".into())] {
+    for host in [
+        Command::NewSession,
+        Command::PickProject,
+        Command::SetView(None),
+        Command::Rename("s1".into()),
+        Command::OpenTicket(Default::default()),
+    ] {
         assert!(!carries_out(&host, true), "{host:?}");
     }
     let world = live();

@@ -18,6 +18,7 @@ use atomics_core::ops::{
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::steer::ReviewComment;
 use atomics_core::store::SessionRecord;
+use atomics_core::tickets::TicketLink;
 use atomics_core::wire::Seq;
 
 use crate::{Backend, PanelMode};
@@ -261,6 +262,8 @@ pub enum Command {
     /// The view switcher's segment: show the board, the diff (or the editor) or the tickets in the panel, or
     /// hide the panel when it shows that view already.
     ToggleView(PanelMode),
+    /// Read a ticket in the app's ticket reader. A platform without one does not offer this.
+    OpenTicket(TicketLink),
     /// A task brief on the board has the keyboard this frame: the desktop's host holds off a restart until
     /// the edit is done.
     EditingPlan,
@@ -304,6 +307,7 @@ impl Command {
                 | Command::ViewPlanHistory(_)
                 | Command::TogglePlan
                 | Command::ToggleView(_)
+                | Command::OpenTicket(_)
                 | Command::EditingPlan
                 | Command::ClosePlanTab(_)
                 | Command::NewSession

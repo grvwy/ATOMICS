@@ -20,6 +20,8 @@ fn accepted_tasks_show_the_integration_count_and_action() {
 struct BoardFrame {
     text: Vec<egui::epaint::TextShape>,
     cards: Vec<Rect>,
+    /// The addresses it opened in the browser.
+    opened: Vec<String>,
 }
 
 fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
@@ -53,8 +55,17 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, even
             _ => None,
         })
         .collect();
+    let opened = output
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+            _ => None,
+        })
+        .collect();
     output.drop_without_applying_deltas();
-    BoardFrame { text, cards }
+    BoardFrame { text, cards, opened }
 }
 
 fn populate(app: &mut Desktop<'_>) {
@@ -266,6 +277,92 @@ fn a_narrow_board_stacks_its_statuses_and_keeps_card_buttons() {
             assert_eq!(app.runtime.plans[0].tasks[4].status, TaskStatus::Review);
         },
     );
+}
+
+/// A plan and its task, each following a ticket of `system`, the plan's without an address.
+fn ticketed(app: &mut Desktop<'_>, system: &str) {
+    use atomics_core::tickets::TicketLink;
+    let link = |id: &str, url: Option<&str>| TicketLink {
+        system: system.into(),
+        id: id.into(),
+        url: url.map(str::to_string),
+        ..TicketLink::default()
+    };
+    app.runtime.plans = vec![Plan {
+        id: "ticketed".into(),
+        goal: "A plan with tickets".into(),
+        ticket: Some(link("PLAN-1", None)),
+        tasks: vec![Task {
+            id: "t".into(),
+            title: "A task with a ticket".into(),
+            ticket: Some(link("TASK-1", Some("https://tickets.example/TASK-1"))),
+            ..Task::default()
+        }],
+        ..Plan::default()
+    }];
+    app.runtime.selected_plan = 0;
+}
+
+/// A click on the chip that says `label`: what it opened in the browser.
+fn click_chip(app: &mut Desktop<'_>, ctx: &egui::Context, label: &str, time: f64) -> Vec<String> {
+    frame(app, ctx, 1600.0, time, vec![]);
+    let rendered = frame(app, ctx, 1600.0, time + 0.1, vec![]);
+    let chip = rendered.text.iter().find(|t| t.galley.text() == label).unwrap();
+    let pos = chip.pos + chip.galley.rect.center().to_vec2();
+    let press = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    frame(app, ctx, 1600.0, time + 0.2, vec![egui::Event::PointerMoved(pos), press(true)]);
+    frame(app, ctx, 1600.0, time + 0.25, vec![press(false)]).opened
+}
+
+#[test]
+fn a_ticket_chip_without_a_reader_for_it_opens_its_address() {
+    let name = "app::board_tests::a_ticket_chip_without_a_reader_for_it_opens_its_address";
+    super::tests::with_app(name, |app, ctx| {
+        let address = ["https://tickets.example/TASK-1"];
+        // No ticket system: there is nothing to read it from.
+        ticketed(app, "demo");
+        app.runtime.tickets.config = None;
+        assert_eq!(click_chip(app, ctx, "TASK-1", 1.0), address);
+        assert!(click_chip(app, ctx, "PLAN-1", 2.0).is_empty(), "no address, nothing to open");
+        assert_ne!(app.runtime.panel, PanelMode::Tickets);
+        // Another system's ticket: the configured system's reader would look up another ticket.
+        app.runtime.tickets.config =
+            Some(Arc::new(atomics_core::tickets::TicketConfig { system: "other".into(), ..Default::default() }));
+        assert_eq!(click_chip(app, ctx, "TASK-1", 3.0), address);
+        assert_ne!(app.runtime.panel, PanelMode::Tickets);
+        assert!(app.runtime.tickets.panel.read.is_none());
+    });
+}
+
+#[test]
+fn a_ticket_chip_says_what_a_click_does() {
+    super::tests::with_app("app::board_tests::a_ticket_chip_says_what_a_click_does", |app, ctx| {
+        let hint = |app: &mut Desktop<'_>, ctx: &egui::Context, label: &str, time: f64| {
+            let rendered = frame(app, ctx, 1600.0, time, vec![]);
+            let chip = rendered.text.iter().find(|t| t.galley.text() == label).unwrap();
+            let pos = chip.pos + chip.galley.rect.center().to_vec2();
+            frame(app, ctx, 1600.0, time + 1.0, vec![egui::Event::PointerMoved(pos)]);
+            frame(app, ctx, 1600.0, time + 2.0, vec![]);
+            let rendered = frame(app, ctx, 1600.0, time + 3.0, vec![]);
+            let says = |t: &&egui::epaint::TextShape| t.galley.text().starts_with("click to");
+            rendered.text.iter().find(says).map(|t| t.galley.text().to_string())
+        };
+        ticketed(app, "demo");
+        app.runtime.tickets.config = None;
+        let opens = "click to open https://tickets.example/TASK-1";
+        assert_eq!(hint(app, ctx, "TASK-1", 1.0).as_deref(), Some(opens));
+        assert_eq!(hint(app, ctx, "PLAN-1", 5.0), None);
+        app.runtime.tickets.config =
+            Some(Arc::new(atomics_core::tickets::TicketConfig { system: "demo".into(), ..Default::default() }));
+        let reads = "click to read it here, with Open in browser";
+        assert_eq!(hint(app, ctx, "TASK-1", 9.0).as_deref(), Some(reads));
+        assert_eq!(hint(app, ctx, "PLAN-1", 13.0).as_deref(), Some("click to read it here"));
+    });
 }
 
 #[test]

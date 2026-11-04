@@ -340,6 +340,28 @@ fn a_boots_view_and_ticket_key_open_their_pane_or_plan() {
 }
 
 #[test]
+fn a_boards_ticket_keys_show_in_either_layout_and_offer_nothing() {
+    for size in [BOARD, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live();
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shows = |label: &str| shown.iter().any(|(text, _)| text == label);
+        assert!(shows("ticket") && shows("ENG-40") && shows("ENG-41"), "{size:?}: {shown:?}");
+        assert!(!world.driver.remote.available(&Command::OpenTicket(Default::default())), "{size:?}");
+
+        // A click on a key is a click on nothing: the view stays, and the host hears nothing of it.
+        world.host.received.clear();
+        for key in ["ENG-40", "ENG-41"] {
+            let before = view.desk.hints(&world.driver.remote);
+            drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, key)));
+            settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert_eq!(view.desk.hints(&world.driver.remote), before, "{size:?}: {key}");
+            assert_eq!(world.driver.remote.notice(), None, "{size:?}: {key}");
+        }
+        assert!(world.sent().is_empty(), "{size:?}: {:?}", world.sent());
+    }
+}
+
+#[test]
 fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
     let (ctx, mut world, mut client, mut view) = live();
     let mut text = Vec::new();
