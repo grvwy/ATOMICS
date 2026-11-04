@@ -47,6 +47,7 @@ pub struct Gate {
 
 #[derive(Default)]
 struct Shared {
+    using: Option<std::fs::File>,
     status: Option<Status>,
     note: Option<String>,
     starting: bool,
@@ -170,6 +171,12 @@ fn resolve(
             "no ATOMICS VM is set up on this Mac: build it with scripts/macos-vm-build.sh --host and run atomics vm setup"
         );
     };
+    {
+        let mut state = shared.lock().unwrap();
+        if state.using.is_none() {
+            state.using = Some(crate::vm::instance_lock(&info.instance, false)?);
+        }
+    }
     if info.host.is_none() {
         set(shared, Status::NotSetUp, None);
         bail!("the VM's bundle has no ATOMICS host: rebuild it with scripts/macos-vm-build.sh --host");

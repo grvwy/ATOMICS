@@ -41,6 +41,7 @@ pub mod text;
 pub mod theme;
 pub mod topbar;
 pub mod touch;
+pub mod vm;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot, Heartbeat,

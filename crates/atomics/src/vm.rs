@@ -8,12 +8,13 @@
 //! instance `atomics vm setup` did not create (an older one of the same name) is never reused or
 //! replaced unless the user confirms it.
 
+mod process;
+mod service;
 pub mod setup;
+pub use service::Monitor;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -74,11 +75,18 @@ impl BundleInfo {
 pub fn installed_dir() -> PathBuf {
     atomics_core::paths::env_override("VM_BUNDLE")
         .map(PathBuf::from)
+        .or_else(|| {
+            std::fs::read_to_string(record_dir().join("selected-bundle"))
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| p.join(BUNDLE_INFO).is_file())
+        })
         .unwrap_or_else(|| atomics_core::paths::home().join(".local/share/atomics-vm"))
 }
 
 pub fn valid_instance(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    name.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 /// The VM as the UI and `atomics vm status` show it.
@@ -166,6 +174,8 @@ struct Record {
     instance: String,
     image: String,
     created_at: u64,
+    #[serde(default)]
+    bundle: Option<PathBuf>,
 }
 
 pub fn created_here(instance: &str) -> bool {
@@ -181,6 +191,7 @@ fn remember(instance: &str, image: &Path) -> Result<()> {
     let record = Record {
         instance: instance.to_string(),
         image: image.display().to_string(),
+        bundle: None,
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
     };
     std::fs::write(dir.join(format!("{instance}.json")), serde_json::to_string_pretty(&record)?)?;
@@ -228,117 +239,6 @@ pub fn guest_shell(info: &BundleInfo) -> Result<Command> {
     Ok(command)
 }
 
-/// The VM's status, kept current on a thread of its own for the UI: Lima is asked every few seconds
-/// while someone looks, and a start or stop runs there too, so the UI never waits on `limactl`.
-#[derive(Clone, Default)]
-pub struct Monitor {
-    shared: Arc<Mutex<Shared>>,
-    window: crate::host::Window,
-}
-
-#[derive(Default)]
-struct Shared {
-    /// The installed bundle's instance, when one is installed.
-    instance: Option<String>,
-    status: Option<Status>,
-    /// A start or stop under way, and what it is.
-    busy: Option<&'static str>,
-    /// Why the last start or stop failed.
-    error: Option<String>,
-    checked: Option<Instant>,
-}
-
-/// How often the UI's view of the VM is refreshed.
-const POLL: Duration = Duration::from_secs(5);
-
-/// What the UI shows of the VM.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct View {
-    pub instance: String,
-    pub status: Status,
-    pub busy: Option<&'static str>,
-    pub error: Option<String>,
-}
-
-impl Monitor {
-    /// Only on macOS, and only with a bundle installed: elsewhere the UI shows no VM at all. `window` is
-    /// asked to repaint when what it shows changes.
-    pub fn start(window: crate::host::Window) -> Option<Self> {
-        if !cfg!(target_os = "macos") || cfg!(test) {
-            return None;
-        }
-        let (_, info) = BundleInfo::installed()?;
-        let monitor = Monitor { window, ..Monitor::default() };
-        monitor.shared.lock().unwrap().instance = Some(info.instance);
-        let thread = monitor.clone();
-        std::thread::Builder::new()
-            .name("atomics-vm-monitor".into())
-            .spawn(move || {
-                loop {
-                    thread.refresh();
-                    std::thread::sleep(POLL);
-                }
-            })
-            .ok()?;
-        Some(monitor)
-    }
-
-    fn refresh(&self) {
-        let (instance, busy) = {
-            let shared = self.shared.lock().unwrap();
-            (shared.instance.clone(), shared.busy)
-        };
-        let Some(instance) = instance else { return };
-        let status = status(&instance, busy == Some("starting"));
-        let mut shared = self.shared.lock().unwrap();
-        let changed = shared.status.as_ref() != Some(&status);
-        shared.status = Some(status);
-        shared.checked = Some(Instant::now());
-        drop(shared);
-        if changed {
-            self.window.request_repaint();
-        }
-    }
-
-    pub fn view(&self) -> Option<View> {
-        let shared = self.shared.lock().unwrap();
-        Some(View {
-            instance: shared.instance.clone()?,
-            status: shared.status.clone().unwrap_or(Status::Unknown("checking".into())),
-            busy: shared.busy,
-            error: shared.error.clone(),
-        })
-    }
-
-    /// Start (`true`) or stop the VM on a thread of its own; the view says so meanwhile.
-    pub fn set_running(&self, run: bool) {
-        let instance = {
-            let mut shared = self.shared.lock().unwrap();
-            if shared.busy.is_some() {
-                return;
-            }
-            shared.busy = Some(if run { "starting" } else { "stopping" });
-            shared.error = None;
-            if run {
-                shared.status = Some(Status::Starting);
-            }
-            shared.instance.clone()
-        };
-        self.window.request_repaint();
-        let Some(instance) = instance else { return };
-        let monitor = self.clone();
-        let _ = std::thread::Builder::new().name("atomics-vm-start".into()).spawn(move || {
-            let result = if run { start(&instance) } else { stop(&instance) };
-            {
-                let mut shared = monitor.shared.lock().unwrap();
-                shared.busy = None;
-                shared.error = result.err().map(|e| format!("{e:#}"));
-            }
-            monitor.refresh();
-        });
-    }
-}
-
 /// `atomics vm …` on Linux: the VM path is a Mac's.
 pub const MACOS_ONLY: &str = "The ATOMICS VM is for macOS: on Linux, ATOMICS and its agents run on the machine itself \
      (docs/nixos-vm.md). Build the VM's image here with `nix build .#atomics-vm-image` for a Mac to use.";
@@ -383,4 +283,71 @@ mod tests {
             assert!(!valid_instance(bad), "{bad}");
         }
     }
+}
+
+/// A bundle installed for this instance; the historical default remains supported.
+pub fn bundle_for(instance: &str) -> Option<(PathBuf, BundleInfo)> {
+    if !valid_instance(instance) {
+        return None;
+    }
+    let record = std::fs::read(record_dir().join(format!("{instance}.json")))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
+    record
+        .and_then(|r| r.bundle)
+        .and_then(|path| BundleInfo::read(&path).ok().map(|i| (path, i)))
+        .or_else(BundleInfo::installed)
+        .filter(|(_, i)| i.instance == instance)
+}
+fn remember_bundle(instance: &str, image: &Path, bundle: &Path) -> Result<()> {
+    remember(instance, image)?;
+    let path = record_dir().join(format!("{instance}.json"));
+    let mut record: Record = serde_json::from_slice(&std::fs::read(&path)?)?;
+    record.bundle = Some(bundle.to_path_buf());
+    std::fs::write(path, serde_json::to_vec_pretty(&record)?)?;
+    Ok(())
+}
+fn client_lock_path(instance: &str) -> Result<PathBuf> {
+    if !valid_instance(instance) {
+        bail!("invalid VM instance");
+    }
+    // One directory per OS user, independent of the ATOMICS home a window uses.
+    let uid = unsafe { libc::geteuid() };
+    Ok(std::env::temp_dir().join(format!("atomics-vm-clients-{uid}")).join(format!("{instance}.lock")))
+}
+/// Shared for the lifetime of a VM window, exclusive throughout a deletion.
+pub(crate) fn instance_lock(instance: &str, exclusive: bool) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let path = client_lock_path(instance)?;
+    let dir = path.parent().unwrap();
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.mode() & 0o077 != 0 || meta.uid() != unsafe { libc::geteuid() } {
+        bail!("VM lock directory is not private");
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let mode = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+    // SAFETY: flock is applied to our own open descriptor and never waits.
+    if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
+        bail!("VM is in use by another ATOMICS window");
+    }
+    Ok(file)
+}
+fn in_use(instance: &str) -> bool {
+    if !client_lock_path(instance).is_ok_and(|p| p.exists()) {
+        return false;
+    }
+    instance_lock(instance, true).is_err()
 }

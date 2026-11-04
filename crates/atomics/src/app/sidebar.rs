@@ -127,6 +127,7 @@ impl Desktop<'_> {
 
 impl Desktop<'_> {
     pub(super) fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        self.draw(|backend, client| atomics_ui::vm::settings(ui, backend, client));
         if ui.button("Edit config").clicked() {
             let _ = open_path(&self.runtime.config_path);
             ui.close();

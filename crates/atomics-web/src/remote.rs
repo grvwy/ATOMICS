@@ -71,6 +71,8 @@ pub struct Welcome {
 }
 
 pub struct RemoteBackend {
+    /// Native clients attach their Mac-local capability; browsers always leave it absent.
+    pub local_vm: Option<Arc<dyn atomics_ui::vm::Capability>>,
     state: RefCell<State>,
     /// Operation IDs: this client's random prefix and a counter.
     prefix: String,
@@ -221,7 +223,7 @@ impl RemoteBackend {
             wide: false,
             screens: Screens::default(),
         };
-        Self { state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
+        Self { local_vm: None, state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
     }
 
     fn next_op(&self) -> String {
@@ -893,6 +895,9 @@ fn known_agents(mirror: &Mirror) -> Vec<String> {
 }
 
 impl Backend for RemoteBackend {
+    fn vm(&self) -> Option<&dyn atomics_ui::vm::Capability> {
+        self.local_vm.as_deref()
+    }
     fn send(&self, command: Command) {
         if let Command::RefreshDiff(root) = &command {
             return self.refetch(root);

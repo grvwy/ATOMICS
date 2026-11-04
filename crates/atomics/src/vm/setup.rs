@@ -42,7 +42,7 @@ fn build_outputs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Lima 2.2 or newer, and Rosetta for the guest's amd64 containers.
-fn check_mac() -> Result<()> {
+pub(super) fn check_mac() -> Result<()> {
     let limactl =
         super::limactl().context("limactl is not installed; install Lima 2.2 or newer (brew install lima)")?;
     let output = std::process::Command::new(&limactl).arg("--version").output().context("running limactl --version")?;

@@ -512,6 +512,7 @@ fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, size: chief::Pill
 fn top_bar_controls(ui: &mut egui::Ui, platform: &mut impl Platform, show_load: bool, in_menu: bool) {
     platform.draw(|backend, client, _| topbar::new_button(ui, in_menu, backend, client));
     platform.top_bar_items(ui, in_menu);
+    platform.draw(|backend, client, _| crate::vm::top_bar(ui, backend, client));
     if read(platform, |backend, _| backend.available(&Command::PickProject)) {
         let response = ui
             .menu_button("Project", |ui| platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client)))

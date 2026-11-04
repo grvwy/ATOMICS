@@ -1627,6 +1627,7 @@ impl Desktop<'_> {
         atomics_ui::shell::frame(ui, self);
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;
+        self.draw(|backend, client| atomics_ui::vm::window(&ctx, backend, client));
         self.dialogs(&ctx);
         self.github_modal(&ctx);
         // egui lets go of a text field on Escape before the next frame's shortcuts see the key.

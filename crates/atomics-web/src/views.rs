@@ -382,6 +382,9 @@ impl Platform for Web<'_> {
 
     /// Where the desktop has its Settings: the layout this page draws.
     fn top_bar_settings(&mut self, ui: &mut egui::Ui) {
+        if self.driver.remote.local_vm.is_some() {
+            ui.menu_button("Settings", |ui| atomics_ui::vm::settings(ui, &self.driver.remote, self.client));
+        }
         layout_menu(ui, self.view, |_| {});
     }
 }

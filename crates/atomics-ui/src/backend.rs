@@ -375,6 +375,11 @@ pub struct WorktreeRow {
 /// Everything the UI reads from a host, and the way its commands reach the host. Methods take `&self` and
 /// return owned or shared data, so an implementation can sit over a lock, a snapshot or a socket.
 pub trait Backend {
+    /// Local to the native window. Never transported through a remote host.
+    fn vm(&self) -> Option<&dyn crate::vm::Capability> {
+        None
+    }
+
     /// Carries out a host's command: at once, or queued to run in order with the host's other work. What
     /// becomes of it shows in later reads. A view command is the UI's own and never comes here.
     fn send(&self, command: Command);

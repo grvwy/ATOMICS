@@ -56,6 +56,7 @@ pub struct ClientApp {
     started: Instant,
     /// The VM's host: what the window does before it can dial (`vm.rs`).
     vm: Option<vm::Gate>,
+    vm_manager: Arc<crate::vm::Monitor>,
     /// Why forgetting the VM's refused token failed, for the dialog that asks to pair again.
     pair_error: Option<String>,
     /// A start of the VM ended: dial again at once.
@@ -124,7 +125,12 @@ impl ClientApp {
                 action: None,
             },
         });
+        let vm_manager =
+            Arc::new(crate::vm::Monitor::new(wake.clone(), vm.as_ref().and_then(|g| g.instance().map(str::to_string))));
+        let mut driver = Driver::direct(&op_prefix());
+        driver.remote.local_vm = Some(vm_manager.clone());
         Self {
+            vm_manager,
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
@@ -132,7 +138,7 @@ impl ClientApp {
             vm_started: Arc::default(),
             confirm_local: false,
             switch_error: None,
-            driver: Driver::direct(&op_prefix()),
+            driver,
             client,
             view,
             target,
@@ -246,7 +252,8 @@ impl ClientApp {
         }
         self.run_outputs();
         self.keyboard.follow(&mut self.view.term.overlay, &mut self.view.term.inputs);
-        self.confirm_local |= std::mem::take(&mut self.view.place_clicked);
+        self.confirm_local |= std::mem::take(&mut self.view.place_clicked) || self.vm_manager.take_use_mac();
+        atomics_ui::vm::window(ui.ctx(), &self.driver.remote, &mut self.client);
         self.pair_dialog(ui.ctx());
         self.switch_dialog(ui.ctx());
     }
@@ -345,6 +352,7 @@ impl ClientApp {
                     ui.label(RichText::new(note).color(p.warning).small());
                 }
                 ui.add_space(18.0);
+                if ui.button("VM settings").clicked() { self.client.vm.open = true; }
                 if ui.small_button("Use this Mac instead").clicked() {
                     self.confirm_local = true;
                 }

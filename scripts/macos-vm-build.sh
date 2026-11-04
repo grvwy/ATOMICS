@@ -75,9 +75,16 @@ out=$(cd -- "$out" && pwd -P)
     [ -e "$repo/$file" ] && printf '%s\0' "$file"
   done > "$out/.files"
 
+# Only this build's container is removed on cancellation, never another build or VM.
+container="atomics-vm-build-$volume-$$"
+cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+previous=$(stat -f %m "$out/atomics-vm.raw" 2>/dev/null || true)
 started=$(date +%s)
 echo "Building the VM for $mac_user (Lima instance $instance, ${cpus} CPUs, ${memory} GiB, ${disk} GiB disk) in Docker; store volume $volume" >&2
-docker run --rm -i --name "atomics-vm-build-$volume" \
+docker run --rm -i --name "$container" \
   --platform linux/arm64 \
   --security-opt "seccomp=$repo/scripts/macos-vm-build.seccomp.json" \
   --mount "type=volume,src=$volume,dst=/nix" \
@@ -124,6 +131,13 @@ rm -f -- "$out/.files"
 if grep -rIl /nix/store "$out/bundle"; then
   echo "macos-vm-build: $out/bundle names /nix/store paths" >&2
   exit 1
+fi
+current=$(stat -f %m "$out/atomics-vm.raw" 2>/dev/null || true)
+if [ "$previous" != "$current" ] || [ ! -f "$out/build-info.json" ]; then
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -n 1)
+  revision=$(git -C "$repo" rev-parse --short HEAD)
+  built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '{"version":"%s (%s)","builtAt":"%s"}\n' "$version" "$revision" "$built_at" > "$out/build-info.json"
 fi
 elapsed=$(( $(date +%s) - started ))
 apparent=$(stat -f %z "$out/atomics-vm.raw" 2>/dev/null || stat -c %s "$out/atomics-vm.raw")

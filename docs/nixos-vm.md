@@ -216,6 +216,32 @@ made, and with it the guest system it was made from: to move the VM to a newer i
 installed: **VM** with its state, and a menu to start or stop it. On Linux every `atomics vm` command
 says that the VM path is for macOS.
 
+### In the native app
+
+Open **Settings → VM**, or **VM** in the top bar, in the desktop or a native client window.
+Management always runs on the Mac, even when the window is connected to a guest host. Browser
+clients expose no VM management capability; Linux explains that this VM path is macOS-only.
+
+The panel shows the built image and bundle (version and UTC build date from `build-info.json`),
+the installed bundle, old port-only forwards, each Lima instance's state and resources, the guest
+host and this Mac's pairing. Choose a build folder under an ATOMICS checkout and an instance name,
+then **Load**. **Build or update image** waits for a test slot and shows a bounded live log;
+**Cancel** ends that build's process group and its own Docker container. CPU and memory defaults
+use half this Mac's cores and RAM, leaving room for the native app.
+
+**Set up** copies the bundle into this ATOMICS home's `vm/bundles/<instance>`, creates the instance
+if absent, and starts it through the QA queue. It never takes over an instance it did not create.
+The selected bundle is remembered in that home's `vm/selected-bundle`; `ATOMICS_VM_BUNDLE` still
+overrides it. `ATOMICS_VM_BUILD` selects a build folder and `ATOMICS_VM_INSTANCE` the panel's initial
+instance, useful with an isolated QA home.
+
+**Resize** requires a stopped instance and offers to stop it first. Disk sizes can only increase;
+the guest's filesystem determines when that extra disk space becomes usable. **Delete** requires
+its exact name and removes its Mac keychain pairing too. A native window holds a shared per-instance
+lock for its lifetime, so deletion refuses a VM any ATOMICS window is using. **Open VM window**
+starts a separate native process alongside the local desktop. **Use this Mac** retains the existing
+confirmation and config-backup behavior.
+
 ### By hand
 
 The bundle's `lima.yaml` is the host definition, generated from the settings above: by default

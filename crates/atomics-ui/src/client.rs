@@ -18,6 +18,7 @@ use crate::touch::Touch;
 /// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
 /// the desktop's client as the draw code that uses them moves into this crate.
 pub struct Client {
+    pub vm: crate::vm::Panel,
     /// The colors and fonts to draw with, made by the platform from the host's theme.
     pub palette: Arc<Palette>,
     /// What the user asked for while this UI drew, oldest first. The platform takes them after each
@@ -70,6 +71,7 @@ impl Default for Client {
         Self {
             palette: Arc::new(Palette::new(&tokens, Fonts::default())),
             commands: Vec::new(),
+            vm: Default::default(),
             expanded_tasks: HashSet::new(),
             confirm_plan_close: None,
             approval_decisions: HashSet::new(),

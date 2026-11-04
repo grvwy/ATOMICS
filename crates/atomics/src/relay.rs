@@ -927,6 +927,26 @@ impl Keychain {
         }
     }
 
+    /// Presence only: macOS returns item metadata, never the password data.
+    pub(crate) fn contains_item(&self, service: &str, account: &str) -> Result<bool> {
+        if let Some(dir) = &self.files {
+            return Ok(Self::item_file(dir, service, account).is_file());
+        }
+        if !self.mac {
+            anyhow::bail!("VM pairing status requires the macOS keychain");
+        }
+        let output = self
+            .output(&["find-generic-password", "-a", account, "-s", service])
+            .map_err(|_| anyhow::anyhow!("Keychain unavailable"))?;
+        if output.status.success() {
+            Ok(true)
+        } else if output.status.code() == Some(44) {
+            Ok(false)
+        } else {
+            anyhow::bail!("Keychain unavailable; unlock it and retry")
+        }
+    }
+
     pub(crate) fn read_item(&self, service: &str, account: &str) -> Result<Option<String>> {
         if let Some(dir) = &self.files {
             return match std::fs::read_to_string(Self::item_file(dir, service, account)) {

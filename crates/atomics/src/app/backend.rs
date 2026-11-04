@@ -77,6 +77,9 @@ impl Local<'_> {
 }
 
 impl Backend for Local<'_> {
+    fn vm(&self) -> Option<&dyn atomics_ui::vm::Capability> {
+        self.0.vm.as_ref().map(|vm| vm as &dyn atomics_ui::vm::Capability)
+    }
     fn send(&self, command: atomics_ui::Command) {
         self.run(command);
     }
