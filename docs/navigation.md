@@ -35,6 +35,9 @@ once in `atomics-ui`, so the desktop and the browser's wide layout behave the sa
   of the location line, `cmd+alt+left` / `cmd+alt+right` (`[keys] back`, `forward`), and **Escape** while the keyboard
   is in no terminal, text field, menu or dialog, so it never takes an Escape meant for an agent. Each window keeps
   its own history (client state, `atomics_ui::nav`).
+- **Settings, Remote and the project picker** take the keyboard when they open, so nothing typed at them reaches a
+  terminal. **Escape** closes the one on top (a menu inside it first), and the keyboard returns to the active terminal.
+  A click on a terminal behind one types there; Escape still closes the window.
 - **A task card's click** shows its session with its diff, or a finished task's diff; its title still opens and
   closes the card. The card of the session on screen is outlined in the accent color.
 - **The sidebar** groups the sessions under the plan they work for (the heading shows the plan's tab), then those

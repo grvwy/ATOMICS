@@ -5,6 +5,10 @@
 //! scroll, Enter opens, Alt+← goes back. Reads run on the ticket worker as panel jobs.
 //! A profile with views lists tickets without a query: its view tabs sit beside the box
 //! (←/→ in the list), its filter chips below it (Alt+1…9), and "More" follows the cursor.
+//!
+//! With `[tickets]` set the window draws `atomics_ui::tickets` from `client.ui.tickets` instead, so keys for the
+//! reader on screen read and change that state. These views are the fallback for a backend without it; ctl and
+//! `atomics://` links still arrive here, and `Platform::draw` (`frame.rs`) hands their requests on.
 use super::*;
 use crate::markdown::{self, Block, Inline};
 use crate::panel_nav;
@@ -180,7 +184,7 @@ pub(super) struct TicketsPanel {
     /// The read an `atomics://open` link waits for: its job number, and the bare key the card must name.
     pub(super) open_link: Option<(u64, Option<String>)>,
     /// A ticket was opened: the panel takes the keys on the next frame.
-    focus: bool,
+    pub(super) focus: bool,
     pub(super) seq: u64,
 }
 
@@ -364,10 +368,6 @@ pub(super) fn query_id() -> egui::Id {
 pub(super) use atomics_ui::tickets::{relative_score, score_range};
 
 impl State {
-    pub(super) fn toggle_tickets(&mut self) {
-        self.toggle_view(PanelMode::Tickets);
-    }
-
     /// Shows the panel on Find with the query box focused.
     pub(super) fn show_find(&mut self) {
         self.panel = PanelMode::Tickets;
@@ -2346,7 +2346,7 @@ mod tests {
         with_app("app::tickets_panel::tests::alt_digits_beyond_the_chips_still_type_in_the_query", |app, ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             fake_profile(app, dir.path());
-            app.runtime.toggle_tickets();
+            app.runtime.toggle_view(PanelMode::Tickets);
             settle(app);
             assert_eq!(app.runtime.tickets.config.as_ref().unwrap().filters.len(), 1);
             ctx.memory_mut(|m| m.request_focus(query_id()));
@@ -3139,7 +3139,7 @@ mod tests {
     }
 
     fn views_and_chips(app: &mut Desktop<'_>, ctx: &egui::Context, state: &Path) {
-        app.runtime.toggle_tickets();
+        app.runtime.toggle_view(PanelMode::Tickets);
         frame(app, ctx, vec![]);
         settle(app);
         // The empty panel shows Recent: newest first, without a query or scores.
@@ -3289,7 +3289,7 @@ mod tests {
                 config.operations.browse.as_mut().unwrap().arguments.insert("take".into(), 2.into());
                 app.runtime.config.tickets = config;
                 app.runtime.apply_ticket_config();
-                app.runtime.toggle_tickets();
+                app.runtime.toggle_view(PanelMode::Tickets);
                 frame(app, ctx, vec![]);
                 settle(app);
                 let link = app.runtime.tickets.panel.find.results[1].link.clone();
@@ -3347,7 +3347,7 @@ mod tests {
     fn more_pages(app: &mut Desktop<'_>, ctx: &egui::Context, config: TicketConfig, state: &Path) {
         app.runtime.config.tickets = config;
         app.runtime.apply_ticket_config();
-        app.runtime.toggle_tickets();
+        app.runtime.toggle_view(PanelMode::Tickets);
         frame(app, ctx, vec![]);
         settle(app);
         assert_eq!(labels(app), ["DEMO-5", "DEMO-4"]);
@@ -3397,7 +3397,7 @@ mod tests {
             config.operations.browse = None;
             app.runtime.config.tickets = config;
             app.runtime.apply_ticket_config();
-            app.runtime.toggle_tickets();
+            app.runtime.toggle_view(PanelMode::Tickets);
             let text = texts(&frame(app, ctx, vec![])).join("\n");
             assert!(!text.contains("Mine") && !text.contains("Recent"), "{text}");
             in_list(ctx);
@@ -3416,7 +3416,7 @@ mod tests {
             config.views.clear();
             app.runtime.config.tickets = config;
             app.runtime.apply_ticket_config();
-            app.runtime.toggle_tickets();
+            app.runtime.toggle_view(PanelMode::Tickets);
             frame(app, ctx, vec![]);
             settle(app);
             assert!(app.runtime.tickets.panel.find.results.is_empty());

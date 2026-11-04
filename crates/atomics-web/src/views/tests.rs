@@ -2600,3 +2600,135 @@ fn a_late_ticket_read_cannot_reopen_find_after_the_client_goes_back() {
     assert!(client.tickets.read.is_none());
     assert!(has(&shown, "Search"));
 }
+
+fn press(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+    let event = |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers };
+    vec![event(true), event(false)]
+}
+
+fn text(text: &str) -> Vec<egui::Event> {
+    vec![egui::Event::Text(text.into())]
+}
+
+fn query_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.has_focus(egui::Id::NULL.with("tickets-query")))
+}
+
+#[test]
+fn opening_tickets_with_a_keyboard_takes_it_to_the_search_field_and_its_arrows_stay_there() {
+    use egui::{Key, Modifiers};
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+    client.send(Command::ToggleView(PanelMode::Tickets));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(query_focused(&ctx), "the panel opens with the keyboard in its search field");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("ab"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::ArrowLeft, Modifiers::NONE));
+    assert!(query_focused(&ctx), "← stays in the field");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("X"));
+    assert_eq!(client.tickets.query, "aXb");
+
+    // A phone's keyboard stays down until its field is tapped.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    client.send(Command::ToggleView(PanelMode::Tickets));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(view.desk.panel == PanelMode::Tickets && view.desk.diff_open);
+    assert!(!query_focused(&ctx));
+}
+
+#[test]
+fn the_ticket_and_its_plan_dialog_take_their_own_keys() {
+    use atomics_core::ticket_ui::TicketAction;
+    use egui::{Key, Modifiers};
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+    view.desk.panel = PanelMode::Tickets;
+    view.desk.diff_open = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "ENG-123")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.tickets.read.as_ref().unwrap().link.label(), "ENG-123");
+    assert!(ctx.memory(|m| m.has_focus(atomics_ui::panel_nav::focus_id())), "an open ticket has the keys");
+
+    // Escape in the dialog is the dialog's: the ticket stays, and has the keys again.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Plan with chief")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let label = on(&shown, "Extra instructions");
+    assert!(
+        (label.x - WIDE.0 / 2.0).abs() < 240.0 && (label.y - WIDE.1 / 2.0).abs() < 120.0,
+        "the dialog is in the middle: {label:?}"
+    );
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("draft"));
+    assert_eq!(client.tickets.extra, "draft", "the field has the keyboard");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
+    assert!(!client.tickets.dialog && client.tickets.read.is_some());
+    assert!(ctx.memory(|m| m.has_focus(atomics_ui::panel_nav::focus_id())));
+
+    // Opened again it is a new draft, and one Return plans once.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Plan with chief")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.tickets.extra, "");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("keep"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Enter, Modifiers::NONE));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let plans = world.host.host_commands.iter().filter(|command| {
+        matches!(command, HostAction::Tickets { ticket, .. }
+            if matches!(ticket.as_ref(), TicketAction::Plan { extra, .. } if extra == "keep"))
+    });
+    assert_eq!(plans.count(), 1, "{:?}", world.host.host_commands);
+    assert!(!client.tickets.dialog);
+    assert!(client.tickets.read.is_some());
+
+    // Escape in the ticket: back to the list, with it selected.
+    client.tickets.selected = None;
+    ctx.memory_mut(|m| m.request_focus(atomics_ui::panel_nav::focus_id()));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
+    assert!(client.tickets.read.is_none());
+    assert_eq!(client.tickets.selected, Some(0));
+}
+
+#[test]
+fn escape_closes_the_window_on_top_and_a_menu_in_it_first() {
+    use egui::{Key, Modifiers};
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+    client.management.settings = true;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    client.send(Command::PickProject);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.management.project && client.management.settings);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
+    assert!(!client.management.project, "the picker first");
+    assert!(client.management.settings, "one window for each press");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
+    assert!(!client.management.settings);
+
+    client.management.settings = true;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    egui::Popup::open_id(&ctx, egui::Id::NULL.with("a menu"));
+    assert!(egui::Popup::is_any_open(&ctx));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
+    assert!(client.management.settings, "a menu inside the window takes Escape first");
+}
+
+#[test]
+fn focus_moved_on_a_frame_with_no_input_asks_for_the_frame_that_settles_it() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+    view.desk.panel = PanelMode::Tickets;
+    view.desk.diff_open = true;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!query_focused(&ctx));
+
+    client.tickets.take_keyboard();
+    view.now_ms += 16.0;
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDE.0, WIDE.1))),
+        time: Some(view.now_ms / 1000.0),
+        ..egui::RawInput::default()
+    };
+    let output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+    assert!(query_focused(&ctx));
+    let asked = output.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.repaint_delay.is_zero());
+    output.drop_without_applying_deltas();
+    assert!(asked, "the field's lock on its own keys takes hold on the next frame, which no input will draw");
+}

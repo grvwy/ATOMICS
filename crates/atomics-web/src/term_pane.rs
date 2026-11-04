@@ -292,8 +292,13 @@ impl TermPane {
             self.held = false;
             self.gestures = Recognizer::default();
             self.inputs.clear();
-            self.blur_next |= std::mem::take(&mut self.focused);
+            self.let_go();
         }
+    }
+
+    /// The keyboard moved to something else the page draws: the overlay gives it up on the next frame.
+    pub fn let_go(&mut self) {
+        self.blur_next |= std::mem::take(&mut self.focused);
     }
 
     /// The terminal this pane follows, by session id.

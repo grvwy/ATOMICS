@@ -242,6 +242,9 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
     open_ticket(driver, client, view);
     view.term.begin_frame();
+    if atomics_ui::management::begin_frame(ui.ctx(), &driver.remote, client) {
+        view.term.let_go();
+    }
     let screen = ui.max_rect();
     // The layout follows the page's width in CSS pixels, which the phone's zoom leaves as they are.
     view.compact = layout::compact(screen.width() * ui.ctx().zoom_factor(), view.viewport.coarse, view.layout);
@@ -266,6 +269,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     carry_out(driver, client, view);
     want(&driver.remote, client, view);
     driver.flush();
+    atomics_ui::panel_nav::settle_focus(ui.ctx());
 }
 
 /// The boot's ticket key, once the board is in: its plan on the board, or the board the page opens on when no
@@ -468,6 +472,14 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
                 }
             }
             Command::PickProject => atomics_ui::management::open_project(remote, client),
+            // On a keyboard the panel takes it where it opens; a phone's stays down until a field is tapped.
+            Command::ToggleView(PanelMode::Tickets) => {
+                view_command(remote, view, command);
+                if client.touch.is_none() && view.desk.panel == PanelMode::Tickets && view.desk.diff_open {
+                    client.tickets.take_keyboard();
+                    view.term.let_go();
+                }
+            }
             Command::OpenProject(path) => {
                 remote.send(Command::OpenProject(path.clone()));
                 view_command(remote, view, Command::ShowRoot(path));

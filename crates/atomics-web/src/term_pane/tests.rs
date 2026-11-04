@@ -512,3 +512,18 @@ fn the_clip_leaves_out_what_covers_the_overlay() {
     let right = Rect::from_min_size(pos2(200.0, 200.0), vec2(200.0, 100.0));
     assert_eq!(clip_path(rect, &[left, right], 1.0), "inset(50%)");
 }
+
+#[test]
+fn a_window_that_opens_takes_the_keyboard_from_the_terminal() {
+    let (ctx, mut world, mut client, mut view) = terminal(|host| {
+        host.board.host.management = fake_host::management().board.host.management;
+    });
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true)]);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(!view.term.overlay.blur, "the terminal has the keyboard");
+    client.management.settings = true;
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(view.term.overlay.blur, "the overlay lets go, so Escape reaches the window");
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(!view.term.overlay.blur, "and a click back can take it again");
+}

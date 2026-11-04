@@ -28,6 +28,49 @@ pub struct State {
     pub revoke: Option<String>,
     pub proposal_seen: Option<(String, f64)>,
     pub proposal_note: String,
+    /// A window here was open as this frame began, and so holds the keyboard.
+    keyboard: bool,
+}
+
+/// Whether Settings, Remote or the project picker is open.
+fn window_open(client: &Client) -> bool {
+    client.management.settings || client.management.remote || client.management.project
+}
+
+/// The windows' share of the keyboard. Every client calls this as its frame begins, before it draws anything that
+/// reads keys: Escape closes the window on top, one for each press, and a menu inside it closes first, so the key
+/// never also reaches a terminal behind it. A window takes the keyboard when it opens. When the last one closes the
+/// active terminal gets it back, unless a click has moved it since; asked here, the closing window's commands have
+/// run, so Open project doesn't hand it to the session it just left. Whether a window just opened: a client whose
+/// terminal keeps its own keyboard lets go.
+pub fn begin_frame(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) -> bool {
+    if window_open(client)
+        && !egui::Popup::is_any_open(ctx)
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        let state = &mut client.management;
+        let top = if state.project {
+            &mut state.project
+        } else if state.remote {
+            &mut state.remote
+        } else {
+            &mut state.settings
+        };
+        *top = false;
+    }
+    let open = window_open(client);
+    if open == client.management.keyboard {
+        return false;
+    }
+    client.management.keyboard = open;
+    if open {
+        if let Some(id) = ctx.memory(|m| m.focused()) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    } else if ctx.memory(|m| m.focused().is_none()) {
+        client.focus_terminal = backend.view_hints().active;
+    }
+    open
 }
 
 fn allowed(backend: &dyn Backend, action: &HostAction) -> bool {
@@ -97,6 +140,10 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
         client.management.project &= open;
     }
     proposal(ctx, backend, client, &info);
+    // What opened or closed as this frame drew moves the keyboard as the next begins.
+    if window_open(client) != client.management.keyboard {
+        ctx.request_repaint();
+    }
 }
 
 fn settings(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
