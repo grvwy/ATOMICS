@@ -749,3 +749,39 @@ fn one_subscription_limit_spans_screens_and_board_topics() {
     }
     assert_eq!(viewer.errors.len(), 1, "only the subscription over the limit was refused");
 }
+
+/// A session on the board whose terminal has not started yet: a client that sees it and subscribes at
+/// once is told `not_found`, which does not count towards disconnecting it however often it happens; a
+/// session the board never had still counts.
+#[test]
+fn subscribing_to_a_session_whose_terminal_has_not_started_does_not_count() {
+    let terminal = Detached::new(40, 6, 10);
+    terminal.feed(b"$ started");
+    let f = start_with(config(), &[]);
+    f.projections.publish_sessions(vec![super::tests::session(
+        "starting",
+        "a shell",
+        atomics_core::session::AgentStatus::Starting,
+    )]);
+    let mut viewer = Viewer::connect(&f);
+    viewer.until(|v| v.client.mirror.sessions.contains_key("starting"));
+    for n in 1..=12 {
+        viewer.subscribe("starting", true);
+        viewer.until(|v| v.errors.len() == n);
+    }
+    assert!(viewer.errors.iter().all(|(code, _)| *code == ErrorCode::NotFound));
+    // Still connected: the terminal starts, and the screen comes.
+    f.terminals.publish(vec![entry("starting", &terminal)]);
+    viewer.subscribe("starting", true);
+    viewer.until_shows("starting", &terminal);
+
+    // A session the board never had counts, as before: the ninth error ends the connection.
+    let mut stranger = Viewer::connect(&f);
+    for _ in 0..9 {
+        stranger.subscribe("nobody", true);
+    }
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while stranger.client.next().is_some() {
+        assert!(Instant::now() < deadline, "the connection should end");
+    }
+}

@@ -8,16 +8,49 @@ more sign-ins and checks) with a module of its own;
 [`nix/examples/dotnet-azure.nix`](../nix/examples/dotnet-azure.nix) is an example, off by default
 ([Example: .NET and Azure DevOps](#example-net-and-azure-devops)).
 
-The guest is headless: it runs ATOMICS's agents and chief, not its window. ATOMICS itself runs natively
-on the Mac and draws with Metal, and its agent tiles are ssh sessions into the guest. That is path C of
-[the display decision](decisions/2026-11-02-vm-display.md): VZ, the only hypervisor with Rosetta for
-Linux, gives Linux guests no GPU, and a native window has headroom a virtual GPU does not. The
-guest starts no desktop and no software renderer.
+The guest is headless: it never draws ATOMICS's window. The window runs natively on the Mac and draws
+with Metal. That is path C of [the display decision](decisions/2026-11-02-vm-display.md): VZ, the only
+hypervisor with Rosetta for Linux, gives Linux guests no GPU, and a native window has headroom a virtual
+GPU does not. The guest starts no desktop and no software renderer.
+
+**Recommended: the ATOMICS host in the VM.** With `atomics.vm.host.enable` the guest runs
+`atomics host` ([the headless host](daemon.md#headless-host-atomics-host)): agents, the chief, hooks,
+MCP, approvals, plans, worktrees, git and builds all run in the VM, and `ATOMICS.app` on the Mac is only
+their window, a client of that host over `atomics.v1` ([The host in the VM](#the-host-in-the-vm)). One
+setting on the Mac, `[client] connect = "vm"`, does it. Nothing of the Mac but the shared folders is
+reachable from the VM.
+
+The older layout keeps the host on the Mac and starts each agent in the VM over ssh
+([Agents in the VM](#agents-in-the-vm)); a bundle built without the host has it.
+
+Quick start on a Mac with Docker, Lima 2.2 and Rosetta (no Nix needed):
+
+```sh
+scripts/macos-vm-build.sh --host --instance atomics-vm   # image and bundle in target/atomics-vm
+atomics vm setup --from target/atomics-vm                # create, start and check the VM
+limactl shell --workdir=/home/atomics atomics-vm atomics-onboard   # your sign-ins, in the VM
+atomics vm config --apply                                # [client] connect = "vm" on this Mac
+```
 
 ## How the Mac and the VM fit together
 
 `programs.atomics.macDesktop` generates both sides from one definition: the guest's half into this
 system, and the Mac's half into a bundle (`packages.aarch64-linux.atomics-vm-mac`).
+
+With the host in the VM (recommended):
+
+| Piece | On the Mac | In the VM |
+| --- | --- | --- |
+| UI | `ATOMICS.app`, Metal, a client of the VM's host (`[client] connect = "vm"`) | none |
+| Runtime: agents, chief, terminals, plans, approvals, worktrees, git | none | `atomics host`, the `atomics-host` service, as the VM's user |
+| How the window reaches it | `bin/atomics-vm-host-forward`: `ssh -L 127.0.0.1:<port>` through Lima's ssh config, held by the window | `atomics.v1` on `127.0.0.1:<port>` (default 47800) only, with a token this Mac paired with |
+| The pairing token | the macOS keychain, item `atomics-vm-host-v1` | a SHA-256 digest in `paired-clients.json` (0600) |
+| Hooks, MCP, `atomics ctl`, `atomics queue` | none | the host's own socket, `/run/atomics/atomics.sock` (`ATOMICS_SOCKET`) |
+| Sign-ins: agents, gh, the ticket system | none | in the VM; ATOMICS's own in `~/.local/share/atomics/credentials` (`ATOMICS_CREDENTIALS_DIR`) |
+| Worktrees | `~/repos` on APFS | mounted over virtiofs at the **same path** |
+| Builds, Docker | none | all here |
+
+With the host on the Mac (agents over ssh):
 
 | Piece | On the Mac | In the VM |
 | --- | --- | --- |
@@ -45,6 +78,9 @@ your Mac account ([The socket forward](#the-socket-forward)). Inside the VM ther
 | `cpus` | `4` | virtual CPUs in the Lima definition |
 | `memoryGiB` | `8` | memory in the Lima definition |
 | `diskGiB` | `100` | size of the (sparse) disk image and of the Lima disk |
+| `host.enable` | `false` | run the ATOMICS host here ([The host in the VM](#the-host-in-the-vm)); `scripts/macos-vm-build.sh --host` sets it |
+| `host.port` | `47800` | its protocol server's port, on the guest's loopback only; the Mac's forward opens the same one |
+| `host.workspace`, `host.projects` | none | `atomics host -w <workspace>` and the projects it opens, in the shared folders |
 | `onboardSteps` | none | extra `atomics-onboard` step files ([below](#sign-in-inside-the-vm)) |
 | `checks` | none | extra checks for `scripts/check-atomics-vm.sh` ([below](#verify-in-the-booted-guest)) |
 
@@ -63,6 +99,7 @@ of your own that extends this configuration, then build from that flake:
           cpus = 8;
           memoryGiB = 24;
           diskGiB = 200;
+          host.enable = true;       # the ATOMICS host in the VM (recommended)
         };
       } ];
     };
@@ -92,10 +129,16 @@ The second command produces `result/atomics-vm.raw`, a sparse GPT disk of `diskG
 partition and a btrfs root. The image uses NixOS's systemd-repart builder, which can populate btrfs
 offline. Keep sparse files sparse when copying it. The third produces the Mac bundle: plain `sh`
 scripts for macOS's own `ssh`, `base64` and `tr`, with no `/nix/store` reference, so the Mac needs no
-Nix. `nix flake check` also builds the guest system with and without the example stack
-(`checks.aarch64-linux.atomics-vm`, `atomics-vm-dotnet-azure`) and runs the bundle's wrappers against
-the guest helper with an ssh stand-in (`checks.aarch64-linux.atomics-vm-mac`,
-[`nix/tests/mac-desktop.sh`](../nix/tests/mac-desktop.sh)).
+Nix. `nix flake check` also builds the guest system with and without the example stack and the host
+(`checks.aarch64-linux.atomics-vm`, `atomics-vm-dotnet-azure`, `atomics-vm-with-host`), runs the
+bundle's wrappers against the guest helper with an ssh stand-in (`checks.aarch64-linux.atomics-vm-mac`,
+[`nix/tests/mac-desktop.sh`](../nix/tests/mac-desktop.sh)), and runs the host as the service does
+(`checks.aarch64-linux.atomics-vm-host`, [`nix/tests/vm-host.sh`](../nix/tests/vm-host.sh)): the real
+`atomics host`, paired, reached through the bundle's `atomics-vm-host-forward` with an ssh stand-in by
+an `atomics.v1` client that starts a stub agent in a shared folder. It checks that the agent runs
+there, that only a paired token or that start's own gets through the forward, that an unpaired token
+stops working, that no token is written down, and that the host stops cleanly and takes the agent
+with it.
 
 On shared development machines, run builds through `atomics queue --class test -- <build command>`.
 
@@ -106,7 +149,7 @@ A Mac needs no Nix: [`scripts/macos-vm-build.sh`](../scripts/macos-vm-build.sh) 
 bundle's paths:
 
 ```sh
-scripts/macos-vm-build.sh --instance atomics-vm [--out DIR] [--mac-user NAME] \
+scripts/macos-vm-build.sh --host --instance atomics-vm [--out DIR] [--mac-user NAME] \
   [--cpus 4] [--memory-gib 8] [--disk-gib 100]
 ```
 
@@ -119,7 +162,7 @@ scripts/macos-vm-build.sh --instance atomics-vm [--out DIR] [--mac-user NAME] \
   or the Nix files does not rebuild it.
 - `--mac-user` (default: you) and the sizes are the [settings](#settings); `--instance` names the
   Lima instance the bundle's scripts reach (default `atomics`; pick another when one of that name
-  exists).
+  exists); `--host` turns on the host in the VM.
 - `DIR` (default `target/atomics-vm`) gets `atomics-vm.raw`, a sparse disk, `bundle/`, the Mac side
   (checked for `/nix/store` references, which a Mac does not have), and `build.json`.
 
@@ -147,7 +190,32 @@ volume that already held most of the closure:
 The image is a 100 GiB sparse disk with 7.5 GiB in use; copying it out of the container keeps it
 sparse. The bundle is a few dozen KiB of `sh` scripts and text.
 
-## Install the Mac side and create the VM with Lima
+## Set up the VM on the Mac
+
+`atomics vm setup --from DIR` takes a Mac from a build's folder to a checked, running VM:
+
+1. checks for Lima 2.2 or newer and Rosetta;
+2. installs the bundle (its `install.sh`: `~/.local/share/atomics-vm`, and the shared folders);
+3. creates the Lima instance the bundle names, from the image (`limactl create`). An instance of that
+   name that `atomics vm setup` did not create is never reused or replaced: setup stops and says so,
+   and only `--replace` (which asks you to type the instance's name, or `--replace --yes`) deletes it
+   and its disk. One it created before is kept, so running setup again is safe;
+4. starts it through `atomics queue --class qa`;
+5. runs [the guest check](#verify-in-the-booted-guest) in the guest, through the same queue;
+6. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
+   nothing itself;
+7. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
+   (`~/.config/atomics/config.d/<LocalHostName>.toml`) as a diff. Nothing is written:
+   `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
+
+Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running) and `check` (the
+guest check and the sign-ins left). Setup installs a newer bundle each time, but keeps the instance it
+made, and with it the guest system it was made from: to move the VM to a newer image, `limactl delete
+<instance>` (its disk goes, and with it the sign-ins in the VM) and run setup again. The desktop's top bar shows the VM too, while a bundle is
+installed: **VM** with its state, and a menu to start or stop it. On Linux every `atomics vm` command
+says that the VM path is for macOS.
+
+### By hand
 
 The bundle's `lima.yaml` is the host definition, generated from the settings above: by default
 **4 vCPU, 8 GiB RAM, 100 GiB disk**, VZ, Rosetta enabled, user `<user>` (`/home/<user>`, UID 1000) and
@@ -184,8 +252,12 @@ runtime and boot scripts stay unused. NixOS mounts the shares itself (`atomics-m
 matching each mount point to the virtiofs tag Lima lists in its cidata `user-data` (tags are hashes,
 not `mount0`). Outside plain mode `limactl start` reports the VM degraded until Lima's guest agent
 answers, so `lima-guestagent.service` runs Lima's own agent from the cidata disk. Every port forward
-is ignored: the VM's listeners, such as a database container's published port, stay in the VM as in
-plain mode, and nothing shadows a port on the Mac. Cloud-init imports Lima's SSH public key at boot;
+is ignored, for listeners on the guest's loopback as well as on all its addresses (a rule for
+`0.0.0.0` alone leaves Lima forwarding loopback ones): the VM's listeners, such as a database
+container's published port or the ATOMICS host's, stay in the VM as in plain mode, and nothing
+shadows a port on the Mac. An instance made from an older bundle gets the loopback rule with
+`limactl edit <instance> --set '.portForwards = [{"guestIP":"127.0.0.1","guestPortRange":[1,65535],"proto":"any","ignore":true},{"guestIP":"0.0.0.0","guestPortRange":[1,65535],"proto":"any","ignore":true}]'`
+while it is stopped. Cloud-init imports Lima's SSH public key at boot;
 the existing NixOS user owns the resulting account. The guest marks Lima's SSH and boot readiness after
 that and after the shares are mounted. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
 VM belong in `~/repos` (`/home/<user>/repos`), on the guest's btrfs filesystem, so warm-folder clones
@@ -199,6 +271,75 @@ guest; no unauthenticated TCP Docker listener is enabled.
 Sign in inside the guest with `atomics-onboard` ([below](#sign-in-inside-the-vm)). Keep tokens, SSH
 private keys, passwords, package feed credentials and agent login state on its writable disk. Do not
 add them to Nix settings, image contents, flake inputs or the Nix store.
+
+## The host in the VM
+
+With `atomics.vm.host.enable` (`scripts/macos-vm-build.sh --host`) the guest runs the ATOMICS host, and
+the Mac's ATOMICS shows it.
+
+**In the guest.** The `atomics-host` service runs `atomics host --remote-port <port>` (with
+`-w <workspace>` and the projects, when set) in a login shell of the VM's user, so agents get the PATH
+and variables an interactive session has, starting in the first writable shared folder (`~/repos` of the
+Mac). It waits for the Mac's folders to be mounted, restarts on failure and stops cleanly on
+`systemctl stop`, ending its agents. Its socket is `/run/atomics/atomics.sock` (mode 0700 folder),
+which `ATOMICS_SOCKET` names in every login shell too, so hooks, MCP servers, `atomics ctl` and
+`atomics queue` reach this host. A first config is seeded with `[isolation] mode = "bare"`: the VM is
+the agents' boundary. `--remote-port` turns on the protocol server whatever the config says, on
+`127.0.0.1` only (`ss -ltn` shows nothing else listening on it).
+
+**Pairing.** The host takes two kinds of token: the one it writes to `protocol.json` on every start,
+for clients in the guest, and a paired client's, which outlives restarts. `atomics ctl
+'{"cmd":"pair_client","name":"ATOMICS on Mac"}'` on the host's socket mints one and answers it once;
+the host keeps only its SHA-256 digest, in `paired-clients.json` (mode 0600). Pairing a name again
+replaces its token; `unpair_client` forgets it, and `atomics ctl '{"cmd":"remote"}'` lists the paired
+clients (names and times, never a token). Only the VM's user can reach the socket, the same user who
+could read `protocol.json`. A paired client is a controller, and its name is the lease holder other
+clients see ("Typing from ATOMICS on Mac").
+
+**On the Mac.** `[client] connect = "vm"` (the bundle's `config.d.toml`, applied by
+`atomics vm config --apply`), or `atomics --connect vm` for one run, opens `ATOMICS.app` as a client of
+that host ([the desktop as a client](daemon.md#the-desktop-as-a-client)). Each time it connects it:
+
+1. asks Lima whether the VM runs. When it does not, the window shows the VM's state and a **Start**
+   button, never an empty window; Start runs `limactl start` through `atomics queue --class qa`;
+2. starts the bundle's `bin/atomics-vm-host-forward` (`ssh -N -L 127.0.0.1:<port>:127.0.0.1:<port>`
+   through Lima's ssh config, as the agent wrappers do) unless it runs, and waits for it to answer;
+3. reads its token from the keychain. Without one it pairs: `atomics ctl pair_client` in the guest
+   over Lima's ssh, and the token goes into the keychain (`atomics-vm-host-v1`, account: the
+   instance). A token the host refuses (its home was reset, or it was unpaired) is forgotten, and the
+   window pairs again;
+4. connects to `ws://127.0.0.1:<port>` with the token.
+
+Every port the window opens needs that token: the forward listens on the Mac's loopback only, and the
+host refuses an upgrade without one. The top bar says where agents run: **Agents in VM <instance>**,
+with **Use this Mac**, which asks once, removes `[client] connect` from the config file that sets it
+(keeping a backup), and opens ATOMICS again as the host on the Mac. The VM's agents keep running.
+Closing the window leaves every agent running in the VM; opening it again shows them, their terminals
+and the plans as they are.
+
+**The ticket sign-in** runs in the guest, headless: `atomics tickets login` in a login shell there
+prints an address to open in the Mac's browser and takes back the address the browser ends on. The
+guest has no keyring, so ATOMICS keeps that sign-in, like every credential it stores, as private files
+in `ATOMICS_CREDENTIALS_DIR` (`~/.local/share/atomics/credentials`: a 0700 folder of 0600 files, an
+item each), which the service and every login shell name. The VM is one trust domain
+([Trust and secrets](#trust-and-secrets)): any agent can read those files, as it can gh's and Claude's.
+
+**End to end on an Apple Silicon Mac** (Lima 2.2, the default 4 vCPU and 8 GiB): `atomics vm setup`
+created the instance in about a second and booted it to a running host in about 20 s, and the guest
+check took 7 s. Opened with `[client] connect = "vm"` and nothing else in its config, `ATOMICS.app`
+paired once (the token went into the keychain), showed the host's board, started a shell with
+`--open shell:<folder>` in a worktree under `~/repos`, and showed its terminal and the worktree's diff,
+both from the VM; in the guest, the shell's process ran as the VM's user with that worktree as its
+folder. Closing the window ended the forward and left the shell running; a window opened later showed
+it as it was. With the VM stopped the window showed its state and **Start** instead of a board.
+
+**What a browser can do.** The forward carries `atomics.v1` with a bearer token, which a browser cannot
+send on a WebSocket. A browser reaches a host through [the rendezvous](daemon.md#rendezvous) instead,
+which the host in the VM can run too. The client the window uses is the browser client's own code
+(atomics-web's driver, backend and views), run natively.
+
+In this layout the [socket forward](#the-socket-forward) is not needed: hooks and MCP are local to the
+VM's host. Keep it off.
 
 ## Sign in inside the VM
 
@@ -221,7 +362,7 @@ ok       claude   Claude subscription (Claude Code login; includes claude.ai con
 missing  codex    Codex (ChatGPT login): not signed in
 ok       gh       GitHub CLI and Git push to github.com (gh login)
 ok       private  Credential files private to this user (no group or other access)
-skipped  host     ATOMICS host over the forwarded socket: no forwarded socket
+ok       host     ATOMICS host (in this VM, or the Mac's over the socket forward)
 ```
 
 Each sign-in uses a device code or a pasted code: the tool prints an address, you open it in the
@@ -248,15 +389,12 @@ Mac's browser, and the code goes back into the terminal. Nothing needs a browser
    file names. `--check` reports the first that another user could open; a run without `--check` takes
    that access away. `atomics-onboard` runs its sign-ins with
    `umask 077`, so files they create start private.
-5. **ATOMICS host** (`host`, check only, always last). In this layout the ATOMICS host stays on the Mac
-   and holds the ticket system's credentials. With the socket forward on, the chief in the guest
-   reaches the `atomics_ticket_*` tools through the host's socket and needs no ticket sign-in of its
-   own. When a socket is there (`ATOMICS_SOCKET`, else the default path), `atomics ctl '{"cmd":"list"}'`
-   must answer; without one (the forward is off) the item is `skipped`.
-
-Once the host itself runs in the VM, its ticket sign-in needs the daemon's headless credential store
-from [the daemon design](daemon.md#container-state-and-credentials), not a desktop keychain. The guest
-has no Secret Service, and `atomics-onboard` does not add one.
+5. **ATOMICS host** (`host`, check only, always last). When a socket is there (`ATOMICS_SOCKET`, else
+   the default path), `atomics ctl '{"cmd":"list"}'` must answer; without one the item is `skipped`.
+   With [the host in the VM](#the-host-in-the-vm) that is the guest's own host, which holds the ticket
+   system's sign-in (`atomics tickets login` in the guest, kept in `ATOMICS_CREDENTIALS_DIR`). With the
+   host on the Mac and the socket forward on, the chief in the guest reaches the `atomics_ticket_*`
+   tools through the Mac's host and needs no ticket sign-in of its own.
 
 **Step files.** More items come from bash files in `/etc/atomics/onboard.d` (or `$ATOMICS_ONBOARD_DIR`),
 sourced in name order before the credential-file and host checks. `atomics.vm.onboardSteps` installs
@@ -307,6 +445,10 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
 ```
 
 ## Agents in the VM
+
+This is the layout with the host on the Mac: a bundle built without the host. With
+[the host in the VM](#the-host-in-the-vm) the host starts agents in the guest itself, and none of this
+applies.
 
 **Wrappers.** `bin/claude` and `bin/codex` are named like their programs because ATOMICS recognizes
 agents by name (Codex's hooks key on it). Each one:
@@ -418,7 +560,11 @@ the base tools, and checks that sshd takes keys only and no root login. For the 
 share is mounted over virtiofs at its Mac path with the right access (writing a probe file in writable
 ones), that the Mac's ATOMICS paths run this guest's `atomics`, that the socket folder belongs to the
 user alone, and that sshd replaces stale sockets; with the forward running, it asks the Mac's ATOMICS
-for its sessions. It clones a file with `cp --reflink=always` and runs a shell in a `linux/amd64`
+for its sessions. With the host in the VM it checks instead that the `atomics-host` service runs, that
+its socket folder is the user's alone, that its protocol server listens on `127.0.0.1:<port>` and
+nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a
+shared Mac folder: the process's working folder is checked through `/proc`. `atomics vm check` runs
+it from the Mac. It clones a file with `cp --reflink=always` and runs a shell in a `linux/amd64`
 container, which works only through Rosetta. Then it runs the checks in `/etc/atomics/check.d` in name
 order (`atomics.vm.checks`); each one fails the run by exiting non-zero.
 

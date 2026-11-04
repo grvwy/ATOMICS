@@ -93,6 +93,8 @@ enum Request {
     /// ended, and the lease state the host sends says so.
     Lease,
     History(String),
+    /// Following a screen.
+    Subscribe(String),
 }
 
 #[derive(Default)]
@@ -101,6 +103,9 @@ struct Term {
     typist: Typist,
     /// Subscribed on this connection, and whether as focused.
     subscribed: Option<bool>,
+    /// The host had no terminal for it yet (a session that is still starting): it is asked again once
+    /// the session changes on the board ([`Screens::session_changed`]), not on every frame.
+    refused: bool,
     /// A frame showed it since the last [`Screens::end_frame`].
     shown: bool,
     acquiring: bool,
@@ -182,10 +187,21 @@ impl Screens {
     pub fn show(&mut self, session: &str, focused: bool, live: bool, out: &mut Vec<Envelope>) {
         let term = self.term(session);
         term.shown = true;
-        if live && term.subscribed != Some(focused) {
+        if live && !term.refused && term.subscribed != Some(focused) {
             term.subscribed = Some(focused);
             let topics = vec![Topic::Screen { session: session.to_string(), focused }];
-            out.push(Envelope::new(Message::Subscribe { topics }));
+            let id = self.request(Request::Subscribe(session.to_string()));
+            out.push(Envelope::new(Message::Subscribe { topics }).reply_to(Some(id)));
+        }
+    }
+
+    /// `session` changed on the board, or the whole board came again: a screen the host had no terminal
+    /// for is asked for again at the next frame that shows it.
+    pub fn session_changed(&mut self, session: Option<&str>) {
+        for (id, term) in &mut self.terms {
+            if session.is_none_or(|s| s == id) {
+                term.refused = false;
+            }
         }
     }
 
@@ -572,6 +588,14 @@ impl Screens {
                 term.lost = Some(if code == ErrorCode::LeaseHeld { Lost::Held } else { Lost::Gone });
             }
             Request::Lease => {}
+            Request::Subscribe(session) => {
+                if let Some(term) = self.terms.get_mut(&session)
+                    && code == ErrorCode::NotFound
+                {
+                    term.subscribed = None;
+                    term.refused = true;
+                }
+            }
             Request::History(session) => {
                 if let Some(term) = self.terms.get_mut(&session) {
                     term.history_asked = false;

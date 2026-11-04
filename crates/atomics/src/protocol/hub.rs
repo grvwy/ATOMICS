@@ -426,6 +426,11 @@ impl Hub {
         self.ring.front().map_or(self.head + 1, |(_, frame)| frame.cursor)
     }
 
+    /// Whether the board as published holds session `id`.
+    pub fn has_session(&self, id: &str) -> bool {
+        self.state.sessions.data.iter().any(|s| s.id == id)
+    }
+
     /// Read the published projections and turn what changed into events for every client.
     pub fn poll(&mut self, projections: &Projections) {
         self.expire_ring();

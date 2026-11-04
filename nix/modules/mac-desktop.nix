@@ -287,8 +287,11 @@ let
     mountType = "virtiofs";
     mounts = map (share: { location = share.path; mountPoint = share.path; inherit (share) writable; }) shares;
     # The VM's ports stay in the VM, as in plain mode: no guest listener appears on the Mac's
-    # loopback, where a container's published port would shadow the Mac's own.
-    portForwards = [ { guestIP = "0.0.0.0"; guestPortRange = [ 1 65535 ]; proto = "any"; ignore = true; } ];
+    # loopback, where a container's published port would shadow the Mac's own. A rule for 0.0.0.0
+    # matches only listeners on every address; Lima's default would forward the guest's loopback
+    # ones (the ATOMICS host's among them, which the bundle's own forward carries instead).
+    portForwards = map (guestIP: { inherit guestIP; guestPortRange = [ 1 65535 ]; proto = "any"; ignore = true; })
+      [ "127.0.0.1" "0.0.0.0" ];
   };
 
   # What `atomics vm` on the Mac reads about this VM (crates/atomics/src/vm.rs, BundleInfo).

@@ -15,6 +15,7 @@
 pub mod input;
 pub mod link;
 pub mod target;
+pub mod vm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -22,8 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atomics_ui::Client;
+use atomics_web::driver::Status;
 use atomics_web::driver::{Driver, Output};
 use atomics_web::views::{self, Place, View};
+use egui::{Align, Layout, RichText};
 
 use self::link::{Endpoint, Event, Link};
 use self::target::Target;
@@ -54,6 +57,14 @@ pub struct ClientApp {
     started: Instant,
     /// Why the last dial could not find the host, for the status line's hover and the log.
     unreachable: Arc<Mutex<Option<String>>>,
+    /// The VM's host: what the window does before it can dial (`vm.rs`).
+    vm: Option<vm::Gate>,
+    /// A start of the VM ended: dial again at once.
+    vm_started: Arc<AtomicBool>,
+    /// The user asked to run agents on this Mac instead; the window asks first.
+    confirm_local: bool,
+    /// Why switching to this Mac failed.
+    switch_error: Option<String>,
     /// Agents to start once the board is in.
     open: Vec<(String, std::path::PathBuf)>,
     /// `--screenshot`: where, when (seconds after the start), and whether it was taken.
@@ -91,23 +102,37 @@ impl ClientApp {
         client.palette = view.looks.desktop.clone();
         client.palette.apply(ctx, &views::BundledFonts);
         client.icon = icon;
-        view.place = Some(Place {
-            text: "Agents on the host".into(),
-            hover: format!(
-                "This window shows an ATOMICS host ({}): its agents run there, and closing the window leaves them \
-                 running.",
-                match &target {
-                    Target::Address { addr } => format!("ws://{addr}"),
-                    _ => "atomics host on this machine".into(),
-                }
-            ),
-            // That host owns this machine's ATOMICS home, so this window cannot become the host too.
-            action: None,
+        let vm = (target == Target::Vm).then(vm::Gate::new);
+        view.place = Some(match &vm {
+            Some(gate) => Place {
+                text: format!("Agents in VM {}", gate.instance().unwrap_or("atomics")),
+                hover: "This window shows the ATOMICS host in this Mac's VM: agents, the chief, hooks, git and \
+                        builds run there. Closing the window leaves them running."
+                    .into(),
+                action: Some("Use this Mac".into()),
+            },
+            None => Place {
+                text: "Agents on the host".into(),
+                hover: format!(
+                    "This window shows an ATOMICS host ({}): its agents run there, and closing the window leaves them \
+                     running.",
+                    match &target {
+                        Target::Address { addr } => format!("ws://{addr}"),
+                        _ => "atomics host on this machine".into(),
+                    }
+                ),
+                // That host owns this machine's ATOMICS home, so this window cannot become the host too.
+                action: None,
+            },
         });
         Self {
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
+            vm,
+            vm_started: Arc::default(),
+            confirm_local: false,
+            switch_error: None,
             driver: Driver::direct(&op_prefix()),
             client,
             view,
@@ -151,6 +176,9 @@ impl ClientApp {
     /// The client's own work for one turn, with or without a frame: the clock, what the link reported,
     /// and what the driver asked for since.
     pub(crate) fn pump(&mut self) {
+        if self.vm_started.swap(false, Ordering::AcqRel) {
+            self.driver.retry_now();
+        }
         let now = self.now_ms();
         self.driver.tick(now);
         self.take_events();
@@ -196,10 +224,108 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
-        views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        if !self.vm_screen(ui) {
+            views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        }
         self.run_outputs();
         self.keyboard.follow(&mut self.view.term.overlay, &mut self.view.term.inputs);
-        self.view.place_clicked = false;
+        self.confirm_local |= std::mem::take(&mut self.view.place_clicked);
+        self.switch_dialog(ui.ctx());
+    }
+
+    /// While the VM is not running and there is no board: its state and a Start button, never an empty
+    /// window. True when it drew that.
+    fn vm_screen(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(gate) = &self.vm else { return false };
+        let has_board = self.driver.remote.with_mirror(|m| m.epoch.is_some());
+        let view = gate.view();
+        if has_board || matches!(self.driver.status(), Status::Live) || view.status == crate::vm::Status::Running {
+            return false;
+        }
+        let p = self.client.palette.clone();
+        let mut start = false;
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                ui.add_space((ui.available_height() / 4.0).min(160.0));
+                ui.label(RichText::new("ATOMICS").strong().size(18.0).color(p.accent).monospace());
+                ui.add_space(12.0);
+                let headline = match &view.status {
+                    crate::vm::Status::NotSetUp => "The ATOMICS VM is not set up on this Mac.".to_string(),
+                    crate::vm::Status::Starting => format!("Starting the VM {}…", view.instance),
+                    status => format!("The VM {} is {}.", view.instance, status.label()),
+                };
+                ui.label(RichText::new(headline).size(16.0));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Agents, the chief, hooks and git run in the VM; this window shows them.").color(p.muted),
+                );
+                ui.add_space(14.0);
+                match &view.status {
+                    crate::vm::Status::NotSetUp => {
+                        ui.label("Build it with scripts/macos-vm-build.sh --host, then run: atomics vm setup --from <folder>");
+                    }
+                    _ if view.starting => {
+                        ui.spinner();
+                    }
+                    _ => start = ui.button(RichText::new(format!("Start {}", view.instance)).size(14.0)).clicked(),
+                }
+                if let Some(note) = view.note.as_ref().filter(|_| !view.starting) {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(note).color(p.warning).small());
+                }
+                ui.add_space(18.0);
+                if ui.small_button("Use this Mac instead").clicked() {
+                    self.confirm_local = true;
+                }
+            });
+        });
+        if start {
+            let started = self.vm_started.clone();
+            let wake = self.wake.clone();
+            gate.start(Arc::new(move || {
+                started.store(true, Ordering::Release);
+                wake();
+            }));
+        }
+        true
+    }
+
+    /// "Use this Mac": asked once, then the window opens again as the host of agents on this Mac. The VM's
+    /// agents keep running there.
+    fn switch_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_local {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new("Run agents in this window?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    "ATOMICS opens again as the host itself: new agents start on this Mac, as without a VM. \
+                     The host this window shows keeps its agents running; open it again with atomics --connect.",
+                );
+                ui.label(
+                    RichText::new("[client] connect is removed from your config (a backup is kept beside it).").small(),
+                );
+                if let Some(error) = &self.switch_error {
+                    ui.label(RichText::new(error).color(self.client.palette.warning));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Use this window").clicked() {
+                        match switch_to_local() {
+                            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            Err(error) => self.switch_error = Some(format!("{error:#}")),
+                        }
+                    }
+                    close = ui.button("Cancel").clicked();
+                });
+            });
+        if close {
+            self.confirm_local = false;
+            self.switch_error = None;
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -212,10 +338,11 @@ impl ClientApp {
         if let Some(fixed) = self.fixed.clone() {
             return Box::new(move || fixed());
         }
-        match self.target.clone() {
-            Target::Local => Box::new(target::local),
-            Target::Address { addr } => Box::new(move || target::address(addr)),
-            Target::Vm => Box::new(|| anyhow::bail!("this build cannot reach the VM's host")),
+        match (self.target.clone(), &self.vm) {
+            (_, Some(gate)) => gate.resolver(),
+            (Target::Local, _) => Box::new(target::local),
+            (Target::Address { addr }, _) => Box::new(move || target::address(addr)),
+            (Target::Vm, None) => Box::new(|| anyhow::bail!("the VM's host is reached through `atomics --connect vm`")),
         }
     }
 
@@ -266,6 +393,15 @@ impl ClientApp {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket) {
                         self.link = None;
                     }
+                    // The VM's host no longer takes this Mac's token (its home was reset, or it was
+                    // unpaired): forget it and pair again on the next dial, after the usual wait.
+                    let code = match &self.vm {
+                        Some(gate) if code == atomics_core::tunnel::close::UNAUTHORISED => {
+                            gate.forget_token();
+                            atomics_core::tunnel::close::ABNORMAL
+                        }
+                        _ => code,
+                    };
                     self.driver.socket_closed(socket, code);
                 }
             }
@@ -305,6 +441,53 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> anyhow::Result<
     encoder.set_depth(png::BitDepth::Eight);
     let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
     encoder.write_header()?.write_image_data(&bytes)?;
+    Ok(())
+}
+
+/// Take `[client] connect` out of the config file that sets it, and open ATOMICS again as the host, with
+/// this launch's arguments but `--connect`.
+fn switch_to_local() -> anyhow::Result<()> {
+    forget_connect_setting()?;
+    relaunch_without_connect()
+}
+
+/// Take `[client] connect` out of every config file that sets it (the host file, the main file), each with
+/// a backup beside it; the files it changed.
+pub(crate) fn forget_connect_setting() -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use atomics_core::selfconfig::{self, Layer, Scope, Source};
+    let [main, host] = atomics_core::config::Config::source_paths(&atomics_core::paths::config_file());
+    let layers = [Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
+    let key = ["client".to_string(), "connect".to_string()];
+    let mut changed = Vec::new();
+    for (scope, file, layer) in [(Scope::Host, &host, &layers[1]), (Scope::Main, &main, &layers[0])] {
+        if selfconfig::defines(&layer.table, &key) {
+            let proposal = selfconfig::propose(scope, &layers, "", &["client.connect".to_string()])
+                .map_err(|why| anyhow::anyhow!("{why}"))?;
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            selfconfig::write(file, proposal.before.as_deref(), &proposal.after, stamp)?;
+            changed.push(file.clone());
+        }
+    }
+    Ok(changed)
+}
+
+/// ATOMICS again, with this launch's arguments but `--connect`, once this process has ended.
+fn relaunch_without_connect() -> anyhow::Result<()> {
+    let mut args = Vec::new();
+    let mut skip = false;
+    for arg in std::env::args_os().skip(1) {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        if text == "--connect" {
+            skip = true;
+        } else if !text.starts_with("--connect=") {
+            args.push(arg);
+        }
+    }
+    let target = crate::restart::Target::with_args(&args)?;
+    target.spawn(std::process::id(), &atomics_core::paths::atomics_home())?;
     Ok(())
 }
 

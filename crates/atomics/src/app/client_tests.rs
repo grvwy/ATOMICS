@@ -191,3 +191,30 @@ fn a_window_that_stalls_catches_up_with_the_board() {
         drop(host);
     });
 }
+
+/// "Use this Mac": `[client] connect` leaves the config file that set it, with a backup beside it, and the
+/// rest of the file and the main config stay as they were.
+#[test]
+fn using_this_mac_takes_the_connect_setting_out_of_the_config() {
+    with_state("app::client_tests::using_this_mac_takes_the_connect_setting_out_of_the_config", |_state, _| {
+        use atomics_core::config::Config;
+        let [main, host] = Config::source_paths(&atomics_core::paths::config_file());
+        let before_main = std::fs::read_to_string(&main).unwrap();
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::write(&host, "# this Mac\n[client]\nconnect = \"vm\"\n\n[layout]\nchief_dock = \"left\"\n").unwrap();
+        assert_eq!(Config::load(&main).unwrap().client.connect, "vm");
+        let changed = crate::client::forget_connect_setting().unwrap();
+        assert_eq!(changed, std::slice::from_ref(&host));
+        let after = std::fs::read_to_string(&host).unwrap();
+        assert!(!after.contains("connect") && after.contains("chief_dock") && after.contains("# this Mac"), "{after}");
+        assert_eq!(Config::load(&main).unwrap().client.connect, "", "the window is the host again");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), before_main);
+        let backups: Vec<_> = std::fs::read_dir(host.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".bak"))
+            .collect();
+        assert_eq!(backups.len(), 1, "a backup of the host file");
+        assert!(crate::client::forget_connect_setting().unwrap().is_empty(), "nothing left to take out");
+    });
+}

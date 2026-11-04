@@ -22,6 +22,13 @@ impl Target {
         Ok(Self { executable, command })
     }
 
+    /// This installation with other arguments: the window switching from a host's client to the host.
+    pub fn with_args(args: &[OsString]) -> Result<Self> {
+        let executable = crate::setup::executable_path().context("locating this installation")?;
+        let command = relaunch_command(&executable, args, cfg!(target_os = "macos"))?;
+        Ok(Self { executable, command })
+    }
+
     pub fn validate(&self) -> Result<()> {
         check_version(&self.executable, Duration::from_secs(5))
     }
