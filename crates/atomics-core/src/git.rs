@@ -1364,22 +1364,24 @@ pub(crate) mod tests {
         let (dir, repo) = project();
         let at = |name: &str| dir.path().join(name);
         let worktrees = |repo: &Path| list_worktrees(repo).unwrap().len();
-        // A filter checkout needs and cannot run, as an LFS repository's on a bare PATH.
-        run(&repo, &["config", "filter.lfs.clean", "cat"]);
-        run(&repo, &["config", "filter.lfs.smudge", "atomics-test-missing-lfs smudge"]);
-        run(&repo, &["config", "filter.lfs.required", "true"]);
-        std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        // A filter checkout needs and cannot run, as an LFS repository's on a bare PATH. Not named `lfs`:
+        // `git lfs install --system`, as on CI's machines, gives that filter a `process` command, which
+        // git prefers over these.
+        run(&repo, &["config", "filter.test-lfs.clean", "cat"]);
+        run(&repo, &["config", "filter.test-lfs.smudge", "atomics-test-missing-lfs smudge"]);
+        run(&repo, &["config", "filter.test-lfs.required", "true"]);
+        std::fs::write(repo.join(".gitattributes"), "*.bin filter=test-lfs -text\n").unwrap();
         std::fs::write(repo.join("asset.bin"), "asset\n").unwrap();
         run(&repo, &["add", "."]);
         run(&repo, &["commit", "-q", "-m", "asset"]);
         let error = add_worktree(&repo, &at("filtered"), "task", "main").unwrap_err();
-        assert!(format!("{error:#}").contains("smudge filter lfs failed"), "{error:#}");
+        assert!(format!("{error:#}").contains("smudge filter test-lfs failed"), "{error:#}");
         assert!(!branch_exists(&repo, "task"), "the branch the failed add made is deleted");
         assert_eq!(worktrees(&repo), 1);
         assert!(!at("filtered").exists());
 
         // A failed post-checkout hook, as LFS installs: git keeps the worktree and branch it made.
-        run(&repo, &["config", "filter.lfs.smudge", "cat"]);
+        run(&repo, &["config", "filter.test-lfs.smudge", "cat"]);
         let hook = repo.join(".git/hooks/post-checkout");
         crate::test_support::write_program(&hook, "#!/bin/sh\necho 'git-lfs was not found on your path' >&2\nexit 2\n");
         let error = add_worktree(&repo, &at("hooked"), "task", "main").unwrap_err();

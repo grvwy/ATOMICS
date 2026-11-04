@@ -506,10 +506,12 @@ mod tests {
                 assert!(crate::setup::login_path().added.is_some_and(|added| added > 0));
 
                 let (_dir, repo) = repository();
+                // Not named `lfs`: `git lfs install --system`, as on CI's machines, gives that filter a
+                // `process` command, which git prefers and this fake does not speak.
                 for (key, value) in [
-                    ("filter.lfs.clean", "git-lfs clean -- %f"),
-                    ("filter.lfs.smudge", "git-lfs smudge -- %f"),
-                    ("filter.lfs.required", "true"),
+                    ("filter.test-lfs.clean", "git-lfs clean -- %f"),
+                    ("filter.test-lfs.smudge", "git-lfs smudge -- %f"),
+                    ("filter.test-lfs.required", "true"),
                 ] {
                     git::git(&repo, &["config", key, value]).unwrap();
                 }
@@ -519,7 +521,8 @@ mod tests {
                     "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { echo >&2 \"git-lfs was not found on your path\"; \
                      exit 2; }\ngit lfs post-checkout \"$@\"\n",
                 );
-                std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n").unwrap();
+                std::fs::write(repo.join(".gitattributes"), "*.bin filter=test-lfs diff=lfs merge=lfs -text\n")
+                    .unwrap();
                 std::fs::write(repo.join("asset.bin"), "large file\n").unwrap();
                 git::git(&repo, &["add", "."]).unwrap();
                 git::git(&repo, &["commit", "-qm", "asset"]).unwrap();
@@ -553,15 +556,16 @@ mod tests {
                 };
 
                 // A required filter that cannot run fails the dispatch, which leaves nothing behind.
-                git::git(&repo, &["config", "filter.lfs.smudge", "atomics-test-missing-lfs smudge -- %f"]).unwrap();
+                git::git(&repo, &["config", "filter.test-lfs.smudge", "atomics-test-missing-lfs smudge -- %f"])
+                    .unwrap();
                 let failed = dispatch(&mut state, "task");
                 let error = failed.1.as_ref().err().expect("the dispatch fails");
-                assert!(error.contains("smudge filter lfs failed"), "{error}");
+                assert!(error.contains("smudge filter test-lfs failed"), "{error}");
                 assert!(!git::branch_ref_exists(&repo, "task").unwrap(), "a retry would find the branch");
                 assert_eq!(git::list_worktrees(&repo).unwrap().len(), 1);
 
                 // The retry, with the filter git-lfs, checks the asset out and starts Codex with hooks.
-                git::git(&repo, &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"]).unwrap();
+                git::git(&repo, &["config", "filter.test-lfs.smudge", "git-lfs smudge -- %f"]).unwrap();
                 state.worktree_tx.send(failed).unwrap();
                 state.runtime_tick();
                 let event = dispatch(&mut state, "task");
