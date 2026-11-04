@@ -201,6 +201,8 @@ impl Keyboard {
                 if let Some((text, _, _)) = &overlay.copy {
                     copy(text.clone());
                     inputs.push(TermInput::Copied);
+                } else if !cfg!(target_os = "macos") {
+                    inputs.push(TermInput::Key { name: "c".into(), mods: Modifiers::CTRL });
                 }
                 true
             }
@@ -402,6 +404,17 @@ mod tests {
         keyboard.route(&mut raw, &overlay, false, 0.0, &mut inputs, &mut |text| copied = Some(text));
         assert_eq!(copied.as_deref(), Some("selected"));
         assert_eq!(inputs, vec![TermInput::Copied]);
+    }
+
+    #[test]
+    fn copy_without_a_selection_routes_control_c_off_macos() {
+        let mut keyboard = Keyboard { focused: true, ..Keyboard::default() };
+        let (inputs, kept) = route(&mut keyboard, &overlay(), vec![Event::Copy]);
+        assert!(kept.is_empty());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(inputs, vec![TermInput::Key { name: "c".into(), mods: Modifiers::CTRL }]);
+        #[cfg(target_os = "macos")]
+        assert!(inputs.is_empty());
     }
 
     #[test]

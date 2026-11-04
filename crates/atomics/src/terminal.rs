@@ -214,6 +214,8 @@ impl TerminalView {
         if let Some(pos) = response.interact_pointer_pos() {
             let (point, side) = self.point_at(pos, rect, metrics, offset);
             if response.drag_started() {
+                let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+                let (point, side) = self.point_at(origin, rect, metrics, offset);
                 self.selection = Some(Selection::new(SelectionType::Simple, point, side));
             } else if response.dragged()
                 && let Some(selection) = self.selection.as_mut()
@@ -289,8 +291,18 @@ impl TerminalView {
                     let previous = std::mem::replace(&mut term.selection, self.selection.clone());
                     let text = term.selection_to_string();
                     term.selection = previous;
-                    if let Some(text) = text {
+                    if let Some(text) = text.filter(|text| !text.is_empty()) {
                         ui.ctx().copy_text(text);
+                        self.selection = None;
+                    } else if !cfg!(target_os = "macos") {
+                        out.push(0x03);
+                        terminal.record_input(std::time::Instant::now(), false);
+                    }
+                }
+                egui::Event::Cut => {
+                    if !cfg!(target_os = "macos") {
+                        out.push(0x18);
+                        terminal.record_input(std::time::Instant::now(), false);
                     }
                 }
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
@@ -749,6 +761,154 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         copied
+    }
+
+    fn raw_input_terminal() -> (Terminal, crate::test_support::TempDir) {
+        let dir = crate::test_support::tempdir().unwrap();
+        // The status response is a barrier for the initial output and its revision. Raw mode
+        // lets the file capture control bytes without the line discipline consuming them.
+        let script = "stty raw -echo; printf 'alpha beta gamma\\r\\n\\033[5n'; \
+                      dd bs=1 count=4 of=/dev/null 2>/dev/null; exec cat > input";
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+        while !dir.path().join("input").exists() {
+            assert!(std::time::Instant::now() < deadline, "terminal did not answer the initial status query");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (terminal, dir)
+    }
+
+    fn captured_input(terminal: &Terminal, dir: &crate::test_support::TempDir) -> Vec<u8> {
+        // A trailing marker proves every preceding write reached the raw reader, including
+        // when an event should have written nothing. Each test captures once per terminal.
+        terminal.write(vec![0]);
+        let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+        loop {
+            let mut bytes = std::fs::read(dir.path().join("input")).unwrap();
+            if bytes.last() == Some(&0) {
+                bytes.pop();
+                return bytes;
+            }
+            assert!(std::time::Instant::now() < deadline, "terminal did not consume the input marker");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn select_input_text(terminal: &Terminal, view: &mut TerminalView) {
+        let _guard = terminal.term.lock();
+        view.sync_selection(terminal);
+        let mut selection = Selection::new(SelectionType::Simple, Point::new(Line(0), Column(0)), Side::Left);
+        selection.update(Point::new(Line(0), Column(15)), Side::Right);
+        view.selection = Some(selection);
+    }
+
+    #[test]
+    fn copy_without_a_selection_sends_interrupt_off_macos() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        assert_eq!(copy_selection(&terminal, &mut view), None);
+        let bytes = captured_input(&terminal, &dir);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(bytes, b"\x03");
+            assert!(terminal.last_typed().is_some());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(bytes.is_empty());
+            assert!(terminal.last_typed().is_none());
+        }
+    }
+
+    #[test]
+    fn copy_clears_the_selection_and_the_next_copy_interrupts_off_macos() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        select_input_text(&terminal, &mut view);
+        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("alpha beta gamma"));
+        assert!(view.selection.is_none());
+        assert!(terminal.last_typed().is_none(), "copying text is not terminal input");
+        // The marker separates the two copies: only the second may send an interrupt.
+        terminal.write(b"!".to_vec());
+        assert_eq!(copy_selection(&terminal, &mut view), None);
+        let bytes = captured_input(&terminal, &dir);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(bytes, b"!\x03");
+        #[cfg(target_os = "macos")]
+        assert_eq!(bytes, b"!");
+    }
+
+    #[test]
+    fn cut_sends_control_x_off_macos_with_or_without_a_selection() {
+        for selected in [false, true] {
+            let (terminal, dir) = raw_input_terminal();
+            let mut view = TerminalView::default();
+            if selected {
+                select_input_text(&terminal, &mut view);
+            }
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(egui::RawInput { events: vec![egui::Event::Cut], ..Default::default() }, |ui| {
+                view.handle_keys(&terminal, ui)
+            });
+            assert!(
+                !output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+            );
+            output.drop_without_applying_deltas();
+            let bytes = captured_input(&terminal, &dir);
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(bytes, b"\x18");
+                assert!(terminal.last_typed().is_some());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                assert!(bytes.is_empty());
+                assert!(terminal.last_typed().is_none());
+                assert_eq!(view.selection.is_some(), selected);
+            }
+        }
+    }
+
+    #[test]
+    fn drag_selection_starts_at_the_press_before_drag_detection() {
+        let (terminal, _dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(160.0, 64.0));
+        let ctx = egui::Context::default();
+        let frame = |view: &mut TerminalView, events| {
+            let mut started = false;
+            ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
+                let response = ui.interact(rect, egui::Id::new("drag selection"), Sense::click_and_drag());
+                started |= response.drag_started();
+                view.handle_mouse(&terminal, ui, &response, rect, &metrics);
+            })
+            .drop_without_applying_deltas();
+            started
+        };
+        let press = egui::pos2(1.0, 8.0);
+        frame(&mut view, vec![egui::Event::PointerMoved(press)]);
+        frame(
+            &mut view,
+            vec![egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(frame(&mut view, vec![egui::Event::PointerMoved(press + vec2(16.0, 0.0))]));
+        frame(&mut view, vec![egui::Event::PointerMoved(egui::pos2(127.0, 8.0))]);
+        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("alpha beta gamma"));
     }
 
     #[test]
