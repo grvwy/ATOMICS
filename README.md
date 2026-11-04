@@ -411,10 +411,15 @@ first line says where `PATH` came from: the login shell's folders added, already
 
 For Codex hook trust, doctor computes the hook definitions ATOMICS passes (its executable and socket) the way Codex
 does, and reads `[hooks.state]` in the Codex home those agents get (`<ATOMICS_HOME>/codex` for an explicit
-`ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). It names each event as trusted, untrusted, changed since
-trusted (a new install path, socket or definition) or disabled, and the fix: trust them in Codex's review prompt
-or `/hooks`, or set the exact `trusted_hash` entries it prints. While every Codex agent runs sandboxed, ATOMICS passes
-no hooks and doctor says trust is not needed.
+`ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). The executable is the one the desktop or `atomics host` that
+serves this ATOMICS home runs from, which it records in `executable.json` there at every start, so a terminal's
+doctor from another install (a cargo-installed CLI beside the app) checks the hooks the app passes; with none
+recorded yet, it checks its own, and its line names the binary either way. It names each event as trusted,
+untrusted, changed since trusted (a new install path, socket or definition) or disabled, and the fix: trust them in
+Codex's review prompt or `/hooks`, or set the exact `trusted_hash` entries it prints. Codex keeps trust per event, not
+per install, so it trusts one install's hooks at a time: doctor lists each other install it finds (itself, the app in
+`~/Applications` or `/Applications`, `~/.local/bin` and `~/.cargo/bin`) and whether Codex trusts its hooks instead.
+While every Codex agent runs sandboxed, ATOMICS passes no hooks and doctor says trust is not needed.
 
 Cleanup failures the startup sweep finds are replaced at every start, so a failure that is fixed, such as a deleted
 project folder or the record of a sandbox that is gone, drops out of doctor after the next start. Failures that no

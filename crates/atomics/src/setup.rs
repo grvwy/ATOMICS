@@ -213,13 +213,37 @@ fn recorded(file: &std::path::Path, shell: &str) -> Option<String> {
 
 /// Records `shell`'s PATH whole, so a window starting meanwhile reads the old one or the new.
 fn record(file: &std::path::Path, shell: &str, path: &str) -> std::io::Result<()> {
+    write_whole(file, &serde_json::to_vec(&Recorded { shell: shell.into(), path: path.into() })?)
+}
+
+/// Replaces `file` with `bytes` at once: a reader finds the old file or the new one, never part.
+fn write_whole(file: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let dir = file.parent().ok_or_else(|| std::io::Error::other("no folder for the record"))?;
+    let dir = file.parent().ok_or_else(|| std::io::Error::other("no folder to write in"))?;
     std::fs::create_dir_all(dir)?;
     let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
-    temporary.write_all(&serde_json::to_vec(&Recorded { shell: shell.into(), path: path.into() })?)?;
+    temporary.write_all(bytes)?;
     temporary.persist(file).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// Where the ATOMICS that serves a home's socket, a desktop or `atomics host`, records the
+/// executable it runs from. The hooks it passes bare Codex agents run that executable, so Codex's
+/// trust in them is for that path, which the doctor checks from whichever install it runs.
+fn executable_record(home: &std::path::Path) -> PathBuf {
+    home.join("executable.json")
+}
+
+/// Records this process's executable as the one that serves `home`'s socket.
+pub(crate) fn record_executable(home: &std::path::Path) -> std::io::Result<()> {
+    let executable = executable_path()?;
+    write_whole(&executable_record(home), &serde_json::to_vec(&executable.to_string_lossy())?)
+}
+
+/// The executable of the desktop or host that last served `home`'s socket.
+pub(crate) fn recorded_executable(home: &std::path::Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(executable_record(home)).ok()?;
+    serde_json::from_str::<String>(&text).ok().map(PathBuf::from)
 }
 
 fn login_shell_path(shell: &str, timeout: Duration) -> Result<String, String> {

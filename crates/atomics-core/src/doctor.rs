@@ -31,51 +31,116 @@ enum Trust {
     Changed,
 }
 
-/// Whether Codex runs the `hooks` ATOMICS passes it ([`crate::hook::codex_hook_trust`]), from
-/// `[hooks.state]` in `text`, Codex's user config read from `config`. Codex runs a hook whose
-/// `trusted_hash` matches its current hash, unless `enabled = false`; a missing file trusts nothing.
-pub fn codex_trust_check(hooks: &[CodexHookTrust], config: &Path, text: std::io::Result<String>) -> String {
-    #[derive(serde::Deserialize)]
-    struct State {
-        trusted_hash: Option<String>,
-        enabled: Option<bool>,
+/// One ATOMICS install's hooks as Codex identifies them for trust ([`crate::hook::codex_hook_trust`]),
+/// with the executable they name, as the doctor describes it.
+pub struct InstallHooks {
+    /// The executable, and why the doctor looks at it: "/Applications/ATOMICS.app/… (the desktop's)".
+    pub binary: String,
+    pub hooks: Vec<CodexHookTrust>,
+}
+
+/// Whether Codex runs the hooks ATOMICS passes it, from `[hooks.state]` in `text`, Codex's user
+/// config read from `config`. Codex runs a hook whose `trusted_hash` matches its current hash,
+/// unless `enabled = false`; a missing file trusts nothing.
+///
+/// Every hook names the executable that runs it, so each install has hooks of its own, but Codex
+/// keys its trust by event: it trusts one install's hooks at a time. The check is for the first of
+/// `installs`, the one whose hooks bare Codex agents get, and its fix trusts those; each other
+/// install found follows as a fact, saying whether Codex trusts its hooks instead.
+pub fn codex_trust_lines(installs: &[InstallHooks], config: &Path, text: std::io::Result<String>) -> Vec<String> {
+    let Some((checked, others)) = installs.split_first() else { return Vec::new() };
+    let states = match hook_states(config, text) {
+        Ok(states) => states,
+        Err(line) => return vec![line],
+    };
+    let mut lines = vec![codex_trust_check(checked, &states, config)];
+    for other in others {
+        let trusted: Vec<&str> = other
+            .hooks
+            .iter()
+            .filter(|hook| states.get(&hook.key).and_then(|state| state.trusted_hash.as_deref()) == Some(&hook.hash))
+            .map(|hook| hook.event.as_str())
+            .collect();
+        let binary = &other.binary;
+        lines.push(if trusted.is_empty() {
+            format!(
+                "Other ATOMICS install {binary}: its hooks are not trusted. A desktop or host started from it asks \
+                 Codex to review them again, and trusting them there stops Codex running those of the install \
+                 checked above: Codex trusts one install's hooks at a time"
+            )
+        } else if trusted.len() == other.hooks.len() {
+            format!(
+                "Other ATOMICS install {binary}: Codex trusts its hooks, rather than those of the install checked above"
+            )
+        } else {
+            format!(
+                "Other ATOMICS install {binary}: Codex trusts its hooks for {}, rather than those of the install \
+                 checked above",
+                trusted.join(", ")
+            )
+        });
     }
+    lines
+}
+
+/// What Codex keeps of a hook's trust.
+#[derive(serde::Deserialize)]
+struct State {
+    trusted_hash: Option<String>,
+    enabled: Option<bool>,
+}
+
+/// `[hooks.state]` of Codex's user config, by trimmed key as Codex reads it, or the check line
+/// that says why trust is unknown.
+fn hook_states(
+    config: &Path,
+    text: std::io::Result<String>,
+) -> Result<std::collections::HashMap<String, State>, String> {
     let text = match text {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => {
-            return check_line(
+            return Err(check_line(
                 false,
                 &format!("cannot read Codex's config {} for ATOMICS hook trust (warning): {err}", config.display()),
                 "fix the file's read permissions",
-            );
+            ));
         }
     };
     let table = match text.parse::<toml::Table>() {
         Ok(table) => table,
         Err(err) => {
-            return check_line(
+            return Err(check_line(
                 false,
                 &format!(
                     "Codex's config {} does not parse; ATOMICS hook trust unknown (warning): {err}",
                     config.display()
                 ),
                 "fix the TOML; Codex refuses to start with it too",
-            );
+            ));
         }
     };
     // Codex trims the keys and skips a state it cannot read.
-    let states: std::collections::HashMap<&str, State> = table
+    Ok(table
         .get("hooks")
         .and_then(|hooks| hooks.get("state"))
         .and_then(toml::Value::as_table)
         .into_iter()
         .flatten()
-        .filter_map(|(key, state)| Some((key.trim(), state.clone().try_into().ok()?)))
-        .collect();
+        .filter_map(|(key, state)| Some((key.trim().to_string(), state.clone().try_into().ok()?)))
+        .collect())
+}
+
+/// Whether Codex runs every hook of `install`, and if not, how to make it.
+fn codex_trust_check(
+    install: &InstallHooks,
+    states: &std::collections::HashMap<String, State>,
+    config: &Path,
+) -> String {
+    let binary = &install.binary;
     let mut found: Vec<(&CodexHookTrust, Trust, bool)> = Vec::new();
-    for hook in hooks {
-        let state = states.get(hook.key.as_str());
+    for hook in &install.hooks {
+        let state = states.get(&hook.key);
         let trust = match state.and_then(|state| state.trusted_hash.as_deref()) {
             Some(hash) if hash == hook.hash => Trust::Trusted,
             Some(_) => Trust::Changed,
@@ -86,7 +151,11 @@ pub fn codex_trust_check(hooks: &[CodexHookTrust], config: &Path, text: std::io:
     if found.iter().all(|(_, trust, enabled)| *trust == Trust::Trusted && *enabled) {
         return check_line(
             true,
-            &format!("Codex trusts ATOMICS's hooks for all {} events ({})", found.len(), config.display()),
+            &format!(
+                "Codex trusts ATOMICS's hooks for all {} events, as {binary} passes them ({})",
+                found.len(),
+                config.display()
+            ),
             "",
         );
     }
@@ -108,7 +177,11 @@ pub fn codex_trust_check(hooks: &[CodexHookTrust], config: &Path, text: std::io:
     if !disabled.is_empty() {
         parts.push(format!("disabled: {}", names(&disabled)));
     }
-    let label = format!("Codex does not run every ATOMICS hook (warning): {} ({})", parts.join("; "), config.display());
+    let label = format!(
+        "Codex does not run every ATOMICS hook as {binary} passes them (warning): {} ({})",
+        parts.join("; "),
+        config.display()
+    );
     let mut fixes = Vec::new();
     if !review.is_empty() {
         let entries: Vec<_> = review
@@ -328,13 +401,19 @@ mod tests {
         let hook = |event: &str| hooks.iter().find(|hook| hook.event == event).unwrap();
         let codex_home = crate::test_support::tempdir().unwrap();
         let config = codex_home.path().join("config.toml");
-        let check = || codex_trust_check(&hooks, &config, std::fs::read_to_string(&config));
+        let install = || vec![InstallHooks { binary: "/usr/local/bin/atomics".into(), hooks: hooks.clone() }];
+        let check = || codex_trust_lines(&install(), &config, std::fs::read_to_string(&config)).remove(0);
         let entry =
             |hook: &CodexHookTrust, hash: &str| format!("[hooks.state.\"{}\"]\ntrusted_hash = \"{hash}\"\n", hook.key);
 
         // A Codex home without a config trusts nothing yet.
         let line = check();
-        assert!(line.starts_with("✗ Codex does not run every ATOMICS hook (warning): untrusted: "), "{line}");
+        assert!(
+            line.starts_with(
+                "✗ Codex does not run every ATOMICS hook as /usr/local/bin/atomics passes them (warning): untrusted: "
+            ),
+            "{line}"
+        );
         assert!(!line.contains("changed") && !line.contains("disabled") && !line.contains("; trusted:"), "{line}");
         assert!(line.contains(&config.display().to_string()) && line.contains("/hooks"), "{line}");
         assert!(line.contains("repository hooks keep their own review"), "{line}");
@@ -351,7 +430,11 @@ mod tests {
         let line = check();
         assert_eq!(
             line,
-            format!("✓ Codex trusts ATOMICS's hooks for all {} events ({})", hooks.len(), config.display())
+            format!(
+                "✓ Codex trusts ATOMICS's hooks for all {} events, as /usr/local/bin/atomics passes them ({})",
+                hooks.len(),
+                config.display()
+            )
         );
         std::fs::write(
             &config,
@@ -398,8 +481,85 @@ mod tests {
         let line = check();
         assert!(line.starts_with('✗') && line.contains("does not parse") && line.contains("trust unknown"), "{line}");
         assert_eq!(line.lines().count(), 1);
-        let denied = codex_trust_check(&hooks, &config, Err(std::io::ErrorKind::PermissionDenied.into()));
+        let denied = codex_trust_lines(&install(), &config, Err(std::io::ErrorKind::PermissionDenied.into())).remove(0);
         assert!(denied.starts_with('✗') && denied.contains("cannot read Codex's config"), "{denied}");
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn codex_trust_is_checked_for_the_install_that_passes_the_hooks_and_others_are_named() {
+        // The app and a cargo-installed CLI: the same hook keys, hashes of their own executables.
+        let socket = Path::new("/run/atomics.sock");
+        let (app, cli) = ("/Applications/ATOMICS.app/Contents/MacOS/atomics", "/home/user/.cargo/bin/atomics");
+        let hooks_of = |exe: &str| crate::hook::codex_hook_trust(Path::new(exe), socket);
+        assert_eq!(
+            hooks_of(app).iter().map(|hook| &hook.key).collect::<Vec<_>>(),
+            hooks_of(cli).iter().map(|hook| &hook.key).collect::<Vec<_>>()
+        );
+        assert!(hooks_of(app).iter().zip(hooks_of(cli)).all(|(app, cli)| app.hash != cli.hash));
+        let installs = || {
+            vec![
+                InstallHooks { binary: format!("{app} (the desktop's)"), hooks: hooks_of(app) },
+                InstallHooks { binary: format!("{cli} (this doctor)"), hooks: hooks_of(cli) },
+            ]
+        };
+        let codex_home = crate::test_support::tempdir().unwrap();
+        let config = codex_home.path().join("config.toml");
+        let trust = |exe: &str| -> String {
+            hooks_of(exe)
+                .iter()
+                .map(|hook| format!("[hooks.state.\"{}\"]\ntrusted_hash = \"{}\"\n", hook.key, hook.hash))
+                .collect()
+        };
+        let fix = |exe: &str| -> Vec<String> {
+            hooks_of(exe).iter().map(|hook| format!("trusted_hash = \"{}\"", hook.hash)).collect()
+        };
+
+        // The app's hooks trusted, as its review wrote them: a doctor run from the CLI says so, and
+        // suggests nothing that would trust the CLI's instead.
+        std::fs::write(&config, trust(app)).unwrap();
+        let lines = codex_trust_lines(&installs(), &config, std::fs::read_to_string(&config));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!(
+                "✓ Codex trusts ATOMICS's hooks for all 8 events, as {app} (the desktop's) passes them ({})",
+                config.display()
+            )
+        );
+        assert!(!lines[1].starts_with(['✓', '✗']), "a fact, not a failed check: {}", lines[1]);
+        assert!(lines[1].starts_with(&format!("Other ATOMICS install {cli} (this doctor): its hooks are not trusted")));
+        assert!(lines[1].contains("one install's hooks at a time"), "{}", lines[1]);
+        for entry in fix(cli) {
+            assert!(!lines.concat().contains(&entry), "{lines:?}");
+        }
+
+        // The CLI's trusted instead: the app's are changed since trusted, its fix trusts the app's
+        // again, and the CLI's line says why.
+        std::fs::write(&config, trust(cli)).unwrap();
+        let lines = codex_trust_lines(&installs(), &config, std::fs::read_to_string(&config));
+        assert!(
+            lines[0].starts_with(&format!(
+                "✗ Codex does not run every ATOMICS hook as {app} (the desktop's) passes them (warning): changed since \
+                 trusted: "
+            )),
+            "{}",
+            lines[0]
+        );
+        assert!(fix(app).iter().all(|entry| lines[0].contains(entry)), "{}", lines[0]);
+        assert!(fix(cli).iter().all(|entry| !lines[0].contains(entry)), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            format!(
+                "Other ATOMICS install {cli} (this doctor): Codex trusts its hooks, rather than those of the install checked above"
+            )
+        );
+
+        // A config Codex cannot read says so once, for every install.
+        std::fs::write(&config, "[hooks.state\n").unwrap();
+        let lines = codex_trust_lines(&installs(), &config, std::fs::read_to_string(&config));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("does not parse"), "{lines:?}");
     }
 
     #[test]
