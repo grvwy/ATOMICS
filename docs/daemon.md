@@ -624,12 +624,14 @@ connect = "local"     # the `atomics host` on this machine; "vm": the host in th
   narrow one) are the client; `client.rs` only carries out the driver's outputs. So terminals, diffs, the
   board, approvals, the chief and comment boxes are the browser's, and offer what `atomics.v1` carries: the
   host's own items (Settings, sandboxes, credentials, the ticket sign-in) stay on the host.
-- **Direct, not through a broker** (`Driver::direct`). The client dials the host's server itself
-  (`client/link.rs`, a WebSocket on a thread of its own with `TCP_NODELAY`), offering `atomics.v1` with the
-  bearer token in the upgrade, and says `hello` as soon as it is through. The address and the token are found
-  again for every dial (`client/target.rs`): `local` reads the host's `protocol.json` in `ATOMICS_HOME`, so a
-  host that restarted with a new token is reached again; an address reads the token this machine paired with
-  from the OS credential store; `vm` starts the bundle's forward and pairs once (docs/nixos-vm.md).
+- **Direct, not through a broker** (`Driver::direct`). The client dials the host's server itself (`client/link.rs`,
+  a WebSocket on a thread of its own, over TCP with `TCP_NODELAY` or a forward's Unix socket), offering
+  `atomics.v1` with the bearer token in the upgrade, and says `hello` as soon as it is through. The address and the
+  token are found again for every dial (`client/target.rs`): `local` reads the host's `protocol.json` in
+  `ATOMICS_HOME`, so a host that restarted with a new token is reached again; an address reads the token this
+  machine paired with from the OS credential store; `vm` starts the bundle's forward on a Unix socket in a folder
+  only this user can enter, and pairs once (docs/nixos-vm.md). A token the VM's host refuses is kept until the user
+  says to pair again.
 - **Input.** Instead of the page's `<textarea>` overlay, `client/input.rs` takes the terminal's share of each
   frame's raw input before egui sees it: a click on the cells gives the terminal the keyboard (and asks for the
   lease, as a tap does), keys and text go to it while it has the keyboard, a click anywhere else or a text box
@@ -640,9 +642,10 @@ connect = "local"     # the `atomics host` on this machine; "vm": the host in th
 - **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop
   reading, and the host then treats it as the slow client it is (a fresh snapshot, or a drop and a reconnect),
   rather than the window holding an unbounded backlog.
-- **When waiting cannot help, it stops and says why**: a refused token ("pair this window again"), or a host of
-  another major version (a frame it cannot decode as such, or the host's `unsupported_version` refusal of the
-  `hello`). Anything else, a host that is not there included, is a drop it dials again after.
+- **When waiting cannot help, it stops and says why**: a refused token ("pair this window again"; the VM's window
+  asks whether to, with **Pair again**), or a host of another major version (a frame it cannot decode as such, or
+  the host's `unsupported_version` refusal of the `hello`). Anything else, a host that is not there included, is a
+  drop it dials again after.
 - **Tests.** `app::client_tests` runs the real host in process with its protocol server and the client's own
   driver, link and backend: a shell started through ctl and a plan show in a first window, which types into the
   shell under the lease; the window closes, and the shell's process (same pid, alive) and its terminal stay; a

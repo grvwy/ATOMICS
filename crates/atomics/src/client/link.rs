@@ -2,8 +2,10 @@
 //! connects with the host's bearer token, then carries `atomics.v1` text frames both ways until either
 //! side closes. What happens is reported as [`Event`]s, each followed by a wake, so the window draws it.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, mpsc};
@@ -18,10 +20,28 @@ use zeroize::Zeroizing;
 /// Where a host's server is and how to get in.
 pub struct Endpoint {
     /// The address to dial: the server's, or a forward's that leads to it.
-    pub addr: SocketAddr,
+    pub addr: Address,
     /// The `Host` the upgrade names: always a loopback name, whatever port the forward has.
     pub host: String,
     pub token: Zeroizing<String>,
+}
+
+/// What the link dials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    /// A port on this machine's loopback.
+    Tcp(SocketAddr),
+    /// A forward's Unix socket, in a folder only this user can enter (the VM's host, `vm.rs`).
+    Unix(PathBuf),
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Address::Tcp(addr) => write!(f, "{addr}"),
+            Address::Unix(path) => write!(f, "{}", path.display()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -94,13 +114,62 @@ impl Drop for Link {
     }
 }
 
+/// The connection under the WebSocket: a loopback port, or a forward's Unix socket.
+pub(super) enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl Stream {
+    fn open(addr: &Address) -> io::Result<Stream> {
+        match addr {
+            Address::Tcp(addr) => {
+                let stream = TcpStream::connect_timeout(addr, CONNECT)?;
+                let _ = stream.set_nodelay(true);
+                Ok(Stream::Tcp(stream))
+            }
+            Address::Unix(path) => UnixStream::connect(path).map(Stream::Unix),
+        }
+    }
+
+    fn set_timeouts(&self, read: Duration, write: Duration) -> io::Result<()> {
+        match self {
+            Stream::Tcp(stream) => stream.set_read_timeout(Some(read)).and(stream.set_write_timeout(Some(write))),
+            Stream::Unix(stream) => stream.set_read_timeout(Some(read)).and(stream.set_write_timeout(Some(write))),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => stream.read(buf),
+            Stream::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => stream.write(buf),
+            Stream::Unix(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Tcp(stream) => stream.flush(),
+            Stream::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
 /// The upgrade, with the token. A refused token is [`close::UNAUTHORISED`]; anything else that fails is
 /// 1006, a drop.
-fn connect(endpoint: &Endpoint) -> Result<(WebSocket<TcpStream>, String), u16> {
-    let stream = TcpStream::connect_timeout(&endpoint.addr, CONNECT).map_err(|_| close::ABNORMAL)?;
-    let _ = stream.set_nodelay(true);
-    stream.set_read_timeout(Some(CONNECT)).map_err(|_| close::ABNORMAL)?;
-    stream.set_write_timeout(Some(CONNECT)).map_err(|_| close::ABNORMAL)?;
+pub(super) fn connect(endpoint: &Endpoint) -> Result<(WebSocket<Stream>, String), u16> {
+    let stream = Stream::open(&endpoint.addr).map_err(|_| close::ABNORMAL)?;
+    stream.set_timeouts(CONNECT, CONNECT).map_err(|_| close::ABNORMAL)?;
     let mut request = format!("ws://{}", endpoint.host).into_client_request().map_err(|_| close::ABNORMAL)?;
     let headers = request.headers_mut();
     let bearer = Zeroizing::new(format!("Bearer {}", endpoint.token.as_str()));
@@ -114,7 +183,7 @@ fn connect(endpoint: &Endpoint) -> Result<(WebSocket<TcpStream>, String), u16> {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            ws.get_ref().set_read_timeout(Some(POLL)).map_err(|_| close::ABNORMAL)?;
+            ws.get_ref().set_timeouts(POLL, CONNECT).map_err(|_| close::ABNORMAL)?;
             Ok((ws, protocol))
         }
         Err(HandshakeError::Failure(tungstenite::Error::Http(response))) if response.status() == 401 => {
@@ -132,7 +201,7 @@ fn socket_config() -> tungstenite::protocol::WebSocketConfig {
 
 /// Frames both ways until the host closes, the link drops, or `stop`. The close code it ended with.
 fn pump(
-    ws: &mut WebSocket<TcpStream>,
+    ws: &mut WebSocket<Stream>,
     frames: &Receiver<String>,
     stop: &AtomicBool,
     received: &mut dyn FnMut(Vec<u8>),

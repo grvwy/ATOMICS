@@ -3,6 +3,8 @@
 //! The real host's gates are in `app::client_tests`.
 
 use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use atomics_core::wire::{self, Envelope, Message};
@@ -11,7 +13,8 @@ use tungstenite::handshake::server::{Request, Response};
 use zeroize::Zeroizing;
 
 use super::ClientApp;
-use super::link::Endpoint;
+use super::link::{Address, Endpoint};
+use super::vm;
 
 /// What the fake server does after it accepts the upgrade.
 type Script = fn(&mut tungstenite::WebSocket<std::net::TcpStream>);
@@ -46,7 +49,11 @@ fn server(refuse: Option<u16>, script: Script) -> SocketAddr {
 fn client(addr: SocketAddr) -> ClientApp {
     let ctx = egui::Context::default();
     ClientApp::fixed(&ctx, move || {
-        Ok(Endpoint { addr, host: format!("127.0.0.1:{}", addr.port()), token: Zeroizing::new("the-token".into()) })
+        Ok(Endpoint {
+            addr: Address::Tcp(addr),
+            host: format!("127.0.0.1:{}", addr.port()),
+            token: Zeroizing::new("the-token".into()),
+        })
     })
 }
 
@@ -122,4 +129,66 @@ fn a_host_that_is_not_there_is_tried_again() {
     drop(listener);
     let mut app = client(addr);
     until(&mut app, "a reconnect", |status| matches!(status, Status::Reconnecting { .. }));
+}
+
+/// The VM's host refusing this Mac's token stops the window and asks: the token stays in the keychain,
+/// and nothing dials or pairs again until the user says "Pair again".
+#[test]
+fn a_token_the_vms_host_refuses_is_kept_until_the_user_pairs_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    {
+        let dials = dials.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                dials.fetch_add(1, Ordering::SeqCst);
+                #[allow(clippy::result_large_err)] // the error type is tungstenite's callback contract
+                let refuse = |_: &Request, _: Response| {
+                    Err(tungstenite::http::Response::builder().status(401).body(None).unwrap())
+                };
+                let _ = tungstenite::accept_hdr(stream, refuse);
+            }
+        });
+    }
+    let dir = crate::test_support::tempdir().unwrap();
+    let info = crate::vm::BundleInfo {
+        version: 1,
+        instance: "atomics-test".into(),
+        user: "atomics".into(),
+        home: "/home/atomics".into(),
+        mac_user: "user".into(),
+        install_dir: dir.path().display().to_string(),
+        host: Some(crate::vm::HostInfo { port: addr.port() }),
+    };
+    let keychain = crate::relay::Keychain::in_folder(&dir.path().join("credentials"));
+    keychain.write_item(vm::KEYCHAIN_SERVICE, &info.instance, "test", "the-token").unwrap();
+    let kept = || keychain.read_item(vm::KEYCHAIN_SERVICE, "atomics-test").unwrap();
+    let gate = vm::Gate::with(Some(info), dir.path().to_path_buf(), keychain.clone());
+    let ctx = egui::Context::default();
+    let mut app = ClientApp::fixed_vm(&ctx, gate, move || {
+        Ok(Endpoint { addr: Address::Tcp(addr), host: addr.to_string(), token: Zeroizing::new("the-token".into()) })
+    });
+    until(&mut app, "the refusal", |status| matches!(status, Status::Stopped(_)));
+    assert_eq!(app.driver().status(), &Status::Stopped(Stop::Unauthorised));
+    assert!(app.asks_to_pair_again());
+    // Well past the driver's first wait: nothing dials, and the token is not forgotten.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "the window dialled again on its own");
+    assert_eq!(kept().as_deref(), Some("the-token"), "the refused token was forgotten without asking");
+    assert!(app.asks_to_pair_again());
+    // "Pair again": the token goes, and the window dials (and would pair) at once.
+    app.pair_again();
+    assert_eq!(kept(), None);
+    assert!(!app.asks_to_pair_again());
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+    while dials.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < deadline, "no dial after Pair again");
+        app.pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

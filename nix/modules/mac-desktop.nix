@@ -163,18 +163,24 @@ let
   '';
 
   # The ATOMICS host in the VM (atomics.vm.host): its protocol server listens on the guest's loopback
-  # only, and this forward opens the same port on the Mac's loopback through Lima's ssh. Clients still
-  # need the token they paired with (`atomics ctl '{"cmd":"pair_client",...}'` in the guest); no
-  # port is ever open without one.
+  # only, and this forward reaches it from the Mac through Lima's ssh. Clients still need the token
+  # they paired with (`atomics ctl '{"cmd":"pair_client",...}'` in the guest).
   hostForwardScript = preamble + ''
-    # Holds the forward from this Mac's loopback to the ATOMICS host in the VM until the VM goes away.
-    # ATOMICS.app runs it while it shows the VM's host; the port defaults to the guest's.
-    port=''${1:-${toString cfg.hostPort}}
-    case $port in
-      ""|*[!0-9]*) echo "atomics-vm-host-forward: $port is not a port" >&2; exit 64 ;;
+    # Holds a forward from this Mac to the ATOMICS host in the VM until the VM goes away.
+    # ATOMICS.app runs it while it shows the VM's host, with a Unix socket (an absolute path) in a
+    # folder only you can enter, and sends its token there alone: on a port of this Mac's loopback,
+    # whatever listened there first would get it, another account's program among them. A port
+    # instead opens that port on this Mac's loopback; it defaults to the guest's.
+    listen=''${1:-${toString cfg.hostPort}}
+    case $listen in
+      /*:*) echo "atomics-vm-host-forward: $listen contains ':'" >&2; exit 64 ;;
+      /*) ;;
+      ""|*[!0-9]*) echo "atomics-vm-host-forward: $listen is not a port or an absolute socket path" >&2; exit 64 ;;
+      *) listen=127.0.0.1:$listen ;;
     esac
-    exec ssh -N -T ${sshOptions} -o ExitOnForwardFailure=yes \
-      -L "127.0.0.1:$port:127.0.0.1:${toString cfg.hostPort}" ${host}
+    # A socket a forward of this window's left behind is replaced; its folder holds nothing else.
+    exec ssh -N -T ${sshOptions} -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+      -L "$listen:127.0.0.1:${toString cfg.hostPort}" ${host}
   '';
 
   tomlValue = value:

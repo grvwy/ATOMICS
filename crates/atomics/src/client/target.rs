@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, bail};
 use zeroize::Zeroizing;
 
-use super::link::Endpoint;
+use super::link::{self, Endpoint};
 
 /// `atomics --connect <address>` and `[client] connect`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +52,7 @@ pub fn local() -> Result<Endpoint> {
         .strip_prefix("ws://")
         .and_then(|rest| rest.parse().ok())
         .with_context(|| format!("{} names no ws:// address", path.display()))?;
-    Ok(Endpoint { addr, host: addr.to_string(), token: Zeroizing::new(advert.token.clone()) })
+    Ok(Endpoint { addr: link::Address::Tcp(addr), host: addr.to_string(), token: Zeroizing::new(advert.token.clone()) })
 }
 
 /// A paired address's endpoint, its token from the OS credential store.
@@ -61,7 +61,7 @@ pub fn address(addr: SocketAddr) -> Result<Endpoint> {
     let token = keychain
         .read_item(PAIRED_SERVICE, &format!("ws://{addr}"))?
         .with_context(|| format!("no token is kept for ws://{addr}; pair with that host first"))?;
-    Ok(Endpoint { addr, host: addr.to_string(), token: Zeroizing::new(token) })
+    Ok(Endpoint { addr: link::Address::Tcp(addr), host: addr.to_string(), token: Zeroizing::new(token) })
 }
 
 #[cfg(test)]
