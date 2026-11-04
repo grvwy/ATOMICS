@@ -16,7 +16,7 @@
 //! `<uuid>/comments`. A meaning search answers the header `X-Semantic-State` from the state's
 //! `semantic_state` (default `ready`); `unconfigured` or `unavailable` means it searched by keyword.
 //! A bare number finds the ticket with that number and is not a meaning search. `Done` tickets
-//! are not in `work-active`.
+//! are not in `work-active`, and `baseViewValueKey = "assigned-to-me"` narrows it to the state's `me`.
 //!
 //! It speaks three unrelated tool dialects, so tests can swap ticket systems by config
 //! alone: "card_*" tools with nested, structured results, and "issue_*" tools with
@@ -196,8 +196,10 @@ fn answer_rest(state: &Value, route: &[&str], query: &str, body: &Value) -> (u16
             }
             let me = state["me"].as_str().unwrap_or("Demo User");
             let view = |ticket: &&Value| match body["baseViewKey"].as_str() {
-                Some("work-active") => ticket["state"] != "Done",
-                Some("work-my") => body["baseViewValueKey"] != "assigned-to-me" || ticket["assignee"] == me,
+                Some("work-active") => {
+                    ticket["state"] != "Done"
+                        && (body["baseViewValueKey"] != "assigned-to-me" || ticket["assignee"] == me)
+                }
                 _ => true,
             };
             let named = |ticket: &&Value| {
