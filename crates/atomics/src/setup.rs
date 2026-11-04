@@ -95,28 +95,35 @@ fn login_shell_path(shell: &str, timeout: Duration) -> Result<String, String> {
         .and_then(|path| if path.trim().is_empty() { Err("it printed an empty PATH".into()) } else { Ok(path) })
 }
 
-/// The folders of `login`, in its order and followed by those only `current` has. Empty entries,
-/// which would put the working folder on PATH, are dropped.
+/// The folders of `login`, in its order and followed by those only `current` has. Entries that are
+/// not absolute are dropped (see [`absolute_folders`]).
 fn with_login_path(current: &str, login: &str) -> String {
     let mut folders: Vec<&str> = Vec::new();
-    for folder in login.split(':').chain(current.split(':')) {
-        if !folder.is_empty() && !folders.contains(&folder) {
+    for folder in absolute_folders(login).chain(absolute_folders(current)) {
+        if !folders.contains(&folder) {
             folders.push(folder);
         }
     }
     folders.join(":")
 }
 
-/// The folders of `login` that `current` lacks, each once.
+/// The folders of `login` that `current` lacks, each once, leaving out those that are not absolute.
 fn missing_folders<'a>(current: &str, login: &'a str) -> Vec<&'a str> {
     let have: Vec<&str> = current.split(':').collect();
     let mut missing: Vec<&str> = Vec::new();
-    for folder in login.split(':').filter(|folder| !folder.is_empty() && !have.contains(folder)) {
+    for folder in absolute_folders(login).filter(|folder| !have.contains(folder)) {
         if !missing.contains(&folder) {
             missing.push(folder);
         }
     }
     missing
+}
+
+/// The absolute folders of a PATH. An empty entry, `.` or `node_modules/.bin` from a shell's startup
+/// files names a folder relative to wherever a program runs: on the PATH of ATOMICS, git, probes and
+/// servers would pick up programs from a repository or the folder ATOMICS was started in.
+fn absolute_folders(path: &str) -> impl Iterator<Item = &str> {
+    path.split(':').filter(|folder| folder.starts_with('/'))
 }
 
 pub fn shell_program() -> String {
@@ -492,6 +499,28 @@ mod tests {
         // Empty entries, which mean the working folder, are dropped; a repeated folder counts once.
         assert_eq!(missing_folders("/bin", ":/opt/a::/opt/a:/bin"), ["/opt/a"]);
         assert_eq!(with_login_path("/bin::", ":/opt/a::/opt/a:/bin"), "/opt/a:/bin");
+    }
+
+    #[test]
+    fn relative_folders_of_a_login_shell_never_reach_the_path_of_atomics() {
+        // As an rc file that adds the working folder and a project's tools would print it.
+        let login = ".:node_modules/.bin:/opt/tools/bin:bin:./vendor/bin:/usr/bin:~/bin";
+        assert_eq!(missing_folders("/usr/bin:/bin", login), ["/opt/tools/bin"]);
+        assert_eq!(with_login_path("/usr/bin:/bin", login), "/opt/tools/bin:/usr/bin:/bin");
+        // Nor do those of the PATH it was started with, once it changes.
+        assert_eq!(with_login_path(".:/usr/bin:node_modules/.bin", login), "/opt/tools/bin:/usr/bin");
+        // A login PATH whose only extra folders are relative changes nothing.
+        assert!(missing_folders("/usr/bin", ".:node_modules/.bin:/usr/bin").is_empty());
+
+        let dir = crate::test_support::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        crate::test_support::write_program(&shell, format!("#!/bin/sh\nprintf '__ATOMICS__{login}__ATOMICS__'\n"));
+        let (found, merged) = LoginPath::read(shell.to_string_lossy().into(), "/usr/bin:/bin", Duration::from_secs(10));
+        assert_eq!(found.added, Some(1));
+        assert_eq!(merged.as_deref(), Some("/opt/tools/bin:/usr/bin:/bin"));
+        let (_, merged) =
+            LoginPath::read(shell.to_string_lossy().into(), "/opt/tools/bin:/usr/bin", Duration::from_secs(10));
+        assert_eq!(merged, None, "relative folders alone are no reason to change PATH");
     }
 
     #[test]

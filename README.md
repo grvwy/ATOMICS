@@ -105,7 +105,8 @@ open -a ATOMICS --args --workspace backend
 
 The Dock, Spotlight and a Linux desktop launcher start ATOMICS with a bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`).
 At startup ATOMICS asks your login shell (`$SHELL -l -i -c`) for its `PATH`, once and for at most five seconds, and
-adds the folders it lacks. Everything ATOMICS runs itself then finds what a terminal would: git with its LFS filters
+adds the folders it lacks. Only absolute folders count: an entry such as `.` or `node_modules/.bin` would find
+programs in whatever folder a command runs in, so ATOMICS leaves it out. Everything ATOMICS runs itself then finds what a terminal would: git with its LFS filters
 and hooks, the Codex version check, MCP and ticket servers and queued commands. A `PATH` that already has those
 folders, as one from a terminal does, is left alone; a shell that gives none in time leaves the `PATH` ATOMICS was
 started with. `atomics doctor` says which happened.
