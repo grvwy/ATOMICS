@@ -1166,7 +1166,7 @@ impl Worker {
     fn http_broken(&mut self, config: &TicketConfig, api: &McpServer, err: McpError) -> String {
         self.throttled = matches!(err, McpError::Transport { retryable: true, .. });
         match &err {
-            McpError::SignInRequired(_) => self.http = None,
+            McpError::SignInRequired(_) | McpError::SignInRefused(_) => self.http = None,
             McpError::Server(message) => self.refusal = config.remote.errors.classify(message),
             McpError::Tool { message, details } => {
                 self.refusal = config.remote.errors.classify(&format!("{message} {details}"))
@@ -1183,7 +1183,7 @@ impl Worker {
     /// run with others.
     fn broken(&mut self, server: &McpServer, err: McpError) -> String {
         self.throttled = matches!(err, McpError::Transport { retryable: true, .. });
-        if matches!(err, McpError::SignInRequired(_)) {
+        if err.needs_sign_in() {
             // No backoff: once the user signs in, the next job reconnects with the new tokens.
             self.client = None;
         }

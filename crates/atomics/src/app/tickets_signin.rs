@@ -2,8 +2,9 @@
 //! jobs, the state the host publishes for every client (`HostInfo::sign_in`), and the desktop's
 //! Tickets panel banner and header chip. Needing a sign-in is a state shown here, not an error: the
 //! worker does not back off from it, and only a click (or `atomics tickets login`) ever opens a
-//! browser. A ticket job the server refused for its sign-in marks it expired, so every place that
-//! shows it offers "Reconnect"; once a sign-in finishes, the worker connects again without a restart.
+//! browser. A ticket job whose saved sign-in the server refused marks it expired, so every place that
+//! shows it offers "Reconnect"; with no saved sign-in it offers "Sign in to <system>". Once a sign-in
+//! finishes, the worker connects again without a restart.
 //! A client's sign-in (`host_command` `sign_in`) opens no browser on this machine: the client shows the
 //! address and pastes back the one its browser ended on.
 use super::*;
@@ -22,8 +23,9 @@ pub(super) struct SignUi {
     out: Option<std::sync::mpsc::Receiver<Result<crate::mcp_client::Revocation, String>>>,
     /// Why the last attempt failed; free of tokens.
     pub(super) failure: Option<String>,
-    /// Why a ticket job said the server wants a sign-in again (it refused the saved one, or it ran
-    /// out), until a sign-in finishes or a later job gets through.
+    /// Why a ticket job said the server refused the saved sign-in (or it ran out), until a sign-in
+    /// finishes, a later job gets through or the person signs out. A job that found no saved sign-in
+    /// never sets it.
     pub(super) expired: Option<String>,
     /// The sign-in under way was started by a client: no browser was opened here.
     pub(super) for_client: bool,
@@ -209,19 +211,22 @@ impl State {
         Ok(())
     }
 
-    /// A ticket job failed: when it says a sign-in is required (the server, or a resource the sign-in
-    /// stands for, refused the saved one), every place that shows the tickets offers it ("Reconnect"),
-    /// through the same `ask_sign_in` as the panel. Only that signal counts: a refusal the OAuth layer
+    /// A ticket job failed: when it says a sign-in is required, every place that shows the tickets offers
+    /// it, through the same `ask_sign_in` as the panel. Only when the server refused the saved sign-in
+    /// (or it ran out) does the button read "Reconnect": with nothing saved, as in a new home or after
+    /// signing out, it stays "Sign in to <system>". Only that signal counts: a refusal the OAuth layer
     /// already turned into an ordinary error stays one, so nothing brings the banner back by itself.
     pub(super) fn ticket_job_failed(&mut self, error: &str) {
-        if self.sign_server().is_none() || !crate::mcp_client::is_sign_in_required(error) {
+        use crate::mcp_client::{is_sign_in_refused, is_sign_in_required, sign_in_reason};
+        if self.sign_server().is_none() || !is_sign_in_required(error) {
             return;
         }
-        let reason = error
-            .strip_prefix(crate::mcp_client::SIGN_IN_REQUIRED)
-            .map_or(error, |rest| rest.trim_start_matches(':').trim_start());
-        let reason = atomics_ui::text::truncate(&self.scrub(reason), 200).to_string();
-        self.tickets.sign.expired = Some(reason);
+        // A refused sign-in is cleared, so the jobs after it find nothing saved; it stays expired until
+        // a sign-in finishes, a job gets through or the person signs out.
+        if is_sign_in_refused(error) {
+            let reason = atomics_ui::text::truncate(&self.scrub(sign_in_reason(error)), 200).to_string();
+            self.tickets.sign.expired = Some(reason);
+        }
         self.ask_sign_in();
     }
 
@@ -400,6 +405,91 @@ mod tests {
         app.runtime.mutate(key, None, command, None)
     }
 
+    /// The button, and the state it is drawn from.
+    fn button(app: &Desktop<'_>) -> (SignInState, String) {
+        let info = app.runtime.sign_in_info().expect("an OAuth server");
+        (info.state, atomics_ui::signin::button_label(&info))
+    }
+
+    /// Signs in through the fake server's browser, and waits for the identity the worker reads after.
+    fn sign_in_here(app: &mut Desktop<'_>) {
+        app.runtime.start_sign_in();
+        work(app, "the address", |r| r.sign_in_info().and_then(|i| i.url).is_some());
+        crate::mcp_client::oauth_test_browse(&app.runtime.sign_in_info().unwrap().url.unwrap());
+        work(app, "the sign-in", |r| r.sign_in_info().is_some_and(|i| i.state == SignInState::SignedIn));
+        work(app, "the identity", |r| r.tickets.whoami.is_some());
+    }
+
+    /// Runs the whoami job and waits for its answer, then reads the sign-in state again.
+    fn whoami_answered(app: &mut Desktop<'_>, what: &str) {
+        app.runtime.refresh_ticket_identity();
+        assert!(app.runtime.tickets.pending > 0, "the whoami job is on its way");
+        work(app, what, |r| r.tickets.pending == 0);
+        app.runtime.poll_signin();
+    }
+
+    #[test]
+    fn reconnect_shows_only_once_the_server_refuses_a_saved_sign_in() {
+        with_app(
+            "app::tickets_signin::tests::reconnect_shows_only_once_the_server_refuses_a_saved_sign_in",
+            |app, _| {
+                let fake = FakeOAuthServer::start();
+                let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+                app.runtime.config.tickets = toml::from_str(
+                "system = \"tracker\"\n[operations.whoami]\ntool = \"whoami\"\nresult = { id = \"userId\", kind = \"kind\", name = \"displayName\" }\n",
+            )
+            .unwrap();
+                app.runtime.config.tickets.server = fake.server();
+                app.runtime.tickets.sign.override_oauth(oauth);
+                app.runtime.tickets.sign.headless = true;
+                let sign_in = (SignInState::SignedOut, "Sign in to tracker".to_string());
+
+                // A fresh home: the whoami job sent as the config applies finds no saved sign-in. The
+                // panel asks for one, and the button signs in rather than reconnects.
+                app.runtime.apply_ticket_config();
+                assert!(app.runtime.tickets.pending > 0, "the whoami job is on its way");
+                work(app, "the first whoami job", |r| r.tickets.pending == 0);
+                app.runtime.poll_signin();
+                assert!(app.runtime.tickets.panel.signin);
+                assert_eq!(button(app), sign_in);
+                assert!(app.runtime.tickets.sign.expired.is_none());
+                assert_eq!(app.runtime.host_info().sign_in.map(|info| info.state), Some(SignInState::SignedOut));
+
+                // Signed in, then out: the jobs after it find nothing saved either.
+                sign_in_here(app);
+                app.runtime.start_sign_out();
+                work(app, "the sign-out", |r| {
+                    r.tickets.sign.out.is_none() && r.tickets.sign.state() == Some(&SignState::SignedOut)
+                });
+                whoami_answered(app, "the whoami job after signing out");
+                assert!(app.runtime.tickets.panel.signin);
+                assert_eq!(button(app), sign_in);
+
+                // Signed in again, and the server refuses the saved sign-in: now it is Reconnect, saying why.
+                sign_in_here(app);
+                {
+                    let mut st = fake.state.lock().unwrap();
+                    st.access.clear();
+                    st.refresh.clear();
+                }
+                whoami_answered(app, "the refusal");
+                assert_eq!(button(app), (SignInState::Expired, "Reconnect".to_string()));
+                let info = app.runtime.sign_in_info().unwrap();
+                assert!(info.reason.as_deref().is_some_and(|r| r.contains("refused the saved sign-in")), "{info:?}");
+                // The refusal cleared the saved sign-in, so the next job finds none; it is still Reconnect.
+                whoami_answered(app, "a job after the refusal");
+                assert_eq!(button(app), (SignInState::Expired, "Reconnect".to_string()));
+                // Signing out from there forgets the refusal too.
+                app.runtime.start_sign_out();
+                work(app, "the second sign-out", |r| {
+                    r.tickets.sign.out.is_none() && r.tickets.sign.state() == Some(&SignState::SignedOut)
+                });
+                whoami_answered(app, "the whoami job after the second sign-out");
+                assert_eq!(button(app), sign_in);
+            },
+        );
+    }
+
     #[test]
     fn a_refused_sign_in_offers_reconnect_and_a_clients_sign_in_reconnects_the_worker() {
         with_app(
@@ -503,12 +593,25 @@ mod tests {
                     assert!(!app.runtime.tickets.panel.signin, "{error}");
                 }
                 // A required sign-in asks, through the panel's own `ask_sign_in`, and the state is read again.
-                app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+                // With nothing saved it is a sign-in, not a reconnect.
+                app.runtime.ticket_job_failed("sign-in required: https://tracker.example/mcp needs a sign-in");
+                assert!(app.runtime.tickets.panel.signin && app.runtime.tickets.sign.state.is_none());
+                app.runtime.poll_signin();
+                let info = app.runtime.sign_in_info().unwrap();
+                assert_eq!((info.state, info.reason.as_deref()), (SignInState::SignedOut, None));
+                assert_eq!(atomics_ui::signin::button_label(&info), "Sign in to tracker");
+                // The server refused the saved one: Reconnect, saying why.
+                signed_in(app);
+                app.runtime.ticket_job_failed("sign-in required again: the server refused the saved sign-in");
                 assert!(app.runtime.tickets.panel.signin && app.runtime.tickets.sign.state.is_none());
                 app.runtime.poll_signin();
                 let info = app.runtime.sign_in_info().unwrap();
                 assert_eq!(info.state, SignInState::Expired);
                 assert_eq!(info.reason.as_deref(), Some("the server refused the saved sign-in"));
+                // The refused sign-in was cleared, so the next job finds none: still Reconnect.
+                app.runtime.ticket_job_failed("sign-in required: https://tracker.example/mcp needs a sign-in");
+                app.runtime.poll_signin();
+                assert_eq!(app.runtime.sign_in_info().unwrap().state, SignInState::Expired);
                 // A sign-in made elsewhere (`atomics tickets login`) is noticed by the next job that gets through.
                 app.runtime.ticket_job_succeeded();
                 signed_in(app);

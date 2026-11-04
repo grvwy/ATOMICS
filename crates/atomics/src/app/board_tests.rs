@@ -492,7 +492,7 @@ fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
             assert!(labels(&rendered).contains(&"Sign in to tracker".to_string()), "{:?}", labels(&rendered));
 
             // The server refused the saved sign-in: the same place offers Reconnect, and says why.
-            app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+            app.runtime.ticket_job_failed("sign-in required again: the server refused the saved sign-in");
             app.runtime.poll_signin();
             let rendered = frame(app, ctx, 1400.0, 0.1, vec![]);
             let texts = labels(&rendered);

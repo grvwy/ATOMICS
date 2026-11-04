@@ -41,6 +41,9 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// What a failed or refused sign-in says first; the ticket worker's errors start with it too.
 pub const SIGN_IN_REQUIRED: &str = "sign-in required";
+/// What an error says first when the server refused the saved sign-in (or it ran out). It starts with
+/// [`SIGN_IN_REQUIRED`], so whatever only asks whether a sign-in is needed reads it the same way.
+pub const SIGN_IN_REFUSED: &str = "sign-in required again";
 /// Why a further resource gets no token: only a person signing in can change this.
 const NOT_COVERED: &str = "is not covered by this sign-in: sign in once more";
 
@@ -64,9 +67,21 @@ pub enum ResourceAccess {
     Missing,
 }
 
-/// Whether a ticket worker's error string says the server needs a sign-in.
+/// Whether a ticket worker's error string says the server needs a sign-in, saved or not.
 pub fn is_sign_in_required(error: &str) -> bool {
     error.starts_with(SIGN_IN_REQUIRED)
+}
+
+/// Whether a ticket worker's error string says the server refused the saved sign-in (or it ran out),
+/// rather than that nothing is saved for it.
+pub fn is_sign_in_refused(error: &str) -> bool {
+    error.starts_with(SIGN_IN_REFUSED)
+}
+
+/// What a sign-in error says after its [`SIGN_IN_REQUIRED`] or [`SIGN_IN_REFUSED`] prefix.
+pub fn sign_in_reason(error: &str) -> &str {
+    let rest = error.strip_prefix(SIGN_IN_REFUSED).or_else(|| error.strip_prefix(SIGN_IN_REQUIRED));
+    rest.map_or(error, |rest| rest.trim_start_matches(':').trim_start())
 }
 
 /// What a sign-in tells the person running it while it waits.
@@ -575,7 +590,7 @@ impl Session {
 
     /// Exchanges the refresh token for a new pair, stores it, and uses it. The refresh token may
     /// rotate; the new one is stored before the old one is dropped. A refusal clears the sign-in
-    /// and says `SignInRequired`; a network failure leaves it for the next try. For a further resource
+    /// and says `SignInRefused`; a network failure leaves it for the next try. For a further resource
     /// a refusal leaves the sign-in alone: it says nothing about the server's own resource.
     ///
     /// Other ATOMICS processes refresh the same sign-in: each refresh holds the server's sign-in lock
@@ -584,6 +599,7 @@ impl Session {
     pub(crate) fn refresh(&mut self) -> Result<(), McpError> {
         self.oauth.clear_trace_secrets();
         let need = |why: &str| McpError::SignInRequired(format!("{} {why}", self.url));
+        let refused = |why: &str| McpError::SignInRefused(format!("{} {why}", self.url));
         let _lock = self.oauth.store.oauth_lock(&self.key).map_err(storage)?;
         let tokens = self
             .oauth
@@ -608,9 +624,10 @@ impl Session {
                 return Err(self.refuse_locked(&extra));
             }
             let _ = self.oauth.clear(&self.key);
-            return Err(need("needs a sign-in again: its token expired and the server gave no refresh token"));
+            return Err(refused("has a saved sign-in that expired, with no refresh token"));
         };
-        let endpoint = Url::parse(&self.tokens.token_endpoint).map_err(|_| need("needs a sign-in again"))?;
+        let endpoint = Url::parse(&self.tokens.token_endpoint)
+            .map_err(|_| refused("has a saved sign-in with an unusable token endpoint"))?;
         let form = [
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.as_str()),
@@ -629,7 +646,7 @@ impl Session {
                 Some(extra) => Err(self.refuse_locked(&extra)),
                 None => {
                     let _ = self.oauth.clear(&self.key);
-                    Err(need("needs a sign-in again: the server refused the saved sign-in"))
+                    Err(refused("refused the saved sign-in"))
                 }
             },
             Err(TokenError::Transport(err)) => Err(err),
@@ -640,7 +657,7 @@ impl Session {
     /// a new sign-in every time would loop when it refuses for a reason no sign-in changes.
     pub(crate) fn refused_by_resource(&mut self) -> McpError {
         let Some(extra) = self.extra.clone() else {
-            return McpError::SignInRequired(format!("{} rejected the saved sign-in", self.url));
+            return McpError::SignInRefused(format!("{} rejected the saved sign-in", self.url));
         };
         let _lock = match self.oauth.store.oauth_lock(&self.key) {
             Ok(lock) => lock,

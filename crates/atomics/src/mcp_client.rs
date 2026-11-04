@@ -21,7 +21,8 @@ pub(crate) use oauth::tests::{
     open_in_browser as oauth_test_open,
 };
 pub use oauth::{
-    OAuth, ResourceAccess, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required,
+    OAuth, ResourceAccess, Revocation, SIGN_IN_REFUSED, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus,
+    is_sign_in_refused, is_sign_in_required, sign_in_reason,
 };
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -43,8 +44,12 @@ pub enum McpError {
         message: String,
         details: String,
     },
-    /// The server needs a person to sign in (again): never retried, never a browser by itself.
+    /// The server needs a person to sign in: nothing is saved for it (never signed in here, or signed
+    /// out), or the saved sign-in does not cover this resource. Never retried, never a browser by itself.
     SignInRequired(String),
+    /// The server refused the saved sign-in, or it ran out with nothing to refresh it: a person signs
+    /// in again ("Reconnect"). Never retried, never a browser by itself.
+    SignInRefused(String),
 }
 
 impl McpError {
@@ -58,6 +63,11 @@ impl McpError {
 
     fn http(status: u16, message: String) -> Self {
         Self::Transport { message, retryable: status == 429 || (500..600).contains(&status) }
+    }
+
+    /// Whether a person has to sign in before this works, whether or not a sign-in was saved.
+    pub fn needs_sign_in(&self) -> bool {
+        matches!(self, McpError::SignInRequired(_) | McpError::SignInRefused(_))
     }
 
     fn request_error(context: String, error: ureq::Error) -> Self {
@@ -76,6 +86,7 @@ impl std::fmt::Display for McpError {
                 f.write_str(message)
             }
             McpError::SignInRequired(message) => write!(f, "{SIGN_IN_REQUIRED}: {message}"),
+            McpError::SignInRefused(message) => write!(f, "{SIGN_IN_REFUSED}: {message}"),
         }
     }
 }
@@ -440,7 +451,7 @@ impl HttpServer {
                 .send(message.to_string())
                 .map_err(|err| McpError::request_error(format!("request to {} failed", self.url), err))?;
             // The server no longer accepts the token (revoked or expired early): refresh once and
-            // retry. A refresh that fails is SignInRequired, so this cannot loop.
+            // retry. A refresh that fails needs a sign-in, so this cannot loop.
             if response.status().as_u16() == 401
                 && !retried
                 && let Some(oauth) = &mut self.oauth
@@ -472,7 +483,7 @@ impl HttpServer {
                 McpError::http(status, format!("{} answered HTTP {status}; reading the answer failed: {err}", self.url))
             })?;
             if status == 401 && self.oauth.is_some() {
-                return Err(McpError::SignInRequired(format!("{} rejected the saved sign-in", self.url)));
+                return Err(McpError::SignInRefused(format!("{} rejected the saved sign-in", self.url)));
             }
             if status == 401 && self.token.is_none() && challenges_oauth(&challenges) {
                 return Err(McpError::SignInRequired(format!(
