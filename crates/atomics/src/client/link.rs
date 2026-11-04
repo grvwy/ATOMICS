@@ -2,8 +2,10 @@
 //! connects with the host's bearer token, then carries `atomics.v1` text frames both ways until either
 //! side closes. What happens is reported as [`Event`]s, each followed by a wake, so the window draws it.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, mpsc};
@@ -18,10 +20,28 @@ use zeroize::Zeroizing;
 /// Where a host's server is and how to get in.
 pub struct Endpoint {
     /// The address to dial: the server's, or a forward's that leads to it.
-    pub addr: SocketAddr,
+    pub addr: Address,
     /// The `Host` the upgrade names: always a loopback name, whatever port the forward has.
     pub host: String,
     pub token: Zeroizing<String>,
+}
+
+/// What the link dials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    /// A port on this machine's loopback.
+    Tcp(SocketAddr),
+    /// A forward's Unix socket, in a folder only this user can enter (the VM's host, `vm.rs`).
+    Unix(PathBuf),
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Address::Tcp(addr) => write!(f, "{addr}"),
+            Address::Unix(path) => write!(f, "{}", path.display()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -32,9 +52,21 @@ impl std::fmt::Debug for Endpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Open { socket: u64, protocol: String },
-    Data { socket: u64, bytes: Vec<u8> },
-    Closed { socket: u64, code: u16 },
+    Open {
+        socket: u64,
+        protocol: String,
+    },
+    Data {
+        socket: u64,
+        bytes: Vec<u8>,
+    },
+    /// The link ended; `unreachable` says why when it never got through (the host could not be found
+    /// or connected to), for the window to show.
+    Closed {
+        socket: u64,
+        code: u16,
+        unreachable: Option<String>,
+    },
 }
 
 /// How long a read waits before the thread looks for frames to send; a keystroke waits at most this.
@@ -48,7 +80,8 @@ pub struct Link {
 
 impl Link {
     /// Find the host with `resolve` and connect, on a thread of its own; `wake` is called after every
-    /// event. A host that cannot be found is a drop (1006), so the driver tries again later.
+    /// event. A host that cannot be found is a drop (1006), so the driver tries again later; why is in
+    /// the closing event.
     pub fn open(
         socket: u64,
         resolve: super::Resolve,
@@ -63,14 +96,15 @@ impl Link {
                 let _ = events.send(event);
                 wake();
             };
-            let code = match resolve().map_err(|_| close::ABNORMAL).and_then(|endpoint| connect(&endpoint)) {
+            let found = resolve().map_err(|error| Refused::because(format!("{error:#}")));
+            let (code, unreachable) = match found.and_then(|endpoint| connect(&endpoint)) {
                 Ok((mut ws, protocol)) => {
                     send(Event::Open { socket, protocol });
-                    pump(&mut ws, &frames, &running, &mut |bytes| send(Event::Data { socket, bytes }))
+                    (pump(&mut ws, &frames, &running, &mut |bytes| send(Event::Data { socket, bytes })), None)
                 }
-                Err(code) => code,
+                Err(Refused { code, why }) => (code, Some(why)),
             };
-            send(Event::Closed { socket, code });
+            send(Event::Closed { socket, code, unreachable });
         });
         if spawned.is_err() {
             eprintln!("atomics: could not start the connection's thread");
@@ -94,18 +128,84 @@ impl Drop for Link {
     }
 }
 
+/// Why a dial did not get through: the close code the driver gets, and what the window shows.
+#[derive(Debug)]
+pub(super) struct Refused {
+    pub code: u16,
+    pub why: String,
+}
+
+impl Refused {
+    /// A drop (1006): the driver dials again later.
+    fn because(why: impl std::fmt::Display) -> Self {
+        Self { code: close::ABNORMAL, why: why.to_string() }
+    }
+}
+
+/// The connection under the WebSocket: a loopback port, or a forward's Unix socket.
+pub(super) enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl Stream {
+    fn open(addr: &Address) -> io::Result<Stream> {
+        match addr {
+            Address::Tcp(addr) => {
+                let stream = TcpStream::connect_timeout(addr, CONNECT)?;
+                let _ = stream.set_nodelay(true);
+                Ok(Stream::Tcp(stream))
+            }
+            Address::Unix(path) => UnixStream::connect(path).map(Stream::Unix),
+        }
+    }
+
+    fn set_timeouts(&self, read: Duration, write: Duration) -> io::Result<()> {
+        match self {
+            Stream::Tcp(stream) => stream.set_read_timeout(Some(read)).and(stream.set_write_timeout(Some(write))),
+            Stream::Unix(stream) => stream.set_read_timeout(Some(read)).and(stream.set_write_timeout(Some(write))),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => stream.read(buf),
+            Stream::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => stream.write(buf),
+            Stream::Unix(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Tcp(stream) => stream.flush(),
+            Stream::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
 /// The upgrade, with the token. A refused token is [`close::UNAUTHORISED`]; anything else that fails is
 /// 1006, a drop.
-fn connect(endpoint: &Endpoint) -> Result<(WebSocket<TcpStream>, String), u16> {
-    let stream = TcpStream::connect_timeout(&endpoint.addr, CONNECT).map_err(|_| close::ABNORMAL)?;
-    let _ = stream.set_nodelay(true);
-    stream.set_read_timeout(Some(CONNECT)).map_err(|_| close::ABNORMAL)?;
-    stream.set_write_timeout(Some(CONNECT)).map_err(|_| close::ABNORMAL)?;
-    let mut request = format!("ws://{}", endpoint.host).into_client_request().map_err(|_| close::ABNORMAL)?;
+pub(super) fn connect(endpoint: &Endpoint) -> Result<(WebSocket<Stream>, String), Refused> {
+    let addr = &endpoint.addr;
+    let stream = Stream::open(addr).map_err(|error| Refused::because(format!("cannot connect to {addr}: {error}")))?;
+    stream.set_timeouts(CONNECT, CONNECT).map_err(Refused::because)?;
+    let mut request = format!("ws://{}", endpoint.host).into_client_request().map_err(Refused::because)?;
     let headers = request.headers_mut();
     let bearer = Zeroizing::new(format!("Bearer {}", endpoint.token.as_str()));
-    headers.insert("Authorization", bearer.parse().map_err(|_| close::ABNORMAL)?);
-    headers.insert("Sec-WebSocket-Protocol", wire::SUBPROTOCOL.parse().map_err(|_| close::ABNORMAL)?);
+    // Never the error itself: it could quote the token.
+    let bearer = bearer.parse().map_err(|_| Refused::because("the token cannot be sent in a header"))?;
+    headers.insert("Authorization", bearer);
+    headers.insert("Sec-WebSocket-Protocol", wire::SUBPROTOCOL.parse().map_err(Refused::because)?);
     match tungstenite::client::client_with_config(request, stream, Some(socket_config())) {
         Ok((ws, response)) => {
             let protocol = response
@@ -114,13 +214,18 @@ fn connect(endpoint: &Endpoint) -> Result<(WebSocket<TcpStream>, String), u16> {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            ws.get_ref().set_read_timeout(Some(POLL)).map_err(|_| close::ABNORMAL)?;
+            ws.get_ref().set_timeouts(POLL, CONNECT).map_err(Refused::because)?;
             Ok((ws, protocol))
         }
         Err(HandshakeError::Failure(tungstenite::Error::Http(response))) if response.status() == 401 => {
-            Err(close::UNAUTHORISED)
+            Err(Refused { code: close::UNAUTHORISED, why: format!("the host at {addr} refused the token") })
         }
-        Err(_) => Err(close::ABNORMAL),
+        Err(HandshakeError::Failure(error)) => {
+            Err(Refused::because(format!("the host at {addr} did not take the connection: {error}")))
+        }
+        Err(HandshakeError::Interrupted(_)) => {
+            Err(Refused::because(format!("the host at {addr} did not answer in time")))
+        }
     }
 }
 
@@ -132,7 +237,7 @@ fn socket_config() -> tungstenite::protocol::WebSocketConfig {
 
 /// Frames both ways until the host closes, the link drops, or `stop`. The close code it ended with.
 fn pump(
-    ws: &mut WebSocket<TcpStream>,
+    ws: &mut WebSocket<Stream>,
     frames: &Receiver<String>,
     stop: &AtomicBool,
     received: &mut dyn FnMut(Vec<u8>),

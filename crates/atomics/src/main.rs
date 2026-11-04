@@ -472,7 +472,7 @@ fn main() -> eframe::Result {
         let target = match client::target::Target::parse(&connect) {
             Ok(target) => target,
             Err(error) => {
-                eprintln!("atomics: {error:#}");
+                client::report_bad_connect(&connect, cli.connect.is_some(), &error);
                 std::process::exit(2);
             }
         };

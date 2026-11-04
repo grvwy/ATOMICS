@@ -852,14 +852,16 @@ mod tests {
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn children_cannot_inherit_instance_routing() {
-        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), None);
+        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), None, None);
         let output = crate::test_support::output(
             std::process::Command::new("/usr/bin/env")
                 .args(args)
                 .env("ATOMICS_SOCKET", "/parent/socket")
+                .env("ATOMICS_HOST_SOCKET", "/parent/socket")
                 .env("ATOMICS_PANE", "parent-pane")
                 .env("ATOMICS_HOOK_PANE", "parent-pane")
                 .env("ATOMICS_HOME", "/parent/home")
@@ -872,6 +874,7 @@ mod isolation_tests {
         let env = String::from_utf8(output.stdout).unwrap();
         for key in [
             "ATOMICS_SOCKET",
+            "ATOMICS_HOST_SOCKET",
             "ATOMICS_PANE",
             "ATOMICS_HOME",
             "ATOMICS_CONFIG",
@@ -886,7 +889,7 @@ mod isolation_tests {
 
     #[test]
     fn a_session_gets_its_own_hook_pane_instead_of_the_parents() {
-        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), Some("own-pane".into()));
+        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), None, Some("own-pane".into()));
         let output = crate::test_support::output(
             std::process::Command::new("/usr/bin/env").args(args).env("ATOMICS_HOOK_PANE", "parent-pane"),
         );
@@ -894,5 +897,56 @@ mod isolation_tests {
         let env = String::from_utf8(output.stdout).unwrap();
         let panes: Vec<&str> = env.lines().filter(|line| line.starts_with("ATOMICS_HOOK_PANE=")).collect();
         assert_eq!(panes, ["ATOMICS_HOOK_PANE=own-pane"], "{env}");
+    }
+
+    #[test]
+    fn a_terminal_reaches_its_own_host_instead_of_the_parents() {
+        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new(), Some("/run/host/atomics.sock"), None);
+        let output = crate::test_support::output(
+            std::process::Command::new("/usr/bin/env")
+                .args(args)
+                .env("ATOMICS_SOCKET", "/parent/socket")
+                .env("ATOMICS_HOST_SOCKET", "/parent/socket"),
+        );
+        assert!(output.status.success());
+        let env = String::from_utf8(output.stdout).unwrap();
+        let routing: Vec<&str> =
+            env.lines().filter(|line| line.starts_with("ATOMICS_") && line.contains("_SOCKET=")).collect();
+        assert_eq!(
+            routing,
+            ["ATOMICS_SOCKET=/run/host/atomics.sock", "ATOMICS_HOST_SOCKET=/run/host/atomics.sock"],
+            "{env}"
+        );
+    }
+
+    /// Every terminal a host starts names that host's socket, even where nothing above it does: a login
+    /// shell on NixOS that skips the profile's session variables, or a host with a socket of its own.
+    #[test]
+    fn every_terminal_a_host_starts_names_its_socket() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let record = dir.path().join("record");
+        let script = format!(
+            "printf '%s|%s' \"${{ATOMICS_SOCKET-unset}}\" \"${{ATOMICS_HOST_SOCKET-unset}}\" > {}.part && mv {0}.part {0}",
+            record.display()
+        );
+        let env = HashMap::from([("ATOMICS_SOCKET".to_string(), "/parent/socket".to_string())]);
+        let _terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/sh".into(),
+            vec!["-c".into(), script],
+            dir.path(),
+            env,
+            100,
+        )
+        .unwrap();
+        let deadline =
+            std::time::Instant::now() + crate::test_support::scaled_timeout(std::time::Duration::from_secs(10));
+        while !record.exists() {
+            assert!(std::time::Instant::now() < deadline, "the terminal never ran");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let socket = atomics_core::paths::socket_path().display().to_string();
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), format!("{socket}|{socket}"));
     }
 }

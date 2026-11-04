@@ -306,7 +306,7 @@ const NO_SLOT_HERE: i32 = 75;
 const RECONNECT_FOR: Duration = Duration::from_secs(120);
 
 /// `atomics queue`: waits for a slot in the running ATOMICS, then runs the command and exits
-/// with its status. Without a running ATOMICS the command runs right away.
+/// with its status. Without a running ATOMICS the command runs right away, and says so.
 pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
     let Some((program, args)) = command.split_first() else {
         eprintln!("atomics queue: nothing to run");
@@ -314,7 +314,11 @@ pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
     };
     let label = command.join(" ");
     let held = match hold_slot(socket, class, &label) {
-        Ok(held) => held,
+        Ok(Queued::Held(stream)) => Some(stream),
+        Ok(Queued::Without(why)) => {
+            eprintln!("atomics queue: {why}; running without a {} slot", class.name());
+            None
+        }
         Err(code) => return code,
     };
     let status = std::process::Command::new(program).args(args).status();
@@ -331,8 +335,17 @@ pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
     }
 }
 
-/// The held slot's connection, or None to run without one (no ATOMICS). Err is an exit code.
-fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Option<UnixStream>, i32> {
+/// What `atomics queue` runs its command with.
+#[derive(Debug)]
+enum Queued {
+    /// The connection that holds the slot until it closes.
+    Held(UnixStream),
+    /// No slot, and why; said before the command runs.
+    Without(String),
+}
+
+/// The held slot, or why the command runs without one. Err is an exit code.
+fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Queued, i32> {
     let mut deadline: Option<Instant> = None;
     loop {
         match UnixStream::connect(socket) {
@@ -340,10 +353,9 @@ fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Option<Unix
                 // ATOMICS is back: a later restart gets the full reconnect time again.
                 deadline = None;
                 match wait_for_slot(stream, class, label) {
-                    Ok(stream) => return Ok(Some(stream)),
+                    Ok(stream) => return Ok(Queued::Held(stream)),
                     Err(SlotError::Refused(reason)) => {
-                        eprintln!("atomics queue: ATOMICS cannot queue ({reason}); running without a slot");
-                        return Ok(None);
+                        return Ok(Queued::Without(format!("ATOMICS cannot queue ({reason})")));
                     }
                     // ATOMICS went away while this waited: wait for it to come back and queue again.
                     Err(SlotError::Lost(err)) => eprintln!("atomics queue: {err:#}; reconnecting"),
@@ -357,10 +369,14 @@ fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Option<Unix
                 );
                 return Err(NO_SLOT_HERE);
             }
-            Err(_) if deadline.is_none() && !socket.exists() => return Ok(None),
+            Err(_) if deadline.is_none() && !socket.exists() => {
+                return Ok(Queued::Without(format!(
+                    "no ATOMICS socket at {} (ATOMICS_SOCKET names the one to queue in)",
+                    socket.display()
+                )));
+            }
             Err(err) if deadline.is_some_and(|d| Instant::now() > d) => {
-                eprintln!("atomics queue: ATOMICS did not come back ({err}); running without a slot");
-                return Ok(None);
+                return Ok(Queued::Without(format!("ATOMICS did not come back ({err})")));
             }
             Err(_) => {}
         }
@@ -537,8 +553,20 @@ mod tests {
             }
         });
         let started = Instant::now();
-        assert!(hold_slot(&socket, SlotClass::Test, "cargo test").unwrap().is_none());
+        let Ok(Queued::Without(why)) = hold_slot(&socket, SlotClass::Test, "cargo test") else { panic!("a slot") };
+        assert!(why.contains("cannot queue") && why.contains("unknown variant"), "{why}");
         assert!(started.elapsed() < Duration::from_secs(2), "a refusal must not be retried");
+    }
+
+    /// An agent whose terminal names no socket (or the wrong one) is told it runs without a slot.
+    #[test]
+    fn a_missing_socket_is_named_rather_than_skipped_silently() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let missing = dir.path().join("missing.sock");
+        let started = Instant::now();
+        let Ok(Queued::Without(why)) = hold_slot(&missing, SlotClass::Test, "cargo test") else { panic!("a slot") };
+        assert!(why.contains(&missing.display().to_string()) && why.contains("ATOMICS_SOCKET"), "{why}");
+        assert!(started.elapsed() < Duration::from_secs(2), "nothing to wait for");
     }
 
     fn client(socket: &Path, class: &str) -> (UnixStream, BufReader<UnixStream>) {
@@ -622,7 +650,7 @@ mod tests {
         let started = Instant::now();
         let held = hold_slot(&socket, SlotClass::Test, "cargo test").unwrap();
         restart.join().unwrap();
-        assert!(held.is_some(), "the client must get a slot from the restarted ATOMICS");
+        assert!(matches!(held, Queued::Held(_)), "the client must get a slot from the restarted ATOMICS: {held:?}");
         assert!(started.elapsed() >= Duration::from_secs(3), "it must not run before ATOMICS is back");
     }
 

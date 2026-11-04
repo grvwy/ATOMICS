@@ -43,7 +43,7 @@ With the host in the VM (recommended):
 | --- | --- | --- |
 | UI | `ATOMICS.app`, Metal, a client of the VM's host (`[client] connect = "vm"`) | none |
 | Runtime: agents, chief, terminals, plans, approvals, worktrees, git | none | `atomics host`, the `atomics-host` service, as the VM's user |
-| How the window reaches it | `bin/atomics-vm-host-forward`: `ssh -L 127.0.0.1:<port>` through Lima's ssh config, held by the window | `atomics.v1` on `127.0.0.1:<port>` (default 47800) only, with a token this Mac paired with |
+| How the window reaches it | `bin/atomics-vm-host-forward`: `ssh -L <socket>:127.0.0.1:<port>` through Lima's ssh config, held by the window, on a Unix socket in a folder only you can enter | `atomics.v1` on `127.0.0.1:<port>` (default 47800) only, with a token this Mac paired with |
 | The pairing token | the macOS keychain, item `atomics-vm-host-v1` | a SHA-256 digest in `paired-clients.json` (0600) |
 | Hooks, MCP, `atomics ctl`, `atomics queue` | none | the host's own socket, `/run/atomics/atomics.sock` (`ATOMICS_SOCKET`) |
 | Sign-ins: agents, gh, the ticket system | none | in the VM; ATOMICS's own in `~/.local/share/atomics/credentials` (`ATOMICS_CREDENTIALS_DIR`) |
@@ -134,11 +134,12 @@ Nix. `nix flake check` also builds the guest system with and without the example
 bundle's wrappers against the guest helper with an ssh stand-in (`checks.aarch64-linux.atomics-vm-mac`,
 [`nix/tests/mac-desktop.sh`](../nix/tests/mac-desktop.sh)), and runs the host as the service does
 (`checks.aarch64-linux.atomics-vm-host`, [`nix/tests/vm-host.sh`](../nix/tests/vm-host.sh)): the real
-`atomics host`, paired, reached through the bundle's `atomics-vm-host-forward` with an ssh stand-in by
-an `atomics.v1` client that starts a stub agent in a shared folder. It checks that the agent runs
-there, that only a paired token or that start's own gets through the forward, that an unpaired token
-stops working, that no token is written down, and that the host stops cleanly and takes the agent
-with it.
+`atomics host`, paired, reached through the bundle's `atomics-vm-host-forward` on a socket in a private
+folder, as the window holds it, with an ssh stand-in, by an `atomics.v1` client that starts a stub agent
+in a shared folder. It checks that the forward refuses a relative socket path or one with a colon, that
+the agent runs there, that only a paired token or that start's own gets through the forward, that an
+unpaired token stops working, that no token is written down, and that the host stops cleanly and takes
+the agent with it.
 
 On shared development machines, run builds through `atomics queue --class test -- <build command>`.
 
@@ -283,7 +284,9 @@ and variables an interactive session has, starting in the first writable shared 
 Mac). It waits for the Mac's folders to be mounted, restarts on failure and stops cleanly on
 `systemctl stop`, ending its agents. Its socket is `/run/atomics/atomics.sock` (mode 0700 folder),
 which `ATOMICS_SOCKET` names in every login shell too, so hooks, MCP servers, `atomics ctl` and
-`atomics queue` reach this host. A first config is seeded with `[isolation] mode = "bare"`: the VM is
+`atomics queue` reach this host. Its agents' terminals get it from the host itself, as every ATOMICS
+gives its terminals its own socket: their login shells inherit the service's
+`__NIXOS_SET_ENVIRONMENT_DONE` and so skip the profile's session variables. A first config is seeded with `[isolation] mode = "bare"`: the VM is
 the agents' boundary. `--remote-port` turns on the protocol server whatever the config says, on
 `127.0.0.1` only (`ss -ltn` shows nothing else listening on it).
 
@@ -302,16 +305,21 @@ that host ([the desktop as a client](daemon.md#the-desktop-as-a-client)). Each t
 
 1. asks Lima whether the VM runs. When it does not, the window shows the VM's state and a **Start**
    button, never an empty window; Start runs `limactl start` through `atomics queue --class qa`;
-2. starts the bundle's `bin/atomics-vm-host-forward` (`ssh -N -L 127.0.0.1:<port>:127.0.0.1:<port>`
-   through Lima's ssh config, as the agent wrappers do) unless it runs, and waits for it to answer;
+2. starts the bundle's `bin/atomics-vm-host-forward` (`ssh -N -L <socket>:127.0.0.1:<port>` through
+   Lima's ssh config, as the agent wrappers do) unless it runs, and waits for it to answer. The socket
+   is in a folder the window makes for it in your temporary folder (mode 0700, removed with the
+   forward), so only that forward can listen there;
 3. reads its token from the keychain. Without one it pairs: `atomics ctl pair_client` in the guest
    over Lima's ssh, and the token goes into the keychain (`atomics-vm-host-v1`, account: the
-   instance). A token the host refuses (its home was reset, or it was unpaired) is forgotten, and the
-   window pairs again;
-4. connects to `ws://127.0.0.1:<port>` with the token.
+   instance). A token the host refuses (its home was reset, or it was unpaired) stops the window,
+   which asks whether to pair again: only **Pair again** forgets the token and pairs anew;
+4. connects through that socket with the token.
 
-Every port the window opens needs that token: the forward listens on the Mac's loopback only, and the
-host refuses an upgrade without one. The top bar says where agents run: **Agents in VM <instance>**,
+The token goes to the window's own forward alone. On a port of the Mac's loopback it would go to
+whatever listened there first: another account's program, or another forward. The window opens no
+port; `bin/atomics-vm-host-forward <port>` still opens one on the Mac's loopback for another client
+(`atomics --connect ws://127.0.0.1:<port>` with a token paired for it), with that risk. The host
+refuses an upgrade without a token. The top bar says where agents run: **Agents in VM <instance>**,
 with **Use this Mac**, which asks once, removes `[client] connect` from the config file that sets it
 (keeping a backup), and opens ATOMICS again as the host on the Mac. The VM's agents keep running.
 Closing the window leaves every agent running in the VM; opening it again shows them, their terminals
@@ -521,8 +529,8 @@ restricted forward that would carry only the agent tools, with a token per pane,
 **Without it**, agents in the VM run in their tiles as plain terminals. Their hooks and MCP servers
 cannot reach ATOMICS: no status, turn ends or approval prompts on the Mac (agents ask in their own
 terminal), no `atomics_report` or ticket tools, and a chief in the VM cannot start or steer agents.
-`atomics queue` in the VM runs its command at once, without a slot. `atomics-onboard` reports the host
-item as `skipped`.
+`atomics queue` in the VM runs its command at once, without a slot, and says so on stderr.
+`atomics-onboard` reports the host item as `skipped`.
 
 **Turning it on.** `bin/atomics-vm-forward` holds one `ssh -N -R <socket>:<socket>` to the VM. Load
 its launchd agent once you accept the trust above:

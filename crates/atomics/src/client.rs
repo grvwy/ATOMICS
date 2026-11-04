@@ -17,14 +17,13 @@ pub mod link;
 pub mod target;
 pub mod vm;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atomics_ui::Client;
-use atomics_web::driver::Status;
-use atomics_web::driver::{Driver, Output};
+use atomics_web::driver::{Driver, Output, Status, Stop};
 use atomics_web::views::{self, Place, View};
 use egui::{Align, Layout, RichText};
 
@@ -55,10 +54,10 @@ pub struct ClientApp {
     link: Option<(u64, Link)>,
     wake: Arc<dyn Fn() + Send + Sync>,
     started: Instant,
-    /// Why the last dial could not find the host, for the status line's hover and the log.
-    unreachable: Arc<Mutex<Option<String>>>,
     /// The VM's host: what the window does before it can dial (`vm.rs`).
     vm: Option<vm::Gate>,
+    /// Why forgetting the VM's refused token failed, for the dialog that asks to pair again.
+    pair_error: Option<String>,
     /// A start of the VM ended: dial again at once.
     vm_started: Arc<AtomicBool>,
     /// The user asked to run agents on this Mac instead; the window asks first.
@@ -143,7 +142,7 @@ impl ClientApp {
             link: None,
             wake,
             started: Instant::now(),
-            unreachable: Arc::default(),
+            pair_error: None,
             #[cfg(test)]
             fixed: None,
         }
@@ -161,6 +160,24 @@ impl ClientApp {
         app.link = None;
         app.driver = Driver::direct(&op_prefix());
         app
+    }
+
+    /// A client of the VM's host behind `gate` that dials what `resolve` finds, for tests.
+    #[cfg(test)]
+    pub(crate) fn fixed_vm(
+        ctx: &egui::Context,
+        gate: vm::Gate,
+        resolve: impl Fn() -> anyhow::Result<Endpoint> + Send + Sync + 'static,
+    ) -> Self {
+        let mut app = Self::fixed(ctx, resolve);
+        app.vm = Some(gate);
+        app
+    }
+
+    /// Why the last dial did not reach the host, as the window shows it.
+    #[cfg(test)]
+    pub(crate) fn unreachable(&self) -> Option<&str> {
+        self.view.unreachable.as_deref()
     }
 
     #[cfg(test)]
@@ -230,7 +247,61 @@ impl ClientApp {
         self.run_outputs();
         self.keyboard.follow(&mut self.view.term.overlay, &mut self.view.term.inputs);
         self.confirm_local |= std::mem::take(&mut self.view.place_clicked);
+        self.pair_dialog(ui.ctx());
         self.switch_dialog(ui.ctx());
+    }
+
+    /// The VM's host refused this Mac's token, and nothing dials until the user says what to do: pair
+    /// again, or run agents on this Mac. Never on its own: a new token is a new grant of the host.
+    pub(crate) fn asks_to_pair_again(&self) -> bool {
+        self.vm.is_some() && *self.driver.status() == Status::Stopped(Stop::Unauthorised)
+    }
+
+    /// "Pair again": forget the refused token and dial, which pairs anew over Lima's ssh.
+    pub(crate) fn pair_again(&mut self) {
+        let Some(gate) = &self.vm else { return };
+        match gate.forget_token() {
+            Ok(()) => {
+                self.pair_error = None;
+                // The refusal is answered: what the next dial finds is the news.
+                self.view.unreachable = None;
+                self.driver.retry_now();
+            }
+            Err(error) => self.pair_error = Some(format!("The keychain item could not be removed: {error:#}")),
+        }
+    }
+
+    fn pair_dialog(&mut self, ctx: &egui::Context) {
+        if !self.asks_to_pair_again() || self.confirm_local {
+            return;
+        }
+        let instance = self.vm.as_ref().and_then(vm::Gate::instance).unwrap_or("atomics").to_string();
+        let (mut pair, mut local) = (false, false);
+        egui::Window::new("Pair with the VM's host again?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "The ATOMICS host in the VM {instance} did not accept this Mac's token: it was unpaired there, \
+                     or the VM's ATOMICS home was reset."
+                ));
+                ui.label(
+                    "Pairing again asks that host for a new token over Lima's ssh and keeps it in this Mac's \
+                     keychain in place of the old one.",
+                );
+                if let Some(error) = &self.pair_error {
+                    ui.label(RichText::new(error).color(self.client.palette.warning));
+                }
+                ui.horizontal(|ui| {
+                    pair = ui.button("Pair again").clicked();
+                    local = ui.button("Use this Mac instead").clicked();
+                });
+            });
+        if pair {
+            self.pair_again();
+        }
+        self.confirm_local |= local;
     }
 
     /// While the VM is not running and there is no board: its state and a Start button, never an empty
@@ -355,14 +426,7 @@ impl ClientApp {
             for output in outputs {
                 match output {
                     Output::DialDirect { socket } => {
-                        let resolve = self.resolver();
-                        let unreachable = self.unreachable.clone();
-                        let resolve: Resolve = Box::new(move || {
-                            let found = resolve();
-                            *unreachable.lock().unwrap() = found.as_ref().err().map(|e| format!("{e:#}"));
-                            found
-                        });
-                        let link = Link::open(socket, resolve, self.events_tx.clone(), self.wake.clone());
+                        let link = Link::open(socket, self.resolver(), self.events_tx.clone(), self.wake.clone());
                         self.link = Some((socket, link));
                     }
                     Output::Send { socket, message } => {
@@ -387,21 +451,23 @@ impl ClientApp {
     fn take_events(&mut self) {
         for event in self.events.try_iter().collect::<Vec<_>>() {
             match event {
-                Event::Open { socket, protocol } => self.driver.socket_open(socket, &protocol),
+                Event::Open { socket, protocol } => {
+                    self.view.unreachable = None;
+                    self.driver.socket_open(socket, &protocol);
+                }
                 Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),
-                Event::Closed { socket, code } => {
+                Event::Closed { socket, code, unreachable } => {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket) {
                         self.link = None;
                     }
-                    // The VM's host no longer takes this Mac's token (its home was reset, or it was
-                    // unpaired): forget it and pair again on the next dial, after the usual wait.
-                    let code = match &self.vm {
-                        Some(gate) if code == atomics_core::tunnel::close::UNAUTHORISED => {
-                            gate.forget_token();
-                            atomics_core::tunnel::close::ABNORMAL
-                        }
-                        _ => code,
-                    };
+                    // Why the host could not be reached: on screen while the window waits for it, and in
+                    // the log each time it changes.
+                    if let Some(why) = unreachable.filter(|why| self.view.unreachable.as_ref() != Some(why)) {
+                        eprintln!("atomics: the host cannot be reached: {why}");
+                        self.view.unreachable = Some(why);
+                    }
+                    // A refused token stops the driver (`Stop::Unauthorised`); for the VM's host the window
+                    // then asks before it pairs again (`pair_dialog`).
                     self.driver.socket_closed(socket, code);
                 }
             }
@@ -449,6 +515,51 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> anyhow::Result<
 fn switch_to_local() -> anyhow::Result<()> {
     forget_connect_setting()?;
     relaunch_without_connect()
+}
+
+/// A `connect` value ATOMICS cannot open, said where it is seen. Opened from the Dock or a launcher there is no
+/// terminal for stderr, so a value from the config is said in a dialog too, rather than quitting silently.
+/// `--connect` on a command line is said on stderr alone.
+pub(crate) fn report_bad_connect(value: &str, from_command_line: bool, error: &anyhow::Error) {
+    use std::io::IsTerminal;
+    let file = (!from_command_line).then(connect_setting_file).flatten();
+    let message = bad_connect_message(value, from_command_line, file.as_deref(), error);
+    eprintln!("atomics: {message}");
+    if !from_command_line && !std::io::stderr().is_terminal() {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("ATOMICS cannot open")
+            .set_description(&message)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+}
+
+fn bad_connect_message(
+    value: &str,
+    from_command_line: bool,
+    file: Option<&std::path::Path>,
+    error: &anyhow::Error,
+) -> String {
+    if from_command_line {
+        return format!("--connect {value:?}: {error:#}.");
+    }
+    let place = file.map(|file| format!(" in {}", file.display())).unwrap_or_default();
+    format!(
+        "[client] connect = {value:?}{place}: {error:#}. Correct it, or remove it to run agents on this Mac; \
+         `atomics --connect \"\"` does that for one run."
+    )
+}
+
+/// The config file whose `[client] connect` is in force: the host file over the main one.
+fn connect_setting_file() -> Option<std::path::PathBuf> {
+    use atomics_core::selfconfig::{self, Layer, Source};
+    let [main, host] = atomics_core::config::Config::source_paths(&atomics_core::paths::config_file());
+    let key = ["client".to_string(), "connect".to_string()];
+    [(Source::Host, host), (Source::Main, main)]
+        .into_iter()
+        .find(|(source, file)| selfconfig::defines(&Layer::read(*source, file).table, &key))
+        .map(|(_, file)| file)
 }
 
 /// Take `[client] connect` out of every config file that sets it (the host file, the main file), each with

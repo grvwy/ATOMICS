@@ -108,6 +108,7 @@ fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result
         for key in [
             "ATOMICS_HOME",
             "ATOMICS_SOCKET",
+            atomics_core::paths::HOST_SOCKET_ENV,
             "ATOMICS_CONFIG",
             "HOME",
             "PATH",
