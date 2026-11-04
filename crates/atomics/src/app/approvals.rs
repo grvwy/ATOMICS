@@ -244,15 +244,24 @@ impl State {
             return None;
         }
         let base = if request.cwd.as_os_str().is_empty() { self.sessions[index].root() } else { request.cwd.clone() };
-        let dirs: Vec<PathBuf> =
-            drops.iter().map(|drop| drop.dirs.iter().fold(base.clone(), |dir, d| dir.join(d))).collect();
-        let mut listed: Vec<(&PathBuf, Result<Vec<stash::Entry>, String>)> = Vec::new();
-        for dir in &dirs {
-            if !listed.iter().any(|(listed, _)| *listed == dir) {
-                listed.push((dir, stash::list(dir).map_err(|error| format!("{error:#}"))));
+        // Where each drop runs git: the folder its `cd`s and `git -C` lead to, and the repository a
+        // `--git-dir` or `GIT_DIR` names from there. The shell expands a leading `~` in both.
+        let dirs: Vec<(PathBuf, Option<PathBuf>)> = drops
+            .iter()
+            .map(|drop| {
+                let dir = drop.dirs.iter().fold(base.clone(), |dir, d| dir.join(paths::expand(d)));
+                (dir, drop.git_dir.as_deref().map(paths::expand))
+            })
+            .collect();
+        type Place = (PathBuf, Option<PathBuf>);
+        let mut listed: Vec<(&Place, Result<Vec<stash::Entry>, String>)> = Vec::new();
+        for place in &dirs {
+            if !listed.iter().any(|(listed, _)| *listed == place) {
+                let (dir, git_dir) = place;
+                listed.push((place, stash::list_in(dir, git_dir.as_deref()).map_err(|error| format!("{error:#}"))));
             }
         }
-        let entries = |dir: &PathBuf| &listed.iter().find(|(listed, _)| *listed == dir).expect("listed").1;
+        let entries = |place: &Place| &listed.iter().find(|(listed, _)| *listed == place).expect("listed").1;
         let drops: Vec<_> = drops
             .iter()
             .zip(&dirs)
@@ -1730,6 +1739,50 @@ mod tests {
                 git::git(&two, &["stash", "drop", "-q"]).unwrap();
                 assert_eq!(app.runtime.decide(&id, Decision::Deny, None).unwrap(), Disposition::Denied);
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
+                app.runtime.sessions.clear();
+                app.runtime.plans.clear();
+            },
+        );
+    }
+
+    #[test]
+    fn a_drop_is_warned_about_in_the_repository_its_cd_or_git_dir_names() {
+        with_app(
+            "app::approvals::tests::a_drop_is_warned_about_in_the_repository_its_cd_or_git_dir_names",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let one = stash_fleet(app, dir.path());
+                // Another repository beside the fleet's, with a stash of its own.
+                let other = one.with_file_name("other");
+                std::fs::create_dir(&other).unwrap();
+                let git = |args: &[&str]| git::git(&other, args).unwrap();
+                git(&["init", "-q", "-b", "main"]);
+                git(&["config", "user.name", "test"]);
+                git(&["config", "user.email", "test@example.com"]);
+                std::fs::write(other.join("b.txt"), "base\n").unwrap();
+                git(&["add", "b.txt"]);
+                git(&["commit", "-q", "-m", "base"]);
+                std::fs::write(other.join("b.txt"), "changed\n").unwrap();
+                git(&["stash", "push", "-q", "-m", "elsewhere"]);
+                let theirs = "git stash drop drops stash@{0} (On main: elsewhere), whose owner ATOMICS cannot tell.";
+                for command in [
+                    "cd ../other && git stash drop",
+                    "cd .. && cd other; git stash drop 2>&1",
+                    "GIT_DIR=../other/.git git stash drop",
+                    "git --git-dir ../other/.git stash drop",
+                    "export GIT_DIR=../other/.git; git stash drop >/dev/null",
+                ] {
+                    let (message, _reply) = stash_permission(&one, command);
+                    app.runtime.on_hook(message);
+                    let pending = app.runtime.sessions[0].approvals.remove(0);
+                    let warning = pending.request.warning.unwrap();
+                    assert!(warning.ends_with(theirs), "{command}: {warning}");
+                }
+                // Without them it is the fleet's own stash, as before.
+                let (message, _reply) = stash_permission(&one, "git stash drop 2>&1");
+                app.runtime.on_hook(message);
+                let warning = app.runtime.sessions[0].approvals.remove(0).request.warning.unwrap();
+                assert!(warning.contains("drops stash@{0} (WIP on main: "), "{warning}");
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();
             },

@@ -49,22 +49,59 @@ pub enum Target {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StashDrop {
-    /// The command's `git -C` folders, in order, each relative to the one before.
+    /// The folders git runs in, in order, each relative to the one before: the script's `cd`s
+    /// before the command, then the command's `git -C` folders. They may start with `~`.
     pub dirs: Vec<String>,
+    /// The repository git is pointed at, relative to the last of `dirs`: the command's
+    /// `--git-dir`, else a `GIT_DIR=` before it, else the script's `export GIT_DIR=`.
+    pub git_dir: Option<String>,
     pub action: Action,
     pub target: Target,
+}
+
+/// Where a script has run git so far: the folders its `cd`s went to and the `GIT_DIR` it exported.
+/// One script is read in order, as one shell; a subshell's `cd` is taken to last too.
+#[derive(Debug, Clone, Default)]
+struct Shell {
+    dirs: Vec<String>,
+    git_dir: Option<String>,
 }
 
 /// The git commands in the shell `command` that drop entries of the shared stash. It reads more
 /// shell than the approval policy accepts (pipes, substitutions, `sh -c` scripts), because a
 /// command it misses here would not wait for anyone.
 pub fn drops(command: &str) -> Vec<StashDrop> {
+    drops_in(command, &mut Shell::default())
+}
+
+fn drops_in(command: &str, shell: &mut Shell) -> Vec<StashDrop> {
     let mut found = Vec::new();
     for words in segments(command) {
+        let (program, args) = match words.split_first() {
+            Some((program, args)) => (program.as_str(), args),
+            None => continue,
+        };
+        match program {
+            "cd" | "pushd" => {
+                let dir = args.iter().find(|arg| !arg.starts_with('-') || *arg == "-");
+                shell.dirs.push(dir.map_or("~", String::as_str).to_string());
+                continue;
+            }
+            "export" => {
+                if let Some(dir) = args.iter().rev().find_map(|arg| arg.strip_prefix("GIT_DIR=")) {
+                    shell.git_dir = Some(dir.to_string());
+                }
+            }
+            "unset" if args.iter().any(|arg| arg == "GIT_DIR") => shell.git_dir = None,
+            _ => {}
+        }
         for (at, word) in words.iter().enumerate() {
             let program = word.rsplit('/').next().unwrap_or(word);
             if program == "git" {
-                found.extend(git_drop(&words[at + 1..]));
+                // `GIT_DIR=… git`, `env GIT_DIR=… git`: an assignment for this command alone.
+                let git_dir = words[..at].iter().rev().find_map(|word| word.strip_prefix("GIT_DIR="));
+                let git_dir = git_dir.map(str::to_string).or_else(|| shell.git_dir.clone());
+                found.extend(git_drop(&words[at + 1..], shell, git_dir));
             } else if matches!(program, "sh" | "bash" | "zsh" | "dash" | "ksh")
                 // `-c`, or with other options: `-lc`, `-ec`.
                 && let Some(script) = words[at + 1..]
@@ -72,10 +109,12 @@ pub fn drops(command: &str) -> Vec<StashDrop> {
                     .skip_while(|word| !(word.starts_with('-') && !word.starts_with("--") && word.contains('c')))
                     .nth(1)
             {
-                found.extend(drops(script));
+                // A shell of its own, started where this one is: its `cd`s end with it.
+                found.extend(drops_in(script, &mut shell.clone()));
             } else if program == "eval" {
-                // The rest of the segment is the command eval runs: read it once, as eval does.
-                found.extend(drops(&words[at + 1..].join(" ")));
+                // The rest of the segment is the command eval runs: read it once, as eval does,
+                // in this shell.
+                found.extend(drops_in(&words[at + 1..].join(" "), shell));
                 break;
             }
         }
@@ -83,9 +122,9 @@ pub fn drops(command: &str) -> Vec<StashDrop> {
     found
 }
 
-/// The drop `git <args>` makes, if any.
-fn git_drop(args: &[String]) -> Option<StashDrop> {
-    let mut dirs = Vec::new();
+/// The drop `git <args>` makes, if any, run where `shell` is with `git_dir` in its environment.
+fn git_drop(args: &[String], shell: &Shell, mut git_dir: Option<String>) -> Option<StashDrop> {
+    let mut dirs = shell.dirs.clone();
     let mut rest = args;
     loop {
         match rest.first().map(String::as_str) {
@@ -93,7 +132,15 @@ fn git_drop(args: &[String]) -> Option<StashDrop> {
                 dirs.push(rest.get(1)?.clone());
                 rest = &rest[2..];
             }
-            Some("-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--super-prefix") => {
+            Some("--git-dir") => {
+                git_dir = Some(rest.get(1)?.clone());
+                rest = &rest[2..];
+            }
+            Some(option) if option.starts_with("--git-dir=") => {
+                git_dir = option.strip_prefix("--git-dir=").map(str::to_string);
+                rest = &rest[1..];
+            }
+            Some("-c" | "--work-tree" | "--namespace" | "--config-env" | "--super-prefix") => {
                 rest = rest.get(2..)?;
             }
             Some(option) if option.starts_with('-') => rest = &rest[1..],
@@ -119,7 +166,7 @@ fn git_drop(args: &[String]) -> Option<StashDrop> {
         Action::Branch => named.nth(1).map_or(Target::Index(0), |name| target(name)),
         Action::Drop | Action::Pop => named.next().map_or(Target::Index(0), |name| target(name)),
     };
-    Some(StashDrop { dirs, action, target })
+    Some(StashDrop { dirs, git_dir, action, target })
 }
 
 fn target(name: &str) -> Target {
@@ -250,9 +297,18 @@ pub fn parse(output: &str) -> Vec<Entry> {
 /// the whitespace of a message, newlines included.
 #[cfg(feature = "native")]
 pub fn list(dir: &Path) -> anyhow::Result<Vec<Entry>> {
+    list_in(dir, None)
+}
+
+/// [`list`] of the repository `git_dir` names from `dir`, as `git --git-dir` (or `GIT_DIR`) does.
+#[cfg(feature = "native")]
+pub fn list_in(dir: &Path, git_dir: Option<&Path>) -> anyhow::Result<Vec<Entry>> {
     let format = format!("--format={FORMAT}");
+    let git_dir = git_dir.map(|git_dir| format!("--git-dir={}", git_dir.display()));
+    let mut args: Vec<&str> = git_dir.iter().map(String::as_str).collect();
     // Signature checks can run a configured program.
-    Ok(parse(&crate::git::git(dir, &["-c", "log.showSignature=false", "stash", "list", &format])?))
+    args.extend(["-c", "log.showSignature=false", "stash", "list", &format]);
+    Ok(parse(&crate::git::git(dir, &args)?))
 }
 
 /// The commits of `entries` (the stash as listed now) that `drop` takes: the entry at its index (none
@@ -381,7 +437,26 @@ mod tests {
         ] {
             assert!(drops(command).is_empty(), "{command}");
         }
-        assert_eq!(drops("git -C ../other --git-dir .git stash clear")[0].dirs, ["../other"]);
+        let place =
+            |command: &str| drops(command).into_iter().map(|drop| (drop.dirs, drop.git_dir)).collect::<Vec<_>>();
+        let dirs = |dirs: &[&str]| dirs.iter().map(|dir| dir.to_string()).collect::<Vec<_>>();
+        assert_eq!(place("git -C ../other --git-dir .git stash clear"), [(dirs(&["../other"]), Some(".git".into()))]);
+        // Where a script's `cd`s and `GIT_DIR` put git, in order.
+        assert_eq!(place("cd ../other && git stash drop"), [(dirs(&["../other"]), None)]);
+        assert_eq!(place("cd a; cd -P b && git -C c stash pop"), [(dirs(&["a", "b", "c"]), None)]);
+        assert_eq!(place("cd && git stash clear"), [(dirs(&["~"]), None)]);
+        assert_eq!(place("GIT_DIR=/r/.git git stash drop"), [(vec![], Some("/r/.git".into()))]);
+        assert_eq!(place("env GIT_DIR=x git --git-dir=y stash drop"), [(vec![], Some("y".into()))]);
+        assert_eq!(
+            place("export GIT_DIR=/r/.git; git stash drop; unset GIT_DIR; git stash drop"),
+            [(vec![], Some("/r/.git".into())), (vec![], None)]
+        );
+        // `sh -c` starts where the script is, and its `cd`s end with it; `eval`'s do not.
+        assert_eq!(
+            place("cd a && bash -c 'cd b && git stash drop' && git stash pop"),
+            [(dirs(&["a", "b"]), None), (dirs(&["a"]), None)]
+        );
+        assert_eq!(place("eval cd b; git stash drop"), [(dirs(&["b"]), None)]);
     }
 
     #[test]

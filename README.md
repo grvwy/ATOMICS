@@ -536,7 +536,8 @@ then belong to that instance. Sign in separately in those provider homes when ne
 All worktrees of a repository share one git stash, so `stash@{1}` names whichever entry is second when git runs,
 possibly another agent's. A Codex request to run `git stash drop`, `pop`, `branch` or `clear` always waits for the
 chief or you, whatever `allow` says, including inside chains, pipes, substitutions and `sh -c`. It carries a `warning` that lists
-the entries the command would drop as git lists them now, each with whose it is: this agent's own, another session's
+the entries the command would drop as git lists them now, in the repository its `cd`s, `git -C`, `--git-dir` or
+`GIT_DIR` lead to, each with whose it is: this agent's own, another session's
 or task's (by the branch it was stashed on, or the task id it was stashed with), or one ATOMICS cannot tell. The
 banner shows the warning above the command and offers no **Allow always**; `allow_always` from the chief answers once
 and is not remembered, because the same index names another entry once anyone stashes. For the same reason an
