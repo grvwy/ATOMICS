@@ -36,6 +36,21 @@ pub struct HookReply {
     pub stdout: Option<String>,
 }
 
+/// Which of an agent's threads a hook event comes from. All of them inherit the session's pane,
+/// so only the payload can tell them apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HookThread {
+    /// The thread the session follows. Its id changes with `/clear` or `/resume`.
+    #[default]
+    Main,
+    /// A thread the main one spawned. It reports under the main thread's session id with an
+    /// `agent_id` of its own, and its permission requests are the session's to answer.
+    Spawned,
+    /// A thread the agent runs for itself, such as Codex's memory agent. It has its own session id
+    /// and, as the agent keeps no transcript of it, a null `transcript_path`.
+    Background,
+}
+
 /// The fields of a hook payload ATOMICS cares about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookEvent {
@@ -51,6 +66,7 @@ pub struct HookEvent {
     pub tool_response: Value,
     pub last_assistant_message: Option<String>,
     pub stop_hook_active: bool,
+    pub thread: HookThread,
 }
 
 impl HookEvent {
@@ -60,6 +76,13 @@ impl HookEvent {
         let session_id = text("session_id")?;
         // CwdChanged reports the new directory separately from the common `cwd`.
         let cwd = text("new_cwd").or_else(|| text("cwd")).map(PathBuf::from);
+        let thread = if payload.get("transcript_path").is_some_and(Value::is_null) {
+            HookThread::Background
+        } else if text("agent_id").is_some() {
+            HookThread::Spawned
+        } else {
+            HookThread::Main
+        };
         Some(HookEvent {
             name,
             session_id,
@@ -73,6 +96,7 @@ impl HookEvent {
             tool_response: payload.get("tool_response").cloned().unwrap_or(Value::Null),
             last_assistant_message: text("last_assistant_message"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
+            thread,
         })
     }
 
@@ -93,9 +117,11 @@ impl HookEvent {
         }
     }
 
-    /// Whether Claude Code reads `additionalContext` from this event's output.
+    /// Whether Claude Code reads `additionalContext` from this event's output, in the thread a
+    /// message for the session is meant for.
     pub fn can_deliver(&self) -> bool {
-        matches!(self.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop")
+        self.thread == HookThread::Main
+            && matches!(self.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop")
     }
 }
 
@@ -396,6 +422,29 @@ pub(crate) fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_payload_tells_an_agents_threads_apart() {
+        // The fields that differ in what Codex 0.166 sent one pane for its main thread, its memory
+        // agent and a spawned agent, with the ids and paths shortened.
+        let thread = |payload: Value| HookEvent::from_payload(&payload).unwrap().thread;
+        for name in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop", "SessionEnd"] {
+            let main = json!({"hook_event_name":name, "session_id":"main", "cwd":"/work",
+                "transcript_path":"/codex/sessions/rollout-main.jsonl"});
+            assert_eq!(thread(main), HookThread::Main, "{name}");
+            let memory = json!({"hook_event_name":name, "session_id":"memory", "cwd":"/codex/memories",
+                "transcript_path":null});
+            assert_eq!(thread(memory), HookThread::Background, "{name}");
+        }
+        for name in ["UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse"] {
+            let spawned = json!({"hook_event_name":name, "session_id":"main", "cwd":"/work",
+                "transcript_path":"/codex/sessions/rollout-spawned.jsonl",
+                "agent_id":"spawned", "agent_type":"default"});
+            assert_eq!(thread(spawned), HookThread::Spawned, "{name}");
+        }
+        // An agent that sends neither field has one thread as far as ATOMICS can tell.
+        assert_eq!(thread(json!({"hook_event_name":"Stop", "session_id":"other"})), HookThread::Main);
+    }
 
     #[test]
     fn chief_mcp_pre_hooks_are_session_local_and_do_not_change_status() {
