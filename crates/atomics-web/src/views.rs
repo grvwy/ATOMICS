@@ -33,7 +33,7 @@ use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
 use atomics_ui::touch::{self, Touch};
 use atomics_ui::{
-    Backend, Client, Command, PanelMode, PlanRow, approvals, board, chief, diff_panel, fleet, sidebar, topbar,
+    Backend, Client, Command, PanelMode, PlanRow, approvals, board, chief, diff_panel, fleet, sidebar, switcher, topbar,
 };
 use egui::{Align, Color32, Layout, Rect, RichText, Sense, Stroke, TextStyle, pos2, vec2};
 
@@ -430,7 +430,11 @@ fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
                 view.diff = Some(worktree.clone());
                 view.tab = Tab::Diffs;
             }
-            Command::OpenDiff | Command::ToggleDiff | Command::SetPanel(PanelMode::Diff) => view.tab = Tab::Diffs,
+            Command::OpenDiff
+            | Command::ToggleDiff
+            | Command::SetPanel(PanelMode::Diff)
+            | Command::ToggleView(PanelMode::Diff) => view.tab = Tab::Diffs,
+            Command::ToggleView(PanelMode::Plan) => view.tab = Tab::Board,
             Command::CloseDiff => view.diff = None,
             Command::SetPanel(PanelMode::Plan) | Command::TogglePlan | Command::ShowPlan(_) => view.tab = Tab::Board,
             Command::ViewPlanHistory(_) => view.tab = Tab::Board,
@@ -647,6 +651,9 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
     ui.painter().rect_filled(Rect::from_x_y_ranges(screen.x_range(), bar.y_range()), 0.0, p.topbar);
     ui.painter().hline(screen.x_range(), bar.top(), Stroke::new(1.0, p.separator));
     let agent_waits = waits(driver, false);
+    // The board and the diff are the view switcher's, with its icons and counts.
+    let segments = switcher::segments(&driver.remote, p);
+    let segment = |mode: PanelMode| segments.iter().find(|s| s.mode == mode);
     for ((tab, label), item) in BAR.iter().zip(layout::bar_items(bar, BAR.len())) {
         let response = ui.interact(item, ui.scope_id().with(("pane", label)), Sense::click());
         let active = view.tab == *tab;
@@ -663,15 +670,54 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
             ui.painter().rect_filled(line, 1.0, p.accent);
         }
         let galley = ui.painter().layout_no_wrap(label.to_string(), p.ui(12.0), color);
-        let at = item.center() - galley.size() / 2.0;
+        let at = item.center() + vec2(-galley.size().x / 2.0, 1.0);
         let end = at.x + galley.size().x;
         ui.painter().galley(at, galley, color);
+        let icon = Rect::from_center_size(item.center() - vec2(0.0, 9.0), vec2(14.0, 14.0));
+        pane_icon(ui.painter(), icon, *tab, color);
+        let badge = match tab {
+            Tab::Board => segment(PanelMode::Plan).and_then(|s| s.badge.clone()),
+            Tab::Diffs => segment(PanelMode::Diff).and_then(|s| s.badge.clone()),
+            _ => None,
+        };
+        if let Some(badge) = badge {
+            let text = ui.painter().layout_no_wrap(badge.text, p.ui(10.0), badge.color);
+            let pill = Rect::from_min_size(
+                pos2(icon.right() + 2.0, icon.top() - 3.0),
+                vec2((text.size().x + 6.0).max(14.0), 13.0),
+            );
+            ui.painter().rect(pill, 6.5, p.topbar, Stroke::new(1.0, badge.color), egui::StrokeKind::Inside);
+            ui.painter().galley(pill.center() - text.size() / 2.0, text, badge.color);
+        }
         // A permission request waits: a dot by the name of the pane that answers it.
         if *tab == Tab::Terminal && agent_waits {
             ui.painter().circle_filled(pos2(end + 5.0, at.y + 3.0), 3.0, p.warning);
         }
         if response.clicked() {
             view.tab = *tab;
+        }
+    }
+}
+
+/// A pane's icon in the pane bar: the switcher's for the board and the diff, a list for the agents and a prompt
+/// for the terminal.
+fn pane_icon(painter: &egui::Painter, rect: Rect, tab: Tab, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    match tab {
+        Tab::Board => switcher::icon(painter, rect, PanelMode::Plan, color),
+        Tab::Diffs => switcher::icon(painter, rect, PanelMode::Diff, color),
+        Tab::Agents => {
+            for k in 0..3 {
+                let y = rect.top() + 2.5 + k as f32 * 4.5;
+                painter.circle_filled(pos2(rect.left() + 2.0, y), 1.3, color);
+                painter.line_segment([pos2(rect.left() + 5.0, y), pos2(rect.right(), y)], stroke);
+            }
+        }
+        _ => {
+            let c = rect.center();
+            painter.line_segment([pos2(rect.left() + 1.0, c.y - 4.0), pos2(rect.left() + 5.0, c.y)], stroke);
+            painter.line_segment([pos2(rect.left() + 5.0, c.y), pos2(rect.left() + 1.0, c.y + 4.0)], stroke);
+            painter.line_segment([pos2(c.x, c.y + 4.0), pos2(rect.right(), c.y + 4.0)], stroke);
         }
     }
 }

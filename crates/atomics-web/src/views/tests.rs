@@ -274,8 +274,8 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "ATOMICS",
         "◆ Parse faster",
         "CHIEF",
-        "Hide diff",
-        "Plan 0/2",
+        "Diff",
+        "Board 0/2",
         "Connected",
         "⋯",
         "◆ CHIEF AGENT",
@@ -340,7 +340,7 @@ fn a_wide_window_over_a_host_without_plans_shows_every_agent_and_no_plan_button(
         text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(text.iter().any(|t| t == "Fix the parser"), "{text:?}");
-    assert!(!text.iter().any(|t| t.starts_with("Plan")), "no Plan button without a plan: {text:?}");
+    assert!(!text.iter().any(|t| t.starts_with("Board")), "no board's segment without a plan: {text:?}");
     assert_eq!(view.term.session(), Some("s1"));
 }
 
@@ -351,7 +351,7 @@ fn a_wide_window_shows_a_diff_and_fetches_only_it() {
         sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(!world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the board shows, no diff");
-    client.send(Command::TogglePlan);
+    client.send(Command::ToggleView(PanelMode::Diff));
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert!(world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the active session's diff");
     let text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
@@ -379,7 +379,7 @@ fn a_page_of_many_plans_opens_on_the_open_plan_with_its_board() {
     let hints = view.desk.hints(&world.driver.remote);
     assert_eq!(view.desk.plan.as_deref(), Some("p1"));
     assert!(hints.plan_view && hints.panel == PanelMode::Plan && hints.selected_plan == 23, "{hints:?}");
-    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Plan 0/2", "History"] {
+    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Board 0/2", "History"] {
         assert!(has(&shown, wanted), "{wanted} is missing: {shown:?}");
     }
     assert!(!has(&shown, "Archived"), "no archived plan shows unless it is picked: {shown:?}");

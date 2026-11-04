@@ -16,7 +16,7 @@ use egui::{Rect, RichText, Sense, Stroke, vec2};
 use crate::chief::{self, VoiceState};
 use crate::terminal_surface::TerminalSurface;
 use crate::topbar::{self, measure, record_item, slot};
-use crate::{Backend, Client, Command, PanelMode, board, diff_panel, diff_view, fleet, sidebar, tabs};
+use crate::{Backend, Client, Command, PanelMode, board, diff_panel, diff_view, fleet, sidebar, switcher, tabs};
 
 /// The height of the tab strip over the tiles, when the sessions do not all fit as tiles.
 pub const TAB_HEIGHT: f32 = 30.0;
@@ -322,6 +322,8 @@ pub enum BrandSize {
 pub struct TopBarPlan {
     pub brand: BrandSize,
     pub chief: chief::PillSize,
+    /// The view switcher without its names.
+    pub compact_switcher: bool,
     pub actions_menu: bool,
     pub show_load: bool,
 }
@@ -343,6 +345,8 @@ pub struct TopBarWidths {
     pub urgent: f32,
     /// The navigation's least width: its menu, which says how many plans need the user.
     pub navigation: f32,
+    /// The view switcher with its names, and without.
+    pub switcher: [f32; 2],
     pub controls: f32,
     pub controls_with_load: f32,
     pub actions_menu: f32,
@@ -365,7 +369,10 @@ impl TopBarPlan {
         } else {
             PillSize::Mark
         };
-        let actions_menu = w.controls > side(chief);
+        // The switcher stays in the bar before the actions; they fold first, then its names go.
+        let right = |rest: f32, switcher: f32| switcher + if switcher > 0.0 { w.gap } else { 0.0 } + rest;
+        let actions_menu = right(w.controls, w.switcher[0]) > side(chief);
+        let compact_switcher = actions_menu && right(w.actions_menu, w.switcher[0]) > side(chief);
         let brand = if left(BrandSize::Full, w.urgent, chief) {
             BrandSize::Full
         } else if left(BrandSize::Name, w.navigation, chief) {
@@ -373,8 +380,8 @@ impl TopBarPlan {
         } else {
             BrandSize::Mark
         };
-        let show_load = chief == PillSize::Full && w.controls_with_load <= side(chief);
-        TopBarPlan { brand, chief, actions_menu, show_load }
+        let show_load = chief == PillSize::Full && right(w.controls_with_load, w.switcher[0]) <= side(chief);
+        TopBarPlan { brand, chief, compact_switcher, actions_menu, show_load }
     }
 }
 
@@ -397,6 +404,9 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
             .map(|size| measure(ui, |ui| brand(ui, platform, size))),
         urgent: platform.draw(|backend, client, _| tabs::urgent_navigation_width(ui, backend, client)).max(navigation),
         navigation,
+        switcher: [false, true].map(|compact| {
+            measure(ui, |ui| platform.draw(|backend, client, _| switcher::draw(ui, compact, backend, client)))
+        }),
         controls: measure(ui, |ui| top_bar_controls(ui, platform, false, false)),
         controls_with_load: measure(ui, |ui| top_bar_controls(ui, platform, true, false)),
         actions_menu: measure(ui, |ui| {
@@ -414,14 +424,18 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     slot(ui, "brand", rect.with_max_x(rect.left() + brand_width), |ui| brand(ui, platform, plan.brand));
     slot(ui, "chief", chief_rect, |ui| chief_pill(ui, platform, plan.chief));
     // The actions keep to the bar's right end, and so does their menu.
-    let used = if plan.actions_menu {
-        widths.actions_menu
-    } else if plan.show_load {
-        widths.controls_with_load
-    } else {
-        widths.controls
-    };
+    let switcher = widths.switcher[usize::from(plan.compact_switcher)];
+    let used = switcher
+        + if switcher > 0.0 { gap } else { 0.0 }
+        + if plan.actions_menu {
+            widths.actions_menu
+        } else if plan.show_load {
+            widths.controls_with_load
+        } else {
+            widths.controls
+        };
     slot(ui, "actions", actions.with_min_x((actions.right() - used).max(actions.left())), |ui| {
+        platform.draw(|backend, client, _| switcher::draw(ui, plan.compact_switcher, backend, client));
         if plan.actions_menu {
             let response = ui.menu_button("Actions", |ui| top_bar_controls(ui, platform, false, true)).response;
             record_item(ui, "Actions", &response);
@@ -447,13 +461,12 @@ fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, size: chief::Pill
     });
 }
 
-/// The bar's actions, in the order a row shows them: diff, `+ New`, Plan, the host's items, Project, the
-/// host's load gauge with `show_load`, and its settings. Each button is a draw of its own, so a click on one
-/// reaches the buttons drawn after it in the same frame.
+/// The bar's actions, in the order a row shows them: `+ New`, the host's items, Project, the host's load
+/// gauge with `show_load`, and its settings. Each button is a draw of its own, so a click on one reaches the
+/// buttons drawn after it in the same frame. The view switcher stands before them, and stays in the bar when
+/// they fold into the Actions menu.
 fn top_bar_controls(ui: &mut egui::Ui, platform: &mut impl Platform, show_load: bool, in_menu: bool) {
-    platform.draw(|backend, client, _| topbar::diff_button(ui, in_menu, backend, client));
     platform.draw(|backend, client, _| topbar::new_button(ui, in_menu, backend, client));
-    platform.draw(|backend, client, _| topbar::plan_button(ui, in_menu, backend, client));
     platform.top_bar_items(ui, in_menu);
     if read(platform, |backend, _| backend.available(&Command::PickProject)) {
         let response = ui
@@ -530,7 +543,8 @@ mod tests {
             brand: [164.0, 99.0, 33.0],
             urgent: 453.0,
             navigation: 138.0,
-            controls: 366.0,
+            switcher: [190.0, 110.0],
+            controls: 226.0,
             controls_with_load: 445.0,
             actions_menu: 65.0,
         }
@@ -539,23 +553,34 @@ mod tests {
     #[test]
     fn the_bar_folds_in_one_order_as_it_narrows_and_the_pill_follows_the_width_alone() {
         let rank = |plan: &TopBarPlan| {
-            (plan.chief as u8, plan.brand as u8, u8::from(plan.actions_menu), u8::from(!plan.show_load))
+            (plan.chief as u8, plan.brand as u8, u8::from(plan.actions_menu), u8::from(plan.compact_switcher))
         };
         let mut last = TopBarPlan::choose(&widths(6000.0));
         assert_eq!(
             last,
-            TopBarPlan { brand: BrandSize::Full, chief: PillSize::Full, actions_menu: false, show_load: true }
+            TopBarPlan {
+                brand: BrandSize::Full,
+                chief: PillSize::Full,
+                compact_switcher: false,
+                actions_menu: false,
+                show_load: true
+            }
         );
         for width in (460..6000).rev().step_by(5).map(|w| w as f32) {
             let plan = TopBarPlan::choose(&widths(width));
             let (before, now) = (rank(&last), rank(&plan));
-            assert!(now.0 >= before.0 && now.1 >= before.1 && now.2 >= before.2, "{width}: {last:?} -> {plan:?}");
+            // The pill and the brand only ever shrink. The actions and the switcher fold in order while the
+            // pill keeps its size; where it shrinks, the room it leaves may bring the actions back.
+            assert!(now.0 >= before.0 && now.1 >= before.1, "{width}: {last:?} -> {plan:?}");
+            assert!(now.0 != before.0 || (now.2, now.3) >= (before.2, before.3), "{width}: {last:?} -> {plan:?}");
             // Whatever the bar holds, the pill's size is the width's.
-            let empty = TopBarWidths { urgent: 0.0, navigation: 40.0, controls: 100.0, ..widths(width) };
+            let empty =
+                TopBarWidths { urgent: 0.0, navigation: 40.0, controls: 100.0, switcher: [0.0; 2], ..widths(width) };
             assert_eq!(TopBarPlan::choose(&empty).chief, plan.chief, "{width}");
             // What is drawn beside the pill fits its half.
             let side = (width - widths(width).chief[plan.chief as usize]) / 2.0 - 7.0;
-            let actions = if plan.actions_menu { 65.0 } else { 366.0 };
+            let switcher = if plan.compact_switcher { 110.0 } else { 190.0 };
+            let actions = switcher + 7.0 + if plan.actions_menu { 65.0 } else { 226.0 };
             assert!(actions <= side, "{width}: actions {actions} in {side}");
             assert!(widths(width).brand[plan.brand as usize] + 7.0 + 138.0 <= side, "{width}: {plan:?}");
             last = plan;

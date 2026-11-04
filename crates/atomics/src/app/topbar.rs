@@ -56,27 +56,9 @@ impl Desktop<'_> {
         }
     }
 
-    /// This host's items after the top bar's Plan button: Tickets, the GitHub counter, Remote, and in the
-    /// Actions menu (`in_menu`) the ticket system's sign-in.
+    /// This host's items after `+ New`: the GitHub counter, Remote, and in the Actions menu (`in_menu`) the
+    /// ticket system's sign-in. The Tickets panel is the view switcher's (`atomics_ui::switcher`).
     pub(super) fn host_top_bar_items(&mut self, ui: &mut egui::Ui, in_menu: bool) {
-        if self.runtime.ticket_config().is_some() {
-            // A dot says the ticket system wants a sign-in.
-            let signed_out = self.runtime.tickets.panel.signin;
-            let text = RichText::new(if signed_out { "Tickets ●" } else { "Tickets" }).color(if signed_out {
-                self.palette().warning
-            } else {
-                self.palette().foreground
-            });
-            let open = self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open;
-            let response = ui.selectable_label(open, text);
-            record_item(ui, "Tickets", &response);
-            if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_tickets)).clicked() {
-                self.runtime.toggle_tickets();
-                if in_menu {
-                    ui.close();
-                }
-            }
-        }
         self.github_counter(ui, in_menu);
         self.rendezvous_indicator(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
@@ -253,14 +235,15 @@ mod tests {
                             }
                         }
                         let collapsed = items.iter().any(|(name, _)| name == "Actions");
+                        // The view switcher stays in the bar when the actions fold; it drops its names.
                         let required: &[&str] = if collapsed {
-                            &["chief", "Actions", "Tabs"]
+                            &["chief", "Actions", "Tabs", "view:Board", "view:Diff"]
                         } else {
-                            &["chief", "Settings", "Project", "Plan", "+ New", "diff"]
+                            &["chief", "Settings", "Project", "+ New", "view:Board", "view:Diff"]
                         };
                         for &name in required {
                             assert_eq!(items.iter().filter(|(n, _)| n == name).count(), 1, "{case}: {name}");
-                            if name != "chief" {
+                            if name != "chief" && !name.starts_with("view:") {
                                 let width = items.iter().find(|(n, _)| n == name).unwrap().1.width();
                                 let natural = action_widths.entry(name).or_insert(width);
                                 assert!((width - *natural).abs() < 0.5, "{case}: {name} shrank");
@@ -349,6 +332,63 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn the_view_switcher_shows_each_view_with_its_count_and_the_window_remembers_the_choice() {
+        with_app(
+            "app::topbar::tests::the_view_switcher_shows_each_view_with_its_count_and_the_window_remembers_the_choice",
+            |app, ctx| {
+                fixture(app, 3);
+                app.runtime.toast = None;
+                let plan = app.runtime.selected_plan;
+                app.runtime.plans[plan].tasks[0].status = TaskStatus::Review;
+                let shown = |app: &mut Desktop<'_>| {
+                    render(app, ctx, 2400.0, vec![]).1.drop_without_applying_deltas();
+                    let (items, output) = render(app, ctx, 2400.0, vec![]);
+                    let text: Vec<String> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|s| {
+                            if let egui::Shape::Text(t) = &s.shape { Some(t.galley.text().into()) } else { None }
+                        })
+                        .collect();
+                    output.drop_without_applying_deltas();
+                    (items.into_iter().map(|(name, _)| name).collect::<Vec<_>>(), text)
+                };
+                let (items, text) = shown(app);
+                assert!(items.contains(&"view:Board".into()) && items.contains(&"view:Diff".into()), "{items:?}");
+                assert!(!items.contains(&"view:Tickets".into()), "no Tickets without a ticket system: {items:?}");
+                assert!(
+                    text.contains(&"Board 0/1".into()) && text.contains(&"1".into()),
+                    "the task in review: {text:?}"
+                );
+                for old in ["Show diff", "Hide diff", "Plan 0/1", "Tickets"] {
+                    assert!(!text.contains(&old.into()), "{old} is the switcher's now: {text:?}");
+                }
+                app.runtime.tickets.config = Some(std::sync::Arc::new(atomics_core::tickets::TicketConfig {
+                    system: "demo".into(),
+                    ..Default::default()
+                }));
+                assert!(shown(app).0.contains(&"view:Tickets".into()));
+                app.runtime.diff_open = false;
+                click(app, ctx, 2400.0, "view:Tickets");
+                assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
+                assert_eq!(app.runtime.store.panel_view.as_deref(), Some("tickets"), "the window remembers it");
+                assert_eq!(Store::load(&paths::store_file()).panel_view.as_deref(), Some("tickets"));
+                // Another plan's tab keeps the view; the editor counts as the diff's.
+                app.send(Command::ShowPlan(0));
+                assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
+                app.runtime.panel = PanelMode::Editor;
+                click(app, ctx, 2400.0, "view:Diff");
+                assert!(
+                    app.runtime.panel == PanelMode::Editor && !app.runtime.diff_open,
+                    "the diff's segment hides it"
+                );
+                click(app, ctx, 2400.0, "view:Diff");
+                assert!(app.runtime.panel == PanelMode::Editor && app.runtime.diff_open, "and shows the editor again");
+            },
+        );
     }
 
     #[test]
@@ -539,12 +579,15 @@ mod tests {
                 output.drop_without_applying_deltas();
                 let collapsed = items.iter().any(|(name, _)| name == "Actions");
                 assert_eq!(collapsed, width < 1000.0, "width={width}: the actions fold beside a centered pill");
-                let was_open = app.runtime.diff_open;
-                if collapsed {
-                    click(app, ctx, width, "Actions");
+                // The switcher's segments are in the bar at every width: one shows its view, again hides it.
+                for (segment, view) in [("view:Diff", PanelMode::Diff), ("view:Board", PanelMode::Plan)] {
+                    app.runtime.panel = PanelMode::Tickets;
+                    app.runtime.diff_open = true;
+                    click(app, ctx, width, segment);
+                    assert!(app.runtime.panel == view && app.runtime.diff_open, "width={width}: {segment} shows");
+                    click(app, ctx, width, segment);
+                    assert!(app.runtime.panel == view && !app.runtime.diff_open, "width={width}: {segment} hides");
                 }
-                click(app, ctx, width, "diff");
-                assert_ne!(app.runtime.diff_open, was_open, "width={width}: diff action");
                 click(app, ctx, width, "Tabs");
                 click(app, ctx, width, "Plan 0:");
                 assert_eq!(app.runtime.selected_plan, 0, "width={width}: Tabs selection");
@@ -554,16 +597,6 @@ mod tests {
                 }
                 click(app, ctx, width, "+ New");
                 assert!(app.client.new_dialog.is_some(), "width={width}: new action");
-                if collapsed {
-                    click(app, ctx, width, "Actions");
-                }
-                let panel_was_open = app.runtime.panel == PanelMode::Plan && app.runtime.diff_open;
-                click(app, ctx, width, "Plan");
-                assert_ne!(
-                    app.runtime.panel == PanelMode::Plan && app.runtime.diff_open,
-                    panel_was_open,
-                    "width={width}: plan action"
-                );
                 for (action, entry) in [("Project", "Open project…"), ("Settings", "Edit config")] {
                     if collapsed {
                         click(app, ctx, width, "Actions");

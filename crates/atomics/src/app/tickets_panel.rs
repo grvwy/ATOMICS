@@ -370,14 +370,7 @@ pub(super) fn score_range(cards: &[TicketCard]) -> Option<(f64, f64)> {
 
 impl State {
     pub(super) fn toggle_tickets(&mut self) {
-        self.window.request_repaint();
-        if self.panel == PanelMode::Tickets && self.diff_open {
-            self.panel = PanelMode::Diff;
-        } else {
-            self.panel = PanelMode::Tickets;
-            self.diff_open = true;
-            self.tickets.panel.focus_query = self.tickets.panel.view == TicketsView::Find;
-        }
+        self.toggle_view(PanelMode::Tickets);
     }
 
     /// Shows the panel on Find with the query box focused.
@@ -2189,8 +2182,9 @@ mod tests {
             assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
             frame(app, ctx, vec![]);
             assert!(ctx.memory(|m| m.has_focus(query_id())), "Find opens on the query box");
+            // Again, it hides the panel, as the switcher's Tickets segment does.
             frame(app, ctx, vec![key(Key::K, modifiers)]);
-            assert!(app.runtime.panel == PanelMode::Diff);
+            assert!(app.runtime.panel == PanelMode::Tickets && !app.runtime.diff_open);
         });
     }
 
@@ -3281,7 +3275,7 @@ mod tests {
             let link = |plan: &str| crate::open_link::OpenLink { plan: Some(plan.into()), ..Default::default() };
             app.runtime.open_link(Ok(link(&one))).unwrap();
             assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);
-            assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Diff);
+            assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Plan && app.runtime.diff_open);
             assert!(app.runtime.open_link(Ok(link("nope"))).is_err());
             assert!(toasted(app).contains("No open plan nope"), "{}", toasted(app));
             assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one);

@@ -1106,6 +1106,12 @@ impl State {
             desktop_diff_split: None,
             launch_dir,
         };
+        // The view the window's switcher showed last time; a restart's own state wins below.
+        app.panel = match app.store.panel_view.as_deref() {
+            Some("board") => PanelMode::Plan,
+            Some("tickets") => PanelMode::Tickets,
+            _ => PanelMode::Diff,
+        };
         app.refresh_themes();
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();

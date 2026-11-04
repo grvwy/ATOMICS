@@ -258,6 +258,9 @@ pub enum Command {
     ViewPlanHistory(usize),
     /// Show or hide the plan board.
     TogglePlan,
+    /// The view switcher's segment: show the board, the diff (or the editor) or the tickets in the panel, or
+    /// hide the panel when it shows that view already.
+    ToggleView(PanelMode),
     /// A task brief on the board has the keyboard this frame: the desktop's host holds off a restart until
     /// the edit is done.
     EditingPlan,
@@ -300,6 +303,7 @@ impl Command {
                 | Command::ShowPlan(_)
                 | Command::ViewPlanHistory(_)
                 | Command::TogglePlan
+                | Command::ToggleView(_)
                 | Command::EditingPlan
                 | Command::ClosePlanTab(_)
                 | Command::NewSession

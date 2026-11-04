@@ -66,7 +66,7 @@ pub enum PillSize {
 /// status word and the heartbeat, or for the recording.
 pub fn pill_width(ui: &egui::Ui, palette: &Palette, size: PillSize) -> f32 {
     let width = |text: &str, font: egui::FontId| {
-        ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x)
+        ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_string(), font, palette.foreground).size().x)
     };
     let mark = PILL_PAD * 2.0 + PILL_ICON + PILL_GAP + 8.0;
     if size == PillSize::Mark {

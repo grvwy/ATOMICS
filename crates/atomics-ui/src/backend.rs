@@ -320,6 +320,13 @@ pub struct Notices {
     pub hook_error: Option<String>,
 }
 
+/// The host's Tickets panel, as the view switcher shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TicketsPanel {
+    /// The ticket system wants the user to sign in.
+    pub signed_out: bool,
+}
+
 /// What the sandbox VMs' process trees use on the host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxLoad {
@@ -473,4 +480,9 @@ pub trait Backend {
     /// The folder the host was started in, where the welcome starts agents outside the Ungrouped tab;
     /// `None` when the host does not say.
     fn launch_dir(&self) -> Option<PathBuf>;
+
+    /// The host's Tickets panel, where it has one ([`PanelMode::Tickets`]); `None` without one.
+    fn tickets_panel(&self) -> Option<TicketsPanel> {
+        None
+    }
 }

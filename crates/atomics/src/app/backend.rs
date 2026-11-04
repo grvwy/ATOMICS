@@ -86,6 +86,10 @@ impl Backend for Local<'_> {
         Some(self.0.launch_dir.clone())
     }
 
+    fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
+        self.0.ticket_config().map(|_| atomics_ui::TicketsPanel { signed_out: self.0.tickets.panel.signin })
+    }
+
     fn plan_list(&self) -> Vec<PlanRow> {
         self.0.plans.iter().enumerate().map(|(index, plan)| self.row(index, plan)).collect()
     }

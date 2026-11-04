@@ -21,7 +21,7 @@ impl Desktop<'_> {
             self.runtime.toast("Voice: recording cancelled");
         }
         if pressed(&keys.toggle_diff) {
-            self.send(Command::ToggleDiff);
+            self.send(Command::ToggleView(PanelMode::Diff));
         }
         if pressed(&keys.focus_steer) {
             self.client.focus_steer = true;
@@ -116,7 +116,7 @@ impl Desktop<'_> {
             }
         }
         if pressed(&keys.toggle_plan) {
-            self.send(Command::TogglePlan);
+            self.send(Command::ToggleView(PanelMode::Plan));
         }
         // Plan with chief, from a ticket the panel is reading.
         if self.runtime.panel == PanelMode::Tickets
@@ -127,7 +127,7 @@ impl Desktop<'_> {
         {
             self.runtime.open_plan_dialog();
         }
-        if pressed(&keys.toggle_tickets) {
+        if pressed(&keys.toggle_tickets) && self.runtime.ticket_config().is_some() {
             self.runtime.toggle_tickets();
             if self.runtime.panel == PanelMode::Tickets {
                 self.client.focus_terminal = None;
