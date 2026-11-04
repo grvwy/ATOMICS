@@ -565,7 +565,7 @@ ticket and, in board mode, the board's tickets without a task), elsewhere a *Fin
 five tickets read. A click opens the ticket in Read. A plan's tab shows its ticket's key and progress
 (`KEY · 2/6`, or `KEY · planning…` while it has no tasks) instead of its goal.
 
-Opening a ticket, from the list, the sidebar or the trace lane, gives the panel the keyboard, so `↑`/`↓`
+Opening a ticket, from the list, the sidebar, the trace lane or a board's chip, gives the panel the keyboard, so `↑`/`↓`
 and `Esc` work at once.
 
 When the ticket system says it needs a sign-in, the panel shows a "not signed in" banner (and a dot on the
@@ -854,8 +854,10 @@ comments. No ticket operation is required to advance ATOMICS's lifecycle.
 
 ## The board
 
-Each card shows a chip with its ticket's key and state; a click opens the ticket in the browser, and
-hovering shows its title, system, last update and when ATOMICS last read it. A failed operation shows in
+Each card shows a chip with its ticket's key and state, and the plan header one for the plan's. A click
+reads the ticket in the Tickets panel, whose **Open in browser** is one more click away. Where ATOMICS cannot
+read it, with no `[tickets]` set up or for a ticket of another system, the click opens its address in the
+browser instead. Hovering shows its title, system, last update and when ATOMICS last read it. A failed operation shows in
 red beneath the chip until an operation on that ticket succeeds. Failed state updates are retried; a
 failed comment is not, and neither is a comment still queued when ATOMICS quits or restarts. The plan header shows the linked board or ticket. In board mode it adds how many
 of the board's tickets have no task yet, plus a **sync** button that reads everything again and retries

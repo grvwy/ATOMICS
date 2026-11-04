@@ -148,6 +148,8 @@ pub struct Session {
     naming: Naming,
     /// MCP servers this sandboxed agent needs that are not connected: its tile offers to connect them.
     mcp_needed: Vec<connections::Needed>,
+    /// Something about how its agent runs that its tile warns of, such as Codex started without hooks.
+    warning: Option<String>,
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -227,6 +229,9 @@ const NEEDS_INPUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
 const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// What a Codex tile says when its version probe failed, so it runs without ATOMICS's hooks.
+const CODEX_HOOKS_UNKNOWN: &str = "Started without ATOMICS hooks: `codex --version` failed, so hook support is \
+                                   unknown. Approvals stay in this terminal; ATOMICS checks again at the next start.";
 /// How long a quit waits for sandboxes being prepared, and then again for those whose creation it
 /// stopped to clean up.
 const QUIT_WAIT: Duration = Duration::from_secs(10);

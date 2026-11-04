@@ -858,11 +858,67 @@ fn worktree_lock(repo: &Path) -> Result<Arc<Mutex<()>>> {
     Ok(locks.entry(common).or_default().clone())
 }
 
+/// Checks `branch` out at `path`, creating it at `base_ref`'s commit. A branch that already exists
+/// there, as one a failed attempt of an older ATOMICS left, is used as it is; one elsewhere is
+/// refused. When git fails, as when a filter or hook it runs is missing, what this attempt made goes
+/// again: the worktree git registered in a folder that was not there before, and the branch while it
+/// still points at the base. So the next attempt starts as this one did.
 fn add_worktree_unlocked(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> Result<()> {
     check_branch_name(repo, branch, base_ref)?;
     let base = resolve_base(repo, base_ref)?;
+    let commit = commit_of(repo, &format!("{base}^{{commit}}"))?.with_context(|| format!("{base} names no commit"))?;
+    let reference = format!("refs/heads/{branch}");
+    let existing = commit_of(repo, &reference)?;
+    if let Some(existing) = &existing {
+        ensure!(
+            *existing == commit,
+            "branch {branch} already exists at {}, not at {base}; delete or rename it to start from {base}",
+            &existing[..existing.len().min(12)]
+        );
+    }
     let path_text = path.to_string_lossy();
-    git(repo, &["worktree", "add", "--no-track", "-b", branch, &path_text, &base]).map(|_| ())
+    // Whatever was there already, such as another worktree with work in it, is never removed.
+    let fresh = path.symlink_metadata().is_err();
+    let added = match existing {
+        Some(_) => git(repo, &["worktree", "add", &path_text, branch]),
+        None => git(repo, &["worktree", "add", "--no-track", "-b", branch, &path_text, &commit]),
+    };
+    let Err(error) = added else { return Ok(()) };
+    let mut undo = Vec::new();
+    if fresh && let Err(problem) = remove_half_made_worktree(repo, path) {
+        undo.push(format!("removing the worktree it began at {path_text}: {problem:#}"));
+    }
+    // Only the branch this attempt made, and only while it is where this attempt made it.
+    if existing.is_none()
+        && commit_of(repo, &reference).ok().flatten().as_deref() == Some(commit.as_str())
+        && let Err(problem) = git(repo, &["update-ref", "-d", &reference, &commit])
+    {
+        undo.push(format!("deleting branch {branch}: {problem:#}"));
+    }
+    if undo.is_empty() {
+        return Err(error);
+    }
+    bail!("{error:#}; cleaning up after it failed too: {}", undo.join("; "))
+}
+
+/// Unregisters the worktree a failed `git worktree add` registered at `path`, and removes what it
+/// checked out there. Git cleans up after most failures itself, but not after one it was stopped
+/// in, nor after a post-checkout hook that failed.
+fn remove_half_made_worktree(repo: &Path, path: &Path) -> Result<()> {
+    // Git records the folder's real path, which a folder it already removed no longer resolves to.
+    let real = |path: &Path| {
+        path.canonicalize().ok().or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)))
+    };
+    let target = real(path);
+    let registered = list_worktrees(repo)?
+        .iter()
+        .skip(1)
+        .any(|entry| entry.path == path || (target.is_some() && real(&entry.path) == target));
+    if registered {
+        // Twice forced: git locks a worktree while it adds it, and a stopped add leaves the lock.
+        git(repo, &["worktree", "remove", "--force", "--force", &path.to_string_lossy()])?;
+    }
+    Ok(())
 }
 
 /// Like `add_worktree`, but from `start` when given, which is created from
@@ -1301,6 +1357,75 @@ pub(crate) mod tests {
                 assert!(result.is_err(), "git would read {full}: {args:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_failed_worktree_add_leaves_no_branch_or_worktree_and_a_retry_starts_over() {
+        let (dir, repo) = project();
+        let at = |name: &str| dir.path().join(name);
+        let worktrees = |repo: &Path| list_worktrees(repo).unwrap().len();
+        // A filter checkout needs and cannot run, as an LFS repository's on a bare PATH.
+        run(&repo, &["config", "filter.lfs.clean", "cat"]);
+        run(&repo, &["config", "filter.lfs.smudge", "atomics-test-missing-lfs smudge"]);
+        run(&repo, &["config", "filter.lfs.required", "true"]);
+        std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        std::fs::write(repo.join("asset.bin"), "asset\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-q", "-m", "asset"]);
+        let error = add_worktree(&repo, &at("filtered"), "task", "main").unwrap_err();
+        assert!(format!("{error:#}").contains("smudge filter lfs failed"), "{error:#}");
+        assert!(!branch_exists(&repo, "task"), "the branch the failed add made is deleted");
+        assert_eq!(worktrees(&repo), 1);
+        assert!(!at("filtered").exists());
+
+        // A failed post-checkout hook, as LFS installs: git keeps the worktree and branch it made.
+        run(&repo, &["config", "filter.lfs.smudge", "cat"]);
+        let hook = repo.join(".git/hooks/post-checkout");
+        crate::test_support::write_program(&hook, "#!/bin/sh\necho 'git-lfs was not found on your path' >&2\nexit 2\n");
+        let error = add_worktree(&repo, &at("hooked"), "task", "main").unwrap_err();
+        assert!(format!("{error:#}").contains("git-lfs was not found"), "{error:#}");
+        assert!(!branch_exists(&repo, "task"));
+        assert_eq!(worktrees(&repo), 1);
+        assert!(!at("hooked").exists());
+
+        // A branch that existed before is kept when the add fails, and used by the next attempt
+        // while it is still at the base.
+        run(&repo, &["branch", "left", "main"]);
+        add_worktree(&repo, &at("left-1"), "left", "main").unwrap_err();
+        assert!(branch_exists(&repo, "left"));
+        assert_eq!(worktrees(&repo), 1);
+        std::fs::remove_file(&hook).unwrap();
+        add_worktree(&repo, &at("left-2"), "left", "main").unwrap();
+        assert_eq!(worktree_of(&at("left-2")).unwrap().branch.as_deref(), Some("left"));
+        assert_eq!(std::fs::read_to_string(at("left-2").join("asset.bin")).unwrap(), "asset\n");
+        add_worktree(&repo, &at("task"), "task", "main").unwrap();
+        assert_eq!(worktrees(&repo), 3);
+        // A worktree already where the next one would go is left as it is, work and all.
+        std::fs::write(at("task").join("work.txt"), "uncommitted\n").unwrap();
+        add_worktree(&repo, &at("task"), "other", "main").unwrap_err();
+        assert!(!branch_exists(&repo, "other"));
+        assert_eq!(worktrees(&repo), 3);
+        assert_eq!(std::fs::read_to_string(at("task").join("work.txt")).unwrap(), "uncommitted\n");
+
+        // One elsewhere is refused, and kept.
+        run(&repo, &["branch", "moved", "main~1"]);
+        let error = add_worktree(&repo, &at("moved"), "moved", "main").unwrap_err();
+        assert!(format!("{error:#}").contains("branch moved already exists at"), "{error:#}");
+        assert!(branch_exists(&repo, "moved"));
+        assert!(!at("moved").exists());
+    }
+
+    #[test]
+    fn a_stopped_worktree_add_is_unregistered_although_git_left_it_locked() {
+        let (dir, repo) = project();
+        let path = dir.path().join("stopped");
+        git(&repo, &["worktree", "add", "-q", "--no-track", "-b", "stopped", &path.to_string_lossy(), "main"]).unwrap();
+        git(&repo, &["worktree", "lock", "--reason", "initializing", &path.to_string_lossy()]).unwrap();
+        remove_half_made_worktree(&repo, &path).unwrap();
+        assert_eq!(list_worktrees(&repo).unwrap().len(), 1);
+        assert!(!path.exists());
+        // Nothing registered there: nothing to do.
+        remove_half_made_worktree(&repo, &path).unwrap();
     }
 
     fn run(dir: &Path, args: &[&str]) {

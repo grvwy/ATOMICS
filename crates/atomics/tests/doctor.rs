@@ -139,3 +139,48 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("✓ ATOMICS running"));
 }
+
+#[test]
+fn doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_shells() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let tools = dir.path().join("login-tools");
+    std::fs::create_dir(&tools).unwrap();
+    test_support::write_program(tools.join("git"), "#!/bin/sh\necho 'git version fixture'\n");
+    // Codex is a script for an interpreter, as Node runs it, that only the login shell's PATH has.
+    test_support::write_program(tools.join("atomics-test-node"), "#!/bin/sh\nexec /bin/sh \"$@\"\n");
+    test_support::write_program(
+        tools.join("codex"),
+        "#!/usr/bin/env atomics-test-node\nprintf 'codex-cli 0.165.0\\n'\n",
+    );
+    let shell = dir.path().join("shell");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let run = |script: &str| {
+        test_support::write_program(&shell, format!("#!/bin/sh\n{script}\n"));
+        let output = test_support::output(
+            Command::new(env!("CARGO_BIN_EXE_atomics"))
+                .arg("doctor")
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("SHELL", &shell)
+                // As a desktop launcher starts it.
+                .env("PATH", "/usr/bin:/bin")
+                .env("ATOMICS_HOME", dir.path().join("state"))
+                .env("ATOMICS_CONFIG", &config)
+                .env("ATOMICS_HOST", "fixture")
+                .env("ATOMICS_SOCKET", dir.path().join("atomics.sock")),
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let text = run(&format!("printf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'", tools.display()));
+    let added =
+        format!("✓ PATH of login shell {}: 1 folder added to the PATH ATOMICS was started with", shell.display());
+    assert!(text.lines().next().is_some_and(|line| line == added), "{text}");
+    assert!(text.contains("✓ git found (git version fixture)"), "{text}");
+    assert!(text.contains("✓ Codex supports ATOMICS hooks"), "{text}");
+    let text = run("exit 0");
+    let unread =
+        format!("✗ PATH as ATOMICS was started: login shell {} gave none, it printed no PATH", shell.display());
+    assert!(text.contains(&unread) && text.contains("(warning) — make your login shell"), "{text}");
+    assert!(!text.contains("Codex supports ATOMICS hooks"), "{text}");
+}
