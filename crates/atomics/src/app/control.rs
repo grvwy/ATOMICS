@@ -210,12 +210,30 @@ impl State {
                     return;
                 }
                 let new = plan.is_none();
-                let index = if plan.is_some() {
-                    target
+                let integration = integration.map(|branch| branch.trim().to_string()).filter(|b| !b.is_empty());
+                // Checked as it would be written, before anything changes: a refused plan keeps the plan,
+                // its approval and its links as they were.
+                let mut candidate = if new {
+                    Plan { id: plan::unique_id(&goal, &self.plans, &paths::atomics_home()), ..Plan::default() }
                 } else {
-                    let id = plan::unique_id(&goal, &self.plans, &paths::atomics_home());
-                    self.plans.push(Plan { id, created_at: super::remote::now_ms(), ..Plan::default() });
+                    self.plans[target].clone()
+                };
+                candidate.replace(goal.clone(), tasks.clone());
+                if integration.is_some() {
+                    candidate.integration = integration.clone();
+                }
+                candidate.project = self.plan_project(&candidate);
+                let (refused, warnings) = self.plan_problems((!new).then_some(target), &candidate);
+                if !refused.is_empty() {
+                    let error = format!("Plan not saved:\n- {}", refused.join("\n- "));
+                    let _ = reply.send(done(ControlResponse::error(error)));
+                    return;
+                }
+                let index = if new {
+                    self.plans.push(Plan { id: candidate.id, created_at: super::remote::now_ms(), ..Plan::default() });
                     self.plans.len() - 1
+                } else {
+                    target
                 };
                 let plan_id = self.plans[index].id.clone();
                 for task in tasks.iter().filter(|t| t.ticket.is_some()) {
@@ -241,19 +259,10 @@ impl State {
                 }
                 self.plans[index].ticket =
                     atomics_core::tickets::TicketLink::relink(ticket, self.plans[index].ticket.as_ref());
-                if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {
-                    self.plans[index].integration = Some(branch.trim().to_string());
+                if integration.is_some() {
+                    self.plans[index].integration = integration;
                 }
-                let project = self.plans[index]
-                    .tasks
-                    .iter()
-                    .find_map(|t| t.repo.as_deref())
-                    .map(paths::expand)
-                    .or_else(|| self.plans[index].project.clone())
-                    .or_else(|| {
-                        self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
-                    });
-                self.plans[index].project = project.and_then(|p| self.project_of(&p));
+                self.plans[index].project = self.plan_project(&self.plans[index]);
                 self.reload_repo_workflows();
                 self.save_plan(index);
                 self.remote_request_approval(index, false);
@@ -275,7 +284,7 @@ impl State {
                 } else {
                     "Plan updated: review and approve it on its board"
                 });
-                done(ControlResponse::ok(json!({
+                let mut result = json!({
                     "plan": self.plans[index].id,
                     "tasks": self.plans[index].tasks.len(),
                     "approved": self.plans[index].approved,
@@ -283,7 +292,11 @@ impl State {
                     "unknown_dependencies": unknown,
                     "next": if self.plans[index].approved { "Call plan_dispatch to start ready tasks." }
                         else { "The user reviews and approves the plan on the board; then call plan_dispatch." },
-                })))
+                });
+                if !warnings.is_empty() {
+                    result["warnings"] = json!(warnings);
+                }
+                done(ControlResponse::ok(result))
             }
             ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
                 Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),

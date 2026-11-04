@@ -562,6 +562,11 @@ blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
+`atomics_plan_set` refuses a plan whose dependencies form a cycle and names it (every plan's final review waits for
+all its other tasks, so no task can depend on the review). It also refuses a branch a planned task pins when another
+task of the plan or of an open plan has it, and suggests a free name such as `<branch>-2`. A pinned branch that already
+exists outside any open plan is accepted with a warning: a task may name it to bring that work into the plan, but
+dispatching an agent on it would fail. Dropping a dependency that closed a cycle in an approved plan keeps the approval.
 
 `atomics_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
 first message is the brief. Every agent ATOMICS starts gets a `atomics_report` tool, pre-approved, to say when it is done,

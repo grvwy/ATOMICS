@@ -27,7 +27,8 @@ found. See [The chief agent](../README.md#the-chief-agent) and [Configuration](c
 
 The chief writes a plan with `atomics_plan_set`: tasks with a brief, acceptance checks, dependencies, an
 agent and its model. The plan appears on its own board (`cmd+b`), where you edit briefs and press
-**Approve plan**; nothing starts before that. Dispatch gives each ready task a worktree and an agent whose
+**Approve plan**; nothing starts before that. A plan whose dependencies form a cycle is refused with the cycle named,
+and so is a task branch that another task of the plan or of an open plan has, with a free name suggested. Dispatch gives each ready task a worktree and an agent whose
 first message is the brief. Agents answer with `atomics_report` (done, blocked or a question), which moves
 the card and wakes the chief's `atomics_wait`. The chief reads the result and the diff, steers, and accepts.
 Several plans can be open at once, each with its own tab. See

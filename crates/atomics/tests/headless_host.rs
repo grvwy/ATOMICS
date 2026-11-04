@@ -75,6 +75,13 @@ impl Instance {
     }
 
     fn ctl(&self, request: Value) -> Value {
+        let response = self.ctl_response(request.clone());
+        assert_eq!(response["ok"], true, "{request} -> {response}");
+        response["result"].clone()
+    }
+
+    /// The host's whole answer, which may be a refusal.
+    fn ctl_response(&self, request: Value) -> Value {
         let output = test_support::output(&mut self.command(["ctl".to_string(), request.to_string()]));
         assert!(
             output.status.success(),
@@ -82,9 +89,7 @@ impl Instance {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(response["ok"], true, "{request} -> {response}");
-        response["result"].clone()
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     /// Waits for the host to answer ctl, failing with its logs if it exits first.
@@ -271,6 +276,15 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let id = plan["plan"].as_str().unwrap().to_string();
     let saved = instance.home().join("plans").join(format!("{id}.json"));
     eventually("the saved plan", || std::fs::read_to_string(&saved).is_ok_and(|text| text.contains("Headless gate")));
+    // A plan whose tasks could never start is refused, naming why, and not saved.
+    let refused = instance.ctl_response(json!({
+        "cmd":"plan_set", "goal":"Never starts",
+        "tasks":[{"id":"t1","title":"Follow-up","brief":"After the review","depends_on":["review"]}]
+    }));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(refused["error"].as_str().unwrap().contains("Dependency cycle t1 → review → t1"), "{refused}");
+    let open = instance.ctl(json!({"cmd":"plan_get"}));
+    assert!(open["plans"].as_array().unwrap().iter().all(|plan| plan["goal"] != "Never starts"), "{open}");
 
     // A loopback protocol client connects and sees the board: the session and the plan.
     let mirror = board(&instance.home(), |mirror| {

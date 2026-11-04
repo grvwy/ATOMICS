@@ -443,6 +443,183 @@ impl State {
         owners
     }
 
+    /// The project a plan works on, as plan_set records it: its tasks' repository, else the one it
+    /// has, else the one in view.
+    pub(super) fn plan_project(&self, plan: &Plan) -> Option<PathBuf> {
+        plan.tasks
+            .iter()
+            .find_map(|t| t.repo.as_deref())
+            .map(paths::expand)
+            .or_else(|| plan.project.clone())
+            .or_else(|| self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned()))
+            .and_then(|p| self.project_of(&p))
+    }
+
+    /// What plan_set finds wrong with `candidate`, the plan as it would be written over plan `index`
+    /// (none for a new plan), as (refused, noted). It refuses dependency cycles, and branches that
+    /// planned tasks pin while another task of the plan or an open plan owns them, as dispatch would.
+    /// A pinned branch of a completed plan's work, or one that exists outside any plan, is only noted:
+    /// a task may name it to bring that work into the plan, though dispatching it there would fail.
+    /// Each branch problem names a free branch.
+    pub(super) fn plan_problems(&self, index: Option<usize>, candidate: &Plan) -> (Vec<String>, Vec<String>) {
+        let mut refused = Vec::new();
+        let cycles = candidate.dependency_cycles();
+        for cycle in &cycles {
+            refused.push(format!(
+                "Dependency cycle {}: each task waits for the next, so none of them can ever start.",
+                cycle.join(" → ")
+            ));
+        }
+        if cycles.iter().flatten().any(|id| id == atomics_core::plan::REVIEW_TASK) {
+            refused.push("The final review waits for every other task, so no task can depend on review.".into());
+        }
+        let mut notes = Vec::new();
+        fn pinned(task: &Task) -> Option<&str> {
+            task.branch.as_deref().filter(|branch| task.status == TaskStatus::Planned && !branch.trim().is_empty())
+        }
+        if !candidate.tasks.iter().any(|task| pinned(task).is_some()) {
+            return (refused, notes);
+        }
+        // Where branches live: the repository's git directory, or the repository when git cannot tell.
+        let mut commons: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+        let mut place = |repo: Option<PathBuf>| {
+            let common =
+                repo.as_ref().and_then(|r| commons.entry(r.clone()).or_insert_with(|| git::common_dir(r).ok()).clone());
+            let key = common.clone().or_else(|| repo.clone());
+            (repo, common, key)
+        };
+        let places: Vec<_> =
+            candidate.tasks.iter().map(|task| place(self.task_repo_in(task, candidate.project.as_deref()))).collect();
+        // The integration branch lives where branch_owners looks for it.
+        let (_, _, project) =
+            place(candidate.project.clone().or_else(|| places.iter().find_map(|(repo, _, _)| repo.clone())));
+        let integration = candidate.integration_branch();
+        let mut taken: HashSet<(Option<PathBuf>, String)> = candidate
+            .tasks
+            .iter()
+            .zip(&places)
+            .filter_map(|(task, (_, _, key))| Some((key.clone(), task.branch.clone()?)))
+            .chain([(project.clone(), integration.clone())])
+            .collect();
+        for (position, task) in candidate.tasks.iter().enumerate() {
+            let Some(branch) = pinned(task) else { continue };
+            let (repo, common, key) = &places[position];
+            // Of two planned tasks pinning one branch, the later one is the conflict.
+            let sibling = candidate.tasks.iter().zip(&places).enumerate().find(|(other, (t, (_, _, other_key)))| {
+                *other != position
+                    && t.branch.as_deref() == Some(branch)
+                    && other_key == key
+                    && (t.status != TaskStatus::Planned || *other < position)
+            });
+            let owners: Vec<_> = common
+                .as_deref()
+                .map(|common| self.branch_owners(common, branch))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(plan, _)| Some(*plan) != index)
+                .collect();
+            let owned = |open: bool| {
+                let status = |plan: usize| self.plans[plan].status == PlanStatus::Open;
+                owners.iter().find(|(plan, _)| status(*plan) == open).map(|(plan, task)| {
+                    let plan = format!("{}plan {}", if open { "" } else { "completed " }, self.plans[*plan].id);
+                    match task {
+                        Some(task) => format!("already belongs to task {task} in {plan}"),
+                        None => format!("is {plan}'s integration branch"),
+                    }
+                })
+            };
+            let owner = if let Some((_, (other, _))) = sibling {
+                Some(format!("already belongs to task {} in this plan", other.id))
+            } else if branch == integration && *key == project {
+                Some("is this plan's integration branch".to_string())
+            } else {
+                owned(true)
+            };
+            if let Some(owner) = owner {
+                let instead = match self.free_branch(branch, repo.as_deref(), common.as_deref(), key, &mut taken) {
+                    Some(free) => {
+                        format!("Use {free} instead, or leave branch out for ATOMICS to choose one at dispatch.")
+                    }
+                    None => "Leave branch out for ATOMICS to choose a free one at dispatch.".into(),
+                };
+                refused.push(format!("Task {}: branch {branch} {owner}. {instead}", task.id));
+                continue;
+            }
+            let (Some(repo), Some(common)) = (repo, common) else { continue };
+            let own = index.is_some_and(|index| {
+                self.plans[index].tasks.iter().any(|t| t.id == task.id && t.branch.as_deref() == Some(branch))
+            });
+            if own {
+                continue;
+            }
+            // Dispatch reuses a worktree of the branch only where worktree_path puts it.
+            let reusable = || {
+                let path = git::worktree_path(&self.config.worktree_path, repo, branch);
+                path.exists()
+                    && git::common_dir(&path).is_ok_and(|dir| dir == *common)
+                    && git::worktree_of(&path).and_then(|tree| tree.branch).as_deref() == Some(branch)
+            };
+            let busy = if let Some(owner) = owned(false) {
+                Some(owner)
+            } else if self.creating.iter().any(|(dir, name, _)| dir == common && name == branch) {
+                Some("has a worktree being created".to_string())
+            } else if let Some(session) = self
+                .sessions
+                .iter()
+                .find(|s| s.branch() == Some(branch) && git::common_dir(&s.root()).is_ok_and(|dir| dir == *common))
+            {
+                Some(format!("is checked out for agent {}", session.title))
+            } else if git::branch_ref_exists(repo, branch).unwrap_or(false) && !reusable() {
+                let tree = git::list_worktrees(repo)
+                    .ok()
+                    .and_then(|trees| trees.into_iter().find(|tree| tree.branch.as_deref() == Some(branch)));
+                Some(match tree {
+                    Some(tree) => format!("already exists, checked out in {}", paths::display(&tree.path)),
+                    None => "already exists".to_string(),
+                })
+            } else {
+                None
+            };
+            if let Some(busy) = busy {
+                let instead = match self.free_branch(branch, Some(repo), Some(common), key, &mut taken) {
+                    Some(free) => format!("Use {free} instead"),
+                    None => "Leave branch out instead".into(),
+                };
+                notes.push(format!(
+                    "Task {id}: branch {branch} {busy}, so dispatching {id} on it would fail or share that work. \
+                     {instead}, unless {id} only brings that work into the plan.",
+                    id = task.id
+                ));
+            }
+        }
+        (refused, notes)
+    }
+
+    /// The first of `branch`-2, `branch`-3… that no task, plan or worktree has, now taken.
+    fn free_branch(
+        &self,
+        branch: &str,
+        repo: Option<&Path>,
+        common: Option<&Path>,
+        key: &Option<PathBuf>,
+        taken: &mut HashSet<(Option<PathBuf>, String)>,
+    ) -> Option<String> {
+        let free = (2..MAX_BRANCH_ALLOCATION_ATTEMPTS + 2).map(|n| format!("{branch}-{n}")).find(|name| {
+            !taken.contains(&(key.clone(), name.clone()))
+                && match (repo, common) {
+                    (Some(repo), Some(common)) => {
+                        self.branch_owners(common, name).is_empty()
+                            && git::branch_ref_exists(repo, name).is_ok_and(|exists| !exists)
+                            && !self.creating.iter().any(|(dir, pending, _)| dir == common && pending == name)
+                            && !git::worktree_path(&self.config.worktree_path, repo, name).exists()
+                    }
+                    _ => true,
+                }
+        })?;
+        taken.insert((key.clone(), free.clone()));
+        Some(free)
+    }
+
     fn available_plan_branch(
         &self,
         index: usize,
@@ -774,6 +951,208 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn plan_set_refuses_dependency_cycles_and_names_them() {
+        with_app("app::plans::tests::plan_set_refuses_dependency_cycles_and_names_them", |app, _| {
+            let plans = app.runtime.plans.len();
+            let refused = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Follow-ups", "tasks":[
+                    {"id":"a"}, {"id":"b", "depends_on":["review"]}, {"id":"c", "depends_on":["c"]}]}),
+            );
+            assert!(!refused.ok);
+            let error = refused.error.unwrap();
+            assert!(error.starts_with("Plan not saved:\n- Dependency cycle b → review → b: "), "{error}");
+            assert!(error.contains("\n- Dependency cycle c → c: "), "{error}");
+            assert!(error.contains("no task can depend on review"), "{error}");
+            assert_eq!(app.runtime.plans.len(), plans, "a refused plan is not created");
+
+            let set = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Ship", "tasks":[{"id":"a"}, {"id":"b", "depends_on":["a"]}]}),
+            );
+            let id = set.result["plan"].as_str().unwrap().to_string();
+            assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+            let refused = request(
+                app,
+                json!({"cmd":"plan_set", "plan":id, "goal":"Ship",
+                    "tasks":[{"id":"a", "depends_on":["b"]}, {"id":"b", "depends_on":["a"]}]}),
+            );
+            let error = refused.error.unwrap();
+            assert!(error.contains("Dependency cycle a → b → a"), "{error}");
+            assert!(!error.contains("review"), "{error}");
+            let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+            let saved = Plan::load(&paths::atomics_home().join("plans").join(format!("{id}.json"))).unwrap();
+            for plan in [&app.runtime.plans[index], &saved] {
+                assert!(plan.approved, "a refused edit keeps the plan and its approval");
+                assert!(plan.tasks[0].depends_on.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn plan_set_refuses_branches_owned_by_other_plan_work_and_suggests_free_ones() {
+        with_app(
+            "app::plans::tests::plan_set_refuses_branches_owned_by_other_plan_work_and_suggests_free_ones",
+            |app, _| {
+                let (_dir, repo) = repository();
+                app.runtime.config.base_ref = "main".into();
+                let first = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"First", "integration":"first-int",
+                        "tasks":[{"id":"a", "title":"Parser", "repo":repo, "branch":"eng-123-parser"}]}),
+                );
+                let id = first.result["plan"].as_str().unwrap().to_string();
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                // Task a finished on its ticket's branch; the next free-looking name is taken outside ATOMICS.
+                git::git(&repo, &["branch", "eng-123-parser"]).unwrap();
+                git::git(&repo, &["branch", "eng-123-parser-2"]).unwrap();
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+
+                // Follow-ups that reuse the ticket's branch, or the plan's integration branch.
+                let refused = request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"First", "tasks":[
+                        {"id":"a", "title":"Parser", "repo":repo, "branch":"eng-123-parser"},
+                        {"id":"f1", "title":"Errors", "repo":repo, "branch":"eng-123-parser"},
+                        {"id":"f2", "title":"Docs", "repo":repo, "branch":"eng-123-parser"},
+                        {"id":"f3", "title":"Merge", "repo":repo, "branch":"first-int"}]}),
+                );
+                let error = refused.error.unwrap();
+                for expected in [
+                    "Task f1: branch eng-123-parser already belongs to task a in this plan. Use eng-123-parser-3 \
+                     instead, or leave branch out for ATOMICS to choose one at dispatch.",
+                    "Task f2: branch eng-123-parser already belongs to task a in this plan. Use eng-123-parser-4",
+                    "Task f3: branch first-int is this plan's integration branch. Use first-int-2",
+                ] {
+                    assert!(error.contains(expected), "{expected}\n{error}");
+                }
+                assert!(!error.contains("Task a:"), "a dispatched task keeps its branch: {error}");
+                assert_eq!(app.runtime.plans[index].tasks.len(), 2, "task a and the review, unchanged");
+
+                // Another plan may not take them either, and of two tasks sharing a branch the later one is named.
+                let error = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Second", "tasks":[
+                        {"id":"x", "repo":repo, "branch":"eng-123-parser"},
+                        {"id":"y", "repo":repo, "branch":"first-int"},
+                        {"id":"z", "repo":repo, "branch":"shared"},
+                        {"id":"w", "repo":repo, "branch":"shared"}]}),
+                )
+                .error
+                .unwrap();
+                for expected in [
+                    format!(
+                        "Task x: branch eng-123-parser already belongs to task a in plan {id}. Use eng-123-parser-3"
+                    ),
+                    format!("Task y: branch first-int is plan {id}'s integration branch. Use first-int-2"),
+                    "Task w: branch shared already belongs to task z in this plan. Use shared-2".into(),
+                ] {
+                    assert!(error.contains(&expected), "{expected}\n{error}");
+                }
+                assert!(!error.contains("Task z:"), "{error}");
+
+                // The suggested names are accepted, and dispatch would find them free.
+                let set = request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"First", "tasks":[
+                        {"id":"a", "title":"Parser", "repo":repo, "branch":"eng-123-parser"},
+                        {"id":"f1", "title":"Errors", "repo":repo, "branch":"eng-123-parser-3"}]}),
+                );
+                assert!(set.ok, "{:?}", set.error);
+                assert!(set.result.get("warnings").is_none(), "{}", set.result);
+            },
+        );
+    }
+
+    #[test]
+    fn plan_set_notes_existing_branches_and_keeps_approval_when_only_branches_change() {
+        with_app(
+            "app::plans::tests::plan_set_notes_existing_branches_and_keeps_approval_when_only_branches_change",
+            |app, _| {
+                let (dir, repo) = repository();
+                app.runtime.config.base_ref = "main".into();
+                app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
+                git::git(&repo, &["branch", "loose"]).unwrap();
+                git::add_worktree(&repo, &dir.path().join("elsewhere-tree"), "elsewhere", "main").unwrap();
+                // Where dispatch would put it: a retry continues there.
+                let retry = git::worktree_path(&app.runtime.config.worktree_path, &repo, "retry");
+                git::add_worktree(&repo, &retry, "retry", "main").unwrap();
+                app.runtime.plans.push(Plan {
+                    id: "finished".into(),
+                    status: PlanStatus::Completed,
+                    project: Some(repo.clone()),
+                    tasks: vec![Task {
+                        id: "p".into(),
+                        branch: Some("accepted".into()),
+                        status: TaskStatus::Done,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+                let plan = |id: Option<&str>, fresh: &str| {
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Adopt", "tasks":[
+                        {"id":"a", "title":"Loose", "repo":repo, "branch":"loose"},
+                        {"id":"b", "title":"Elsewhere", "repo":repo, "branch":"elsewhere"},
+                        {"id":"c", "title":"Retry", "repo":repo, "branch":"retry"},
+                        {"id":"d", "title":"Fresh", "repo":repo, "branch":fresh},
+                        {"id":"e", "title":"Accepted", "repo":repo, "branch":"accepted"}]})
+                };
+                let set = request(app, plan(None, "fresh"));
+                assert!(set.ok, "{:?}", set.error);
+                let warnings: Vec<String> = serde_json::from_value(set.result["warnings"].clone()).unwrap();
+                assert_eq!(warnings.len(), 3, "{warnings:?}");
+                assert_eq!(
+                    warnings[2],
+                    "Task e: branch accepted already belongs to task p in completed plan finished, so dispatching e \
+                     on it would fail or share that work. Use accepted-2 instead, unless e only brings that work into \
+                     the plan."
+                );
+                assert_eq!(
+                    warnings[0],
+                    "Task a: branch loose already exists, so dispatching a on it would fail or share that work. \
+                     Use loose-2 instead, unless a only brings that work into the plan."
+                );
+                assert!(
+                    warnings[1].starts_with("Task b: branch elsewhere already exists, checked out in ")
+                        && warnings[1].contains("elsewhere-tree, so dispatching b")
+                        && warnings[1].contains("Use elsewhere-2 instead"),
+                    "{}",
+                    warnings[1]
+                );
+                let id = set.result["plan"].as_str().unwrap().to_string();
+                assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+                let again = request(app, plan(Some(&id), "fresh"));
+                assert!(again.result.get("warnings").is_none(), "noted once: {}", again.result);
+                assert_eq!(again.result["approved"], true);
+
+                // Another plan claims d's branch after approval. The refusal keeps the approval, and so
+                // does the fix, which changes only the branch.
+                app.runtime.plans.push(Plan {
+                    id: "other".into(),
+                    project: Some(repo.clone()),
+                    tasks: vec![Task {
+                        id: "o".into(),
+                        branch: Some("fresh".into()),
+                        status: TaskStatus::Running,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+                let error = request(app, plan(Some(&id), "fresh")).error.unwrap();
+                assert!(
+                    error.contains("Task d: branch fresh already belongs to task o in plan other. Use fresh-2"),
+                    "{error}"
+                );
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                assert!(app.runtime.plans[index].approved);
+                let fixed = request(app, plan(Some(&id), "fresh-2"));
+                assert_eq!(fixed.result["approved"], true, "{fixed:?}");
+                assert_eq!(app.runtime.plans[index].tasks[3].branch.as_deref(), Some("fresh-2"));
+            },
+        );
+    }
 
     #[test]
     fn plan_events_reach_only_waiters_asking_for_them() {
