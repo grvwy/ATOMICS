@@ -124,6 +124,8 @@ pub struct TileView {
     pub sandbox_error: Option<String>,
     /// What the host's slot queue holds for the session's processes, e.g. "queued for a test slot".
     pub queue_note: Option<String>,
+    /// How its agent runs that the user should know of, such as Codex started without ATOMICS's hooks.
+    pub warning: Option<String>,
     /// The MCP servers the sandboxed session needs and lacks, as its banner offers to connect them.
     pub connect: Vec<ConnectButton>,
     /// Its process exited; the tile stays until it is closed.

@@ -382,13 +382,10 @@ impl Fixture {
         }
     }
 
-    /// Wait until no session of the paired devices is open.
-    fn none_connected(&self) {
-        let deadline = Instant::now() + wait(Duration::from_secs(10));
-        while self.devices.list().iter().any(|(_, connected)| *connected) {
-            assert!(Instant::now() < deadline, "a device stayed connected");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+    /// Wait until the channels' threads have ended, and with them their sessions' last writes. Not
+    /// until no device is connected: a channel that has only just paired has not connected yet.
+    fn channels_ended(&self) {
+        self.rendezvous.crew.wait(Instant::now() + wait(Duration::from_secs(10)));
     }
 
     /// The desktop's prompt for a device that proved the link: its name and code.
@@ -790,7 +787,7 @@ fn a_replayed_handshake_marks_nothing_connected_and_writes_nothing() {
     let device = Secret::generate().unwrap();
     let _paired = host.paired(&mut socket, 1, &device, Access::Control);
     socket.send(service::left(1, close::NORMAL));
-    host.none_connected();
+    host.channels_ended();
     let before = host.allowlist();
     // A session's first frame as the service saw it, sent again on new channels: each gets an
     // answer, and with nothing that decrypts after it, an idle close.

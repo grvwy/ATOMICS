@@ -331,6 +331,7 @@ impl Desktop<'_> {
             }
             Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
             Command::TogglePlan => self.runtime.toggle_plan(),
+            Command::OpenTicket(link) => self.runtime.open_ticket(link, tickets_panel::Nav::Fresh),
             Command::EditingPlan => self.runtime.plan_edit_open = true,
             Command::ClosePlanTab(plan) => self.close_plan_tab(plan),
             Command::NewSession => self.open_new_dialog(None),

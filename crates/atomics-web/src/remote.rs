@@ -37,6 +37,7 @@ use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
+use atomics_core::tickets::TicketLink;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
 use atomics_ui::signin::SignInView;
 use atomics_ui::{
@@ -809,6 +810,12 @@ fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
     }
 }
 
+/// A ticket as the projection names it, by its key or else its id. The rest of it stays on the host, so its
+/// chip shows the key and offers no action.
+fn ticket(key: &Option<String>) -> Option<TicketLink> {
+    key.as_ref().map(|key| TicketLink { id: key.clone(), ..TicketLink::default() })
+}
+
 fn task(info: &TaskInfo) -> Task {
     Task {
         id: info.id.clone(),
@@ -824,6 +831,7 @@ fn task(info: &TaskInfo) -> Task {
         additions: info.additions,
         deletions: info.deletions,
         report: info.report.as_ref().map(|r| Report { status: r.status.clone(), summary: r.summary.clone(), at: r.at }),
+        ticket: ticket(&info.ticket),
         ..Task::default()
     }
 }
@@ -838,6 +846,7 @@ fn plan(info: &PlanInfo) -> Plan {
         tasks: info.tasks.iter().map(task).collect(),
         approved: info.approved,
         integration: info.integration.clone(),
+        ticket: ticket(&info.ticket),
         ..Plan::default()
     }
 }

@@ -166,7 +166,8 @@ secrets. At most five proposals wait at once.
 
 Runs the same checks as `atomics doctor` and returns them as JSON: `checks`, each with `ok`, the `check`,
 a `hint` when it failed and whether it is only a `warning`, and `facts` such as the host name and the loaded
-files. `ok` is true when the required checks pass: git, and a config that loads.
+files. `ok` is true when the required checks pass: git, and a config that loads; every other failed check is a
+`warning`.
 
 ## Reviewing a proposal
 

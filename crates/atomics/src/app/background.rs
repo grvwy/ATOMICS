@@ -57,12 +57,7 @@ impl State {
             if let Some(supported) = ready.get().copied() {
                 changed = true;
                 let id = launch.id.clone();
-                if supported.is_none() {
-                    self.toast(
-                        "Codex version probe failed; starting without hooks and retrying detection on the next start",
-                    );
-                }
-                if let Err(error) = self.launch_agent(launch, Some(supported.unwrap_or(false))) {
+                if let Err(error) = self.launch_codex(launch, supported) {
                     if let Some(index) = self.find(&id) {
                         self.sessions[index].status = AgentStatus::Exited;
                         self.sessions[index].last_message = Some(error.clone());
@@ -619,6 +614,7 @@ impl State {
                     held: Vec::new(),
                     approval_hold: false,
                     menu_absent_since: None,
+                    answered_menu: None,
                     chief: false,
                     pending: None,
                     sandbox: None,
@@ -629,6 +625,7 @@ impl State {
                     scratch: None,
                     naming: Naming::Folder,
                     mcp_needed: Vec::new(),
+                    warning: None,
                 });
                 if self.active.is_none() {
                     self.active = Some(format!("ext:{}", event.session_id));
@@ -663,10 +660,13 @@ impl State {
             }
             session.approval_hold = true;
             session.menu_absent_since = None;
+            // The hook is the request itself: a menu read off the screen only stood in for it.
+            session.approvals.retain(|pending| pending.native.is_none());
             session.approvals.push(PendingApproval {
                 id: uuid::Uuid::new_v4().to_string(),
                 request,
                 reply: message.approval_reply,
+                native: None,
             });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {

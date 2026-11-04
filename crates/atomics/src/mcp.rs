@@ -279,7 +279,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_approve",
-            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, answers only a visible matching native menu; retry if it is not visible yet.",
+            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, or the agent runs without hooks, answers only a visible matching Codex or Claude command menu with that agent's keys; retry if it is not visible yet. The result echoes the command answered. Other menus (edits, questions) are not approvals: answer them with atomics_send raw.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -309,7 +309,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_set",
-            "description": "Write the plan for a goal as tasks. It appears on ATOMICS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short and unique in the plan, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Passing the id of a completed plan reopens it (archived plans stay closed): its tasks' progress and integration branch are kept, and any added or changed task needs the user's approval again. Tasks are merged into the integration branch (default atomics/plan-<plan-id>, kept unless explicitly overridden).",
+            "description": "Write the plan for a goal as tasks. It appears on ATOMICS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short and unique in the plan, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Passing the id of a completed plan reopens it (archived plans stay closed): its tasks' progress and integration branch are kept, and any added or changed task needs the user's approval again. Tasks are merged into the integration branch (default atomics/plan-<plan-id>, kept unless explicitly overridden). Every plan ends with a final review task (id review) that depends on all other tasks, so no task can depend on it. A plan whose dependencies form a cycle is refused, naming the cycle; so is a planned task's branch that another task of the plan or of an open plan already has, with a free name to use instead. Leave branch out to let ATOMICS choose one at dispatch. warnings in the reply name branches that already exist outside any open plan: dispatching a task on one would fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -398,7 +398,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_send",
-            "description": "Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected. Use atomics_approve to answer permission menus.",
+            "description": "Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },

@@ -12,20 +12,26 @@ use crate::theme::{Palette, lerp};
 use crate::touch::{self, Touch};
 use crate::{Backend, Client, Command};
 
-/// A ticket's key and state. A click opens it in the browser; hovering shows the rest.
-/// A failed ticket operation shows beneath it, and a state that means another ATOMICS
-/// status than the task's is pointed out.
+/// A ticket's key and state; hovering shows the rest. A click reads it in the app's ticket reader where
+/// `readable`, and otherwise opens its address in the browser; without an address it offers nothing. Returns
+/// whether the user asked to read it. A failed ticket operation shows beneath it, and a state that means
+/// another ATOMICS status than the task's is pointed out.
 fn ticket_chip(
     ui: &mut egui::Ui,
     link: &atomics_core::tickets::TicketLink,
     means: Option<(TaskStatus, TaskStatus)>,
     config: Option<&atomics_core::tickets::TicketConfig>,
+    readable: bool,
     now: u64,
     p: &Palette,
-) {
+) -> bool {
     let mismatch = config.and_then(|config| config.mismatch(link));
     let color = if link.error.is_some() || mismatch.is_some() { p.warning } else { p.info };
-    ui.horizontal_wrapped(|ui| {
+    // The configured system's reader cannot read a ticket of another system.
+    let read = readable && mismatch.is_none();
+    let acts = read || link.url.is_some();
+    let mut asked = false;
+    label_row(ui, !readable && link.url.is_none(), |ui| {
         let text = match &link.state {
             Some(state) => format!("{} · {state}", link.label()),
             None => link.label().to_string(),
@@ -37,8 +43,8 @@ fn ticket_chip(
             .inner_margin(egui::Margin::symmetric(6, 1))
             .show(ui, |ui| ui.add(egui::Label::new(RichText::new(text).color(color).size(11.0)).selectable(false)))
             .response
-            .interact(Sense::click());
-        if link.url.is_some() {
+            .interact(if acts { Sense::click() } else { Sense::hover() });
+        if acts {
             response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         }
         let response = response.on_hover_ui(|ui| {
@@ -50,21 +56,34 @@ fn ticket_chip(
             if let Some(updated) = &link.updated_at {
                 ui.label(format!("updated {updated}"));
             }
+            // A client that knows only the ticket's key cannot say when its host read it.
             match link.synced_at {
-                Some(at) => ui.label(format!("read {} min ago", now.saturating_sub(at) / 60)),
-                None => ui.label("not read yet"),
-            };
+                Some(at) => {
+                    ui.label(format!("read {} min ago", now.saturating_sub(at) / 60));
+                }
+                None if config.is_some() => {
+                    ui.label("not read yet");
+                }
+                None => {}
+            }
             if let Some(error) = &link.error {
                 ui.label(RichText::new(error).color(p.error));
             }
-            if let Some(url) = &link.url {
-                ui.label(RichText::new(format!("click to open {url}")).color(p.muted));
+            let hint = match (read, &link.url) {
+                (true, Some(_)) => Some("click to read it here, with Open in browser".to_string()),
+                (true, None) => Some("click to read it here".to_string()),
+                (false, Some(url)) => Some(format!("click to open {url}")),
+                (false, None) => None,
+            };
+            if let Some(hint) = hint {
+                ui.label(RichText::new(hint).color(p.muted));
             }
         });
-        if response.clicked()
-            && let Some(url) = &link.url
-        {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        if response.clicked() {
+            asked = read;
+            if let Some(url) = link.url.as_ref().filter(|_| !read) {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
         }
         if let Some((ticket, task)) = means.filter(|(ticket, task)| ticket != task) {
             ui.label(RichText::new(format!("ticket says {}", ticket.label())).color(p.warning).size(11.0))
@@ -79,6 +98,18 @@ fn ticket_chip(
     if let Some(error) = &link.error {
         ui.label(RichText::new(format!("⚠ {}", truncate(error, 160))).color(p.error).size(11.0)).on_hover_text(error);
     }
+    asked
+}
+
+/// `add` in a wrapping row. Where `label`, for a ticket's chip that offers nothing, the row is only as high as what
+/// it holds, and the chip no higher than a label: it does not look like what can be pressed on a phone.
+fn label_row(ui: &mut egui::Ui, label: bool, add: impl FnOnce(&mut egui::Ui)) {
+    let height = ui.spacing().interact_size.y;
+    if label {
+        ui.spacing_mut().interact_size.y = 0.0;
+    }
+    ui.horizontal_wrapped(add);
+    ui.spacing_mut().interact_size.y = height;
 }
 
 fn stage_chip(ui: &mut egui::Ui, stage: Option<&atomics_core::workflow::Stage>) {
@@ -284,6 +315,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let can_integrate = can(Command::IntegrateTask { plan: index, task: String::new() });
     let can_open = can(Command::OpenTaskSession(String::new()));
     let can_acknowledge = can(Command::AcknowledgeRefs { plan: index, task: 0 });
+    let can_read_ticket = can(Command::OpenTicket(Default::default()));
     let buttons = TaskButtons::of(backend, index);
     if board.checking {
         ui.label(RichText::new("Checking integration freshness…").color(p.muted));
@@ -379,11 +411,13 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let ticket_config = &board.ticket_config;
     stage_chip(ui, plan.stages.last());
     let mut sync_tickets = false;
+    let mut read_ticket = None;
     if let Some(link) = &plan.ticket {
-        ui.horizontal_wrapped(|ui| {
+        label_row(ui, !can_read_ticket && link.url.is_none(), |ui| {
             let system = ticket_config.as_ref().map_or(link.system.as_str(), |c| c.system.as_str());
             let what = ticket_config.as_ref().map_or("ticket".to_string(), |c| mode_label(plan, c));
-            ui.label(RichText::new(format!("{system} {what}")).color(p.muted).size(11.5));
+            // A client that knows only the ticket's key has no system to name.
+            ui.label(RichText::new(format!("{system} {what}").trim_start()).color(p.muted).size(11.5));
             let means = ticket_config
                 .as_ref()
                 .filter(|c| {
@@ -392,7 +426,10 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 })
                 .and_then(|c| c.states.status_of(link.state.as_deref()?))
                 .map(|ticket| (ticket, atomics_core::tickets::plan_status(plan)));
-            ui.vertical(|ui| ticket_chip(ui, link, means, ticket_config.as_deref(), now, &p));
+            if ui.vertical(|ui| ticket_chip(ui, link, means, ticket_config.as_deref(), can_read_ticket, now, &p)).inner
+            {
+                read_ticket = Some(link.clone());
+            }
             if let Some(title) = &link.title {
                 ui.label(RichText::new(title).color(p.foreground).size(11.5));
             }
@@ -499,7 +536,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                             .filter(|_| !expected_tasks.contains(&task.id))
                             .and_then(|s| s.status_of(link.state.as_deref()?))
                             .map(|ticket| (ticket, task.status));
-                        ticket_chip(ui, link, means, ticket_config.as_deref(), now, &p);
+                        if ticket_chip(ui, link, means, ticket_config.as_deref(), can_read_ticket, now, &p) {
+                            read_ticket = Some(link.clone());
+                        }
                     }
                     if let Some(branch) = &task.branch {
                         let branch = RichText::new(branch).color(p.muted).size(11.0);
@@ -693,6 +732,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
 
     if editing {
         client.send(Command::EditingPlan);
+    }
+    if let Some(link) = read_ticket {
+        client.send(Command::OpenTicket(link));
     }
     for (id, action) in actions {
         match action {

@@ -9,6 +9,11 @@ const INTEGRATION_CHECK_LIMIT: Duration = Duration::from_secs(150);
 impl State {
     /// The repository a task works in.
     pub(super) fn task_repo(&self, index: usize, task: &Task) -> Option<PathBuf> {
+        self.task_repo_in(task, self.plans[index].project.as_deref())
+    }
+
+    /// `task_repo` for a task of a plan whose project is `project`.
+    pub(super) fn task_repo_in(&self, task: &Task, project: Option<&Path>) -> Option<PathBuf> {
         task.repo
             .as_deref()
             .map(paths::expand)
@@ -16,7 +21,7 @@ impl State {
                 let session = task.session.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id))?;
                 self.project_of(&session.root())
             })
-            .or_else(|| self.plans[index].project.clone())
+            .or_else(|| project.map(Path::to_path_buf))
             .or_else(|| self.diff_target().and_then(|t| self.project_of(&t)))
             .or_else(|| self.repos.first().cloned())
     }
