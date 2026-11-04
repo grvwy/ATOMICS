@@ -387,10 +387,21 @@ uses the repository fixture and reports explicitly that VM isolation and KVM wer
 ## Troubleshooting
 
 Run `atomics doctor` to check git, Claude Code, Codex, the configured editor, the config, the running ATOMICS socket and global Claude hooks.
-It also checks Codex hook support (0.165+), reports hook trust as unverified with `/hooks` instructions, reads plan files,
+It also checks Codex hook support (0.165+) and whether Codex trusts the hooks ATOMICS passes its bare Codex agents, reads plan files,
 warns about cargo entries in `[approvals].allow`, and lists merged worktrees safe to review for cleanup. It changes nothing.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
 agents, Helix, a running ATOMICS or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
+
+For Codex hook trust, doctor computes the hook definitions ATOMICS passes (its executable and socket) the way Codex
+does, and reads `[hooks.state]` in the Codex home those agents get (`<ATOMICS_HOME>/codex` for an explicit
+`ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). It names each event as trusted, untrusted, changed since
+trusted (a new install path, socket or definition) or disabled, and the fix: trust them in Codex's review prompt
+or `/hooks`, or set the exact `trusted_hash` entries it prints. While every Codex agent runs sandboxed, ATOMICS passes
+no hooks and doctor says trust is not needed.
+
+Cleanup failures the startup sweep finds are replaced at every start, so a failure that is fixed, such as a deleted
+project folder or the record of a sandbox that is gone, drops out of doctor after the next start. Failures that no
+sweep looks at again, such as a ref guard's alert, stay until you review them.
 
 ## Usage
 
@@ -418,7 +429,7 @@ their own trust review; ATOMICS never bypasses hook trust. Each Codex session ge
 `ATOMICS_HOOK_PANE`, which its hooks inherit, so it is found even through a wrapper such as ssh into
 a VM; without it, a hook's process ancestry identifies the terminal (Codex runs with `--no-daemon`).
 `SessionStart` maps the Codex session ID to that pane, including when several panes share a worktree.
-`atomics doctor` prints the trust instructions. To make Claude sessions in any other terminal show up too
+`atomics doctor` says which events Codex trusts and how to trust the rest. To make Claude sessions in any other terminal show up too
 (status, diff, and messages delivered at their next tool call or turn end), add the hooks to your user settings:
 
 ```sh

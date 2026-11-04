@@ -75,8 +75,9 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
         assert_eq!(output.status.code(), Some(expected));
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.contains("✗ claude not found"), "{text}");
-        assert!(text.contains("✗ ATOMICS running"), "{text}");
-        assert!(text.contains("✗ global Claude hooks installed"), "{text}");
+        assert!(text.contains("✗ ATOMICS not running (warning)"), "{text}");
+        assert!(text.contains("✗ global Claude hooks not installed (warning)"), "{text}");
+        assert!(!text.contains("✗ ATOMICS running") && !text.contains("✗ global Claude hooks installed"), "{text}");
         if expected == 0 {
             assert!(text.contains("✓ git found (git version fixture)"), "{text}");
             assert!(text.contains("✓ config parses"), "{text}");
