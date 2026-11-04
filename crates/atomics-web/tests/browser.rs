@@ -77,7 +77,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -153,6 +153,8 @@ struct Browser {
     child: Arc<Mutex<Child>>,
     log: PathBuf,
     profile: tempfile::TempDir,
+    cancel: mpsc::Sender<()>,
+    watchdog: Option<thread::JoinHandle<()>>,
 }
 
 impl Browser {
@@ -164,6 +166,19 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+        if thread::panicking() {
+            // Keep the failing frame even when an assertion precedes the test's next screenshot.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let name = thread::current().name().unwrap_or("browser").to_string();
+                let out = actions_dir().join(format!("failed-{name}.png"));
+                screenshot(&self.devtools(), &out);
+                eprintln!("failure screenshot: {}", out.display());
+            }));
+        }
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
@@ -175,9 +190,17 @@ impl Drop for Browser {
 }
 
 /// Past `overall`, say what the servers saw and the browser logged, stop the browser and exit.
-fn watchdog(child: Arc<Mutex<Child>>, seen: Arc<Log>, log: PathBuf, overall: Duration) {
-    thread::spawn(move || {
-        thread::sleep(overall);
+fn watchdog(
+    child: Arc<Mutex<Child>>,
+    seen: Arc<Log>,
+    log: PathBuf,
+    overall: Duration,
+) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (cancel, cancelled) = mpsc::channel();
+    let watchdog = thread::spawn(move || {
+        if cancelled.recv_timeout(overall) != Err(mpsc::RecvTimeoutError::Timeout) {
+            return;
+        }
         eprintln!("browser test: still running after {overall:?}; the servers saw {:#?}", seen.lines.lock().unwrap());
         console(&log);
         if let Ok(mut child) = child.lock() {
@@ -186,6 +209,7 @@ fn watchdog(child: Arc<Mutex<Child>>, seen: Arc<Log>, log: PathBuf, overall: Dur
         }
         std::process::exit(1);
     });
+    (cancel, watchdog)
 }
 
 struct Reply {
@@ -761,8 +785,8 @@ fn launch(flags: &[String], url: &str, log: &Arc<Log>, overall: Duration) -> Bro
         .spawn()
         .expect("Chrome starts");
     let child = Arc::new(Mutex::new(child));
-    watchdog(child.clone(), log.clone(), chrome_log.clone(), overall);
-    Browser { child, log: chrome_log, profile }
+    let (cancel, watchdog) = watchdog(child.clone(), log.clone(), chrome_log.clone(), overall);
+    Browser { child, log: chrome_log, profile, cancel, watchdog: Some(watchdog) }
 }
 
 #[test]
@@ -941,10 +965,16 @@ fn until_on<T>(
 
 /// The areas of `color` (±`tol` a channel) inside `region` on the last screenshot, in points, largest first.
 fn boxes(page: &mut DevTools, color: Color32, tol: u8, region: Rect, min_area: f32) -> Vec<Rect> {
+    boxes_near(page, color, tol, region, min_area, 1)
+}
+
+fn boxes_near(page: &mut DevTools, color: Color32, tol: u8, region: Rect, min_area: f32, gap: u8) -> Vec<Rect> {
     let [r, g, b, _] = color.to_srgba_unmultiplied();
     let (min, max) = (region.min, region.max);
-    let found =
-        page.eval(&format!("boxes([{r}, {g}, {b}], {tol}, [{}, {}, {}, {}], {min_area})", min.x, min.y, max.x, max.y));
+    let found = page.eval(&format!(
+        "boxes([{r}, {g}, {b}], {tol}, [{}, {}, {}, {}], {min_area}, {gap})",
+        min.x, min.y, max.x, max.y
+    ));
     let found = found.as_array().unwrap_or_else(|| panic!("boxes: the page said {found}"));
     found
         .iter()
@@ -953,6 +983,20 @@ fn boxes(page: &mut DevTools, color: Color32, tol: u8, region: Rect, min_area: f
             Rect::from_min_size(pos2(n(0), n(1)), vec2(n(2), n(3)))
         })
         .collect()
+}
+
+/// Rounded outlines may have antialiased corners that separate their horizontal strokes.
+fn outlines(page: &mut DevTools, color: Color32, region: Rect) -> Vec<Rect> {
+    let parts = boxes_near(page, color, 3, region, 8.0, 2);
+    let mut found = parts.clone();
+    for top in parts.iter().filter(|r| r.height() <= 3.0) {
+        for bottom in parts.iter().filter(|r| r.height() <= 3.0 && r.top() > top.bottom()) {
+            if (top.left() - bottom.left()).abs() <= 3.0 && (top.width() - bottom.width()).abs() <= 3.0 {
+                found.push(top.union(*bottom));
+            }
+        }
+    }
+    found
 }
 
 /// How much of `region` shows `color` on the last screenshot, in square points: text in that colour, say.
@@ -1560,12 +1604,13 @@ fn a_menu_over_a_terminal_acts_and_takes_no_lease() {
         session.status = AgentStatus::Idle;
         session.pending_approvals = 0;
     }
-    let Opened { log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    let Opened { log, _browser, mut page, mut frame, palette, .. } = open(board, WIDE, false);
     log.wait("subscribe s1", 1);
     frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
 
-    // "Hide diff": the agent's terminal reaches the right edge, under where the ⋯ menu opens.
-    page.click((1316.0, 16.0));
+    // Hide Board: the agent's terminal reaches the right edge, under where the ⋯ menu opens.
+    let panel = panel_button(&mut page, &palette, true);
+    page.click(panel);
     frame.wait(
         "the terminal under the menu's place",
         "document.getElementById('atomics-input').getBoundingClientRect().right > 1560",
@@ -1695,10 +1740,121 @@ fn terminal_input(frame: &mut DevTools) {
     frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
 }
 
+/// The terminal cells covered by the browser's input, in CSS pixels.
+fn input_rect(frame: &mut DevTools) -> Rect {
+    let rect = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; })()");
+    let n = |i: usize| rect[i].as_f64().expect("an input coordinate") as f32;
+    Rect::from_min_size(pos2(n(0), n(1)), vec2(n(2), n(3)))
+}
+
+/// The two-view switcher's outline on a wide screen; its left segment is Board, its right is Diff.
+/// Find the drawn control so connection status, load and New can change the bar's spacing.
+fn panel_button(page: &mut DevTools, palette: &Palette, board: bool) -> (f64, f64) {
+    let size = page.eval("[innerWidth, innerHeight, devicePixelRatio]");
+    let n = |i: usize| size[i].as_f64().expect("a viewport dimension") as f32;
+    let top = Rect::from_min_max(pos2(n(0) / 2.0, 0.0), pos2(n(0), 34.0));
+    let (outline, _) = until_on(page, (n(0) * n(2), n(1) * n(2)), &actions_dir(), "the Board/Diff switcher", |page| {
+        outlines(page, palette.border, top)
+            .into_iter()
+            .find(|r| r.width() > 120.0 && (18.0..=30.0).contains(&r.height()))
+    });
+    let x = outline.left() + outline.width() * if board { 0.25 } else { 0.75 };
+    (f64::from(x), f64::from(outline.center().y))
+}
+
+/// Find a button by its drawn outline and the size egui gives its label in this look.
+fn button(page: &mut DevTools, palette: &Palette, size: (f32, f32), region: Rect, label: &str, small: bool) -> Pos2 {
+    let phone = size.0 < 600.0;
+    let zoom = if phone { layout::ZOOM } else { 1.0 };
+    let ctx = egui::Context::default();
+    let mut style = palette.style();
+    if phone {
+        style.text_styles = egui::Style::default().text_styles;
+        style.spacing.button_padding = vec2(10.0, 4.0);
+        style.spacing.interact_size = vec2(layout::TOUCH, layout::TOUCH);
+    }
+    ctx.all_styles_mut(|s| *s = style.clone());
+    let mut expected = egui::Vec2::ZERO;
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let response = if small && !phone { ui.small_button(label) } else { ui.button(label) };
+        expected = response.rect.size() * zoom;
+    });
+    output.textures_delta.clear();
+    eprintln!("button {label:?}: looking for {expected:?} CSS pixels");
+    let pixels = if phone { (size.0 * PHONE_SCALE, size.1 * PHONE_SCALE) } else { size };
+    let (rect, _) = until_on(page, pixels, &actions_dir(), label, |page| {
+        outlines(page, palette.border, region)
+            .into_iter()
+            .filter(|r| {
+                (r.height() - expected.y).abs() <= 3.0
+                    && (r.width() - expected.x).abs().min((r.width() + 4.0 - expected.x).abs()) <= 2.5
+            })
+            .min_by(|a, b| a.top().total_cmp(&b.top()).then_with(|| a.left().total_cmp(&b.left())))
+    });
+    rect.center()
+}
+
+fn click_button(page: &mut DevTools, palette: &Palette, region: Rect, label: &str, small: bool) {
+    let at = button(page, palette, WIDE, region, label, small);
+    page.click((f64::from(at.x), f64::from(at.y)));
+}
+
+/// The active agent's accent stripe, below Usage, locates its sidebar row.
+fn sidebar_row(page: &mut DevTools, palette: &Palette, size: (f32, f32)) -> (f64, f64) {
+    let sidebar = Rect::from_min_max(pos2(0.0, 34.0), pos2(20.0, size.1 - 40.0));
+    let (stripe, _) = until_on(page, size, &actions_dir(), "the active sidebar row", |page| {
+        boxes(page, palette.accent, 3, sidebar, 30.0)
+            .into_iter()
+            .find(|r| r.width() <= 4.0 && (34.0..=40.0).contains(&r.height()))
+    });
+    (f64::from(stripe.left() + 60.0), f64::from(stripe.center().y))
+}
+
+/// A tile's close sits above the terminal's 24-point typing strip, in the fleet's own header.
+fn tile_close(frame: &mut DevTools) -> (f64, f64) {
+    let cells = input_rect(frame);
+    (f64::from(cells.right() - 14.0), f64::from(cells.top() - 24.0 - atomics_ui::fleet::TILE_HEADER / 2.0))
+}
+
+/// An added band in the visible diff. A host comment splits the first file's band in two.
+fn diff_band(page: &mut DevTools, palette: &Palette, index: usize) -> Rect {
+    let region = Rect::from_min_max(pos2(WIDE.0 / 2.0, 90.0), pos2(WIDE.0, WIDE.1 - 40.0));
+    let (band, _) = until_on(page, WIDE, &actions_dir(), "the added diff lines", |page| {
+        let mut bands: Vec<_> = boxes(page, palette.added, 2, region, 1000.0)
+            .into_iter()
+            .filter(|r| r.width() > 200.0 && r.height() > 10.0)
+            .collect();
+        bands.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        bands.get(index).copied()
+    });
+    band
+}
+
+fn comment_line(page: &mut DevTools, palette: &Palette, index: usize) {
+    let band = diff_band(page, palette, index);
+    page.click((f64::from(band.center().x), f64::from(band.top() + 8.0)));
+}
+
+fn dialog_region(size: (f32, f32)) -> Rect {
+    Rect::from_center_size(
+        pos2(size.0 / 2.0, size.1 / 2.0),
+        vec2(size.0 * 0.9, if size.0 < 600.0 { 220.0 } else { 300.0 }),
+    )
+}
+
+fn phone_pane(size: (f32, f32), tab: Tab) -> Pos2 {
+    let points = Rect::from_min_size(Pos2::ZERO, vec2(size.0, size.1) / layout::ZOOM);
+    let regions =
+        layout::regions(points, &Viewport { visible: Some(points), coarse: true, ..Viewport::default() }, false);
+    let items = layout::bar_items(regions.bar.expect("the pane bar"), views::BAR.len());
+    let index = views::BAR.iter().position(|(t, _)| *t == tab).expect("a pane");
+    (items[index].center().to_vec2() * layout::ZOOM).to_pos2()
+}
+
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn text_boxes_take_the_keyboard_from_a_terminal() {
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(fake_host::working(), WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
     let (terminal, bar) = ((700.0, 500.0), (362.0, 981.0));
@@ -1752,7 +1908,8 @@ fn text_boxes_take_the_keyboard_from_a_terminal() {
     assert_eq!(typed(&host, "s1"), "lspwd", "none of it reached the terminal");
 
     // The diff in the right panel, and the terminal with the keyboard again.
-    page.click((1456.0, 16.0));
+    let panel = panel_button(&mut page, &palette, false);
+    page.click(panel);
     wait_host(&host, "both files of the diff asked for", |h| {
         let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
         asked("src/a.rs") && asked("src/b.rs")
@@ -1762,7 +1919,7 @@ fn text_boxes_take_the_keyboard_from_a_terminal() {
     frame.wait("the focus back on the input", FOCUSED);
 
     // A click on a line opens its comment box, which takes the keyboard; Return adds the comment on the host.
-    page.click((1374.0, 172.0));
+    comment_line(&mut page, &palette, 0);
     frame.wait("the keyboard on the comment box", TEXT_BOX);
     page.call("Input.insertText", json!({ "text": "Why this step?" }));
     keep(&mut page, "wide-comment-typed");
@@ -1772,7 +1929,8 @@ fn text_boxes_take_the_keyboard_from_a_terminal() {
     keep(&mut page, "wide-comment");
 
     // Send review sends it to the agent, as one review, and it leaves the diff.
-    page.click((1471.7, 49.5));
+    let header = Rect::from_min_max(pos2(WIDE.0 / 2.0, 34.0), pos2(WIDE.0, 120.0));
+    click_button(&mut page, &palette, header, "Send review (1)", false);
     wait_host(&host, "the review", |h| h.reviews.len() == 1 && h.reviews[0].1[0].body == "Why this step?");
     wait_host(&host, "the comment gone from the diff", |h| h.board.diffs[0].comments.is_empty());
     keep(&mut page, "wide-review-sent");
@@ -1828,14 +1986,15 @@ fn a_shell_under_another_name_gets_no_steer_for_want_of_all_agents() {
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn the_keyboard_in_a_text_box_lets_go_of_the_terminals_lease() {
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(fake_host::working(), WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
     let (terminal, bar) = ((700.0, 500.0), (362.0, 981.0));
     let held = |host: &Mutex<FakeHost>| host.lock().unwrap().terminals["s1"].lease.is_some();
 
     // A card's open types in its agent, as picking it from the sidebar does.
-    page.click((1369.0, 289.0));
+    let board = Rect::from_min_max(pos2(input_rect(&mut frame).right(), 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
+    click_button(&mut page, &palette, board, "open", true);
     log.wait("acquire s1", 1);
     frame.wait("the focus on the input", FOCUSED);
     page.call("Input.insertText", json!({ "text": "a" }));
@@ -1886,7 +2045,7 @@ fn the_keyboard_in_a_text_box_lets_go_of_the_terminals_lease() {
     page.click(terminal);
     frame.wait("the focus back on the input", FOCUSED);
     wait_host(&host, "the lease again", |h| h.terminals["s1"].lease.is_some());
-    page.click((1374.0, 172.0));
+    comment_line(&mut page, &palette, 0);
     frame.wait("the keyboard on the comment box", TEXT_BOX);
     log.wait("release s1", 2);
     wait_host(&host, "the lease given back again", |h| h.terminals["s1"].lease.is_none());
@@ -1911,16 +2070,18 @@ fn a_steer_one_target_missed_names_it_and_stays_out_of_the_bar() {
     const SIZE: (f32, f32) = (2800.0, 1000.0);
     let mut board = fake_host::working();
     a_second_task(&mut board);
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, SIZE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(board, SIZE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
     let (away, bar) = ((800.0, 16.0), (362.0, 981.0));
 
     // Both rows in "selected", and the bar's target on them.
-    for (row, include) in [((80.5, 81.5), (182.0, 98.0)), ((69.5, 122.0), (171.0, 138.0))] {
+    let first = sidebar_row(&mut page, &palette, SIZE);
+    // Rows are 38 points high with the look's four-point spacing between them.
+    for row in [first, (first.0, first.1 + 42.0)] {
         page.right_click(row);
         frame.wait("the menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
-        page.click(include);
+        page.click((row.0 + 20.0, row.1 + 15.0));
         thread::sleep(Duration::from_millis(300));
         page.click(away);
         frame.wait("the menu closed", &format!("{CLIP} === ''"));
@@ -1948,7 +2109,7 @@ fn a_steer_one_target_missed_names_it_and_stays_out_of_the_bar() {
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn a_note_takes_the_pointer_and_a_refused_comment_comes_back() {
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(fake_host::working(), WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
 
@@ -1956,6 +2117,8 @@ fn a_note_takes_the_pointer_and_a_refused_comment_comes_back() {
     let long = "message not delivered: the session is not ready for it, and this sentence goes on long enough \
                 to take the width the note has and then some, over the terminal, as a real host's message can \
                 when it has a good deal to say about what went wrong and what to do about it";
+    // The location row puts the cells below the original note. Keep the fixture over actual cells.
+    let long = format!("{long} {long}");
     host.lock().unwrap().refuse_next = Some(WireError::new(ErrorCode::Rejected, long));
     page.click((362.0, 981.0));
     frame.wait("the keyboard on the steer bar", TEXT_BOX);
@@ -1963,20 +2126,45 @@ fn a_note_takes_the_pointer_and_a_refused_comment_comes_back() {
     thread::sleep(Duration::from_millis(300));
     page.key("Enter", 13, Some("\r"));
     wait_host(&host, "the refusal used", |h| h.refuse_next.is_none());
+    keep(&mut page, "wide-note-at-refusal");
+    let cells = input_rect(&mut frame);
+    eprintln!("terminal cells at the refusal (CSS pixels): {cells:?}");
+    let screen = Rect::from_min_max(pos2(0.0, 34.0), pos2(WIDE.0, 220.0));
+    let (note, png) = until_on(&mut page, WIDE, &actions_dir(), "the note's warning outline", |page| {
+        // The note's thin stroke falls between pixels; include its antialiased yellow edges.
+        boxes(page, palette.warning, 80, screen, 400.0)
+            .into_iter()
+            .filter(|r| r.width() > WIDE.0 / 2.0)
+            .reduce(|a, b| a.union(b))
+    });
+    std::fs::write(actions_dir().join("wide-note-measured.png"), base64(&png)).unwrap();
+    let overlap = note.intersect(cells);
+    eprintln!(
+        "note overlap (CSS pixels): note={note:?}, terminal={cells:?}, intersection={overlap:?}, positive={}",
+        overlap.is_positive()
+    );
+    assert!(overlap.is_positive(), "the note must actually cover terminal cells: {note:?}, {cells:?}");
     frame.wait("the note cut out of the input", &format!("{CLIP}.startsWith('path(')"));
+    let at = overlap.center();
+    assert_eq!(
+        frame.eval(&format!("document.elementFromPoint({}, {}).id", at.x, at.y)),
+        json!("atomics"),
+        "the note takes the overlapping cells' pointer"
+    );
     keep(&mut page, "wide-note-long");
-    page.click((1023.3, 50.5));
+    page.click(tile_close(&mut frame));
     frame.wait("the note gone, and no dialog", &format!("{CLIP} === ''"));
     keep(&mut page, "wide-note-dismissed");
 
     // A refused comment comes back in its box, with the keyboard, and Enter tries again.
-    page.click((1456.0, 16.0));
+    let panel = panel_button(&mut page, &palette, false);
+    page.click(panel);
     wait_host(&host, "both files of the diff asked for", |h| {
         let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
         asked("src/a.rs") && asked("src/b.rs")
     });
     thread::sleep(Duration::from_millis(400));
-    page.click((1374.0, 172.0));
+    comment_line(&mut page, &palette, 0);
     frame.wait("the keyboard on the comment box", TEXT_BOX);
     page.call("Input.insertText", json!({ "text": "Why this step?" }));
     thread::sleep(Duration::from_millis(300));
@@ -2013,16 +2201,19 @@ fn review_commands(host: &Mutex<FakeHost>) -> usize {
 fn a_comment_box_keeps_its_draft_while_the_connection_is_down() {
     let mut board = fake_host::working();
     comment_on_the_host(&mut board);
-    let Opened { host, log, _browser, mut page, mut frame, line, .. } = open(board, WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, line, palette, .. } = open(board, WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
-    page.click((1456.0, 16.0));
+    let panel = panel_button(&mut page, &palette, false);
+    page.click(panel);
     wait_host(&host, "both files of the diff asked for", |h| {
         let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
         asked("src/a.rs") && asked("src/b.rs")
     });
     thread::sleep(Duration::from_millis(400));
-    page.click((1374.3, 189.7));
+    let first = diff_band(&mut page, &palette, 0);
+    let comment = (f64::from(first.center().x), f64::from(first.bottom() + 8.0));
+    comment_line(&mut page, &palette, 1);
     frame.wait("the keyboard on the comment box", TEXT_BOX);
     page.call("Input.insertText", json!({ "text": "draft" }));
     thread::sleep(Duration::from_millis(300));
@@ -2045,7 +2236,7 @@ fn a_comment_box_keeps_its_draft_while_the_connection_is_down() {
     keep(&mut page, "wide-comment-offline-enter");
 
     // A comment on the diff has no × meanwhile.
-    page.mouse("mouseMoved", (1196.8, 170.6));
+    page.mouse("mouseMoved", comment);
     keep(&mut page, "wide-comment-row-offline");
 
     // Back: the box still has its text and the keyboard, so Enter sends it without a click.
@@ -2066,7 +2257,7 @@ fn a_comment_box_keeps_its_draft_while_the_connection_is_down() {
     log.wait("cut", 2);
     thread::sleep(Duration::from_millis(1000));
     let before = review_commands(&host);
-    page.click((1196.8, 170.6));
+    page.click(comment);
     keep(&mut page, "wide-comment-row-clicked-offline");
     line.down.store(false, Ordering::SeqCst);
     log.wait("hello epoch-1", 2);
@@ -2112,10 +2303,11 @@ fn a_viewer_has_no_comment_actions_in_a_diff() {
     let mut board = fake_host::working();
     board.answer = Some(atomics_core::noise::Access::View);
     comment_on_the_host(&mut board);
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(board, WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
-    page.click((1372.0, 16.0));
+    let panel = panel_button(&mut page, &palette, false);
+    page.click(panel);
     wait_host(&host, "both files of the diff asked for", |h| {
         let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
         asked("src/a.rs") && asked("src/b.rs")
@@ -2123,11 +2315,13 @@ fn a_viewer_has_no_comment_actions_in_a_diff() {
     thread::sleep(Duration::from_millis(400));
     keep(&mut page, "viewer-diff");
 
-    page.mouse("mouseMoved", (1196.8, 170.6));
+    let first = diff_band(&mut page, &palette, 0);
+    let comment = (f64::from(first.center().x), f64::from(first.bottom() + 8.0));
+    page.mouse("mouseMoved", comment);
     keep(&mut page, "viewer-comment-hover");
-    page.click((1196.8, 170.6));
+    page.click(comment);
     keep(&mut page, "viewer-comment-clicked");
-    page.click((1374.3, 189.7));
+    comment_line(&mut page, &palette, 1);
     thread::sleep(Duration::from_millis(400));
     assert_eq!(frame.eval(TEXT_BOX), json!(false), "a viewer never gets a box");
     keep(&mut page, "viewer-line-clicked");
@@ -2177,34 +2371,35 @@ fn a_board_and_a_tile_act_in_a_wide_window() {
     let mut another = board.board.plans[0].tasks[2].clone();
     (another.id, another.title) = ("t7".into(), "Task t7".into());
     board.board.plans[0].tasks.push(another);
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(board, WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
     keep(&mut page, "wide-board");
 
     // A card's start starts that task; Dispatch ready, then, the other one that is ready.
-    page.click((1086.5, 325.0));
+    let board = Rect::from_min_max(pos2(input_rect(&mut frame).right(), 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
+    click_button(&mut page, &palette, board, "start", true);
     wait_host(&host, "t3 started", |h| task(h, "t3").status == TaskStatus::Running);
     assert_eq!(task(&host.lock().unwrap(), "t7").status, TaskStatus::Planned);
     thread::sleep(Duration::from_millis(300));
-    page.click((1415.0, 52.5));
+    click_button(&mut page, &palette, board, "Dispatch ready (1)", false);
     wait_host(&host, "t7 dispatched", |h| task(h, "t7").status == TaskStatus::Running);
     keep(&mut page, "wide-board-dispatched");
 
     // A running agent's × asks, over the terminal, whose input gives way to the dialog; Cancel closes nothing.
-    let (close, confirm, cancel) = ((1023.3, 50.5), (690.5, 532.0), (780.4, 532.0));
+    let close = tile_close(&mut frame);
     page.click(close);
     frame.wait("the dialog cut out of the input", &format!("{CLIP}.startsWith('path(')"));
     keep(&mut page, "wide-close-session");
     assert!(has_agent(&host.lock().unwrap()), "not yet");
-    page.click(cancel);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Cancel", false);
     frame.wait("the dialog gone", &format!("{CLIP} === ''"));
     assert!(has_agent(&host.lock().unwrap()));
 
     // The dialog's Close session closes it, and the input goes with its terminal.
     page.click(close);
     frame.wait("the dialog again", &format!("{CLIP}.startsWith('path(')"));
-    page.click(confirm);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Close session", false);
     wait_host(&host, "the agent closed", |h| !has_agent(h));
     frame.wait("the input gone with its terminal", "document.getElementById('atomics-input').hidden");
     keep(&mut page, "wide-session-closed");
@@ -2216,7 +2411,7 @@ fn a_board_and_a_tile_act_in_a_wide_window() {
 fn a_plan_closes_and_a_new_session_starts() {
     use atomics_core::plan::PlanStatus;
 
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(fake_host::working(), WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
 
@@ -2245,20 +2440,22 @@ fn a_plan_closes_and_a_new_session_starts() {
     );
     log.wait("subscribe new-0", 1);
 
-    // Back on the plan, its board: Close plan… offers Archive alone, and Cancel keeps it open.
-    page.click((372.5, 16.5));
+    // Back on the plan, its board: Cancel keeps it open, and Archive plan archives it.
+    let top = Rect::from_min_max(Pos2::ZERO, pos2(WIDE.0 / 2.0, 34.0));
+    let (plan, _) = until_on(&mut page, WIDE, &actions_dir(), "the plan tab", |page| {
+        boxes(page, palette.warning, 6, top, 1.0).into_iter().reduce(|a, b| a.union(b))
+    });
+    page.click((f64::from(plan.center().x), f64::from(plan.center().y)));
     thread::sleep(Duration::from_millis(300));
-    page.click((1456.0, 16.0));
-    thread::sleep(Duration::from_millis(300));
-    let (close, archive, cancel) = ((1541.0, 52.5), (687.0, 533.5), (773.2, 532.0));
-    page.click(close);
+    let board = Rect::from_min_max(pos2(WIDE.0 / 2.0, 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
+    click_button(&mut page, &palette, board, "Close plan…", true);
     keep(&mut page, "wide-close-plan");
-    page.click(cancel);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Cancel", false);
     thread::sleep(Duration::from_millis(300));
     assert_eq!(host.lock().unwrap().board.plans[0].status, PlanStatus::Open);
-    page.click(close);
+    click_button(&mut page, &palette, board, "Close plan…", true);
     thread::sleep(Duration::from_millis(400));
-    page.click(archive);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Archive plan", false);
     wait_host(&host, "the plan archived", |h| h.board.plans[0].status == PlanStatus::Archived);
     keep(&mut page, "wide-plan-archived");
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
@@ -2270,16 +2467,17 @@ fn a_row_steers_and_a_review_column_acts() {
     use atomics_core::plan::TaskStatus;
 
     // A window with room for the sidebar beside the docked chief.
-    const SIZE: (f32, f32) = (2800.0, 1000.0);
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), SIZE, false);
+    const SIZE: (f32, f32) = (3200.0, 1000.0);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(fake_host::working(), SIZE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
 
     // A row's menu puts it in "selected", and the bar's target sends to the selected.
-    page.right_click((80.5, 81.5));
+    let row = sidebar_row(&mut page, &palette, SIZE);
+    page.right_click(row);
     frame.wait("the menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
     keep(&mut page, "wide-row-menu");
-    page.click((182.0, 98.0));
+    page.click((row.0 + 20.0, row.1 + 15.0));
     thread::sleep(Duration::from_millis(300));
     page.click((1500.0, 700.0));
     frame.wait("the menu closed", &format!("{CLIP} === ''"));
@@ -2296,32 +2494,45 @@ fn a_row_steers_and_a_review_column_acts() {
     wait_host(&host, "the steer to the selected", |h| h.steered == [("s1".to_string(), "both of you".to_string())]);
 
     // The divider dragged left, as far as the agent's tile lets it, brings the board's fourth column on screen.
-    page.mouse_drag((1877.0, 600.0), (1000.0, 600.0));
+    let edge = f64::from(input_rect(&mut frame).right() + 3.0);
+    page.mouse_drag((edge, 600.0), (edge - 1000.0, 600.0));
     keep(&mut page, "wide-board-wider");
-    page.click((2265.0, 248.0));
+    let left = input_rect(&mut frame).right() + 3.0;
+    let board = Rect::from_min_max(pos2(left, 180.0), pos2(SIZE.0, SIZE.1 - 40.0));
+    let review =
+        Rect::from_min_max(pos2(left + board.width() * 0.6, 180.0), pos2(left + board.width() * 0.8, board.bottom()));
+    let click = |page: &mut DevTools, region: Rect, label: &str, small: bool| {
+        let at = button(page, &palette, SIZE, region, label, small);
+        page.click((f64::from(at.x), f64::from(at.y)));
+    };
+    click(&mut page, board, "unblock", true);
     wait_host(&host, "t6 unblocked", |h| task(h, "t6").status == TaskStatus::Running);
     thread::sleep(Duration::from_millis(300));
-    page.click((2709.4, 249.5));
+    // "send back" has the same monospace width; integrate is the row's last button.
+    click(&mut page, review.with_min_x(review.center().x), "integrate", true);
     wait_host(&host, "t4 integrated", |h| task(h, "t4").integrated.is_some());
     thread::sleep(Duration::from_millis(300));
-    page.click((2547.5, 249.5));
+    click(&mut page, review, "accept", true);
     wait_host(&host, "t4 accepted", |h| task(h, "t4").status == TaskStatus::Done);
     thread::sleep(Duration::from_millis(300));
-    page.click((1948.9, 112.5));
+    let header = board.with_min_y(34.0).with_max_y(180.0);
+    click(&mut page, header, "Integrate", false);
     wait_host(&host, "t5 integrated", |h| task(h, "t5").integrated.is_some());
     keep(&mut page, "wide-board-integrated");
 
     // A panel this wide has the changed-files column beside the diff; a click there scrolls to the file, and
     // asks nothing of the host.
-    page.click((2656.2, 16.0));
+    let panel = panel_button(&mut page, &palette, false);
+    page.click(panel);
     wait_host(&host, "both files of the diff asked for", |h| {
         let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
         asked("src/a.rs") && asked("src/b.rs")
     });
     keep(&mut page, "wide-changed-files");
     let before = host.lock().unwrap().received.len();
-    page.click((1720.0, 124.0));
+    page.click((f64::from(left + 80.0), 148.0));
     keep(&mut page, "wide-changed-files-picked");
+    eprintln!("messages after the file-row click: {:#?}", &host.lock().unwrap().received[before..]);
     assert_eq!(host.lock().unwrap().received.len(), before, "nothing went to the host");
 }
 
@@ -2335,7 +2546,7 @@ fn a_phone_acts_by_touch() {
     let at = |x: f32, y: f32| pos2(x * layout::ZOOM, y * layout::ZOOM);
     let mut board = fake_host::working();
     board.board.plans[0].tasks.retain(|t| t.id == "t4" || t.id == "t5");
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, SIZE, true);
+    let Opened { host, log, _browser, mut page, mut frame, palette, .. } = open(board, SIZE, true);
     log.wait("hello new", 1);
     frame.wait("an iPhone's screen in the frame", "matchMedia('(pointer: coarse)').matches");
     thread::sleep(Duration::from_millis(600));
@@ -2352,15 +2563,16 @@ fn a_phone_acts_by_touch() {
     wait_host(&host, "t5 integrated", |h| task(h, "t5").integrated.is_some());
     keep(&mut page, "phone-integrated");
 
-    // Close plan… offers Archive alone, at a finger's size, and Cancel keeps it open.
+    // Close plan… offers its choices at a finger's size, and Cancel keeps it open.
     page.tap(at(58.4, 191.1));
     keep(&mut page, "phone-close-plan");
-    page.tap(at(151.1, 329.6));
+    let cancel = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Cancel", false);
+    page.tap(cancel);
     thread::sleep(Duration::from_millis(400));
     assert_eq!(host.lock().unwrap().board.plans[0].status, PlanStatus::Open);
 
     // A terminal takes the keyboard by a tap; going on to the diff takes it from the terminal.
-    let (terminal_pane, diffs_pane) = (at(201.6, 569.2), at(144.5, 569.2));
+    let (terminal_pane, diffs_pane) = (phone_pane(SIZE, Tab::Terminal), phone_pane(SIZE, Tab::Diffs));
     page.tap(terminal_pane);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
@@ -2393,7 +2605,9 @@ fn a_phone_acts_by_touch() {
     wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "Why this step?"));
     assert_eq!(typed(&host, "s1"), "ls", "none of it reached the terminal");
     keep(&mut page, "phone-comment");
-    page.tap(at(110.0, 143.2));
+    let header = Rect::from_min_max(Pos2::ZERO, pos2(SIZE.0, 300.0));
+    let send = button(&mut page, &palette, SIZE, header, "Send review (1)", false);
+    page.tap(send);
     wait_host(&host, "the review", |h| h.reviews.len() == 1 && h.reviews[0].1[0].body == "Why this step?");
     keep(&mut page, "phone-review-sent");
 
@@ -2406,21 +2620,24 @@ fn a_phone_acts_by_touch() {
     frame.wait("the dialog cut out of the input", &format!("{CLIP}.startsWith('path(')"));
     keep(&mut page, "phone-close-session");
     assert!(has_agent(&host.lock().unwrap()), "not yet");
-    page.tap(at(156.5, 329.6));
+    let cancel = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Cancel", false);
+    page.tap(cancel);
     frame.wait("the dialog gone", &format!("{CLIP} === ''"));
     assert!(has_agent(&host.lock().unwrap()));
     page.tap(close);
     frame.wait("the dialog again", &format!("{CLIP}.startsWith('path(')"));
-    page.tap(at(71.0, 329.6));
+    let confirm = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Close session", false);
+    page.tap(confirm);
     wait_host(&host, "the agent closed", |h| !has_agent(h));
     keep(&mut page, "phone-session-closed");
 
     // Archive, from the board.
-    page.tap(at(86.3, 569.2));
+    page.tap(phone_pane(SIZE, Tab::Board));
     thread::sleep(Duration::from_millis(400));
     page.tap(at(58.4, 191.1));
     keep(&mut page, "phone-close-plan-again");
-    page.tap(at(68.2, 330.8));
+    let archive = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Archive plan", false);
+    page.tap(archive);
     wait_host(&host, "the plan archived", |h| h.board.plans[0].status == PlanStatus::Archived);
     keep(&mut page, "phone-plan-archived");
 

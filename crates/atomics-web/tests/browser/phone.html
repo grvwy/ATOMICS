@@ -53,7 +53,7 @@
       shot = { scale: image.width / innerWidth, data: g.getImageData(0, 0, image.width, image.height) };
       return [image.width, image.height];
     };
-    window.boxes = ([r, g, b], tol, [x0, y0, x1, y1], minArea) => {
+    window.boxes = ([r, g, b], tol, [x0, y0, x1, y1], minArea, gap = 1) => {
       const { scale, data } = shot;
       const [w, h] = [Math.floor(x1 - x0), Math.floor(y1 - y0)];
       const hit = new Uint8Array(w * h);
@@ -75,10 +75,16 @@
           const at = stack.pop();
           const [x, y] = [at % w, Math.floor(at / w)];
           [left, top, right, bottom, area] = [Math.min(left, x), Math.min(top, y), Math.max(right, x), Math.max(bottom, y), area + 1];
-          for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
-            if (nx >= 0 && ny >= 0 && nx < w && ny < h && hit[ny * w + nx] === 1) {
-              hit[ny * w + nx] = 2;
-              stack.push(ny * w + nx);
+          // Outlines can bridge a pixel lost to antialiasing or a letter's descender. The default
+          // keeps the original four-neighbour search for glyphs, selection handles and touch targets.
+          for (let dy = -gap; dy <= gap; dy++) {
+            for (let dx = -gap; dx <= gap; dx++) {
+              if (gap === 1 && Math.abs(dx) + Math.abs(dy) !== 1) continue;
+              const [nx, ny] = [x + dx, y + dy];
+              if (nx >= 0 && ny >= 0 && nx < w && ny < h && hit[ny * w + nx] === 1) {
+                hit[ny * w + nx] = 2;
+                stack.push(ny * w + nx);
+              }
             }
           }
         }
