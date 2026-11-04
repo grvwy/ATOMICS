@@ -1,13 +1,123 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::Duration;
 
 use atomics_core::paths;
 
 /// The PATH of an interactive login shell. Desktop launchers can supply a bare
 /// PATH, hiding tools installed by the user's shell startup files.
-pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_shell_var("PATH"));
+pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_path().path.clone().ok());
+
+/// How long ATOMICS waits for the login shell to print a variable. A shell that takes longer
+/// is stopped, and ATOMICS goes on with what it has.
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The login shell's PATH, read once per process: by [`adopt_login_path`] at startup, or else
+/// when something first needs it.
+static LOGIN_PATH: OnceLock<LoginPath> = OnceLock::new();
+
+/// The login shell's PATH, and what ATOMICS made of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginPath {
+    pub shell: String,
+    /// The login shell's PATH, or why it gave none.
+    pub path: Result<String, String>,
+    /// How many of its folders ATOMICS added to the PATH it was started with; `None` when this
+    /// process did not take it on (only [`adopt_login_path`] does).
+    pub added: Option<usize>,
+}
+
+impl LoginPath {
+    /// Reads `shell`'s PATH, and the PATH taking it on makes of `current`, if that changes it.
+    fn read(shell: String, current: &str, timeout: Duration) -> (LoginPath, Option<String>) {
+        let path = login_shell_path(&shell, timeout);
+        let missing = path.as_ref().map_or(0, |login| missing_folders(current, login).len());
+        let merged = path.as_ref().ok().filter(|_| missing > 0).map(|login| with_login_path(current, login));
+        (LoginPath { shell, path, added: Some(missing) }, merged)
+    }
+
+    /// Where the PATH of ATOMICS and of what it runs came from, and whether the login shell gave
+    /// its own, for the doctor.
+    pub fn describe(&self) -> (bool, String) {
+        let shell = &self.shell;
+        match (&self.path, self.added) {
+            (Ok(_), Some(0)) => {
+                (true, format!("PATH as ATOMICS was started, which has all of login shell {shell}'s folders"))
+            }
+            (Ok(_), Some(added)) => (
+                true,
+                format!(
+                    "PATH of login shell {shell}: {added} folder{} added to the PATH ATOMICS was started with",
+                    if added == 1 { "" } else { "s" }
+                ),
+            ),
+            (Ok(_), None) => (true, format!("PATH as ATOMICS was started; login shell {shell}'s is used where needed")),
+            (Err(reason), _) => {
+                (false, format!("PATH as ATOMICS was started: login shell {shell} gave none, {reason} (warning)"))
+            }
+        }
+    }
+}
+
+/// Takes on the login shell's PATH for this process, and so for everything it runs: git and its
+/// filters and hooks, version probes, MCP and ticket servers. A desktop launcher starts ATOMICS
+/// with a bare PATH that lacks what the user's shell startup files add. A PATH that already has
+/// all the login shell's folders, as one from a terminal does, is left as it is; when the shell
+/// gives none in time, ATOMICS keeps the PATH it was started with.
+///
+/// # Safety
+///
+/// Changes the process environment: no other thread may exist yet.
+pub unsafe fn adopt_login_path() -> &'static LoginPath {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let (found, merged) = LoginPath::read(shell_program(), &current, LOGIN_SHELL_TIMEOUT);
+    if let Some(merged) = merged {
+        // SAFETY: the caller guarantees this process has no other thread.
+        unsafe { std::env::set_var("PATH", merged) };
+    }
+    LOGIN_PATH.get_or_init(|| found)
+}
+
+/// The login shell's PATH: as [`adopt_login_path`] found it, or read now without changing
+/// this process's own. Blocks while the shell starts the first time.
+pub fn login_path() -> &'static LoginPath {
+    LOGIN_PATH.get_or_init(|| {
+        let shell = shell_program();
+        let path = login_shell_path(&shell, LOGIN_SHELL_TIMEOUT);
+        LoginPath { shell, path, added: None }
+    })
+}
+
+fn login_shell_path(shell: &str, timeout: Duration) -> Result<String, String> {
+    login_shell_output(shell, "PATH", timeout)
+        .and_then(|path| if path.trim().is_empty() { Err("it printed an empty PATH".into()) } else { Ok(path) })
+}
+
+/// The folders of `login`, in its order and followed by those only `current` has. Empty entries,
+/// which would put the working folder on PATH, are dropped.
+fn with_login_path(current: &str, login: &str) -> String {
+    let mut folders: Vec<&str> = Vec::new();
+    for folder in login.split(':').chain(current.split(':')) {
+        if !folder.is_empty() && !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders.join(":")
+}
+
+/// The folders of `login` that `current` lacks, each once.
+fn missing_folders<'a>(current: &str, login: &'a str) -> Vec<&'a str> {
+    let have: Vec<&str> = current.split(':').collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for folder in login.split(':').filter(|folder| !folder.is_empty() && !have.contains(folder)) {
+        if !missing.contains(&folder) {
+            missing.push(folder);
+        }
+    }
+    missing
+}
 
 pub fn shell_program() -> String {
     std::env::var("SHELL")
@@ -35,14 +145,55 @@ pub fn executable_path() -> std::io::Result<PathBuf> {
 
 /// A variable as an interactive login shell sets it. `name` must be a plain identifier.
 pub(crate) fn login_shell_var(name: &str) -> Option<String> {
-    let shell = shell_program();
-    let out = std::process::Command::new(shell)
+    login_shell_output(&shell_program(), name, LOGIN_SHELL_TIMEOUT).ok()
+}
+
+/// The variable `name` as `shell`, started as an interactive login shell, prints it, or why it
+/// did not. The shell runs in a session of its own, without a terminal, so job control and
+/// prompts in its startup files cannot stop it; after `timeout` its process group is stopped.
+/// Output goes to an unlinked file: nothing left running can keep this waiting.
+fn login_shell_output(shell: &str, name: &str, timeout: Duration) -> Result<String, String> {
+    use std::io::{Read, Seek};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut stdout = tempfile::tempfile().map_err(|err| format!("no file for its output: {err}"))?;
+    let mut command = Command::new(shell);
+    command
         .args(["-l", "-i", "-c", &format!("printf '{MARKER}%s{MARKER}' \"${name}\"")])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    between_markers(&String::from_utf8_lossy(&out.stdout))
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone().map_err(|err| format!("no file for its output: {err}"))?)
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|err| format!("it did not start: {err}"))?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                // SAFETY: setsid made the shell the leader of a process group of its own.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(match result {
+                    Err(err) => format!("waiting for it failed: {err}"),
+                    _ => format!("it did not finish within {} s, and was stopped", timeout.as_secs()),
+                });
+            }
+        }
+    };
+    let mut bytes = Vec::new();
+    let _ = stdout.rewind().and_then(|()| stdout.take(1024 * 1024).read_to_end(&mut bytes));
+    between_markers(&String::from_utf8_lossy(&bytes)).ok_or_else(|| format!("it printed no {name} ({status})"))
 }
 
 /// Brackets the value the login shell prints, so shell startup noise is ignored.
@@ -151,12 +302,33 @@ pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Opti
 }
 
 /// Claude Code's user settings, in `$CLAUDE_CONFIG_DIR` when it is set, as Claude Code reads them.
-fn claude_settings_path() -> PathBuf {
+pub(crate) fn claude_settings_path() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .unwrap_or_else(|| paths::home().join(".claude"))
         .join("settings.json")
+}
+
+/// An explicit instance home also isolates the mutable provider trust and settings of the bare
+/// agents it starts.
+pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
+    let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
+    [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
+        .into_iter()
+        .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// The Codex home of a bare agent ATOMICS starts, where Codex keeps its hook trust: the instance's
+/// own ([`instance_agent_env`]), else the `$CODEX_HOME` it inherits, else `~/.codex`.
+pub(crate) fn agent_codex_home() -> PathBuf {
+    instance_agent_env()
+        .into_iter()
+        .find(|(key, _)| key == "CODEX_HOME")
+        .map(|(_, home)| PathBuf::from(home))
+        .or_else(|| std::env::var_os("CODEX_HOME").filter(|home| !home.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| paths::home().join(".codex"))
 }
 
 pub fn global_hooks_installed() -> bool {
@@ -289,6 +461,70 @@ mod tests {
         assert_eq!(between_markers(noise).as_deref(), Some("/opt/homebrew/bin:/usr/bin"));
         assert_eq!(between_markers("__ATOMICS____ATOMICS__").as_deref(), Some(""));
         assert_eq!(between_markers("no markers"), None);
+    }
+
+    #[test]
+    fn the_login_path_comes_first_and_a_path_that_has_it_all_is_left_alone() {
+        let login = "/opt/tools/bin:/usr/bin:/bin";
+        assert_eq!(missing_folders("/usr/bin:/bin", login), ["/opt/tools/bin"]);
+        assert_eq!(with_login_path("/usr/bin:/bin:/usr/sbin", login), "/opt/tools/bin:/usr/bin:/bin:/usr/sbin");
+        // A terminal's PATH, in its own order and with more: nothing is missing.
+        assert!(missing_folders("/bin:/home/user/venv/bin:/usr/bin:/opt/tools/bin", login).is_empty());
+        // Empty entries, which mean the working folder, are dropped; a repeated folder counts once.
+        assert_eq!(missing_folders("/bin", ":/opt/a::/opt/a:/bin"), ["/opt/a"]);
+        assert_eq!(with_login_path("/bin::", ":/opt/a::/opt/a:/bin"), "/opt/a:/bin");
+    }
+
+    #[test]
+    fn the_login_shell_is_bounded_and_without_its_path_atomics_keeps_its_own() {
+        use std::time::Instant;
+        let dir = crate::test_support::tempdir().unwrap();
+        let shell = |name: &str, script: &str| {
+            let path = dir.path().join(name);
+            crate::test_support::write_program(&path, format!("#!/bin/sh\n{script}\n"));
+            path.to_string_lossy().into_owned()
+        };
+        let good = shell("good", "echo 'startup noise'; printf '__ATOMICS__/opt/tools/bin:/usr/bin__ATOMICS__'");
+        let (found, merged) = LoginPath::read(good.clone(), "/usr/bin:/bin", Duration::from_secs(10));
+        assert_eq!(found.path.as_deref(), Ok("/opt/tools/bin:/usr/bin"));
+        assert_eq!(merged.as_deref(), Some("/opt/tools/bin:/usr/bin:/bin"));
+        let expected = format!("PATH of login shell {good}: 1 folder added to the PATH ATOMICS was started with");
+        assert_eq!(found.describe(), (true, expected));
+        let (found, merged) = LoginPath::read(good.clone(), "/usr/bin:/opt/tools/bin", Duration::from_secs(10));
+        assert_eq!((found.added, merged), (Some(0), None));
+        assert!(found.describe().1.contains("which has all of login shell"));
+
+        // One that hangs is stopped in time, with what it started.
+        let hangs = shell("hangs", "sleep 30 &\necho $! > \"${0%/*}/started\"\nwait");
+        let (started, timeout) = (Instant::now(), crate::test_support::scaled_timeout(Duration::from_secs(1)));
+        let (found, merged) = LoginPath::read(hangs, "/usr/bin:/bin", timeout);
+        assert!(started.elapsed() < timeout + Duration::from_secs(10));
+        assert!(found.path.as_ref().unwrap_err().contains("did not finish within"), "{found:?}");
+        assert_eq!(merged, None);
+        let (ok, text) = found.describe();
+        assert!(!ok && text.contains("(warning)"), "{text}");
+        let sleeper: i32 = std::fs::read_to_string(dir.path().join("started")).unwrap().trim().parse().unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(sleeper, 0) } == 0 {
+            assert!(Instant::now() < deadline, "what the shell started must stop with it");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        for (script, reason) in [
+            ("exit 0", "printed no PATH"),
+            ("printf '__ATOMICS__ __ATOMICS__'", "empty PATH"),
+            ("printf '__ATOMICS__/opt/tools/bin__ATOMICS__'; exit 3", ""),
+        ] {
+            let (found, merged) = LoginPath::read(shell("other", script), "/usr/bin", Duration::from_secs(10));
+            match reason {
+                // Its exit status does not matter once it printed the PATH: interactive startup files often fail.
+                "" => assert_eq!(merged.as_deref(), Some("/opt/tools/bin:/usr/bin")),
+                reason => assert!(found.path.unwrap_err().contains(reason) && merged.is_none()),
+            }
+        }
+        let (found, merged) = LoginPath::read("/nonexistent/shell".into(), "/usr/bin", Duration::from_secs(10));
+        assert!(found.path.unwrap_err().contains("did not start") && merged.is_none());
     }
 
     #[test]

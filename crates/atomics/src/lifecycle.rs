@@ -111,10 +111,14 @@ pub fn wait_for(jobs: &[Job], name: Option<&str>, path: Option<&Path>) {
     }
 }
 
+/// How a plan cleanup's note starts when ATOMICS's git records could not be loaded, its only reason
+/// to skip the plan.
+const PLAN_SKIPPED: &str = "Plan cleanup skipped: ";
+
 pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Vec<String> {
     let mut notes = Vec::new();
     if let Err(error) = sandbox::load_owned_pins(home) {
-        return vec![format!("Plan cleanup skipped: {error:#}")];
+        return vec![format!("{PLAN_SKIPPED}{error:#}")];
     }
     let entries = match cleanup::closed_tasks(plan) {
         Ok(entries) => entries,
@@ -169,30 +173,75 @@ pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) ->
     notes
 }
 
-/// Persisted failures survive quitting before a worker can deliver its toast.
-pub fn leftovers(home: &Path) -> Vec<String> {
-    std::fs::read(home.join("cleanup-leftovers.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// Failures kept until someone looks: a session's or plan's cleanup, a ref guard's alert.
+const KEPT_LEFTOVERS: &str = "cleanup-leftovers.json";
+/// The last startup sweep's failures. Each sweep looks at all of it again and replaces them.
+const SWEEP_LEFTOVERS: &str = "cleanup-sweep.json";
+
+/// How notes of the startup sweep start, which earlier versions kept with the others.
+const SWEEP_NOTES: &[&str] = &[
+    "Startup cleanup skipped: ",
+    "Sandbox/MCP ",
+    "Sandbox inventory: ",
+    "MCP inventory: ",
+    "Brief ",
+    "Worktrees ",
+    "Warm worktree ",
+    "Warm cache ",
+    "Scratch folders: ",
+    "Scratch folder: ",
+    "Scratch session ",
+];
+
+/// How the note ends that cleanup work was cut short by quitting; the next startup sweep finds what
+/// it left.
+pub const UNFINISHED_AT_QUIT: &str = " sandbox or worktree cleanup jobs were still running at quit";
+
+static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_notes(path: &Path) -> Vec<String> {
+    std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
 
-pub fn save_leftovers(home: &Path, notes: &[String]) -> Result<()> {
-    std::fs::create_dir_all(home)?;
-    let path = home.join("cleanup-leftovers.json");
+fn write_notes(path: &Path, notes: &[String]) -> Result<()> {
+    std::fs::create_dir_all(path.parent().context("no folder")?)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(notes)?)?;
     std::fs::rename(tmp, path)?;
     Ok(())
 }
 
+/// Persisted failures survive quitting before a worker can deliver its toast: those kept until
+/// someone looks, then the last startup sweep's.
+pub fn leftovers(home: &Path) -> Vec<String> {
+    let mut all = kept_leftovers(home);
+    for note in sweep_leftovers(home) {
+        if !all.contains(&note) {
+            all.push(note);
+        }
+    }
+    all
+}
+
+pub fn kept_leftovers(home: &Path) -> Vec<String> {
+    read_notes(&home.join(KEPT_LEFTOVERS))
+}
+
+/// What the last startup sweep could not clean up; the next one tries again.
+pub fn sweep_leftovers(home: &Path) -> Vec<String> {
+    read_notes(&home.join(SWEEP_LEFTOVERS))
+}
+
+pub fn save_leftovers(home: &Path, notes: &[String]) -> Result<()> {
+    write_notes(&home.join(KEPT_LEFTOVERS), notes)
+}
+
 pub fn record_leftovers(home: &Path, notes: &[String]) {
     if notes.is_empty() {
         return;
     }
-    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = WRITE.lock().unwrap_or_else(|err| err.into_inner());
-    let mut all = leftovers(home);
+    let mut all = kept_leftovers(home);
     for note in notes {
         if !all.contains(note) {
             all.push(note.clone());
@@ -203,13 +252,45 @@ pub fn record_leftovers(home: &Path, notes: &[String]) {
     }
 }
 
+/// Replaces the last startup sweep's failures with this one's `notes`, so a fixed failure goes
+/// away. Kept notes this sweep has looked at again, of those `before` it started, go too: the
+/// sweep's own from earlier versions, work cut short by quitting, and, once the sweep could load
+/// ATOMICS's git records (`pins_loaded`), plan cleanups skipped because it could not.
+pub fn record_sweep(home: &Path, notes: &[String], pins_loaded: bool, before: &[String]) {
+    let _guard = WRITE.lock().unwrap_or_else(|err| err.into_inner());
+    let kept = kept_leftovers(home);
+    let stale = |note: &String| {
+        before.contains(note)
+            && (SWEEP_NOTES.iter().any(|start| note.starts_with(start))
+                || note.ends_with(UNFINISHED_AT_QUIT)
+                || (pins_loaded && note.starts_with(PLAN_SKIPPED)))
+    };
+    let result = (|| -> Result<()> {
+        if kept.iter().any(stale) {
+            save_leftovers(home, &kept.iter().filter(|note| !stale(note)).cloned().collect::<Vec<_>>())?;
+        }
+        let path = home.join(SWEEP_LEFTOVERS);
+        match notes {
+            [] => match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+                _ => Ok(()),
+            },
+            notes => write_notes(&path, notes),
+        }
+    })();
+    if let Err(err) = result {
+        eprintln!("ATOMICS: recording cleanup failures: {err:#}");
+    }
+}
+
 /// Run only in the instance owning the control socket. The cutoff predates window construction's
 /// return, so resources created while this background sweep runs cannot become candidates.
 /// A malformed ownership record fails closed, rather than treating its resources as orphans.
 #[cfg(test)]
 pub fn sweep(home: &Path, config: &Config, sbx: &str) -> Result<Vec<String>> {
+    let before = kept_leftovers(home);
     let notes = sweep_before(home, config, sbx, Cutoff::mark(home)?)?;
-    record_leftovers(home, &notes);
+    record_sweep(home, &notes, true, &before);
     Ok(notes)
 }
 
@@ -239,6 +320,7 @@ impl Cutoff {
 
 pub fn sweep_before(home: &Path, config: &Config, sbx: &str, cutoff: Cutoff) -> Result<Vec<String>> {
     let Cutoff { time: before, files } = cutoff;
+    sandbox::heal_pin_records(home, sbx)?;
     sandbox::load_owned_pins(home)?;
     let store = match std::fs::read(home.join("sessions.json")) {
         Ok(bytes) => serde_json::from_slice::<Store>(&bytes).context("reading cleanup session ownership")?,
@@ -347,6 +429,10 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, cutoff: Cutoff) -> 
         .chain(plans.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.worktree.as_deref()).map(real))
         .collect();
     for repo in repos {
+        // A project folder deleted since, such as a scratch one, has no worktrees left to sweep.
+        if std::fs::symlink_metadata(&repo).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) {
+            continue;
+        }
         let result = (|| -> Result<()> {
             // Git never runs in a worktree listed from files that do not lead back to it.
             let trees: Vec<_> = git::list_worktrees(&repo)?.into_iter().filter(|tree| tree.trusted).collect();
@@ -851,6 +937,110 @@ mod tests {
         assert!(stage.exists() && tree.exists());
         assert!(raw(&evil, &["status"]).unwrap().status.success() && marker.exists(), "the planted config is live");
         git::unpin(&tree.canonicalize().unwrap());
+    }
+
+    /// The ledger notes `name`'s git record in `pins` long ago, while the record file itself is gone.
+    fn stale_pin_record(home: &Path, name: &str, sandbox: bool) -> PathBuf {
+        let pins = home.join("git-pins");
+        if sandbox {
+            ownership::created(home, name, Resource::Sandbox).unwrap();
+        }
+        ownership::record_pins(home, name, &pins).unwrap();
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("sandbox-ownership.json")).unwrap()).unwrap();
+        ledger[name]["created"] = 0.into();
+        ledger[name]["creator"] = serde_json::Value::Null;
+        std::fs::write(home.join("sandbox-ownership.json"), ledger.to_string()).unwrap();
+        pins.join(format!("{name}.json"))
+    }
+
+    #[test]
+    fn missing_git_records_of_gone_sandboxes_and_deleted_projects_heal_instead_of_failing_every_start() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let repo = repository(dir.path());
+        let home = dir.path().join("home");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let sbx = fake::install(&bin).display().to_string();
+        stale_pin_record(&home, "atomics-gone", true);
+        stale_pin_record(&home, "atomics-unowned", false);
+        let alive = stale_pin_record(&home, "atomics-alive", true);
+        sandbox(&bin, "atomics-alive", &repo);
+        // A session still names the live sandbox, so the sweep leaves it running.
+        let scratch = dir.path().join("scratch-project");
+        let store = Store {
+            sessions: vec![SessionRecord {
+                chief: false,
+                pane: Some("alive".into()),
+                claude_session_id: "conversation".into(),
+                agent: "codex".into(),
+                cwd: repo.clone(),
+                title: "alive".into(),
+                last_prompt: None,
+                updated: 0,
+                sandbox: Some("atomics-alive".into()),
+                named: false,
+            }],
+            recent_projects: vec![scratch.clone()],
+            ..Default::default()
+        };
+        store.save(&home.join("sessions.json")).unwrap();
+        let config = Config { repos: vec![repo.display().to_string()], ..Config::default() };
+
+        // While sbx still has a sandbox whose record is gone, cleanup fails closed and says what to do.
+        let error = format!("{:#}", sweep(&home, &config, &sbx).unwrap_err());
+        assert!(error.contains(&alive.display().to_string()) && error.contains("sbx rm atomics-alive"), "{error}");
+        let owned = ownership::owned(&home).unwrap();
+        assert!(owned["atomics-alive"].pins.is_some() && owned["atomics-alive"].sandbox, "{owned:?}");
+        // Records of sandboxes that are gone pinned nothing; they no longer stop anything.
+        assert!(!owned.contains_key("atomics-unowned") && owned["atomics-gone"].pins.is_none(), "{owned:?}");
+        // Without an sbx to ask, the live sandbox's note stays too.
+        assert!(sweep(&home, &config, "/missing/sbx").is_err());
+        assert!(ownership::owned(&home).unwrap()["atomics-alive"].pins.is_some());
+
+        // Once sbx no longer has it, the next start heals, and a deleted project folder is no failure.
+        std::fs::remove_file(bin.join("sandboxes/atomics-alive")).unwrap();
+        let earlier = [
+            format!("Worktrees {}: git worktree list --porcelain failed: fatal: cannot change to", scratch.display()),
+            format!("Startup cleanup skipped: reading {}: No such file or directory (os error 2)", alive.display()),
+            format!("Plan cleanup skipped: reading {}: No such file or directory (os error 2)", alive.display()),
+            format!("2{UNFINISHED_AT_QUIT}"),
+            "Final ref guard check FAILED: refs/heads/main moved".to_string(),
+        ];
+        save_leftovers(&home, &earlier).unwrap();
+        let notes = sweep(&home, &config, &sbx).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(ownership::owned(&home).unwrap().values().all(|entry| entry.pins.is_none()));
+        sandbox::load_owned_pins(&home).unwrap();
+        // The notes of earlier sweeps go; what no sweep looks at again stays.
+        assert_eq!(leftovers(&home), ["Final ref guard check FAILED: refs/heads/main moved"]);
+
+        // A failure the sweep finds is noted once and goes when it is fixed.
+        let warm = dir.path().join("warm");
+        git::add_worktree(&repo, &warm, "atomics/warm-dirty", "main").unwrap();
+        std::fs::write(warm.join("keep"), "uncommitted").unwrap();
+        let backdate = || {
+            let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            std::fs::File::open(&warm).unwrap().set_modified(earlier).unwrap();
+        };
+        backdate();
+        let notes = sweep(&home, &config, &sbx).unwrap();
+        assert!(
+            notes.len() == 1 && notes[0].starts_with("Warm worktree") && notes[0].contains("uncommitted"),
+            "{notes:?}"
+        );
+        assert_eq!(sweep(&home, &config, &sbx).unwrap(), notes, "the same failure is not added twice");
+        assert_eq!(sweep_leftovers(&home), notes);
+        std::fs::remove_file(warm.join("keep")).unwrap();
+        backdate();
+        assert!(sweep(&home, &config, &sbx).unwrap().is_empty());
+        assert!(!warm.exists());
+        assert_eq!(leftovers(&home), ["Final ref guard check FAILED: refs/heads/main moved"]);
+        // A kept note recorded while a sweep ran is one it has not looked at.
+        let before = kept_leftovers(&home);
+        record_leftovers(&home, &["Scratch folder: removing /home/user/scratch/x: busy".into()]);
+        record_sweep(&home, &[], true, &before);
+        assert_eq!(kept_leftovers(&home).len(), 2);
     }
 
     #[test]

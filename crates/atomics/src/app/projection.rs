@@ -316,6 +316,7 @@ mod tests {
                 warning: None,
             },
             reply: None,
+            native: None,
         }
     }
 

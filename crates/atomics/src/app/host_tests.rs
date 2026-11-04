@@ -77,6 +77,7 @@ fn expired_approval(state: &mut State) -> Arc<ipc::ApprovalReply> {
             warning: None,
         },
         reply: Some(reply.clone()),
+        native: None,
     });
     state.sessions = vec![worker];
     reply
@@ -1014,6 +1015,7 @@ fn waiting_approval(session: &mut Session, id: &str) -> Arc<ipc::ApprovalReply> 
             warning: None,
         },
         reply: Some(reply.clone()),
+        native: None,
     });
     session.status = AgentStatus::NeedsInput;
     reply

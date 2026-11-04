@@ -1,0 +1,32 @@
+#!/usr/bin/python3
+"""An agent without hooks that draws recorded approval screens and shows the keys it gets.
+
+Each argument is a screen file. ⌃a moves on to the next one, as Codex shows a hidden command;
+any other key leaves the menu for a composer that lists every key received, in hex.
+"""
+import os
+import sys
+import tty
+
+screens = [open(path, encoding="utf-8").read() for path in sys.argv[1:]]
+tty.setraw(sys.stdin.fileno())
+
+
+def show(body):
+    sys.stdout.write("\x1b[2J\x1b[H" + body.replace("\n", "\r\n"))
+    sys.stdout.flush()
+
+
+shown = 0
+keys = b""
+show(screens[shown])
+while True:
+    char = os.read(sys.stdin.fileno(), 1)
+    if not char:
+        break
+    keys += char
+    if char == b"\x01" and shown + 1 < len(screens):
+        shown += 1
+        show(screens[shown])
+    else:
+        show("Keys: " + keys.hex(" ") + "\n\n› ")

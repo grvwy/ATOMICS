@@ -103,6 +103,13 @@ scripts/macos-app.sh
 open -a ATOMICS --args --workspace backend
 ```
 
+The Dock, Spotlight and a Linux desktop launcher start ATOMICS with a bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`).
+At startup ATOMICS asks your login shell (`$SHELL -l -i -c`) for its `PATH`, once and for at most five seconds, and
+adds the folders it lacks. Everything ATOMICS runs itself then finds what a terminal would: git with its LFS filters
+and hooks, the Codex version check, MCP and ticket servers and queued commands. A `PATH` that already has those
+folders, as one from a terminal does, is left alone; a shell that gives none in time leaves the `PATH` ATOMICS was
+started with. `atomics doctor` says which happened.
+
 On Linux, install the build dependencies first (Debian/Ubuntu example), then install or update from this checkout.
 For a new desktop, [Fresh start on Linux](docs/fresh-start-linux.md) lists every prerequisite and check:
 
@@ -387,11 +394,23 @@ uses the repository fixture and reports explicitly that VM isolation and KVM wer
 ## Troubleshooting
 
 Run `atomics doctor` to check git, Claude Code, Codex, the configured editor, the config, the running ATOMICS socket and global Claude hooks.
-It also checks Codex hook support (0.165+), reports hook trust as unverified with `/hooks` instructions, reads plan files,
+It also checks Codex hook support (0.165+) and whether Codex trusts the hooks ATOMICS passes its bare Codex agents, reads plan files,
 warns about cargo entries in `[approvals].allow`, lists merged worktrees safe to review for cleanup, and lists each
 repository's stash, which all its worktrees share, entry by entry with its message. It changes nothing.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
-agents, Helix, a running ATOMICS or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
+agents, Helix, a running ATOMICS or hooks do not affect the exit code. Tools are checked on your login-shell PATH; the
+first line says where `PATH` came from: the login shell's folders added, already there, or (a warning) not given in time.
+
+For Codex hook trust, doctor computes the hook definitions ATOMICS passes (its executable and socket) the way Codex
+does, and reads `[hooks.state]` in the Codex home those agents get (`<ATOMICS_HOME>/codex` for an explicit
+`ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). It names each event as trusted, untrusted, changed since
+trusted (a new install path, socket or definition) or disabled, and the fix: trust them in Codex's review prompt
+or `/hooks`, or set the exact `trusted_hash` entries it prints. While every Codex agent runs sandboxed, ATOMICS passes
+no hooks and doctor says trust is not needed.
+
+Cleanup failures the startup sweep finds are replaced at every start, so a failure that is fixed, such as a deleted
+project folder or the record of a sandbox that is gone, drops out of doctor after the next start. Failures that no
+sweep looks at again, such as a ref guard's alert, stay until you review them.
 
 ## Usage
 
@@ -410,7 +429,8 @@ project-local settings keep their usual precedence. Without a custom command it 
 Claude agents that ATOMICS starts get its hooks through `--settings`. Codex 0.165+ gets inline
 `-c hooks.<Event>=...` settings; older versions keep `busy_text` status tracking.
 Version detection runs in the background with a 30-second limit. Successful results are shared;
-failed or timed-out probes are retried on the next start.
+failed or timed-out probes are retried on the next start. Until one answers, hook support is unknown: Codex starts
+without hook flags (an older Codex refuses them), and its tile warns that its approvals stay in its terminal.
 
 On the first Codex launch from an ATOMICS install, review and trust the ATOMICS hooks in Codex's
 startup prompt (or `/hooks`). Their definitions stay identical across panes, so this is a
@@ -419,7 +439,7 @@ their own trust review; ATOMICS never bypasses hook trust. Each Codex session ge
 `ATOMICS_HOOK_PANE`, which its hooks inherit, so it is found even through a wrapper such as ssh into
 a VM; without it, a hook's process ancestry identifies the terminal (Codex runs with `--no-daemon`).
 `SessionStart` maps the Codex session ID to that pane, including when several panes share a worktree.
-`atomics doctor` prints the trust instructions. To make Claude sessions in any other terminal show up too
+`atomics doctor` says which events Codex trusts and how to trust the rest. To make Claude sessions in any other terminal show up too
 (status, diff, and messages delivered at their next tool call or turn end), add the hooks to your user settings:
 
 ```sh
@@ -481,10 +501,21 @@ Codex prefix rule. A denial message can only be supplied while the hook is waiti
 Truncated commands match their visible prefix. If a long reason hides the command, `atomics_approve`
 expands it with Ctrl+A and asks for a retry so the command is checked before selecting a choice.
 
+An agent started without hooks still asks in its own menu. When a Codex command menu ("Would you like
+to run the following command?") or a Claude one ("Bash command … Do you want to proceed?") is on screen
+and no hook request exists, that menu becomes the session's pending permission request: its header,
+the board, `atomics_list` and remote clients show it, and `atomics_approve` answers it with that agent's
+keys (Codex: the numbered Yes, or Esc to deny; Claude: Enter on the focused Yes, or Esc). It presses them only
+while the screen still shows the very command that was reviewed, and its result echoes the command
+(`command`, `reason`, `menu`). `allow_always` answers such a menu once; only hook requests are remembered.
+Other menus, such as Codex's edit and terminal-input prompts or Claude's file edits, are not command
+approvals: answer them with raw keys.
+
 While a permission request is pending, `atomics_send` holds plain messages and returns `held: true`.
 It releases these messages after a lifecycle event confirms the request has finished, or after the
 menu has been absent for one second. This also covers requests answered directly in the terminal.
-Raw input is rejected with an error pointing to `atomics_approve`.
+Raw input is rejected with an error pointing to `atomics_approve` while `atomics_approve` can answer the
+request; while any other menu waits, raw keys go through, so there is always one way to answer.
 
 Codex sends wait for the complete message to appear in the transcript or visible queue, or for its
 prompt hook. ATOMICS retries unconfirmed input and returns an error if delivery cannot be confirmed;
@@ -578,6 +609,11 @@ blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
+`atomics_plan_set` refuses a plan whose dependencies form a cycle and names it (every plan's final review waits for
+all its other tasks, so no task can depend on the review). It also refuses a branch a planned task pins when another
+task of the plan or of an open plan has it, and suggests a free name such as `<branch>-2`. A pinned branch that already
+exists outside any open plan is accepted with a warning: a task may name it to bring that work into the plan, but
+dispatching an agent on it would fail. Dropping a dependency that closed a cycle in an approved plan keeps the approval.
 
 `atomics_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
 first message is the brief. Every agent ATOMICS starts gets a `atomics_report` tool, pre-approved, to say when it is done,
@@ -705,6 +741,9 @@ ordinary ext4), cross-filesystem clones and unsupported files skip warming and l
 partial cache, and ATOMICS never retries it as a full copy. Use `atomics doctor` to check the actual filesystem pair.
 Each worktree then owns its cache independently; builds cannot change the main checkout's cache. A successful
 clone shows **warm cache from main** in a toast. Existing worktrees are left alone when retrying a launch.
+When creating a worktree fails (a filter or hook git runs is missing, say), ATOMICS removes the worktree git began
+and deletes the branch it made while that still points at the base, so a retry starts over. A retry uses a branch
+that already exists while it is still at the base, and refuses one that has moved.
 `atomics doctor` probes CoW cloning between the repository and configured worktree folders, using temporary files
 that it removes afterwards.
 
