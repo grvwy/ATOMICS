@@ -548,7 +548,7 @@ impl State {
             if self.tickets.config.as_ref() == Some(config) && self.tickets.identity_epoch == *epoch {
                 match result {
                     Ok(TicketOutput::Whoami(identity)) => self.tickets.whoami = Some(identity),
-                    Err(error) if crate::mcp_client::is_sign_in_required(&error) => self.tickets.panel.signin = true,
+                    Err(error) if crate::mcp_client::is_sign_in_required(&error) => self.ask_sign_in(),
                     Err(error) => self.toast(format!("Ticket identity: {error}")),
                     _ => {}
                 }
@@ -591,7 +591,7 @@ impl State {
                 Ok(TicketOutput::Card(card)) => Ok(ticket::card_reply(&card)),
                 Ok(_) => Err("unexpected ticket card result".into()),
                 Err(error) if crate::mcp_client::is_sign_in_required(&error) => {
-                    self.tickets.panel.signin = true;
+                    self.ask_sign_in();
                     Err("sign-in required; press Sign in in the Tickets panel (tickets.server)".into())
                 }
                 Err(error) => Err(error),

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use atomics_core::tickets::{McpServer, TicketConfig};
 
-use crate::mcp_client::{OAuth, Revocation, SignInControl, SignInEvent, SignInStatus};
+use crate::mcp_client::{OAuth, ResourceAccess, Revocation, SignInControl, SignInEvent, SignInStatus};
 
 /// Where one ticket server stands. `SigningIn` is held by whoever runs the sign-in job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,9 @@ pub enum SignState {
     SignedOut,
     SigningIn,
     SignedIn,
+    /// Signed in, without consent to a resource the profile now reads from: the banner asks for one
+    /// more sign-in, and what the sign-in does cover keeps working.
+    Partial,
     /// The keychain could not be read; free of any stored value.
     Unavailable(String),
 }
@@ -35,6 +38,7 @@ impl SignState {
         }
         match oauth.status(server) {
             SignInStatus::SignedIn => SignState::SignedIn,
+            SignInStatus::Partial => SignState::Partial,
             SignInStatus::NeedsSignIn => SignState::SignedOut,
             SignInStatus::Error(message) => SignState::Unavailable(message),
         }
@@ -52,12 +56,21 @@ pub(crate) fn headless_in(os: &str, set: impl Fn(&str) -> bool) -> bool {
 
 /// A server's host for display, never its path or query.
 pub fn host_of(server: &McpServer) -> String {
-    server
-        .url
-        .as_deref()
-        .and_then(|url| url::Url::parse(url.trim()).ok())
+    server.url.as_deref().map_or_else(|| "the server".into(), host_of_url)
+}
+
+fn host_of_url(url: &str) -> String {
+    url::Url::parse(url.trim())
+        .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| "the server".into())
+}
+
+/// The further resources a sign-in stands for, by host, as a person reads them.
+pub fn resource_hosts(server: &McpServer) -> String {
+    let mut hosts: Vec<String> = server.resources.iter().map(|url| host_of_url(url)).collect();
+    hosts.dedup();
+    hosts.join(", ")
 }
 
 /// What the person sees while a sign-in waits.
@@ -161,16 +174,34 @@ pub fn sign_out_message(host: &str, result: &Result<Revocation, String>) -> Stri
 
 /// The doctor line for a server that signs in with OAuth; values hidden.
 pub fn doctor_line(oauth: &OAuth, config: &TicketConfig) -> Option<String> {
-    if !config.server.uses_oauth() {
+    let server = config.sign_in_server();
+    if !server.uses_oauth() {
         return None;
     }
-    let host = host_of(&config.server);
-    Some(match SignState::of(oauth, &config.server) {
+    let host = host_of(&server);
+    let hosts = |wanted: ResourceAccess| {
+        let found = oauth.resource_access(&server).into_iter().filter(|(_, access)| *access == wanted);
+        let found: Vec<String> = found.map(|(resource, _)| resource).collect();
+        resource_hosts(&McpServer { resources: found, ..McpServer::default() })
+    };
+    Some(match SignState::of(oauth, &server) {
+        SignState::SignedIn if !hosts(ResourceAccess::Refused).is_empty() => format!(
+            "· credential MCP sign-in ({host}): present; {} refuses it, and signing in again did not change that; ask whoever runs it",
+            hosts(ResourceAccess::Refused)
+        ),
+        SignState::SignedIn if !server.resources.is_empty() => format!(
+            "✓ credential MCP sign-in ({host}): present, with a token per resource for {}; OS keychain → ATOMICS → each token to its own resource only (values hidden)",
+            hosts(ResourceAccess::Consented)
+        ),
         SignState::SignedIn => {
             format!(
                 "✓ credential MCP sign-in ({host}): present; OS keychain → ATOMICS → that server only (values hidden)"
             )
         }
+        SignState::Partial => format!(
+            "· credential MCP sign-in ({host}): present, without {}; press Sign in in the Tickets panel or run `atomics tickets login` once more",
+            hosts(ResourceAccess::Missing)
+        ),
         SignState::Unavailable(why) => format!("✗ credential MCP sign-in ({host}) (warning): {why}"),
         _ => format!(
             "· credential MCP sign-in ({host}): absent; press Sign in in the Tickets panel or run `atomics tickets login`"
@@ -208,15 +239,16 @@ pub fn run_cli(login: bool, workspace: Option<&str>) -> i32 {
         return 1;
     }
     let oauth = OAuth::current();
-    let host = host_of(&config.server);
+    let server = config.sign_in_server();
+    let host = host_of(&server);
     let wake = crate::host::Wake::default();
     if !login {
-        let result = sign_out(oauth, config.server.clone(), &wake).recv().map_err(|e| e.to_string()).and_then(|r| r);
+        let result = sign_out(oauth, server, &wake).recv().map_err(|e| e.to_string()).and_then(|r| r);
         println!("{}", sign_out_message(&host, &result));
         return i32::from(result.is_err());
     }
     let headless = headless();
-    let mut job = SignInJob::start(oauth, config.server.clone(), !headless, &wake);
+    let mut job = SignInJob::start(oauth, server, !headless, &wake);
     let paste = job.paste.clone();
     if headless {
         // Pasting is read from the terminal; the thread ends with the process.

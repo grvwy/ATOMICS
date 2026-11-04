@@ -16,8 +16,13 @@ mod oauth;
 pub use http_operation::{HttpClient, http_base, shared_token};
 use oauth::Session;
 #[cfg(test)]
-pub(crate) use oauth::tests::{Fake as FakeOAuthServer, browse as oauth_test_browse, machine as oauth_test_machine};
-pub use oauth::{OAuth, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required};
+pub(crate) use oauth::tests::{
+    Fake as FakeOAuthServer, browse as oauth_test_browse, machine as oauth_test_machine,
+    open_in_browser as oauth_test_open,
+};
+pub use oauth::{
+    OAuth, ResourceAccess, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required,
+};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL: usize = 2000;

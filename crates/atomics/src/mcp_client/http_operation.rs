@@ -81,22 +81,23 @@ pub struct HttpClient {
     base: Url,
     /// `token_env`'s value, when it belongs to this origin (`shared_token`).
     token: Option<String>,
-    /// This resource's own browser sign-in. It replaces `token`.
+    /// This resource's token from the server's browser sign-in. It replaces `token`.
     oauth: Option<Box<Session>>,
 }
 
 impl HttpClient {
-    /// `api` is the resource from `TicketConfig::http_server`. A server not signed in is `SignInRequired`.
+    /// `api` is the resource from `TicketConfig::http_server`, and `sign_in` the keychain and the server
+    /// whose sign-in covers it. A sign-in that does not cover it is `SignInRequired`.
     pub fn connect(
         api: &McpServer,
         token: Option<String>,
         timeout: Duration,
-        oauth: Option<&OAuth>,
+        sign_in: Option<(&OAuth, &McpServer)>,
     ) -> Result<HttpClient, McpError> {
         let base = http_base(api.url.as_deref().unwrap_or_default())?;
         let oauth = if api.uses_oauth() {
-            let oauth = oauth.ok_or_else(|| McpError::transport("OAuth sign-in is unavailable".into()))?;
-            Some(Box::new(oauth.session(api, timeout)?))
+            let (oauth, server) = sign_in.ok_or_else(|| McpError::transport("OAuth sign-in is unavailable".into()))?;
+            Some(Box::new(oauth.session_for(server, base.as_str(), timeout)?))
         } else {
             None
         };
@@ -106,6 +107,11 @@ impl HttpClient {
     /// The OAuth access token in use, if any. It changes on refresh.
     pub fn oauth_token(&self) -> Option<&str> {
         self.oauth.as_ref().map(|session| session.access_token())
+    }
+
+    /// Whether this client's token comes from `server`'s sign-in, or from no sign-in at all.
+    pub fn signs_in_with(&self, server: &McpServer) -> bool {
+        self.oauth.as_ref().is_none_or(|session| session.belongs_to(server))
     }
 
     /// `cleaner` also covering what this client authenticates with right now.
@@ -153,8 +159,16 @@ impl HttpClient {
             break response;
         };
         let status = response.status().as_u16();
+        if status == 401
+            && let Some(oauth) = &mut self.oauth
+        {
+            return Err(oauth.refused_by_resource());
+        }
         if !(200..300).contains(&status) {
             return Err(self.refusal(label, status, &mut response, &self.cleaner(cleaner)));
+        }
+        if let Some(oauth) = &mut self.oauth {
+            oauth.accepted_by_resource();
         }
         let headers: Map<String, Value> = call
             .response_headers
@@ -223,9 +237,6 @@ impl HttpClient {
             .iter()
             .filter_map(|value| value.to_str().ok())
             .any(|value| value.to_ascii_lowercase().contains("resource_metadata"));
-        if status == 401 && self.oauth.is_some() {
-            return McpError::SignInRequired(format!("{} rejected the saved sign-in", self.base));
-        }
         if status == 401 && self.token.is_none() && challenged {
             return McpError::SignInRequired(format!(
                 "{} asks for a sign-in: set oauth = true on the server and sign in",
