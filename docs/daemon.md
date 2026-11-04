@@ -96,7 +96,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. An optional `warning` is what the host tells whoever decides, such as whose shared stash entries the command drops. |
 | Host → client | `host_upsert` | The host's own state (`host` capability): open/saved workspaces, projects/worktrees, editors and pull requests, Settings/Remote management, account usage and governor load/slots/queue (`resources`), the ticket system's sign-in, and the optional safe ticket-reader profile and replies. Never a token. |
-| Client → host | `host_command` | `sign_in`, `sign_in_paste`, `sign_in_cancel`, `open_workspace` / `save_workspace`, `browse_folder`, `open_project` / `close_project`, `config_propose` / `config_decide`, pairing and Settings tools, `edit` / `editor_hints`, `pull_request_diff`, `start_chief`, or `tickets` with a request ID and search/read/children/related/link/plan action (`host` and `mutations`; grant `host`). |
+| Client → host | `host_command` | `sign_in`, `sign_in_paste`, `sign_in_cancel`, `open_workspace` / `save_workspace`, `browse_folder`, `open_project` / `close_project`, `config_propose` / `config_decide`, `select_theme`, pairing and Settings tools, `edit` / `editor_hints`, `pull_request_diff`, `start_chief`, or `tickets` with a request ID and search/read/children/related/link/plan action (`host` and `mutations`; grant `host`). |
 | Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |
@@ -106,6 +106,9 @@ publishes the safe effective configuration and its sources, the oldest pending p
 risks, warnings and theme preview), host folder listings and remote-device status. `host.projects`
 is the common project/worktree list for the explorer, picker and new-session dialog. A client proposes
 a configuration edit; its user reviews it and sends `config_decide` to apply or reject. The host retains the original proposal for conflict detection, backups and reloads.
+A theme pick (`select_theme`) and the Azure CLI switch are the user's own and can be undone, so they apply at
+once. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
+when they open: sandbox checks, connections, and value-free credential status.
 Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
 The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.
 The `host` grant is checked before any of these commands reaches the runtime. View-only clients see

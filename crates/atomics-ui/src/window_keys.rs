@@ -38,6 +38,11 @@ fn agent_modifiers(os: OperatingSystem) -> Modifiers {
     if command_chords(os) { Modifiers::MAC_CMD } else { Modifiers::CTRL }
 }
 
+/// The agent chords as this client's keyboard says them, for the shortcut list.
+pub fn agents_label(ctx: &Context) -> String {
+    format!("{}…9", ctx.format_shortcut(&KeyboardShortcut::new(agent_modifiers(ctx.os()), Key::Num1)))
+}
+
 /// Which agent `event` picks, from 0. The physical key, because some layouts type digits only with Shift.
 fn agent_key(event: &Event, os: OperatingSystem) -> Option<usize> {
     let Event::Key { key, physical_key, pressed: true, modifiers, .. } = event else { return None };

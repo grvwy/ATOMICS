@@ -1,8 +1,31 @@
-//! The theme picker in the Settings menu: every built-in theme and theme file, each with a strip
-//! of its own colors. A click shows the theme at once and saves `[theme] name` the way an applied
-//! config change is saved: comments kept, a backup, an atomic write, then a reload.
+//! What Settings' theme picker offers and does: every built-in theme and theme file, each with a
+//! strip of its own colors. A pick shows the theme at once and saves `[theme] name` the way an
+//! applied config change is saved: comments kept, a backup, an atomic write, then a reload.
 use super::*;
+use atomics_core::config::ThemeConfig;
+use atomics_core::projection::{ThemeChoice, ThemesInfo};
 use atomics_core::selfconfig;
+
+/// The built-in themes, then the theme files in `dir`. A file named like a built-in theme takes
+/// its place, since that is the theme the name now shows. `selected` is the name in `[theme]`.
+fn theme_choices(dir: &Path, selected: &str) -> Vec<ThemeChoice> {
+    let files = atomics_core::theme::file_names(dir);
+    let builtin: Vec<&str> = atomics_core::theme::builtin_names().collect();
+    let names = builtin
+        .iter()
+        .map(|name| (name.to_string(), files.iter().any(|file| file == name)))
+        .chain(files.iter().filter(|file| !builtin.contains(&file.as_str())).map(|file| (file.clone(), true)));
+    names
+        .map(|(name, file)| {
+            let p = Theme::load(&ThemeConfig { name: name.clone(), ..ThemeConfig::default() }, dir).0.palette();
+            let swatches = [p.background, p.panel, p.foreground, p.accent, p.ansi[1], p.ansi[2], p.ansi[4]]
+                .map(|color| format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b()))
+                .into();
+            let selected = name == selected || (!file && name.eq_ignore_ascii_case(selected));
+            ThemeChoice { name, selected, file, swatches }
+        })
+        .collect()
+}
 
 /// Sets `[theme] name` in `file` as an applied config change is written: comments kept, a
 /// backup, an atomic replace. Returns whether the file changed.
@@ -24,35 +47,51 @@ impl State {
     /// The picker's themes, and whether this machine's file picks one; read when the config
     /// or a theme file changes, never per frame.
     pub(super) fn refresh_themes(&mut self) {
-        let host = std::fs::read_to_string(&Config::source_paths(&self.config_path)[1]).unwrap_or_default();
+        let [_, host_file] = Config::source_paths(&self.config_path);
+        let host = std::fs::read_to_string(&host_file).unwrap_or_default();
         self.host_theme = selfconfig::picks_theme(&host);
+        let dir = atomics_core::theme::themes_dir(&self.config_path);
+        let cleaner = self.config_cleaner(&self.config_layers(None));
+        self.themes = ThemesInfo {
+            choices: theme_choices(&dir, self.config.theme.name.trim()),
+            host_file: format!(
+                "config.d/{}",
+                host_file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+            ),
+            host_picks: self.host_theme,
+            inline: self.config.theme.tokens.set_keys().into_iter().map(str::to_string).collect(),
+            error: self.theme_error.as_deref().map(|error| cleaner.text(error)),
+        };
     }
 
     /// The user picked a theme: save its name to `config.toml`, or to this machine's file, and
     /// show it at once. The user's own click, so no proposal.
-    pub(super) fn select_theme(&mut self, name: &str, host: bool) {
+    pub(super) fn select_theme(&mut self, name: &str, host: bool) -> Result<(), String> {
+        if !self.themes.choices.iter().any(|choice| choice.name == name) {
+            return Err(format!("There is no theme named {name}"));
+        }
         let [main, host_file] = Config::source_paths(&self.config_path);
         let file = if host { host_file } else { main };
-        match write_theme_name(&file, name, atomics_core::store::now()) {
-            Ok(changed) => {
-                if changed {
-                    self.reload_config();
-                }
-                let shown = paths::display(&file);
-                self.toast(if !host && self.host_theme {
-                    format!("Theme {name} saved to {shown}, but this machine's config.d file picks its own")
-                } else {
-                    format!("Theme {name} saved to {shown}")
-                });
-            }
-            Err(err) => self.toast(format!("Theme not saved: {err}")),
+        let changed = write_theme_name(&file, name, atomics_core::store::now())
+            .map_err(|err| format!("Theme not saved: {err}"))?;
+        if changed {
+            self.reload_config();
         }
+        let shown = paths::display(&file);
+        self.toast(if !host && self.host_theme {
+            format!("Theme {name} saved to {shown}, but this machine's config.d file picks its own")
+        } else {
+            format!("Theme {name} saved to {shown}")
+        });
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::with_state;
+    use super::*;
+    use atomics_core::ops::HostAction;
 
     #[test]
     fn selecting_a_theme_keeps_comments_and_backs_up_the_file() {
@@ -61,7 +100,7 @@ mod tests {
             let before = "# theme\n[theme]\npreset = \"midnight\" # old key\naccent = \"#00ff88\"\n";
             std::fs::write(&file, before).unwrap();
             state.reload_config();
-            state.select_theme("paper", false);
+            state.select_theme("paper", false).unwrap();
             assert_eq!(state.config.theme.name, "paper");
             assert_eq!(state.theme.palette().accent, atomics_ui::theme::parse_hex("#00ff88").unwrap());
             let written = std::fs::read_to_string(&file).unwrap();
@@ -75,8 +114,71 @@ mod tests {
             assert_eq!(backups.len(), 1);
             assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), before);
             std::fs::write(&file, "[theme\nname = 'claude'").unwrap();
-            state.select_theme("midnight", false);
+            assert!(state.select_theme("midnight", false).unwrap_err().contains("Theme not saved"));
             assert_eq!(std::fs::read_to_string(file).unwrap(), "[theme\nname = 'claude'");
+        });
+    }
+
+    #[test]
+    fn two_picks_in_a_row_leave_the_second_theme_with_no_proposal() {
+        with_state("app::themes::tests::two_picks_in_a_row_leave_the_second_theme_with_no_proposal", |mut state, _| {
+            std::fs::write(&state.config_path, "[layout]\nmin_tile_width = 407.0\n").unwrap();
+            state.reload_config();
+            let pick = |name: &str| HostAction::SelectTheme { name: name.into(), host: false };
+            for name in ["paper", "midnight"] {
+                state.manage(pick(name)).unwrap();
+                assert_eq!(state.config.theme.name, name, "it shows at once");
+                assert!(state.proposals.is_empty(), "the user's own pick is not proposed");
+                let chosen: Vec<_> =
+                    state.management_info().themes.choices.into_iter().filter(|c| c.selected).map(|c| c.name).collect();
+                assert_eq!(chosen, [name], "the picker follows");
+            }
+            let written = std::fs::read_to_string(&state.config_path).unwrap();
+            assert!(written.contains("name = \"midnight\"") && !written.contains("paper"), "{written}");
+            assert!(written.contains("min_tile_width = 407.0"), "the rest stays: {written}");
+
+            let refused = state.manage(pick("../outside")).unwrap_err();
+            assert!(refused.message.contains("no theme"), "{refused:?}");
+            assert_eq!(state.config.theme.name, "midnight");
+        });
+    }
+
+    #[test]
+    fn a_pick_can_go_to_this_machines_file_and_the_picker_says_who_wins() {
+        with_state(
+            "app::themes::tests::a_pick_can_go_to_this_machines_file_and_the_picker_says_who_wins",
+            |mut state, _| {
+                let [main, host] = Config::source_paths(&state.config_path);
+                std::fs::write(&main, "[theme]\nname = 'paper'\n").unwrap();
+                state.reload_config();
+                assert!(!state.management_info().themes.host_picks);
+                state.manage(HostAction::SelectTheme { name: "midnight".into(), host: true }).unwrap();
+                assert!(std::fs::read_to_string(&host).unwrap().contains("midnight"));
+                assert!(std::fs::read_to_string(&main).unwrap().contains("paper"), "config.toml keeps its own");
+                let themes = state.management_info().themes;
+                assert!(themes.host_picks);
+                assert!(themes.host_file.starts_with("config.d/") && themes.host_file.ends_with(".toml"));
+                assert_eq!(state.config.theme.name, "midnight");
+            },
+        );
+    }
+
+    #[test]
+    fn the_picker_lists_theme_files_with_their_own_colors() {
+        with_state("app::themes::tests::the_picker_lists_theme_files_with_their_own_colors", |mut state, _| {
+            let themes = atomics_core::theme::themes_dir(&state.config_path);
+            std::fs::create_dir_all(&themes).unwrap();
+            std::fs::write(themes.join("dusk.toml"), "extends = \"midnight\"\naccent = \"#e0a458\"\n").unwrap();
+            std::fs::write(&state.config_path, "[theme]\nname = 'dusk'\naccent = '#123456'\n").unwrap();
+            state.reload_config();
+            let themes = state.management_info().themes;
+            let dusk = themes.choices.iter().find(|c| c.name == "dusk").expect("the file is offered");
+            assert!(dusk.file && dusk.selected);
+            assert_eq!(dusk.swatches.len(), 7);
+            assert_eq!(dusk.swatches[3], "#e0a458", "its own accent, not the one [theme] sets over it");
+            assert_eq!(themes.inline, ["accent"]);
+            let midnight = themes.choices.iter().find(|c| c.name == "midnight").unwrap();
+            assert!(!midnight.file && !midnight.selected);
         });
     }
 }

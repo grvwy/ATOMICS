@@ -484,6 +484,8 @@ pub(crate) struct State {
     theme_error: Option<String>,
     /// This machine's config.d file picks a theme, which wins over config.toml's.
     host_theme: bool,
+    /// What Settings offers to pick a theme from; read with `host_theme`.
+    themes: atomics_core::projection::ThemesInfo,
     /// The theme as resolved: what terminals answer and the highlighter draws with. Each change is a new
     /// `Arc`, which tells clients to make their palette again.
     theme: Arc<Theme>,
@@ -1019,6 +1021,7 @@ impl State {
             config_problems,
             theme_error,
             host_theme: false,
+            themes: Default::default(),
             sessions: Vec::new(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),

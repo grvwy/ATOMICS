@@ -214,11 +214,8 @@ pub enum Command {
     SaveChiefPreferences,
     /// What the user said, for the chief, which starts with it as its first prompt when it is not running.
     VoiceToChief(String),
-    /// Show a theme and save its name to `config.toml`, or to this machine's file with `host`.
-    SelectTheme {
-        name: String,
-        host: bool,
-    },
+    /// Open the config file in an editor of the machine this UI runs on: only a window on the host has one.
+    EditConfig,
     /// Check again whether agents can run in Docker Sandboxes.
     CheckSandbox,
     /// Read the MCP servers sbx has and ATOMICS knows again.

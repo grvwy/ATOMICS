@@ -1002,6 +1002,9 @@ impl FakeHost {
                 let _ = self.publish_host(host);
                 return Outcome::done(serde_json::Value::Null);
             }
+            HostAction::SettingsTool { .. } | HostAction::SelectTheme { .. } | HostAction::RevokeDevice { .. } => {
+                return Outcome::done(serde_json::Value::Null);
+            }
             _ if now.is_none() => return refused(ErrorCode::Rejected, "the ticket system has no sign-in".into()),
             HostAction::SignIn => (SignInState::SigningIn, Some(SIGN_IN_URL.to_string())),
             HostAction::SignInPaste { .. } if now != Some(SignInState::SigningIn) => {
@@ -1421,15 +1424,71 @@ pub fn host() -> FakeHost {
 
 /// A host with shared settings, pairing and a host folder picker.
 pub fn management() -> FakeHost {
-    use atomics_core::projection::{ManagementInfo, PairingInfo, RemoteInfo};
+    use atomics_core::projection::{DeviceInfo, ManagementInfo, PairingInfo, RemoteInfo, ThemeChoice, ThemesInfo};
     let mut host = self::host();
+    let choice = |name: &str, selected, file| ThemeChoice {
+        name: name.into(),
+        selected,
+        file,
+        swatches: ["#101010", "#202020", "#f0f0f0", "#c06030", "#d04040", "#40a060", "#4060d0"]
+            .map(str::to_string)
+            .into(),
+    };
     host.board.host.management = Some(ManagementInfo {
-        config: serde_json::json!({"values": {"layout.min_tile_width": {"value":520.0,"source":"default"}}}),
+        config: serde_json::json!({
+            "values": {
+                "layout.min_tile_width": {"value":520.0,"source":"default"},
+                "keys.quick_open": {"value":"cmd+p","source":"default"},
+                "keys.toggle_diff": {"value":"cmd+d","source":"default"},
+                "agents": {"value":[{"name":"claude","command":["claude"],"kind":"claude"}],"source":"default"},
+                "isolation.mode": {"value":"sandbox","source":"default"},
+                "isolation.sandbox.azure.enabled": {"value":false,"source":"default"},
+                "voice.api_key": {"value":"***","source":"main"},
+            },
+            "files": [{"source":"main","path":"~/.config/atomics/config.toml","exists":true}],
+        }),
+        tools: serde_json::json!({
+            "hooks": false,
+            "sandbox": ["✓ sbx is signed in", "✗ KVM is not available"],
+            "sandbox_busy": false,
+            "connections": {"rows": [{
+                "name": "linear", "status": "connected", "detail": "https://mcp.linear.app/mcp · remote",
+                "env": 0, "skipped": 0, "busy": false,
+            }]},
+            "credentials": {
+                "entries": [
+                    {"label": "Claude subscription", "present": true, "route": "OS keychain → ATOMICS → api.example.com",
+                     "kind": "claude", "last_used": null, "sessions": []},
+                    {"label": "OpenAI", "present": false, "route": "OS keychain → ATOMICS → api.example.com", "kind": "openai",
+                     "last_used": null, "sessions": []},
+                ],
+                "invalid": 1,
+                "azure": "az found: false; logged in: false; sessions: none",
+            },
+            "credential_busy": false,
+            "credential_kinds": [
+                {"id": "claude", "label": "Claude subscription"},
+                {"id": "openai", "label": "OpenAI"},
+                {"id": "registry", "label": "Private registry"},
+            ],
+        }),
+        themes: ThemesInfo {
+            choices: vec![choice("claude", true, false), choice("midnight", false, false), choice("dusk", false, true)],
+            host_file: "config.d/host.toml".into(),
+            ..Default::default()
+        },
         folder_start: "/home/user".into(),
         remote: RemoteInfo {
             enabled: true,
             status: "Online".into(),
             pairing: Some(PairingInfo::Idle { note: None }),
+            devices: vec![DeviceInfo {
+                id: "phone".into(),
+                name: "A phone".into(),
+                controls: true,
+                connected: false,
+                seen_ms: 0,
+            }],
             ..Default::default()
         },
         ..Default::default()

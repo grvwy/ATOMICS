@@ -6,6 +6,7 @@ use atomics_core::selfconfig::Scope;
 use egui::RichText;
 
 mod remote;
+mod settings;
 
 #[derive(Default)]
 pub struct State {
@@ -28,8 +29,30 @@ pub struct State {
     pub revoke: Option<String>,
     pub proposal_seen: Option<(String, f64)>,
     pub proposal_note: String,
+    /// "This machine only" as the user set it; unset, it follows whether this host's own file picks a theme, so that
+    /// a pick shows.
+    theme_host_only: Option<bool>,
+    /// What Settings has asked the host to read since it opened.
+    loaded: Vec<atomics_core::ops::SettingsTool>,
+    /// The action Settings waits for a yes on, because it cannot be undone.
+    confirm: Option<settings::Confirm>,
+    /// The credential's value field takes the keyboard when it next draws.
+    focus_credential: bool,
     /// A window here was open as this frame began, and so holds the keyboard.
     keyboard: bool,
+}
+
+impl State {
+    /// What lives as long as Settings is open goes when it closes: above all a value typed and never saved.
+    fn forget_settings(&mut self) {
+        self.credential_value.clear();
+        self.confirm = None;
+        self.loaded.clear();
+        self.focus_credential = false;
+        if !self.remote {
+            self.revoke = None;
+        }
+    }
 }
 
 /// Whether Settings, Remote or the project picker is open.
@@ -102,18 +125,29 @@ pub fn buttons(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 }
 
 pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
+    if !client.management.settings {
+        client.management.forget_settings();
+    }
     let Some(info) = backend.management() else { return };
-    let width = (ctx.content_rect().width() - 24.0).clamp(160.0, 780.0);
+    let screen = ctx.content_rect();
+    let width = (screen.width() - 24.0).clamp(160.0, 780.0);
     if client.management.settings {
+        // Its top stays put as sections open and close, so the row under the pointer does not move away.
+        const TOP: f32 = 44.0;
+        const WINDOW_CHROME: f32 = 52.0;
         let mut open = true;
         egui::Window::new("Settings")
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, TOP))
             .open(&mut open)
-            .default_width(width)
+            .collapsible(false)
+            .auto_sized()
+            .min_width(width.min(680.0))
+            .max_width(width.min(680.0))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
-                    .max_height(ctx.content_rect().height() * 0.7)
-                    .show(ui, |ui| settings(ui, backend, client, &info));
+                    .auto_shrink([false, true])
+                    .max_height((screen.height() - TOP - WINDOW_CHROME).max(120.0))
+                    .show(ui, |ui| settings::draw(ui, backend, client, &info));
             });
         client.management.settings = open;
     }
@@ -144,87 +178,6 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
     if window_open(client) != client.management.keyboard {
         ctx.request_repaint();
     }
-}
-
-fn settings(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
-    ui.heading("Effective configuration");
-    ui.label("Changes are proposed first. Review the diff, then Apply to save them on the host.");
-    if let Some(problem) = info.config["load_error"].as_str() {
-        ui.colored_label(client.palette.warning, problem);
-    }
-    ui.add(egui::TextEdit::singleline(&mut client.management.filter).hint_text("Find a setting"));
-    if let Some(values) = info.config["values"].as_object() {
-        egui::ScrollArea::vertical().id_salt("effective-settings").max_height(230.0).show(ui, |ui| {
-            for (key, entry) in values {
-                if !key.to_lowercase().contains(&client.management.filter.to_lowercase()) {
-                    continue;
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "{key} = {}  ({})",
-                        entry["value"],
-                        entry["source"].as_str().unwrap_or("default")
-                    ))
-                    .monospace(),
-                );
-            }
-        });
-    }
-    ui.separator();
-    ui.heading("Propose a change");
-    let enabled = allowed(
-        backend,
-        &HostAction::ConfigPropose {
-            scope: Scope::Main,
-            toml: String::new(),
-            remove: vec![],
-            theme: None,
-            reason: None,
-        },
-    );
-    if !enabled {
-        ui.label("View only: settings changes require the host grant.");
-    }
-    ui.add_enabled_ui(enabled, |ui| {
-        let state = &mut client.management;
-        let mut scope = state.scope.unwrap_or(Scope::Main);
-        egui::ComboBox::from_label("Save to").selected_text(scope.name()).show_ui(ui, |ui| {
-            for target in [Scope::Main, Scope::Host, Scope::Workspace, Scope::Theme] {
-                ui.selectable_value(&mut scope, target, target.name());
-            }
-        });
-        state.scope = Some(scope);
-        if scope == Scope::Theme {
-            ui.add(egui::TextEdit::singleline(&mut state.theme).hint_text("Theme name"));
-        }
-        ui.add(
-            egui::TextEdit::multiline(&mut state.toml)
-                .code_editor()
-                .desired_rows(5)
-                .desired_width(ui.available_width())
-                .hint_text("[layout]\nmin_tile_width = 400.0"),
-        );
-        ui.add(egui::TextEdit::singleline(&mut state.remove).hint_text("Keys to remove, separated by commas"));
-        ui.add(egui::TextEdit::singleline(&mut state.reason).hint_text("Reason (optional)"));
-        if ui
-            .add_enabled(
-                !state.toml.trim().is_empty() || !state.remove.trim().is_empty(),
-                egui::Button::new("Propose change"),
-            )
-            .clicked()
-        {
-            let action = HostAction::ConfigPropose {
-                scope,
-                toml: state.toml.clone(),
-                remove: state.remove.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
-                theme: (scope == Scope::Theme).then(|| state.theme.clone()),
-                reason: Some(state.reason.clone()),
-            };
-            client.send(Command::Manage(action));
-        }
-    });
-    tools(ui, backend, client, info);
-    // The VM panel can be inserted as another Settings section without changing the shell.
 }
 
 fn folder(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
@@ -306,9 +259,10 @@ fn proposal(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client, inf
     }
     let enabled =
         backend.available(&Command::DecideProposal { id: pending.id.clone(), apply: true, note: String::new() });
-    egui::Window::new("Proposed config change")
+    let shown = egui::Window::new("Proposed config change")
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .id(egui::Id::NULL.with("config-proposal"))
+        .collapsible(false)
         .default_width((ctx.content_rect().width() - 24.0).min(820.0))
         .show(ctx, |ui| {
             ui.label(RichText::new(format!("{} · {} scope", pending.file, pending.scope)).strong());
@@ -349,144 +303,8 @@ fn proposal(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client, inf
                     .hint_text("Note for the chief (optional)"),
             );
         });
-}
-
-fn tool(client: &mut Client, tool: atomics_core::ops::SettingsTool) {
-    client.send(Command::Manage(HostAction::SettingsTool { tool }));
-}
-
-fn tools(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
-    use atomics_core::ops::SettingsTool;
-    let enabled = allowed(backend, &HostAction::SettingsTool { tool: SettingsTool::CheckSandbox });
-    ui.separator();
-    ui.collapsing("Themes", |ui| {
-        ui.label("Selecting a theme proposes the setting; Apply saves it.");
-        for source in ["built_in", "files"] {
-            if let Some(names) = info.config["themes"][source].as_array() {
-                ui.horizontal_wrapped(|ui| {
-                    for name in names.iter().filter_map(|n| n.as_str()) {
-                        if ui.add_enabled(enabled, egui::Button::new(name)).clicked() {
-                            client.send(Command::Manage(HostAction::ConfigPropose {
-                                scope: client.management.scope.filter(|s| *s == Scope::Host).unwrap_or(Scope::Main),
-                                toml: format!("[theme]\nname = {name:?}"),
-                                remove: vec![],
-                                theme: None,
-                                reason: Some("Select theme".into()),
-                            }));
-                        }
-                    }
-                });
-            }
-        }
-    });
-    ui.collapsing("Host setup", |ui| {
-        if info.tools["hooks"] == true {
-            ui.label("Hooks for all Claude sessions are installed");
-        } else if ui.add_enabled(enabled, egui::Button::new("Install hooks for all Claude sessions")).clicked() {
-            tool(client, SettingsTool::InstallHooks);
-        }
-        if let Some(lines) = info.tools["sandbox"].as_array() {
-            for line in lines.iter().filter_map(|s| s.as_str()) {
-                ui.label(line);
-            }
-        }
-        if ui
-            .add_enabled(enabled && info.tools["sandbox_busy"] != true, egui::Button::new("Refresh sandbox checks"))
-            .clicked()
-        {
-            tool(client, SettingsTool::CheckSandbox);
-        }
-        if ui.button("Copy: atomics setup").clicked() {
-            ui.ctx().copy_text("atomics setup".into());
-        }
-    });
-    ui.collapsing("Connections", |ui| {
-        let connections = &info.tools["connections"];
-        ui.label("MCP servers for sandboxed agents");
-        if let Some(error) = connections["error"].as_str() {
-            ui.label(error);
-        }
-        if let Some(rows) = connections["rows"].as_array() {
-            for row in rows {
-                let name = row["name"].as_str().unwrap_or_default();
-                ui.label(format!("{name} · {}", row["status"].as_str().unwrap_or("not connected")));
-                if let Some(detail) = row["detail"].as_str() {
-                    ui.label(detail);
-                }
-                if let Some(error) = row["error"].as_str() {
-                    ui.label(error);
-                }
-                ui.add_enabled_ui(enabled && row["busy"] != true, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Connect").clicked() {
-                            tool(client, SettingsTool::Connect { name: name.into(), store_env: false });
-                        }
-                        if row["env"].as_u64().unwrap_or(0) > 0 && ui.button("Connect and store env values").clicked() {
-                            tool(client, SettingsTool::Connect { name: name.into(), store_env: true });
-                        }
-                        if row["status"].is_string() && ui.button("Disconnect").clicked() {
-                            tool(client, SettingsTool::Disconnect { name: name.into() });
-                        }
-                    });
-                });
-            }
-        }
-        ui.add_enabled_ui(enabled, |ui| {
-            if ui.button("Import from Claude Code / Codex").clicked() {
-                tool(client, SettingsTool::ImportConnections);
-            }
-            if ui.button("Refresh connections").clicked() {
-                tool(client, SettingsTool::RefreshConnections);
-            }
-            ui.add(egui::TextEdit::singleline(&mut client.management.connection_name).hint_text("Server name"));
-            ui.add(
-                egui::TextEdit::singleline(&mut client.management.connection_url)
-                    .hint_text("https://mcp.example.com/mcp"),
-            );
-            if ui.button("Add connection").clicked() {
-                tool(
-                    client,
-                    SettingsTool::AddConnection {
-                        name: client.management.connection_name.clone(),
-                        url: client.management.connection_url.clone(),
-                    },
-                );
-            }
-        });
-    });
-    ui.collapsing("Credentials", |ui| {
-        ui.label("Stored values are never displayed. Replacing or removing a credential revokes existing session placeholders.");
-        let credentials = &info.tools["credentials"];
-        if let Some(lines) = credentials["lines"].as_array() { for line in lines.iter().filter_map(|s| s.as_str()) { ui.label(line); } }
-        if let Some(azure) = credentials["azure"].as_str() { ui.label(azure); }
-        ui.add_enabled_ui(enabled && info.tools["credential_busy"] != true, |ui| {
-            if ui.button("Refresh credentials").clicked() { tool(client, SettingsTool::RefreshCredentials); }
-            let state = &mut client.management;
-            if state.credential_kind.is_empty() { state.credential_kind = "claude".into(); }
-            egui::ComboBox::from_label("Credential type").selected_text(&state.credential_kind).show_ui(ui, |ui| {
-                if let Some(kinds) = info.tools["credential_kinds"].as_array() {
-                    for kind in kinds {
-                        let id = kind["id"].as_str().unwrap_or_default();
-                        if ui.selectable_value(&mut state.credential_kind, id.into(), kind["label"].as_str().unwrap_or(id)).changed() { state.credential_value.clear(); state.credential_host.clear(); }
-                    }
-                }
-            });
-            let hosted = matches!(state.credential_kind.as_str(), "registry" | "github-app");
-            if hosted { ui.add(egui::TextEdit::singleline(&mut state.credential_host).hint_text("Host (optional for github.com)")); }
-            ui.add(egui::TextEdit::singleline(&mut state.credential_value).password(true).hint_text("New value (hidden)"));
-            let host = hosted.then(|| state.credential_host.trim().to_string());
-            let kind = state.credential_kind.clone();
-            if ui.add_enabled(!state.credential_value.is_empty(), egui::Button::new("Add / replace credential")).clicked() {
-                let value = std::mem::take(&mut state.credential_value);
-                tool(client, SettingsTool::PutCredential { kind: kind.clone(), value, host: host.clone() });
-            }
-            if ui.button("Remove credential").clicked() { client.management.credential_value.clear(); tool(client, SettingsTool::RemoveCredential { kind, host }); }
-            if credentials["invalid"].as_u64().unwrap_or(0) > 0 && ui.button("Remove unknown / misfiled entries").clicked() { tool(client, SettingsTool::CleanCredentials); }
-            let azure = info.config["values"]["isolation.sandbox.azure.enabled"]["value"].as_bool().unwrap_or(false);
-            let mut changed = azure;
-            if ui.checkbox(&mut changed, "Enable Azure CLI access").changed() {
-                client.send(Command::Manage(HostAction::ConfigPropose { scope: Scope::Main, toml: format!("[isolation.sandbox.azure]\nenabled = {changed}"), remove: vec![], theme: None, reason: Some("Change Azure CLI access".into()) }));
-            }
-        });
-    });
+    // Above Settings, which a click may have raised: Apply stays in reach.
+    if let Some(shown) = shown {
+        ctx.move_to_top(shown.response.layer_id);
+    }
 }

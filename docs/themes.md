@@ -2,7 +2,7 @@
 
 Every color and font in ATOMICS comes from a theme. Five themes are built in, theme files beside the config
 can add more, and `[theme]` in the config picks one and can override any part of it. Pick one in
-Settings → Themes, or save a theme file or the config: either applies while ATOMICS runs.
+Settings → Theme, or save a theme file or the config: either applies while ATOMICS runs.
 
 ```toml
 [theme]
@@ -27,17 +27,19 @@ The built-in themes are ordinary theme files that set every token. They are in
 
 ## Picking a theme
 
-Settings → Themes lists the built-in themes and your theme files (marked *yours*), each with a strip of its
+Settings → Theme lists the built-in themes and your theme files (marked *yours*), each with a strip of its
 own colors: background, panel, text, accent, and red, green and blue from its terminal colors. The current
 theme is checked. Clicking another shows it at once and saves `[theme] name` in `config.toml` the way an
 applied config change is saved: the rest of the file and its comments stay as they were, the old file is kept
 as a `.bak` backup beside it, and the new one replaces it in one step. A legacy `preset` key gives way to
-`name`. The menu stays open, so you can try several.
+`name`. It is your own click, so nothing asks first: to undo it, pick the theme you had. The window stays open,
+so you can try several. A remote client picks for the host the same way; a view-only one sees the list and cannot
+change it.
 
-**This machine only** saves to `config.d/<host>.toml` instead, so other machines that share `config.toml` keep
-their theme. A host file that names a theme wins over `config.toml`, and the menu says so when you are saving to
-`config.toml`. Tokens set inline in `[theme]` still win over whichever theme you pick; the menu names them under
-the list.
+**This machine only** (**Only this host** from a remote client) saves to `config.d/<host>.toml` instead, so other
+machines that share `config.toml` keep their theme. A host file that names a theme wins over `config.toml`, so
+while one does the box starts ticked, and unticking it says your pick would not show. Tokens set inline in
+`[theme]` still win over whichever theme you pick; the section names them under the list.
 
 ## Theme files
 

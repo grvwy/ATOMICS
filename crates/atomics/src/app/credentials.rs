@@ -1,5 +1,6 @@
 //! Credential I/O belongs to a worker, never the UI/state lock. The client only keeps a masked
 //! edit buffer and value-free status; submitting moves the buffer straight to that worker.
+use super::management::write_azure_enabled;
 use super::*;
 #[cfg(test)]
 use crate::credentials::{KINDS, Snapshot, Store};
@@ -12,24 +13,6 @@ struct StatusView {
 }
 #[cfg(test)]
 type Checked = Result<StatusView, String>;
-
-#[cfg(test)]
-fn write_azure_enabled(file: &Path, enabled: bool) -> Result<(), String> {
-    let before = match std::fs::read_to_string(file) {
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Err("Cannot read user config; fix it before changing Azure access".into()),
-    };
-    let after = atomics_core::selfconfig::edit(
-        before.as_deref().unwrap_or(""),
-        &format!("[isolation.sandbox.azure]\nenabled = {enabled}"),
-        &[],
-    )
-    .map_err(|_| "Cannot edit invalid user config; fix it in Edit config first".to_string())?;
-    atomics_core::selfconfig::write(file, before.as_deref(), &after, atomics_core::store::now())
-        .map_err(|_| "Could not save Azure setting; reload config and retry".to_string())?;
-    Ok(())
-}
 
 #[cfg(test)]
 #[derive(Default)]

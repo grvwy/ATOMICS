@@ -140,6 +140,20 @@ impl State {
 
 impl State {
     /// The theme on screen, the themes there are, and the tokens a theme file takes.
+    /// Settings' Edit config: the config file in the desktop's own editor. A client of a remote host has no such
+    /// file, and proposes a change instead.
+    pub(super) fn edit_config(&mut self) {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        match std::process::Command::new(opener).arg(&self.config_path).spawn() {
+            Ok(mut opening) => {
+                std::thread::spawn(move || opening.wait());
+            }
+            Err(error) => {
+                self.toast(format!("Could not open {}: {error}", paths::display(&self.config_path)));
+            }
+        }
+    }
+
     fn themes_json(&self) -> serde_json::Value {
         let dir = atomics_core::theme::themes_dir(&self.config_path);
         let files = atomics_core::theme::file_names(&dir);
