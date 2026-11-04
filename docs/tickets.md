@@ -298,11 +298,14 @@ Ctrl+Shift+K on Linux/Windows), and the top bar's **Sign in to <system>** item, 
 (in the Actions menu when the bar is narrow). The Tickets entry carries a dot meanwhile. With no saved sign-in
 (never signed in here, or signed out), the button reads **Sign in to <system>**, even after a job answered
 `sign-in required`, as the `whoami` job does at start-up. Only once the server refused the saved sign-in, or it ran
-out with nothing to refresh it (a job answered `sign-in required again`), or the sign-in does not cover a resource
-the profile now reads from, it reads **Reconnect** and the reason shows under "<system> needs you to sign in again".
-The jobs after a refusal find the sign-in cleared and leave **Reconnect** as it is. It is the one sign-in below,
-for the server and the ticket API alike; a refusal that the sign-in already turned into an ordinary error stays
-one, so nothing brings the banner back by itself. Desktop, browser and phone draw the same banner (`atomics-ui`'s
+out with nothing to refresh it (a job answered `sign-in required again`), it reads **Reconnect** and the reason shows
+under "<system> needs you to sign in again". The jobs after a refusal find the sign-in cleared and leave
+**Reconnect** as it is. A sign-in that does not cover a resource the profile now reads from (its ticket API, say)
+stays signed in for what it does cover: the banner reads "<system> needs one more sign-in", names the hosts it does
+not cover, and offers **Sign in to <system>**, which signs in for all of them. On the desktop it also offers **Try
+again**, which puts the banner away, and **Sign out**, since the signed-in chip does not show. It is the one sign-in
+below, for the server and the ticket API alike; a refusal that the sign-in already turned into an ordinary error
+stays one, so nothing brings the banner back by itself. Desktop, browser and phone draw the same banner (`atomics-ui`'s
 `signin`).
 
 1. **Sign in** runs the host's sign-in job. On the desktop it opens the default browser (`open` on macOS, `xdg-open`
