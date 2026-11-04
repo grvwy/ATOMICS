@@ -142,6 +142,19 @@ fn a_host_that_cannot_be_found_says_why() {
     assert_eq!(app.unreachable(), Some("the VM atomics is stopped"));
 }
 
+/// A `connect` value ATOMICS cannot open names the setting, the file that sets it, and the way out.
+#[test]
+fn a_bad_connect_value_says_where_it_is_set() {
+    let error = super::target::Target::parse("vm2").unwrap_err();
+    let file = std::path::Path::new("/home/user/.config/atomics/config.d/mac.toml");
+    let message = super::bad_connect_message("vm2", false, Some(file), &error);
+    assert!(message.starts_with("[client] connect = \"vm2\" in /home/user/.config/atomics/config.d/mac.toml: "));
+    assert!(message.contains("connect to `local`, `vm` or ws://127.0.0.1:PORT"), "{message}");
+    assert!(message.contains("remove it to run agents on this Mac"), "{message}");
+    let message = super::bad_connect_message("vm2", true, None, &error);
+    assert!(message.starts_with("--connect \"vm2\": connect to"), "{message}");
+}
+
 /// The VM's host refusing this Mac's token stops the window and asks: the token stays in the keychain,
 /// and nothing dials or pairs again until the user says "Pair again".
 #[test]

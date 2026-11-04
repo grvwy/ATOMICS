@@ -615,7 +615,9 @@ connect = "local"     # the `atomics host` on this machine; "vm": the host in th
                       # "ws://127.0.0.1:PORT": a host this machine paired with; "" (default): the desktop
 ```
 
-`atomics --connect ""` opens the desktop for one run whatever the config says.
+`atomics --connect ""` opens the desktop for one run whatever the config says. A value it cannot connect to stops
+it with a message naming the file that sets it, in a dialog too when there is no terminal (opened from the Dock or
+a launcher).
 
 - **The browser client's own path, run natively** (`crates/atomics/src/client.rs`). atomics-web's `Driver`
   (connecting, reconnecting with the same jittered waits, replaying from the cursor), its `RemoteBackend` (the

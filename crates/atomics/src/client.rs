@@ -517,6 +517,51 @@ fn switch_to_local() -> anyhow::Result<()> {
     relaunch_without_connect()
 }
 
+/// A `connect` value ATOMICS cannot open, said where it is seen. Opened from the Dock or a launcher there is no
+/// terminal for stderr, so a value from the config is said in a dialog too, rather than quitting silently.
+/// `--connect` on a command line is said on stderr alone.
+pub(crate) fn report_bad_connect(value: &str, from_command_line: bool, error: &anyhow::Error) {
+    use std::io::IsTerminal;
+    let file = (!from_command_line).then(connect_setting_file).flatten();
+    let message = bad_connect_message(value, from_command_line, file.as_deref(), error);
+    eprintln!("atomics: {message}");
+    if !from_command_line && !std::io::stderr().is_terminal() {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("ATOMICS cannot open")
+            .set_description(&message)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+}
+
+fn bad_connect_message(
+    value: &str,
+    from_command_line: bool,
+    file: Option<&std::path::Path>,
+    error: &anyhow::Error,
+) -> String {
+    if from_command_line {
+        return format!("--connect {value:?}: {error:#}.");
+    }
+    let place = file.map(|file| format!(" in {}", file.display())).unwrap_or_default();
+    format!(
+        "[client] connect = {value:?}{place}: {error:#}. Correct it, or remove it to run agents on this Mac; \
+         `atomics --connect \"\"` does that for one run."
+    )
+}
+
+/// The config file whose `[client] connect` is in force: the host file over the main one.
+fn connect_setting_file() -> Option<std::path::PathBuf> {
+    use atomics_core::selfconfig::{self, Layer, Source};
+    let [main, host] = atomics_core::config::Config::source_paths(&atomics_core::paths::config_file());
+    let key = ["client".to_string(), "connect".to_string()];
+    [(Source::Host, host), (Source::Main, main)]
+        .into_iter()
+        .find(|(source, file)| selfconfig::defines(&Layer::read(*source, file).table, &key))
+        .map(|(_, file)| file)
+}
+
 /// Take `[client] connect` out of every config file that sets it (the host file, the main file), each with
 /// a backup beside it; the files it changed.
 pub(crate) fn forget_connect_setting() -> anyhow::Result<Vec<std::path::PathBuf>> {
