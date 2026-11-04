@@ -892,7 +892,7 @@ mod tests {
         let frame = |view: &mut TerminalView, events| {
             let mut started = false;
             ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
-                let response = ui.interact(rect, ui.id().with("drag selection"), Sense::click_and_drag());
+                let response = ui.interact(rect, egui::Id::NULL.with("drag selection"), Sense::click_and_drag());
                 started |= response.drag_started();
                 view.handle_mouse(&terminal, ui, &response, rect, &metrics);
             })
