@@ -849,7 +849,12 @@ command = ["codex"]
             "pane-1",
             false,
         );
-        assert!(bare.get("permissions").is_none(), "bare Claude keeps its existing read permissions");
+        // Its only rules make it ask before dropping shared stash entries; they add no allow rule.
+        assert_eq!(
+            bare["permissions"],
+            serde_json::json!({ "ask": crate::hook::CLAUDE_STASH_ASK }),
+            "bare Claude keeps its existing read permissions"
+        );
     }
 
     #[test]

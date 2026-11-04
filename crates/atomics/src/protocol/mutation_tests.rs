@@ -153,7 +153,7 @@ fn a_view_only_client_is_told_it_may_change_nothing_and_every_mutation_is_refuse
 fn mutations_need_the_capability_and_a_controller_is_told_what_it_may_do() {
     let (server, recorder) = start(Role::Controller);
     let (_, may) = connect(&server, CAPABILITIES);
-    assert_eq!(may, vec![Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review]);
+    assert_eq!(may, vec![Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review, Grant::Host]);
 
     let without: Vec<&str> = CAPABILITIES.iter().copied().filter(|c| *c != MUTATIONS).collect();
     let (mut client, may) = connect(&server, &without);

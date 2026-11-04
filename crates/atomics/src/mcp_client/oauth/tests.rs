@@ -105,6 +105,8 @@ pub(crate) struct State {
     pub(crate) authorize_urls: Vec<String>,
     pub(crate) token_requests: Vec<HashMap<String, String>>,
     pub(crate) list_auth: Vec<String>,
+    /// The bearer each `tools/call` came with, in order.
+    pub(crate) call_auth: Vec<String>,
     pub(crate) state_override: Option<String>,
     pub(crate) iss_override: Option<String>,
     pub(crate) metadata_issuer: Option<String>,
@@ -393,10 +395,19 @@ impl Fake {
                     json!({ "jsonrpc": "2.0", "id": body["id"], "result": { "tools": [{ "name": "search" }] } }),
                 )
             }
-            "tools/call" => json_resp(
-                200,
-                json!({ "jsonrpc": "2.0", "id": body["id"], "result": { "content": [{ "type": "text", "text": "{}" }] } }),
-            ),
+            "tools/call" => {
+                st.call_auth.push(token.to_string());
+                // A `whoami` tool answers who signed in, so a profile that maps it reads an identity.
+                let text = if body["params"]["name"] == "whoami" {
+                    json!({ "userId": "agent-1", "kind": "agent", "displayName": "Example agent" }).to_string()
+                } else {
+                    "{}".to_string()
+                };
+                json_resp(
+                    200,
+                    json!({ "jsonrpc": "2.0", "id": body["id"], "result": { "content": [{ "type": "text", "text": text }] } }),
+                )
+            }
             _ => Resp(202, vec![], String::new()),
         }
     }

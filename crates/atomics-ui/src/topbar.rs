@@ -210,3 +210,47 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         client.send(Command::Activate { session: session.id.clone(), open_diff: true });
     }
 }
+
+/// The workspace open on the host, as a top-bar item a platform adds through its `top_bar_items` hook:
+/// "Workspace: <name>", or "No workspace" in the warning colour, opening a picker of the saved workspaces
+/// with the open one marked. In the Actions menu it is a submenu. Nothing is drawn where the backend
+/// cannot open a workspace, or while none is open and none is saved, so there is nothing to pick.
+pub fn workspace_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    if !backend.available(&Command::OpenWorkspace(String::new())) {
+        return;
+    }
+    let menu = backend.project_menu();
+    if menu.current.is_none() && menu.workspaces.is_empty() {
+        return;
+    }
+    let p = client.palette.clone();
+    let label = match &menu.current {
+        Some(name) => RichText::new(format!("Workspace: {name}")),
+        None => RichText::new("No workspace").color(p.warning),
+    };
+    let response = ui
+        .menu_button(label, |ui| {
+            let open = match &menu.current {
+                Some(name) => format!("{name} is open"),
+                None => "No workspace is open".into(),
+            };
+            ui.label(RichText::new(open).strong());
+            ui.label(RichText::new("Open workspace").size(11.0).color(p.muted));
+            if menu.workspaces.is_empty() {
+                ui.label(RichText::new("none saved yet").size(11.0).color(p.muted));
+            }
+            for name in &menu.workspaces {
+                let current = menu.current.as_deref() == Some(name.as_str());
+                if ui.selectable_label(current, name).clicked() {
+                    client.send(Command::OpenWorkspace(name.clone()));
+                    ui.close();
+                }
+            }
+        })
+        .response;
+    record_item(ui, "Workspace", &response);
+    response.on_hover_text(
+        "The workspace open on the host: its projects and its [tickets], workflow and chief settings. A start \
+         that names none, and a restart, open it again.",
+    );
+}

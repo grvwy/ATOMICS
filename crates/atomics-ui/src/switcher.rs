@@ -1,8 +1,9 @@
 //! The view switcher: one segmented control for what the panel beside the agents shows, the plan's board, the
 //! diff or the tickets. Each segment has its icon, its name and, where it helps, a count: the board's tasks
-//! that wait for the user, the diff's changed files, the tickets no task follows yet. The view on screen is
-//! filled; picking it again hides the panel ([`Command::ToggleView`]), and the keys that toggle a view do the
-//! same. A phone draws the same segments as its pane bar's tabs ([`segments`], [`icon`]).
+//! that wait for the user, the diff's changed files, the ticket system's sign-in (signin's state) or the tickets
+//! no task follows yet. The view on screen is filled; picking it again hides the panel ([`Command::ToggleView`]),
+//! and the keys that toggle a view do the same. A phone draws the same segments as its pane bar's tabs
+//! ([`segments`], [`icon`]).
 
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
@@ -86,21 +87,40 @@ pub fn segments(backend: &dyn Backend, p: &Palette) -> Vec<Segment> {
     if let Some(tickets) = backend.tickets_panel()
         && backend.available(&Command::ToggleView(PanelMode::Tickets))
     {
+        use atomics_core::projection::SignInState;
         let untracked = backend.board(hints.selected_plan).and_then(|board| board.board_counts).map(|(_, n)| n);
-        let badge = if tickets.signed_out {
+        // The sign-in's state, as the host's sign-in says it, else the panel's own word for it.
+        let sign_in = backend.sign_in().map(|view| view.info);
+        let wants = sign_in.as_ref().filter(|info| {
+            matches!(
+                info.state,
+                SignInState::SignedOut | SignInState::Expired | SignInState::Partial | SignInState::Unavailable
+            )
+        });
+        let signing = sign_in.as_ref().is_some_and(|info| info.state == SignInState::SigningIn);
+        let badge = if signing {
+            Some(Badge { text: "…".into(), color: p.muted })
+        } else if wants.is_some() || tickets.signed_out {
             Some(Badge { text: "●".into(), color: p.warning })
         } else {
             untracked.filter(|&n| n > 0).map(|n| Badge { text: n.to_string(), color: p.info })
         };
         let mut hover = String::from("Find and read tickets");
-        if tickets.signed_out {
-            hover.push_str("\nThe ticket system wants you to sign in");
+        match (wants, &sign_in) {
+            (Some(info), _) if info.state == SignInState::Expired => {
+                hover.push_str(&format!("\n{} needs you to sign in again: Reconnect", info.system));
+            }
+            (Some(info), _) => hover.push_str(&format!("\n{} needs you to sign in", info.system)),
+            (None, Some(info)) if signing => hover.push_str(&format!("\nSigning in to {}…", info.system)),
+            _ if tickets.signed_out => hover.push_str("\nThe ticket system wants you to sign in"),
+            _ => {}
+        }
+        if let Some(reason) = wants.and_then(|info| info.reason.as_ref()) {
+            hover.push_str(&format!(" ({reason})"));
         }
         if let Some(n) = untracked.filter(|&n| n > 0) {
-            hover.push_str(&format!(
-                "\n{n} ticket{} on the plan's board that no task follows",
-                if n == 1 { "" } else { "s" }
-            ));
+            let plural = if n == 1 { "" } else { "s" };
+            hover.push_str(&format!("\n{n} ticket{plural} on the plan's board that no task follows"));
         }
         segments.push(Segment { mode: PanelMode::Tickets, label: "Tickets", detail: None, badge, hover });
     }

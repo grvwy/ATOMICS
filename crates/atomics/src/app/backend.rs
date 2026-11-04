@@ -191,6 +191,7 @@ impl Backend for Local<'_> {
                 .map(|usage| usage.label()),
             sandbox_error: sandboxes.error.clone(),
             queue_note,
+            warning: session.warning.clone(),
             connect: match session.sandbox {
                 Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
                 None => Vec::new(),
@@ -386,6 +387,10 @@ impl Backend for Local<'_> {
             current: state.workspace.clone(),
             can_save: !state.open_projects.is_empty(),
         }
+    }
+
+    fn sign_in(&self) -> Option<atomics_ui::signin::SignInView> {
+        self.0.sign_in_view()
     }
 }
 
@@ -619,8 +624,10 @@ mod tests {
                     cwd: dir.path().into(),
                     reason: None,
                     input: json!({}),
+                    warning: None,
                 },
                 reply: None,
+                native: None,
             };
             let mut asking = session("asking", AgentKind::Claude, AgentStatus::NeedsInput, dir.path());
             asking.title = "Asking".into();

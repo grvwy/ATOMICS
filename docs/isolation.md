@@ -845,7 +845,7 @@ atomics ctl '{"cmd":"exec","session":"<id or title>","command":"cargo test -p at
 - **Time.** `timeout_secs` (default 600, at most 3600) bounds the wait for a slot, and then the run. In the
   VM, coreutils' `timeout` stops the command (exit 124) and kills it 10 seconds later if it ignores that:
   stopping `sbx exec` on your machine alone would leave the command running in the VM.
-- **What comes back.** The exit code, whether it timed out, how long it waited and ran, and the last 40,000
+- **What comes back.** The exit code, whether it timed out, how long it waited and ran, and the last 24,000
   bytes of stdout and stderr, with each stream's full size. No environment is passed in, and none is logged:
   in ATOMICS's slot list, the values of `NAME=value` words in a command show as `NAME=…`.
 - **Afterwards.** The command ran agent code, which can move refs, so ATOMICS checks the session's refs as

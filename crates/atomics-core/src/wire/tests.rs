@@ -19,6 +19,23 @@ fn session() -> SessionInfo {
     }
 }
 
+fn host() -> crate::projection::HostInfo {
+    use crate::projection::{HostInfo, SignInInfo, SignInState};
+    HostInfo {
+        workspace: Some("team".into()),
+        workspaces: vec!["daily".into(), "team".into()],
+        sign_in: Some(SignInInfo {
+            system: "tracker".into(),
+            server: "tickets.example.com".into(),
+            state: SignInState::SigningIn,
+            reason: Some("the server refused the saved sign-in".into()),
+            url: Some("https://auth.example.com/authorize?state=s".into()),
+            rejected: None,
+            browser_failed: true,
+        }),
+    }
+}
+
 fn plan() -> PlanInfo {
     PlanInfo {
         id: "p".into(),
@@ -58,7 +75,17 @@ fn approval() -> ApprovalInfo {
         command: Some("ls".into()),
         cwd: "/w/a".into(),
         reason: None,
+        warning: Some("stash@{0} (On atomics/t2: t2), which belongs to task t2".into()),
     }
+}
+
+#[test]
+fn an_approval_without_a_warning_reads_as_before() {
+    let mut info = approval();
+    info.warning = None;
+    let json = serde_json::to_value(&info).unwrap();
+    assert!(json.get("warning").is_none(), "{json}");
+    assert_eq!(serde_json::from_value::<ApprovalInfo>(json).unwrap(), info);
 }
 
 fn summary() -> DiffSummary {
@@ -157,13 +184,24 @@ fn every_message() -> Vec<Message> {
         Message::Unsubscribe { topics },
         Message::StateSnapshot {
             cursor: Seq(3),
-            revisions: Revisions { sessions: Seq(1), plans: Seq(2), approvals: Seq(3), diffs: Seq(4) },
+            revisions: Revisions { sessions: Seq(1), plans: Seq(2), approvals: Seq(3), diffs: Seq(4), host: Seq(5) },
             sessions: vec![session()],
             plans: vec![plan()],
             approvals: vec![approval()],
             diffs: vec![summary()],
+            host: host(),
             part: Some(Part { index: 1, count: 3 }),
         },
+        Message::HostUpsert { cursor: Seq(13), host: host() },
+        Message::HostCommand(crate::ops::HostCommand { op: "o9".into(), action: crate::ops::HostAction::SignIn }),
+        Message::HostCommand(crate::ops::HostCommand {
+            op: "o10".into(),
+            action: crate::ops::HostAction::SignInPaste { text: "http://127.0.0.1:1/callback?code=c&state=s".into() },
+        }),
+        Message::HostCommand(crate::ops::HostCommand {
+            op: "o11".into(),
+            action: crate::ops::HostAction::OpenWorkspace { name: "team".into() },
+        }),
         Message::Skipped { cursor: Seq(12) },
         Message::SessionUpsert { cursor: Seq(4), session: session() },
         Message::SessionRemoved { cursor: Seq(5), id: "s1".into() },
@@ -386,6 +424,30 @@ fn a_newer_minor_decodes_and_unknown_fields_are_ignored() {
 }
 
 #[test]
+fn host_state_needs_its_capability_and_an_older_snapshot_has_none() {
+    let caps = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    let may = Role::Controller.may(&caps(&["board", MUTATIONS]));
+    assert!(!may.contains(&Grant::Host), "host_command needs the host capability too: {may:?}");
+    assert!(Role::Controller.may(&caps(&[MUTATIONS, HOST])).contains(&Grant::Host));
+    assert!(Role::Controller.may(&caps(&[HOST])).is_empty(), "nothing changes without mutations");
+    assert!(Role::Viewer.may(&caps(&[MUTATIONS, HOST])).is_empty());
+    // A snapshot from a host before `host` decodes with an empty host state.
+    let frame = r#"{"v":{"major":1,"minor":0},"epoch":"e","kind":"state_snapshot","cursor":"1","revisions":{"sessions":"1","plans":"0","approvals":"0","diffs":"0"},"sessions":[],"plans":[],"approvals":[],"diffs":[]}"#;
+    let Message::StateSnapshot { host, revisions, .. } = decode(frame).unwrap().message else { panic!("snapshot") };
+    assert_eq!((host, revisions.host), (Default::default(), Seq(0)));
+    // A sign-in state from a newer host is read as unknown, never refused.
+    let frame = r#"{"v":{"major":1,"minor":2},"epoch":"e","kind":"host_upsert","cursor":"2","host":{"sign_in":{"system":"tracker","server":"tickets.example.com","state":"locked"}}}"#;
+    let Message::HostUpsert { host, .. } = decode(frame).unwrap().message else { panic!("host_upsert") };
+    assert_eq!(host.sign_in.map(|s| s.state), Some(crate::projection::SignInState::Unknown));
+    // A host command keeps its bounds: a workspace needs a name, a paste its size.
+    let command = |action| Message::HostCommand(crate::ops::HostCommand { op: "o".into(), action });
+    let blank = command(crate::ops::HostAction::OpenWorkspace { name: " ".into() });
+    assert_eq!(blank.validate().unwrap_err().code, ErrorCode::Malformed);
+    let long = command(crate::ops::HostAction::SignInPaste { text: "x".repeat(crate::ops::MAX_TEXT_BYTES + 1) });
+    assert_eq!(long.validate().unwrap_err().code, ErrorCode::Oversize);
+}
+
+#[test]
 fn an_error_code_from_a_newer_peer_decodes_as_unknown() {
     let frame = r#"{"v":{"major":1,"minor":3},"kind":"error","code":"quota_exceeded","message":"later"}"#;
     let envelope = decode(frame).unwrap();
@@ -508,13 +570,30 @@ fn a_state_snapshot_carries_the_cursor_and_revisions_it_was_loaded_at() {
     let envelope = Envelope::snapshot("boot", &p.load());
     let decoded = decode(&encode(&envelope).unwrap()).unwrap();
     assert_eq!(decoded.epoch.as_deref(), Some("boot"));
-    let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, part } = decoded.message else {
+    let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, host: none, part } =
+        decoded.message
+    else {
         panic!("snapshot")
     };
     assert_eq!(part, None, "a board that fits is one frame");
     assert_eq!(cursor, Seq(5));
-    assert_eq!(revisions, Revisions { sessions: Seq(2), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) });
+    assert_eq!(
+        revisions,
+        Revisions { sessions: Seq(2), plans: Seq(1), approvals: Seq(1), diffs: Seq(1), host: Seq(0) }
+    );
     assert_eq!((sessions.len(), plans.len(), approvals.len(), diffs.len()), (0, 1, 1, 1));
+    assert_eq!(none, Default::default());
+    assert!(!encode(&envelope).unwrap().contains("\"host\":{"), "an empty host is left out");
+
+    // The host's own state moves the cursor and its revision, and travels with the snapshot.
+    assert!(p.publish_host(host()));
+    assert!(!p.publish_host(host()), "the same host state is not a change");
+    let Message::StateSnapshot { cursor, revisions, host: carried, .. } =
+        decode(&encode(&Envelope::snapshot("boot", &p.load())).unwrap()).unwrap().message
+    else {
+        panic!("snapshot")
+    };
+    assert_eq!((cursor, revisions.host, carried), (Seq(6), Seq(1), host()));
 }
 
 #[test]
@@ -768,7 +847,7 @@ fn a_board_over_the_budget_is_cut_into_numbered_parts_of_one_cursor() {
     let mut rest = (0, 0, 0);
     for (i, frame) in frames.iter().enumerate() {
         assert!(frame.len() <= 2000, "part {i} is {} bytes", frame.len());
-        let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, part } =
+        let Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, part, .. } =
             decode(frame).unwrap().message
         else {
             panic!("a snapshot part")

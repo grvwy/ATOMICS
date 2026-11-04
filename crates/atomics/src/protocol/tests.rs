@@ -57,6 +57,7 @@ fn approval(id: &str) -> ApprovalInfo {
         command: Some("git status".into()),
         cwd: "/w/a".into(),
         reason: None,
+        warning: None,
     }
 }
 
@@ -677,6 +678,57 @@ fn removals_become_events_and_a_removed_diff_is_a_tombstone() {
     }
     assert!(board_matches(&mirror, &p));
     assert_eq!(mirror.cursor, hub.head());
+}
+
+#[test]
+fn the_hosts_own_state_reaches_a_client_that_asked_for_it_and_is_skipped_for_one_that_did_not() {
+    use atomics_core::projection::{HostInfo, SignInInfo, SignInState};
+    let f = start();
+    let hello = |client: &mut TestClient, capabilities: &[&str]| {
+        client.send(&Envelope::new(Message::Hello {
+            client_id: "test".into(),
+            versions: vec![VERSION],
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            prior_epoch: None,
+            prior_cursor: None,
+        }));
+    };
+    let mut new = TestClient::connect(f.server.addr(), f.server.token());
+    hello(&mut new, CAPABILITIES);
+    let older: Vec<&str> = CAPABILITIES.iter().copied().filter(|c| *c != wire::HOST).collect();
+    let mut old = TestClient::connect(f.server.addr(), f.server.token());
+    hello(&mut old, &older);
+    for client in [&mut new, &mut old] {
+        client.sync_until(|m| m.epoch.is_some());
+    }
+    let Some(Message::Welcome { may, .. }) = old.welcome.as_ref().map(|w| w.message.clone()) else { panic!() };
+    assert!(!may.contains(&atomics_core::ops::Grant::Host), "host_command needs the host capability: {may:?}");
+
+    let expired = HostInfo {
+        workspace: Some("team".into()),
+        workspaces: vec!["team".into()],
+        sign_in: Some(SignInInfo {
+            system: "tracker".into(),
+            server: "tickets.example.com".into(),
+            state: SignInState::Expired,
+            reason: Some("the server refused the saved sign-in".into()),
+            url: None,
+            rejected: None,
+            browser_failed: false,
+        }),
+    };
+    f.projections.publish_host(expired.clone());
+    new.sync_until(|m| m.host == expired);
+    // The older client is sent `skipped` in its place, so its cursor still follows, and then the
+    // events after it as usual.
+    let head = f.projections.cursor();
+    f.projections.publish_sessions(vec![session("b", "next", AgentStatus::Idle)]);
+    old.sync_until(|m| m.sessions.contains_key("b"));
+    assert_eq!(old.mirror.host, HostInfo::default(), "nothing of the host's own state reached it");
+    assert!(old.mirror.cursor > head);
+    // A snapshot carries it to everyone, which an older client ignores.
+    old.send(&Envelope::new(Message::Resync { reason: None, screens: Vec::new() }));
+    old.sync_until(|m| m.host == expired);
 }
 
 #[test]

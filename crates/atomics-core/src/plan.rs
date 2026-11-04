@@ -462,14 +462,7 @@ impl Plan {
 
     pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
         Plan::assign_task_ids(&mut tasks);
-        let approved = self.approved
-            && self.goal == goal
-            && self
-                .tasks
-                .iter()
-                .filter(|t| t.id != REVIEW_TASK)
-                .map(Task::approval_specification)
-                .eq(tasks.iter().filter(|t| t.id != REVIEW_TASK).map(Task::approval_specification));
+        let approved = self.approved && self.goal == goal && self.keeps_approval_scope(&tasks);
         for task in tasks.iter_mut() {
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
@@ -499,6 +492,25 @@ impl Plan {
         self.tasks = tasks;
         self.approved = approved;
         self.add_review_task();
+    }
+
+    /// Whether `tasks` leave the approval scope of this plan's tasks as it is. Dropping a dependency
+    /// that closed a cycle leaves it too: the tasks it held could never have started.
+    fn keeps_approval_scope(&self, tasks: &[Task]) -> bool {
+        let old: Vec<&Task> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
+        let new: Vec<&Task> = tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
+        old.len() == new.len()
+            && old.into_iter().zip(new).all(|(old, new)| {
+                let mut scope = old.approval_specification();
+                scope["depends_on"] = old
+                    .depends_on
+                    .iter()
+                    .filter(|dep| new.depends_on.contains(dep) || self.dependency_path(dep, &old.id).is_none())
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .into();
+                scope == new.approval_specification()
+            })
     }
 
     /// Every plan ends with a fresh agent reviewing all of its work together, so
@@ -595,6 +607,49 @@ impl Plan {
             .filter(|(_, dep)| !self.tasks.iter().any(|o| &o.id == dep))
             .collect()
     }
+
+    /// Dependency cycles, each a path from a task through what it waits for back to that task:
+    /// `["a", "b", "a"]` when a waits for b, which waits for a. Tasks on a cycle can never start.
+    /// Every dependency that lies on a cycle is on one of the paths.
+    pub fn dependency_cycles(&self) -> Vec<Vec<String>> {
+        let mut covered = std::collections::HashSet::new();
+        let mut cycles = Vec::new();
+        for task in &self.tasks {
+            for dep in &task.depends_on {
+                if covered.contains(&(task.id.as_str(), dep.as_str())) {
+                    continue;
+                }
+                let Some(mut path) = self.dependency_path(dep, &task.id) else { continue };
+                path.insert(0, &task.id);
+                covered.extend(path.windows(2).map(|pair| (pair[0], pair[1])));
+                cycles.push(path.into_iter().map(String::from).collect());
+            }
+        }
+        cycles
+    }
+
+    /// The shortest chain of dependencies from task `from` to task `to`, both included.
+    fn dependency_path<'a>(&'a self, from: &'a str, to: &str) -> Option<Vec<&'a str>> {
+        let mut came_from = std::collections::HashMap::new();
+        let mut queue = std::collections::VecDeque::from([from]);
+        while let Some(id) = queue.pop_front() {
+            if id == to {
+                let mut path = vec![id];
+                while let Some(&previous) = came_from.get(path[path.len() - 1]) {
+                    path.push(previous);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for dep in self.tasks.iter().filter(|t| t.id == id).flat_map(|t| &t.depends_on) {
+                if dep != from && !came_from.contains_key(dep.as_str()) {
+                    came_from.insert(dep.as_str(), id);
+                    queue.push_back(dep);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Task {
@@ -656,6 +711,14 @@ impl Task {
              ATOMICS socket, request to run them outside the sandbox.\n",
         );
         }
+        // Sandboxed or not, an agent's git shares the repository's one stash with every other checkout.
+        text.push_str(&format!(
+            "\nAll worktrees of this repository share one git stash, so an index such as `stash@{{0}}` can name \
+             another agent's entry. If you stash, use `git stash push -m {}` and refer to your entry by that \
+             message: `git stash list --format='%H %gs'` shows each entry's commit, and `git stash apply <commit>` \
+             restores it. Never drop, pop or clear stash entries without the chief's or the user's approval.\n",
+            crate::hook::shell_quote(&self.id)
+        ));
         text.push_str(
             "\nWork only in this worktree and do not commit unless the task says so. When you are done, \
              blocked, or have a question, call the atomics_report tool with status (done, blocked or question) \
@@ -753,6 +816,60 @@ mod tests {
         tasks[0].acceptance.push("Another requirement".into());
         plan.replace("Ship".into(), tasks);
         assert!(!plan.approved);
+    }
+
+    #[test]
+    fn dependency_cycles_name_every_path_that_keeps_tasks_from_starting() {
+        let mut plan = Plan::default();
+        plan.replace("Acyclic".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &["a", "b", "zz"])]);
+        assert!(plan.dependency_cycles().is_empty(), "unknown dependencies are not cycles");
+        // Follow-ups that wait for the final review, which waits for them.
+        plan.replace(
+            "Follow-ups".into(),
+            vec![task("a", &[]), task("f1", &["review"]), task("f2", &["a", "review"]), task("f3", &["review"])],
+        );
+        let cycles = plan.dependency_cycles();
+        let paths: Vec<String> = cycles.iter().map(|cycle| cycle.join(" → ")).collect();
+        assert_eq!(paths, ["f1 → review → f1", "f2 → review → f2", "f3 → review → f3"]);
+        let path = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        plan.replace("Loops".into(), vec![task("a", &["c"]), task("b", &["a"]), task("c", &["b"]), task("d", &["d"])]);
+        assert_eq!(plan.dependency_cycles(), [path(&["a", "c", "b", "a"]), path(&["d", "d"])]);
+    }
+
+    #[test]
+    fn dropping_only_dependencies_that_closed_a_cycle_keeps_approval() {
+        // An approved plan from before plan_set refused cycles.
+        let mut plan = Plan::default();
+        let tasks = vec![task("a", &[]), task("b", &["a", "review"]), task("c", &["b"])];
+        plan.replace("Ship".into(), tasks.clone());
+        plan.approved = true;
+        let fixed = vec![task("a", &[]), task("b", &["a"]), task("c", &["b"])];
+        let mut kept = plan.clone();
+        kept.replace("Ship".into(), fixed.clone());
+        assert!(kept.approved, "b could never have started: dropping review from it changes no approved work");
+        assert!(kept.dependency_cycles().is_empty());
+        for (what, edit) in [
+            (
+                "dropping a dependency outside the cycle",
+                vec![task("a", &[]), task("b", &["review"]), task("c", &["b"])],
+            ),
+            ("adding a dependency", vec![task("a", &[]), task("b", &["a"]), task("c", &["a", "b"])]),
+            ("reordering dependencies", vec![task("a", &[]), task("b", &["review", "a"]), task("c", &["b"])]),
+        ] {
+            let mut changed = plan.clone();
+            changed.replace("Ship".into(), edit);
+            assert!(!changed.approved, "{what}");
+        }
+        let mut reworded = fixed;
+        reworded[1].brief = "Another brief".into();
+        let mut changed = plan.clone();
+        changed.replace("Ship".into(), reworded);
+        assert!(!changed.approved, "a fix together with a scope change needs approval");
+        let mut acyclic = Plan::default();
+        acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &["a"])]);
+        acyclic.approved = true;
+        acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &[])]);
+        assert!(!acyclic.approved, "dropping a dependency that held no cycle needs approval");
     }
 
     #[test]
@@ -1268,6 +1385,11 @@ mod tests {
         );
         assert!(text.contains("atomics_report"));
         assert!(text.contains("atomics queue --class test -- dotnet test"));
+        assert!(text.contains("share one git stash"), "{text}");
+        assert!(text.contains("use `git stash push -m a` and refer to your entry by that message"), "{text}");
+        assert!(text.contains("Never drop, pop or clear stash entries without the chief's or the user's approval."));
+        t.id = "it's 1".into();
+        assert!(t.compose_brief("Better CLI").contains(r"`git stash push -m 'it'\''s 1'`"));
     }
 
     #[test]

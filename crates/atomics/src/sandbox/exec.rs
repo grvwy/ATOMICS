@@ -18,8 +18,9 @@ use crate::governor::Governor;
 /// How long a command may run unless the chief says otherwise, and the most it may ask for.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
-/// How much of the end of each stream comes back: where test failures and errors are.
-const MAX_OUTPUT: u64 = 40_000;
+/// How much of the end of each stream comes back: where test failures and errors are. Both
+/// streams together stay inside what an MCP client takes from one tool call.
+pub(crate) const MAX_OUTPUT: u64 = 24_000;
 /// Past its timeout, how long sbx gets to start a stopped sandbox and end the command in the VM
 /// before it is killed here.
 const GRACE: Duration = Duration::from_secs(30);

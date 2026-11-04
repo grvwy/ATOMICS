@@ -416,6 +416,11 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             None => ui.horizontal(row),
         };
     }
+    // Needing a sign-in shows where the tickets do, with the button that signs in; with no open plan the
+    // sidebar shows it instead.
+    if !crate::signin::no_board_shows(backend) {
+        crate::signin::framed(ui, backend, client);
+    }
     let ticket_config = &board.ticket_config;
     stage_chip(ui, plan.stages.last());
     let mut sync_tickets = false;

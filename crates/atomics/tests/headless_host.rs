@@ -75,6 +75,13 @@ impl Instance {
     }
 
     fn ctl(&self, request: Value) -> Value {
+        let response = self.ctl_response(request.clone());
+        assert_eq!(response["ok"], true, "{request} -> {response}");
+        response["result"].clone()
+    }
+
+    /// The host's whole answer, which may be a refusal.
+    fn ctl_response(&self, request: Value) -> Value {
         let output = test_support::output(&mut self.command(["ctl".to_string(), request.to_string()]));
         assert!(
             output.status.success(),
@@ -82,9 +89,7 @@ impl Instance {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(response["ok"], true, "{request} -> {response}");
-        response["result"].clone()
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     /// Waits for the host to answer ctl, failing with its logs if it exits first.
@@ -263,6 +268,52 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let reply: Value = serde_json::from_slice(&reply.stdout).unwrap();
     assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "allow", "{reply}");
 
+    // Dropping an entry of the stash every worktree shares waits, and its approval says which entry
+    // that is, to ctl and to protocol clients alike.
+    let repo = instance.dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = test_support::output(
+            Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(&repo),
+        );
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+    std::fs::write(repo.join("a.txt"), "work in progress\n").unwrap();
+    git(&["stash", "push", "-q", "-m", "ENG-123"]);
+    let mut hook = TestChild::spawn(
+        instance.command(["hook", "--socket"]).arg(instance.socket()).args(["--pane", &session]).stdin(Stdio::piped()),
+        CHILD_TIMEOUT,
+    )
+    .unwrap();
+    let request = json!({
+        "hook_event_name":"PermissionRequest", "session_id":"headless-gate", "cwd":repo,
+        "tool_name":"Bash", "tool_input":{"command":"git stash drop stash@{0}"}
+    });
+    let mut stdin = hook.child.stdin.take().unwrap();
+    stdin.write_all(request.to_string().as_bytes()).unwrap();
+    drop(stdin);
+    let entry = "git stash drop drops stash@{0} (On main: ENG-123)";
+    eventually("the stash warning", || {
+        let list = instance.ctl(json!({"cmd":"list"}));
+        list["sessions"].as_array().unwrap().iter().any(|s| {
+            s["id"] == session && s["approval"]["warning"].as_str().is_some_and(|warning| warning.contains(entry))
+        })
+    });
+    let mirror = board(&instance.home(), |mirror| {
+        mirror.approvals.values().any(|approval| approval.warning.as_deref().is_some_and(|w| w.contains(entry)))
+    });
+    assert!(mirror.approvals.values().all(|approval| approval.session == session), "{:?}", mirror.approvals);
+    instance.ctl(json!({"cmd":"approve","session":session,"decision":"deny"}));
+    let reply: Value = serde_json::from_slice(&hook.wait_output().unwrap().stdout).unwrap();
+    assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "deny", "{reply}");
+
     // A plan persists on disk.
     let plan = instance.ctl(json!({
         "cmd":"plan_set", "goal":"Headless gate",
@@ -271,6 +322,15 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let id = plan["plan"].as_str().unwrap().to_string();
     let saved = instance.home().join("plans").join(format!("{id}.json"));
     eventually("the saved plan", || std::fs::read_to_string(&saved).is_ok_and(|text| text.contains("Headless gate")));
+    // A plan whose tasks could never start is refused, naming why, and not saved.
+    let refused = instance.ctl_response(json!({
+        "cmd":"plan_set", "goal":"Never starts",
+        "tasks":[{"id":"t1","title":"Follow-up","brief":"After the review","depends_on":["review"]}]
+    }));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(refused["error"].as_str().unwrap().contains("Dependency cycle t1 → review → t1"), "{refused}");
+    let open = instance.ctl(json!({"cmd":"plan_get"}));
+    assert!(open["plans"].as_array().unwrap().iter().all(|plan| plan["goal"] != "Never starts"), "{open}");
 
     // A loopback protocol client connects and sees the board: the session and the plan.
     let mirror = board(&instance.home(), |mirror| {
@@ -320,6 +380,197 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
+/// The chief's two tools as `atomics mcp` serves them, one call each, in order.
+fn mcp_calls(instance: &Instance, calls: &[(&str, Value)]) -> Vec<Value> {
+    let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut stdin = mcp.child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}})
+    )
+    .unwrap();
+    for (id, (name, arguments)) in calls.iter().enumerate() {
+        let call =
+            json!({"jsonrpc":"2.0", "id":id + 1, "method":"tools/call", "params":{"name":name, "arguments":arguments}});
+        writeln!(stdin, "{call}").unwrap();
+    }
+    drop(stdin);
+    let output = mcp.wait_output().unwrap();
+    assert!(output.status.success());
+    let replies: Vec<Value> = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (1..=calls.len()).map(|id| replies.iter().find(|reply| reply["id"] == id).unwrap()["result"].clone()).collect()
+}
+
+#[test]
+fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() {
+    let instance = Instance::new(Some(0));
+    // An agent with no hooks that stops on Codex's recorded command menu.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+    let screen =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures/codex-0.165-approval-screen.txt");
+    let mut config = std::fs::OpenOptions::new().append(true).open(instance.dir.path().join("config.toml")).unwrap();
+    let agent = json!([script, screen]);
+    write!(config, "\n[[agents]]\nname = \"menu\"\ncommand = {agent}\nkind = \"generic\"\n").unwrap();
+    drop(config);
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let started = instance.ctl(json!({"cmd":"start", "agent":"menu", "isolation":"bare"}));
+    let session = started["id"].as_str().unwrap().to_string();
+    let command = "atomics queue --class test -- ./check.sh";
+
+    // ctl and the board both hold the menu as the session's one pending approval.
+    eventually("the native approval", || {
+        let list = instance.ctl(json!({"cmd":"list"}));
+        list["sessions"][0]["approval_menu"] == "codex" && list["sessions"][0]["approval"]["command"] == command
+    });
+    let mirror = board(&instance.home(), |mirror| mirror.approvals.values().any(|a| a.session == session));
+    let approval = mirror.approvals.values().find(|a| a.session == session).unwrap();
+    assert_eq!(approval.command.as_deref(), Some(command));
+    assert_eq!(mirror.sessions[&session].pending_approvals, 1);
+
+    // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu and echoes it.
+    let results = mcp_calls(
+        &instance,
+        &[
+            ("atomics_send", json!({"session":session, "text":"y", "raw":true})),
+            ("atomics_approve", json!({"session":session, "decision":"allow"})),
+        ],
+    );
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    assert!(results[0]["content"][0]["text"].as_str().unwrap().contains("use atomics_approve"), "{}", results[0]);
+    assert_eq!(results[1]["isError"], false, "{}", results[1]);
+    let answered = results[1]["content"][0]["text"].as_str().unwrap();
+    assert!(answered.contains(command) && answered.contains("codex"), "{answered}");
+    eventually("the menu's keys", || {
+        instance.ctl(json!({"cmd":"read", "session":session, "lines":40}))["screen"]
+            .as_str()
+            .is_some_and(|screen| screen.contains("Keys: 31 0d"))
+    });
+    board(&instance.home(), |mirror| {
+        mirror.approvals.is_empty() && mirror.sessions.get(&session).is_some_and(|s| s.pending_approvals == 0)
+    });
+
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// The chief's `atomics_ticket_search` through `atomics mcp --chief`: whether it failed, and its text.
+fn chief_ticket_search(instance: &Instance) -> (bool, String) {
+    let mut mcp = TestChild::spawn(instance.command(["mcp", "--chief"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut stdin = mcp.child.stdin.take().unwrap();
+    for message in [
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+               "params":{"name":"atomics_ticket_search", "arguments":{"query":"sign-in"}}}),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+    let output = mcp.wait_output().unwrap();
+    assert!(output.status.success());
+    let reply = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+        .find(|reply| reply["id"] == 2)
+        .expect("an answer to the tool call");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    (reply["result"]["isError"] == true, text)
+}
+
+/// Send one `host_command` and wait for its final outcome.
+fn host_command(home: &Path, action: atomics_core::ops::HostAction) -> atomics_core::ops::Outcome {
+    let mut socket = connect(home);
+    // Each operation has an ID of its own: the journal answers a reused one with its first outcome.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let op = format!("gate-op-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let command = atomics_core::ops::HostCommand { op, action };
+    send(&mut socket, Envelope::new(Message::HostCommand(command)));
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));
+    loop {
+        assert!(Instant::now() < deadline, "the host_command was never answered");
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => match wire::decode(text.as_str()).unwrap().message {
+                Message::CommandResult(result) if result.outcome.is_final() => {
+                    let _ = socket.close(None);
+                    return result.outcome;
+                }
+                Message::Ping { nonce } => send(&mut socket, Envelope::new(Message::Pong { nonce })),
+                Message::Error { code, message } => {
+                    panic!("the host_command was refused as a frame: {code:?}: {message}")
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => panic!("protocol connection failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn a_start_without_a_workspace_opens_the_last_one_and_the_ticket_tools_say_why_when_none_is_open() {
+    let instance = Instance::new(Some(0));
+    // Saved workspaces, as flat files that load whatever this machine is called; one has [tickets].
+    let saved = instance.dir.path().join("workspaces");
+    std::fs::create_dir_all(&saved).unwrap();
+    std::fs::write(
+        saved.join("team.toml"),
+        "projects = []\n[tickets]\nsystem = \"tracker\"\n[tickets.server]\ncommand = [\"/bin/false\"]\n",
+    )
+    .unwrap();
+    std::fs::write(saved.join("daily.toml"), "projects = []\n").unwrap();
+
+    // Started with no workspace and none open last time: the chief's ticket tools name the cause.
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let (failed, text) = chief_ticket_search(&instance);
+    assert!(failed, "{text}");
+    assert!(text.contains("no workspace is open; saved: daily, team (has [tickets])"), "{text}");
+    // Clients see that no workspace is open, and which are saved.
+    let mirror = board(&instance.home(), |m| m.host.workspaces.len() == 2);
+    assert_eq!(
+        (mirror.host.workspace.clone(), mirror.host.workspaces.clone()),
+        (None, vec!["daily".into(), "team".into()])
+    );
+
+    // A client opens one from its picker; every client sees it, and the ticket tools have a system.
+    let opened = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "team".into() });
+    assert!(matches!(opened, atomics_core::ops::Outcome::Done { .. }), "{opened:?}");
+    board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
+    let (_, text) = chief_ticket_search(&instance);
+    assert!(!text.contains("No ticket system is configured"), "{text}");
+    // A workspace that is not saved is refused, and nothing changes.
+    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "gone".into() });
+    assert!(matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("gone")));
+    // No OAuth server in this profile: a sign-in is refused, saying why.
+    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::SignIn);
+    assert!(
+        matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("oauth = true")),
+        "{refused:?}"
+    );
+
+    // The next start names no workspace either, as from the Dock: the one open last opens again.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    let mut again = instance.host();
+    instance.ready(&mut again);
+    board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
+    let (_, text) = chief_ticket_search(&instance);
+    assert!(!text.contains("No ticket system is configured"), "{text}");
+    assert_eq!(unsafe { libc::kill(again.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(again.wait_output().unwrap().status.success());
+}
+
 #[test]
 fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
     let instance = Instance::new(None);
@@ -331,15 +582,19 @@ fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
     let mut host = instance.host();
     instance.ready(&mut host);
     assert!(!advert.exists(), "a stale protocol.json outlived the start of a host without remote");
-    let plan = instance.ctl(json!({"cmd":"plan_set","goal":"Local only","tasks":[]}));
+    let brief = format!("Brief start {}", "context ".repeat(5000));
+    let plan =
+        instance.ctl(json!({"cmd":"plan_set","goal":"Local only","tasks":[{"id":"a","title":"First","brief":brief}]}));
     let id = plan["plan"].as_str().unwrap().to_string();
 
-    // `atomics mcp` reaches the host through the local socket, with no client attached.
+    // `atomics mcp` reaches the host through the local socket, with no client attached: a plan
+    // reads compactly, and one task in full.
     let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
     let mut stdin = mcp.child.stdin.take().unwrap();
     for message in [
         json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}),
         json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"atomics_plan_get", "arguments":{"plan":id}}}),
+        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"atomics_plan_get", "arguments":{"plan":id, "task":"a"}}}),
     ] {
         writeln!(stdin, "{message}").unwrap();
     }
@@ -354,7 +609,13 @@ fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
         .collect();
     let got = replies.iter().find(|reply| reply["id"] == 2).expect("an answer to the tool call");
     assert_eq!(got["result"]["isError"], false, "{got}");
-    assert!(got["result"]["content"][0]["text"].as_str().unwrap().contains("Local only"), "{got}");
+    let compact = got["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(compact.contains("Local only") && compact.contains("\"First\""), "{got}");
+    assert!(!compact.contains("Brief start"), "a plan reads without its briefs: {got}");
+    let task = replies.iter().find(|reply| reply["id"] == 3).expect("an answer to the task call");
+    assert_eq!(task["result"]["isError"], false, "{task}");
+    let full: Value = serde_json::from_str(task["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(full["task"]["brief"], brief, "one task in full");
 
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     let output = host.wait_output().unwrap();
@@ -395,6 +656,52 @@ fn with_remote_on_a_taken_port_the_host_fails_loudly_and_cleans_up() {
     instance.ready(&mut host);
     let url = serde_json::from_str::<Value>(&std::fs::read_to_string(&advert).unwrap()).unwrap()["url"].clone();
     assert_eq!(url, format!("ws://127.0.0.1:{port}"));
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
+    let instance = Instance::new(None);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
+    // An earlier version left the ledger noting a git record whose file and sandbox are gone, so
+    // every start and plan cleanup failed on it, and kept those failures forever.
+    let record = instance.home().join("git-pins/atomics-gone.json");
+    std::fs::write(
+        instance.home().join("sandbox-ownership.json"),
+        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins")}}).to_string(),
+    )
+    .unwrap();
+    let missing = format!("reading {}: No such file or directory (os error 2)", record.display());
+    let alert = "Final ref guard check FAILED: refs/heads/main moved";
+    let notes = [
+        format!("Startup cleanup skipped: {missing}"),
+        format!("Plan cleanup skipped: {missing}"),
+        "Worktrees /home/user/deleted-scratch: git worktree list --porcelain failed: fatal: cannot change to".into(),
+        alert.to_string(),
+    ];
+    std::fs::write(instance.home().join("cleanup-leftovers.json"), json!(notes).to_string()).unwrap();
+
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let kept = || {
+        std::fs::read(instance.home().join("cleanup-leftovers.json"))
+            .map(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).unwrap())
+            .unwrap_or_default()
+    };
+    eventually("the startup sweep to drop what it no longer finds", || kept() == [alert]);
+    assert!(!instance.home().join("cleanup-sweep.json").exists(), "the sweep found nothing to report");
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(instance.home().join("sandbox-ownership.json")).unwrap()).unwrap();
+    assert!(ledger.get("atomics-gone").is_none(), "{ledger}");
+
+    let doctor = test_support::output(&mut instance.command(["doctor"]));
+    let text = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(text.matches("cleanup leftover").count(), 1, "{text}");
+    assert!(text.contains(&format!("✗ cleanup leftover (warning): {alert}")), "{text}");
+
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     let output = host.wait_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

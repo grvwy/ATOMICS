@@ -281,6 +281,14 @@ pub fn tiles(
             body.min.y = banner.bottom();
         }
         let term_id = ui.scope_id().with(("term", &row.id));
+        if let Some(warning) = &view.warning {
+            let wrap = (body.width() - 16.0).max(40.0);
+            let galley = ui.fonts_mut(|f| f.layout(warning.clone(), p.ui(12.0), p.warning, wrap));
+            let banner = body.with_max_y((body.top() + galley.size().y + 10.0).min(body.bottom()));
+            ui.painter().rect_filled(banner, 0.0, lerp(p.panel, p.warning, 0.12));
+            ui.painter().with_clip_rect(banner).galley(banner.left_top() + vec2(8.0, 5.0), galley, p.warning);
+            body.min.y = banner.bottom();
+        }
         if let Some(reported) = view.reported {
             let banner = body.with_max_y(body.top() + 24.0);
             ui.painter().rect_filled(banner, 0.0, p.panel);

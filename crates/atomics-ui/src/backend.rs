@@ -127,6 +127,8 @@ pub struct TileView {
     pub sandbox_error: Option<String>,
     /// What the host's slot queue holds for the session's processes, e.g. "queued for a test slot".
     pub queue_note: Option<String>,
+    /// How its agent runs that the user should know of, such as Codex started without ATOMICS's hooks.
+    pub warning: Option<String>,
     /// The MCP servers the sandboxed session needs and lacks, as its banner offers to connect them.
     pub connect: Vec<ConnectButton>,
     /// Its process exited; the tile stays until it is closed.
@@ -486,6 +488,11 @@ pub trait Backend {
 
     /// The host's Tickets panel, where it has one ([`PanelMode::Tickets`]); `None` without one.
     fn tickets_panel(&self) -> Option<TicketsPanel> {
+        None
+    }
+
+    /// The ticket system's sign-in, when the host's ticket system signs in with OAuth and says how it stands.
+    fn sign_in(&self) -> Option<crate::signin::SignInView> {
         None
     }
 }

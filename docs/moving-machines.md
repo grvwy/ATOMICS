@@ -78,8 +78,9 @@ On the old machine:
 1. Integrate every task whose work you want to keep (`atomics_plan_integrate`, or **integrate** on its card).
    Integration commits what a task left uncommitted, so the integration branch then holds all of it. Work
    you do not integrate stays behind.
-2. Keep a copy of what is left to do: `atomics_plan_get {plan}` shows the goal and every task's brief and
-   status.
+2. Keep a copy of what is left to do: `atomics_plan_get {plan}` shows the goal and every task's status, and
+   `atomics_plan_get {plan, task}` shows a task's brief. The full plan is also in `plans/<id>.json` under the
+   state directory.
 3. Bundle the branch and check the bundle:
 
    ```sh

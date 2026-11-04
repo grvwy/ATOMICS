@@ -18,8 +18,8 @@ use super::*;
 use crate::protocol::journal::{self, Begun};
 use crate::protocol::{OpReply, OpRequest};
 use atomics_core::ops::{
-    ApprovalDecide, Command, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction,
-    SessionCommand,
+    ApprovalDecide, Command, HostAction, HostCommand, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand,
+    SessionAction, SessionCommand,
 };
 
 /// A mutation whose outcome comes later, and who waits for it.
@@ -192,6 +192,9 @@ impl State {
             Command::ReviewCommand(review) => {
                 return Started::Now(self.review(review).map_or_else(Outcome::refused, Outcome::done));
             }
+            Command::HostCommand(host) => {
+                return Started::Now(self.host_command(host).map_or_else(Outcome::refused, Outcome::done));
+            }
             Command::PlanCommand(plan) => self.plan_request(plan),
             Command::SessionCommand(session) => self.session_request(session),
         };
@@ -211,6 +214,34 @@ impl State {
             Err(TryRecvError::Disconnected) => Started::Now(Outcome::Uncertain {
                 message: "the command ended without an answer; check the board".into(),
             }),
+        }
+    }
+
+    /// The ticket system's sign-in and the open workspace, for a client. A client's sign-in never opens a
+    /// browser here: the client shows the address and pastes back where its browser ended. What becomes of
+    /// the sign-in shows in the host's state, not in this outcome.
+    fn host_command(&mut self, command: HostCommand) -> Result<serde_json::Value, WireError> {
+        let rejected = |message: String| WireError::new(ErrorCode::Rejected, message);
+        match command.action {
+            HostAction::SignIn => {
+                self.start_client_sign_in().map_err(rejected)?;
+                Ok(json!({ "signing_in": true }))
+            }
+            HostAction::SignInPaste { text } => {
+                self.paste_signin(&text).map_err(rejected)?;
+                Ok(json!({ "pasted": true }))
+            }
+            HostAction::SignInCancel => {
+                self.cancel_sign_in().map_err(rejected)?;
+                Ok(json!({ "cancelled": true }))
+            }
+            HostAction::OpenWorkspace { name } => {
+                if !Workspace::list().contains(&name) {
+                    return Err(not_found(format!("no saved workspace {name}")));
+                }
+                let projects = self.open_workspace(&name).map_err(rejected)?;
+                Ok(json!({ "workspace": name, "projects": projects }))
+            }
         }
     }
 

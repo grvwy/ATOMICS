@@ -71,6 +71,9 @@ pub struct Store {
     /// Projects open when ATOMICS last ran.
     #[serde(default)]
     pub projects: Vec<PathBuf>,
+    /// The workspace open when ATOMICS last ran, by name: a start that names none opens it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
 }

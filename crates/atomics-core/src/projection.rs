@@ -119,6 +119,72 @@ pub struct PlanInfo {
     pub ticket: Option<String>,
 }
 
+/// What the host says about itself beside the board: the workspace open there and the ticket system's
+/// sign-in. It never holds a token or a client secret; while a sign-in waits it holds the address to
+/// open in a browser, as the desktop's banner shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInfo {
+    /// The workspace open on the host, by name; `None` when none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The saved workspaces, by name, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
+    /// The configured ticket system's sign-in, when it signs in with OAuth from ATOMICS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInInfo>,
+}
+
+/// Where the ticket system's sign-in stands, as the Sign in and Reconnect buttons show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInInfo {
+    /// The ticket system, as `[tickets] system` names it.
+    pub system: String,
+    /// The server's host, never its path or query.
+    pub server: String,
+    pub state: SignInState,
+    /// Why it needs a sign-in, or why the last one did not finish; free of tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// While a sign-in waits: the address to open in a browser, on any machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// While a sign-in waits: why the address pasted last was not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// While a sign-in waits: the host could not open its own browser, so the address has to be opened by hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser_failed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInState {
+    /// Signed in; the ticket tools work.
+    SignedIn,
+    /// Never signed in on the host, or signed out: "Sign in to <system>".
+    SignedOut,
+    /// It was signed in, but the server refused the saved sign-in or it ran out: "Reconnect".
+    Expired,
+    /// Signed in, but not for a resource the profile now reads from (its ticket API, say): one more
+    /// sign-in covers it, and `reason` names it. What the sign-in covers keeps working.
+    Partial,
+    /// A sign-in is under way; `url` and `rejected` say how far.
+    SigningIn,
+    /// The host's keychain could not be read; `reason` says why.
+    Unavailable,
+    /// A state from a newer host.
+    #[serde(other)]
+    Unknown,
+}
+
+impl SignInInfo {
+    /// Whether the ticket tools need the person: anything but signed in (or under way).
+    pub fn needs_sign_in(&self) -> bool {
+        matches!(self.state, SignInState::SignedOut | SignInState::Expired | SignInState::Partial)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalInfo {
     pub id: String,
@@ -127,6 +193,9 @@ pub struct ApprovalInfo {
     pub command: Option<String>,
     pub cwd: String,
     pub reason: Option<String>,
+    /// What the host warns whoever decides about, such as whose shared stash entries the command drops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +293,7 @@ pub struct Projections {
     pub plans: Published<Vec<PlanInfo>>,
     pub approvals: Published<Vec<ApprovalInfo>>,
     pub diffs: Published<Vec<DiffSummary>>,
+    pub host: Published<HostInfo>,
     cursor: AtomicU64,
     /// How approvals that left the board ended, newest last, so `approval_resolved` can say.
     resolutions: Mutex<VecDeque<(String, Disposition)>>,
@@ -240,6 +310,7 @@ pub struct Loaded {
     pub plans: Arc<Snapshot<Vec<PlanInfo>>>,
     pub approvals: Arc<Snapshot<Vec<ApprovalInfo>>>,
     pub diffs: Arc<Snapshot<Vec<DiffSummary>>>,
+    pub host: Arc<Snapshot<HostInfo>>,
 }
 
 impl Projections {
@@ -271,6 +342,10 @@ impl Projections {
         self.moved(self.diffs.publish(data))
     }
 
+    pub fn publish_host(&self, data: HostInfo) -> bool {
+        self.moved(self.host.publish(data))
+    }
+
     /// Record how approvals ended (the newest `MAX_RESOLUTIONS`). Publish them before the
     /// approvals that no longer list them, so a reader that sees one gone finds how it ended.
     pub fn publish_resolutions(&self, resolved: &VecDeque<(String, Disposition)>) {
@@ -300,6 +375,7 @@ impl Projections {
             plans: self.plans.load(),
             approvals: self.approvals.load(),
             diffs: self.diffs.load(),
+            host: self.host.load(),
         }
     }
 }
@@ -340,6 +416,7 @@ mod tests {
             command: None,
             cwd: "/w".into(),
             reason: None,
+            warning: None,
         }]));
         assert_eq!((p.approvals.load().revision, p.cursor()), (1, 3));
     }
