@@ -40,6 +40,8 @@ pub enum Grant {
     Plan,
     /// `review_command`.
     Review,
+    /// `host_command`: the ticket system's sign-in and the open workspace.
+    Host,
     /// A grant from a newer host.
     #[serde(other)]
     Unknown,
@@ -174,6 +176,31 @@ pub enum SessionAction {
     Close { session: String },
 }
 
+/// The host's own state: the ticket system's sign-in and the workspace open there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCommand {
+    pub op: String,
+    #[serde(flatten)]
+    pub action: HostAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum HostAction {
+    /// Start the ticket system's sign-in on the host (or join the one under way). The host opens no
+    /// browser for a client: the host's `sign_in.url` is the address to open, and the address the
+    /// browser ends on comes back with `sign_in_paste`. Once it finishes, the ticket worker
+    /// connects again with the new sign-in.
+    SignIn,
+    /// The address (or just its query) a browser ended on after signing in, for the sign-in under
+    /// way. One that does not match it is refused there and the sign-in keeps waiting.
+    SignInPaste { text: String },
+    /// Stop the sign-in under way.
+    SignInCancel,
+    /// Open a saved workspace on the host, by name, in place of the projects open there.
+    OpenWorkspace { name: String },
+}
+
 /// What became of an operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -224,6 +251,7 @@ pub enum Command {
     PlanCommand(PlanCommand),
     ReviewCommand(ReviewCommand),
     SessionCommand(SessionCommand),
+    HostCommand(HostCommand),
 }
 
 impl Command {
@@ -234,6 +262,7 @@ impl Command {
             Message::PlanCommand(c) => Some(Command::PlanCommand(c)),
             Message::ReviewCommand(c) => Some(Command::ReviewCommand(c)),
             Message::SessionCommand(c) => Some(Command::SessionCommand(c)),
+            Message::HostCommand(c) => Some(Command::HostCommand(c)),
             _ => None,
         }
     }
@@ -244,6 +273,7 @@ impl Command {
             Command::PlanCommand(c) => Message::PlanCommand(c),
             Command::ReviewCommand(c) => Message::ReviewCommand(c),
             Command::SessionCommand(c) => Message::SessionCommand(c),
+            Command::HostCommand(c) => Message::HostCommand(c),
         }
     }
 
@@ -253,6 +283,7 @@ impl Command {
             Command::PlanCommand(c) => &c.op,
             Command::ReviewCommand(c) => &c.op,
             Command::SessionCommand(c) => &c.op,
+            Command::HostCommand(c) => &c.op,
         }
     }
 
@@ -263,6 +294,7 @@ impl Command {
             Command::PlanCommand(_) => Grant::Plan,
             Command::ReviewCommand(_) => Grant::Review,
             Command::SessionCommand(_) => Grant::Session,
+            Command::HostCommand(_) => Grant::Host,
         }
     }
 
@@ -274,6 +306,7 @@ impl Command {
             Command::PlanCommand(c) => c.validate(),
             Command::ReviewCommand(c) => c.validate(),
             Command::SessionCommand(c) => c.validate(),
+            Command::HostCommand(c) => c.validate(),
         }
     }
 }
@@ -383,6 +416,28 @@ impl SessionCommand {
             }
         }
         bounds.check()
+    }
+}
+
+impl HostCommand {
+    pub fn validate(&self) -> Result<(), WireError> {
+        let mut bounds = Bounds::new(&self.op);
+        match &self.action {
+            HostAction::SignInPaste { text } => {
+                bounds.text("text", Some(text));
+            }
+            HostAction::OpenWorkspace { name } => {
+                bounds.id("name", Some(name));
+            }
+            HostAction::SignIn | HostAction::SignInCancel => {}
+        }
+        bounds.check()?;
+        if let HostAction::OpenWorkspace { name } = &self.action
+            && name.trim().is_empty()
+        {
+            return Err(WireError::new(ErrorCode::Malformed, "name the workspace"));
+        }
+        Ok(())
     }
 }
 

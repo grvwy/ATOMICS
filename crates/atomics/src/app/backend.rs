@@ -55,6 +55,10 @@ impl Local<'_> {
             branch: session.branch().map(str::to_string),
             project: self.0.project_of(&root),
             ungrouped: self.0.ungrouped_session(session),
+            task: self.0.plans.iter().find_map(|plan| {
+                let task = plan.tasks.iter().find(|task| task.session.as_deref() == Some(session.id.as_str()))?;
+                Some(atomics_ui::TaskLink { plan: plan.id.clone(), task: task.id.clone() })
+            }),
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
             outside: session.terminal.is_none(),
@@ -84,6 +88,10 @@ impl Backend for Local<'_> {
 
     fn launch_dir(&self) -> Option<PathBuf> {
         Some(self.0.launch_dir.clone())
+    }
+
+    fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
+        self.0.ticket_config().map(|_| atomics_ui::TicketsPanel { signed_out: self.0.tickets.panel.signin })
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {
@@ -183,6 +191,7 @@ impl Backend for Local<'_> {
                 .map(|usage| usage.label()),
             sandbox_error: sandboxes.error.clone(),
             queue_note,
+            warning: session.warning.clone(),
             connect: match session.sandbox {
                 Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
                 None => Vec::new(),
@@ -378,6 +387,10 @@ impl Backend for Local<'_> {
             current: state.workspace.clone(),
             can_save: !state.open_projects.is_empty(),
         }
+    }
+
+    fn sign_in(&self) -> Option<atomics_ui::signin::SignInView> {
+        self.0.sign_in_view()
     }
 }
 
@@ -611,8 +624,11 @@ mod tests {
                     cwd: dir.path().into(),
                     reason: None,
                     input: json!({}),
+                    warning: None,
                 },
                 reply: None,
+                native: None,
+                stash: Default::default(),
             };
             let mut asking = session("asking", AgentKind::Claude, AgentStatus::NeedsInput, dir.path());
             asking.title = "Asking".into();

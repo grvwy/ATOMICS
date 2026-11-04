@@ -32,6 +32,9 @@ enum Stage {
     Open {
         channel: Channel,
     },
+    /// A direct link to the host's own server (a native client on loopback or through a forward):
+    /// `atomics.v1` text frames as they are, the upgrade's bearer token being the authentication.
+    Plain,
     Ended,
 }
 
@@ -80,13 +83,24 @@ impl Connection {
         Ok(Self { stage: Stage::Handshake { initiator: Box::new(initiator), pairing: None }, outgoing: vec![first] })
     }
 
-    /// The messages to send, in order: one binary WebSocket message each.
+    /// A direct link to the host's server, which the WebSocket upgrade authenticated: no handshake, and
+    /// each message is one `atomics.v1` frame.
+    pub fn plain() -> Self {
+        Self { stage: Stage::Plain, outgoing: Vec::new() }
+    }
+
+    /// The messages to send, in order: one binary WebSocket message each (text on a plain link).
     pub fn take_outgoing(&mut self) -> Vec<Vec<u8>> {
         mem::take(&mut self.outgoing)
     }
 
     pub fn is_open(&self) -> bool {
-        matches!(self.stage, Stage::Open { .. })
+        matches!(self.stage, Stage::Open { .. } | Stage::Plain)
+    }
+
+    /// A direct link to the host's server, carrying text frames.
+    pub fn is_plain(&self) -> bool {
+        matches!(self.stage, Stage::Plain)
     }
 
     /// One binary message from the broker.
@@ -128,12 +142,21 @@ impl Connection {
                 self.stage = Stage::Open { channel };
                 Ok(event.into_iter().collect())
             }
+            Stage::Plain => {
+                self.stage = Stage::Plain;
+                let frame = String::from_utf8(message.to_vec()).map_err(|_| Failure::Malformed)?;
+                Ok(vec![Event::Frame(frame)])
+            }
             Stage::Ended => Err(Failure::Ended),
         }
     }
 
     /// Seal one `atomics.v1` frame for sending; it may take several messages.
     pub fn send(&mut self, frame: &str) -> Result<(), Failure> {
+        if matches!(self.stage, Stage::Plain) {
+            self.outgoing.push(frame.as_bytes().to_vec());
+            return Ok(());
+        }
         let Stage::Open { channel } = &mut self.stage else { return Err(Failure::Ended) };
         match channel.seal(frame.as_bytes()) {
             Ok(messages) => {

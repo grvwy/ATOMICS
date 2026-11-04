@@ -462,8 +462,129 @@ impl Desktop<'_> {
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
-    use super::super::tests::{repository, with_state};
+    use super::super::tests::{repository, with_login_state, with_state};
     use super::*;
+
+    /// Started from a desktop launcher, ATOMICS has a bare PATH; git-lfs and Codex (a script for an
+    /// interpreter, as Node runs Codex) are in a folder only the login shell adds.
+    #[test]
+    fn from_a_bare_launcher_path_dispatch_and_codex_use_the_login_shell_path() {
+        with_login_state(
+            "app::worktrees::tests::from_a_bare_launcher_path_dispatch_and_codex_use_the_login_shell_path",
+            |home| {
+                let tools = home.join("login-tools");
+                std::fs::create_dir(&tools).unwrap();
+                let program = |name: &str, text: &str| crate::test_support::write_program(tools.join(name), text);
+                program(
+                    "git-lfs",
+                    "#!/bin/sh\ncase \"$1\" in clean|smudge) exec cat ;; post-*) exit 0 ;; esac\nexit 1\n",
+                );
+                program("atomics-test-node", "#!/bin/sh\nexec /bin/sh \"$@\"\n");
+                program(
+                    "codex",
+                    "#!/usr/bin/env atomics-test-node\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.165.0\\n'; \
+                     else printf '%s\\n' \"$@\" > launch-args; fi\n",
+                );
+                // Git and the rest stay where this test found them.
+                let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+                let shell = home.join("login-shell");
+                crate::test_support::write_program(
+                    &shell,
+                    format!(
+                        "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nPATH='{login}'\nexport PATH\neval \"$4\"\n"
+                    ),
+                );
+                vec![("SHELL", shell.into()), ("PATH", "/usr/bin:/bin".into())]
+            },
+            |mut state, _ctx| {
+                let tools = paths::home().join("login-tools");
+                let path = std::env::var("PATH").unwrap();
+                assert!(path.starts_with(&format!("{}:", tools.display())), "{path}");
+                for started in ["/usr/bin", "/bin"] {
+                    assert!(path.split(':').any(|folder| folder == started), "{started} stays: {path}");
+                }
+                assert!(crate::setup::login_path().added.is_some_and(|added| added > 0));
+
+                let (_dir, repo) = repository();
+                for (key, value) in [
+                    ("filter.lfs.clean", "git-lfs clean -- %f"),
+                    ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+                    ("filter.lfs.required", "true"),
+                ] {
+                    git::git(&repo, &["config", key, value]).unwrap();
+                }
+                // As `git lfs install` writes it.
+                crate::test_support::write_program(
+                    repo.join(".git/hooks/post-checkout"),
+                    "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { echo >&2 \"git-lfs was not found on your path\"; \
+                     exit 2; }\ngit lfs post-checkout \"$@\"\n",
+                );
+                std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n").unwrap();
+                std::fs::write(repo.join("asset.bin"), "large file\n").unwrap();
+                git::git(&repo, &["add", "."]).unwrap();
+                git::git(&repo, &["commit", "-qm", "asset"]).unwrap();
+
+                let codex = crate::setup::resolve_program("codex");
+                assert_eq!(codex, tools.join("codex").to_string_lossy());
+                assert_eq!(crate::setup::codex_supports_hooks(&codex, None, Duration::from_secs(10)), Some(true));
+
+                state.config.base_ref = "main".into();
+                state.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "login-codex".into(),
+                    command: vec!["codex".into()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: None,
+                });
+                let dispatch = |state: &mut State, branch: &str| {
+                    let launch = Launch {
+                        agent: "login-codex".into(),
+                        prompt: None,
+                        args: vec![],
+                        reply: None,
+                        task: None,
+                        isolation: None,
+                    };
+                    state.create_worktree(repo.clone(), branch.into(), None, launch);
+                    state
+                        .worktree_rx
+                        .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(30)))
+                        .unwrap()
+                };
+
+                // A required filter that cannot run fails the dispatch, which leaves nothing behind.
+                git::git(&repo, &["config", "filter.lfs.smudge", "atomics-test-missing-lfs smudge -- %f"]).unwrap();
+                let failed = dispatch(&mut state, "task");
+                let error = failed.1.as_ref().err().expect("the dispatch fails");
+                assert!(error.contains("smudge filter lfs failed"), "{error}");
+                assert!(!git::branch_ref_exists(&repo, "task").unwrap(), "a retry would find the branch");
+                assert_eq!(git::list_worktrees(&repo).unwrap().len(), 1);
+
+                // The retry, with the filter git-lfs, checks the asset out and starts Codex with hooks.
+                git::git(&repo, &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"]).unwrap();
+                state.worktree_tx.send(failed).unwrap();
+                state.runtime_tick();
+                let event = dispatch(&mut state, "task");
+                let worktree = event.1.as_ref().unwrap().path.clone();
+                assert_eq!(std::fs::read_to_string(worktree.join("asset.bin")).unwrap(), "large file\n");
+                state.worktree_tx.send(event).unwrap();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+                while !state
+                    .sessions
+                    .iter()
+                    .any(|s| s.cwd == worktree && s.terminal.as_ref().is_some_and(Terminal::exited))
+                {
+                    assert!(Instant::now() < deadline, "Codex never started in the worktree");
+                    state.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let args = std::fs::read_to_string(worktree.join("launch-args")).unwrap();
+                assert!(args.contains("--no-daemon") && args.contains("hooks.PermissionRequest"), "{args}");
+                assert!(state.sessions.iter().all(|s| s.warning.is_none()));
+                state.sessions.clear();
+            },
+        );
+    }
 
     #[test]
     fn cache_warming_finishes_on_the_worktree_job_before_agent_launch() {

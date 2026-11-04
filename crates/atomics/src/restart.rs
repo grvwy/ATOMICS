@@ -15,10 +15,19 @@ pub struct Target {
 }
 
 impl Target {
-    pub fn current() -> Result<Self> {
+    /// This installation with this process's arguments, but `workspace` in place of any
+    /// `--workspace` they had: a restart keeps the workspace open now, even one picked after the start.
+    pub fn current(workspace: Option<&str>) -> Result<Self> {
         let executable = crate::setup::executable_path().context("locating this installation")?;
-        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        let args = with_workspace(std::env::args_os().skip(1).collect(), workspace);
         let command = relaunch_command(&executable, &args, cfg!(target_os = "macos"))?;
+        Ok(Self { executable, command })
+    }
+
+    /// This installation with other arguments: the window switching from a host's client to the host.
+    pub fn with_args(args: &[OsString]) -> Result<Self> {
+        let executable = crate::setup::executable_path().context("locating this installation")?;
+        let command = relaunch_command(&executable, args, cfg!(target_os = "macos"))?;
         Ok(Self { executable, command })
     }
 
@@ -57,6 +66,36 @@ impl Target {
     }
 }
 
+/// `args` without their `--workspace NAME` (`-w NAME`, `--workspace=NAME`, `-wNAME`), then
+/// `--workspace=<workspace>` when one is open (one argument, so no name reads as an option). The
+/// other arguments keep their order.
+fn with_workspace(args: Vec<OsString>, workspace: Option<&str>) -> Vec<OsString> {
+    let mut kept = Vec::with_capacity(args.len() + 2);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            kept.push(arg);
+            kept.extend(args.by_ref());
+            break;
+        }
+        if text == "--workspace" || text == "-w" {
+            args.next();
+            continue;
+        }
+        if text.starts_with("--workspace=") || (text.starts_with("-w") && text.len() > 2 && !text.starts_with("--")) {
+            continue;
+        }
+        kept.push(arg);
+    }
+    if let Some(name) = workspace {
+        // Before a `--`, so it stays an option.
+        let at = kept.iter().position(|arg| arg == "--").unwrap_or(kept.len());
+        kept.insert(at, OsString::from(format!("--workspace={name}")));
+    }
+    kept
+}
+
 fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result<Vec<OsString>> {
     let mut command = if macos {
         let bundle = executable
@@ -69,6 +108,7 @@ fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result
         for key in [
             "ATOMICS_HOME",
             "ATOMICS_SOCKET",
+            atomics_core::paths::HOST_SOCKET_ENV,
             "ATOMICS_CONFIG",
             "HOME",
             "PATH",
@@ -175,6 +215,32 @@ mod tests {
         assert_eq!(linux[0], executable);
         assert_eq!(&linux[1..], args);
         assert!(relaunch_command(Path::new("/tmp/atomics"), &[], true).is_err());
+    }
+
+    #[test]
+    fn a_restart_keeps_the_open_workspace_in_place_of_the_one_it_started_with() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        // Started from the Dock with no arguments: the workspace open now is named.
+        assert_eq!(with_workspace(vec![], Some("team")), args(&["--workspace=team"]));
+        // Each way of naming one is replaced; the rest keep their order.
+        for started in [
+            &["/repo", "--workspace", "daily", "--size", "800x600"][..],
+            &["/repo", "-w", "daily", "--size", "800x600"],
+            &["/repo", "--workspace=daily", "--size", "800x600"],
+            &["/repo", "-wdaily", "--size", "800x600"],
+        ] {
+            assert_eq!(
+                with_workspace(args(started), Some("team")),
+                args(&["/repo", "--size", "800x600", "--workspace=team"]),
+                "{started:?}"
+            );
+            assert_eq!(with_workspace(args(started), None), args(&["/repo", "--size", "800x600"]), "{started:?}");
+        }
+        // A workspace named like an option stays one value; nothing after `--` is read as an option.
+        assert_eq!(
+            with_workspace(args(&["host", "--", "-w"]), Some("-x")),
+            args(&["host", "--workspace=-x", "--", "-w"])
+        );
     }
 
     #[test]

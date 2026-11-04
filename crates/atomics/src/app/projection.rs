@@ -10,7 +10,7 @@ use atomics_core::diff::FileDiff;
 use atomics_core::diff_data::Prepared;
 
 use atomics_core::projection::{
-    ApprovalInfo, DiffSummary, PlanInfo, Projections, ReportInfo, SessionInfo, TaskInfo, TaskLink,
+    ApprovalInfo, DiffSummary, HostInfo, PlanInfo, Projections, ReportInfo, SessionInfo, TaskInfo, TaskLink,
 };
 
 use super::State;
@@ -166,7 +166,37 @@ impl State {
             },
             "rendezvous": self.rendezvous_status(),
             "paired": devices,
+            "clients": view.clients.as_ref().map(|clients| {
+                clients.list().into_iter().map(|c| serde_json::json!({ "name": c.name, "paired_at": c.paired_at })).collect::<Vec<_>>()
+            }),
         })
+    }
+
+    /// `pair_client`: a token for a client that reaches the protocol server through a forward. Only
+    /// while the server runs; the token is in this answer and nowhere else.
+    pub(crate) fn pair_client(&self, name: &str) -> atomics_core::control::ControlResponse {
+        use atomics_core::control::ControlResponse;
+        let Some(clients) = &self.remote.clients else {
+            return ControlResponse::error(
+                "the protocol server is off: enable [remote] or start atomics host --remote-port",
+            );
+        };
+        match clients.pair(name) {
+            Ok((name, token)) => ControlResponse::ok(serde_json::json!({ "name": name, "token": token })),
+            Err(error) => ControlResponse::error(format!("pairing failed: {error}")),
+        }
+    }
+
+    pub(crate) fn unpair_client(&self, name: &str) -> atomics_core::control::ControlResponse {
+        use atomics_core::control::ControlResponse;
+        let Some(clients) = &self.remote.clients else {
+            return ControlResponse::error("the protocol server is off");
+        };
+        match clients.unpair(name) {
+            Ok(true) => ControlResponse::ok(serde_json::json!({ "name": name.trim() })),
+            Ok(false) => ControlResponse::error(format!("no client is paired as {name}")),
+            Err(error) => ControlResponse::error(format!("unpairing failed: {error}")),
+        }
     }
 
     /// Publish sessions, plans, approvals and diff summaries. Every pass rebuilds them; each
@@ -178,6 +208,16 @@ impl State {
         out.publish_resolutions(&self.resolved);
         out.publish_approvals(self.approval_infos());
         self.publish_diffs(out, cache, bodies);
+        out.publish_host(self.host_info());
+    }
+
+    /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
+    pub(crate) fn host_info(&self) -> HostInfo {
+        HostInfo {
+            workspace: self.workspace.clone(),
+            workspaces: self.workspace_names.clone(),
+            sign_in: self.sign_in_info(),
+        }
     }
 
     fn session_infos(&self) -> Vec<SessionInfo> {
@@ -252,7 +292,7 @@ impl State {
             .collect()
     }
 
-    fn approval_infos(&self) -> Vec<ApprovalInfo> {
+    pub(super) fn approval_infos(&self) -> Vec<ApprovalInfo> {
         self.sessions
             .iter()
             .flat_map(|s| {
@@ -263,6 +303,7 @@ impl State {
                     command: a.request.command.clone(),
                     cwd: text(&a.request.cwd),
                     reason: a.request.reason.clone(),
+                    warning: a.request.warning.clone(),
                 })
             })
             .collect()
@@ -312,8 +353,11 @@ mod tests {
                 cwd: "/w".into(),
                 reason: None,
                 input: serde_json::json!({}),
+                warning: None,
             },
             reply: None,
+            native: None,
+            stash: Default::default(),
         }
     }
 

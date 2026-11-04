@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::projection::{ApprovalInfo, DiffSummary, PlanInfo, SessionInfo};
+use crate::projection::{ApprovalInfo, DiffSummary, HostInfo, PlanInfo, SessionInfo};
 use crate::wire::{Envelope, Message, Resume};
 
 /// Why the mirror cannot follow the stream and needs a fresh snapshot.
@@ -41,6 +41,8 @@ pub struct Mirror {
     pub approvals: BTreeMap<String, ApprovalInfo>,
     /// By worktree.
     pub diffs: BTreeMap<String, DiffSummary>,
+    /// The host's own state: its workspace and the ticket sign-in.
+    pub host: HostInfo,
     awaiting_snapshot: bool,
     /// The parts of a snapshot received so far. Only one is ever kept: a part of another
     /// snapshot starts over.
@@ -62,6 +64,7 @@ struct Board {
     plans: Vec<PlanInfo>,
     approvals: Vec<ApprovalInfo>,
     diffs: Vec<DiffSummary>,
+    host: HostInfo,
 }
 
 impl Mirror {
@@ -93,12 +96,13 @@ impl Mirror {
             return Err(Gap::Epoch);
         }
         let cursor = match &envelope.message {
-            Message::StateSnapshot { cursor, sessions, plans, approvals, diffs, part, .. } => {
+            Message::StateSnapshot { cursor, sessions, plans, approvals, diffs, host, part, .. } => {
                 let board = Board {
                     sessions: sessions.clone(),
                     plans: plans.clone(),
                     approvals: approvals.clone(),
                     diffs: diffs.clone(),
+                    host: host.clone(),
                 };
                 let parts = match part {
                     None => {
@@ -131,6 +135,7 @@ impl Mirror {
                 self.plans = parts.iter().flat_map(|b| &b.plans).map(|p| (p.id.clone(), p.clone())).collect();
                 self.approvals = parts.iter().flat_map(|b| &b.approvals).map(|a| (a.id.clone(), a.clone())).collect();
                 self.diffs = parts.iter().flat_map(|b| &b.diffs).map(|d| (d.worktree.clone(), d.clone())).collect();
+                self.host = parts.into_iter().next().map(|b| b.host).unwrap_or_default();
                 return Ok(Applied::Changed);
             }
             Message::SessionUpsert { cursor, .. }
@@ -141,7 +146,8 @@ impl Mirror {
             | Message::TaskReport { cursor, .. }
             | Message::ApprovalPending { cursor, .. }
             | Message::ApprovalResolved { cursor, .. }
-            | Message::DiffSummary { cursor, .. } => cursor.0,
+            | Message::DiffSummary { cursor, .. }
+            | Message::HostUpsert { cursor, .. } => cursor.0,
             _ => return Ok(Applied::Ignored),
         };
         if self.awaiting_snapshot {
@@ -179,6 +185,7 @@ impl Mirror {
                     self.diffs.insert(summary.worktree.clone(), summary.clone());
                 }
             }
+            Message::HostUpsert { host, .. } => self.host = host.clone(),
             // A report is already inside the plan it belongs to, and a skipped event is one the
             // client asked not to see: both only advance the cursor.
             _ => {}
@@ -244,6 +251,20 @@ mod tests {
         assert_eq!(m.sessions.len(), 2);
         assert_eq!(m.apply(&upsert(4, "c")), Err(Gap::Missing { have: 2, got: 4 }));
         assert_eq!(m.sessions.len(), 2, "a gap changes nothing");
+    }
+
+    #[test]
+    fn the_hosts_own_state_comes_with_the_snapshot_and_its_upserts() {
+        let p = Projections::default();
+        p.publish_sessions(vec![session("a", AgentStatus::Idle)]);
+        p.publish_host(HostInfo { workspace: Some("team".into()), ..HostInfo::default() });
+        let mut m = Mirror::default();
+        m.apply(&Envelope::snapshot("e", &p.load())).unwrap();
+        assert_eq!(m.host.workspace.as_deref(), Some("team"));
+        let daily = HostInfo { workspace: Some("daily".into()), ..HostInfo::default() };
+        let event = Envelope::host("e", Message::HostUpsert { cursor: Seq(3), host: daily.clone() });
+        assert_eq!(m.apply(&event), Ok(Applied::Changed));
+        assert_eq!((m.host.clone(), m.cursor), (daily, 3));
     }
 
     #[test]

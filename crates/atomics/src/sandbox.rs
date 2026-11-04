@@ -374,7 +374,8 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
 /// sandbox would keep git out of a folder for good. A folder whose git files no longer match its
 /// record stays pinned, since the sandbox may have changed them and git would follow. Without an
 /// sbx that answers, which sandboxes exist is unknown, and every record stays. Without a record,
-/// sbx is not asked: asking starts its daemon, which outlives ATOMICS.
+/// sbx is not asked: asking starts its daemon, which outlives ATOMICS. The ledger forgets a dropped
+/// record too, or [`load_owned_pins`] would fail on the missing file at every start.
 pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
     let records = read_pins(dir);
     if records.is_empty() || !installed(program) {
@@ -384,7 +385,10 @@ pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
     let Ok(owned) = ownership::owned(home) else { return };
     let names: std::collections::HashSet<String> = sandboxes.into_iter().map(|sandbox| sandbox.name).collect();
     for (name, pins) in records {
-        if names.contains(&name) || owned.get(&name).is_some_and(ownership::building) {
+        // A sandbox being made is not listed yet.
+        if names.contains(&name)
+            || owned.get(&name).is_some_and(|entry| ownership::building(entry) || ownership::may_be_creating(entry))
+        {
             continue;
         }
         if pins.work_tree.exists() && git::resolve_pins(&pins.work_tree).ok().as_ref() != Some(&pins) {
@@ -394,10 +398,45 @@ pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
             );
             continue;
         }
-        if let Err(error) = forget_pins(dir, &name) {
+        let forgotten = forget_pins(dir, &name).and_then(|()| match owned.get(&name) {
+            Some(entry) if entry.pins.as_deref() == Some(dir) => ownership::removed(home, &name, Resource::Pins),
+            _ => Ok(()),
+        });
+        if let Err(error) = forgotten {
             eprintln!("ATOMICS: removing git record {name}: {error:#}");
         }
     }
+}
+
+/// Drops the ledger's note of a sandbox's git record whose file is gone, once the sandbox is gone
+/// too: the ledger owns no such sandbox any more, or sbx no longer has it. Such a note pins nothing,
+/// and [`load_owned_pins`] fails closed on it, which would stop every cleanup for good. While a
+/// sandbox may still exist (sbx lists it, cannot answer, or may be making it) the note stays. Only a
+/// missing file makes sbx be asked.
+pub fn heal_pin_records(home: &Path, program: &str) -> Result<()> {
+    let missing: Vec<(String, ownership::Owned)> = ownership::owned(home)?
+        .into_iter()
+        .filter(|(name, entry)| {
+            entry.pins.as_ref().is_some_and(|dir| {
+                std::fs::metadata(dir.join(format!("{name}.json")))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            })
+        })
+        .collect();
+    let listed: Option<std::collections::HashSet<String>> =
+        if missing.iter().any(|(_, entry)| entry.sandbox) && installed(program) {
+            list(program).ok().map(|sandboxes| sandboxes.into_iter().map(|sandbox| sandbox.name).collect())
+        } else {
+            None
+        };
+    for (name, entry) in missing {
+        let gone = !entry.sandbox
+            || (listed.as_ref().is_some_and(|listed| !listed.contains(&name)) && !ownership::may_be_creating(&entry));
+        if gone {
+            ownership::removed(home, &name, Resource::Pins)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
@@ -543,15 +582,23 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     ownership::removed(home, name, Resource::Creator)
 }
 
-/// Fail closed on an unreadable owned record rather than following checkout metadata.
+/// Fail closed on an unreadable owned record rather than following checkout metadata. A missing
+/// one stays a failure until [`heal_pin_records`] finds its sandbox gone.
 pub fn load_owned_pins(home: &Path) -> Result<()> {
     load_pins(&home.join("git-pins"));
     for (name, entry) in ownership::owned(home)? {
         if let Some(dir) = entry.pins {
             let file = dir.join(format!("{name}.json"));
-            let pins =
-                serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?)?;
-            git::pin(pins);
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "sandbox {name}'s git record {} is missing, and sbx has not confirmed the sandbox is gone; \
+                     remove it with `sbx rm {name}` and restart ATOMICS",
+                    file.display()
+                ),
+                Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
+            };
+            git::pin(serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display()))?);
         }
     }
     Ok(())
@@ -1268,11 +1315,36 @@ mod tests {
             names
         };
 
+        // The ledger notes the gone sandboxes' records, long ago, and one a sandbox being made just wrote.
+        let home = bin.path().join("home");
+        for name in ["atomics-clean", "atomics-tampered", "atomics-plain", "atomics-deleted"] {
+            ownership::record_pins(&home, name, &pins).unwrap();
+        }
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("sandbox-ownership.json")).unwrap()).unwrap();
+        for entry in ledger.as_object_mut().unwrap().values_mut() {
+            entry["created"] = 0.into();
+        }
+        std::fs::write(home.join("sandbox-ownership.json"), ledger.to_string()).unwrap();
+        let making = worktree("making");
+        pin_git(&pins, "atomics-making", &making).unwrap();
+        ownership::record_pins(&home, "atomics-making", &pins).unwrap();
+
         // Without an sbx to ask, nothing is known to be gone.
-        prune_pins(&bin.path().join("home"), &pins, &bin.path().join("missing-sbx").display().to_string());
-        assert_eq!(records().len(), 5);
-        prune_pins(&bin.path().join("home"), &pins, &sbx.display().to_string());
-        assert_eq!(records(), ["atomics-live", "atomics-tampered"]);
+        prune_pins(&home, &pins, &bin.path().join("missing-sbx").display().to_string());
+        assert_eq!(records().len(), 6);
+        prune_pins(&home, &pins, &sbx.display().to_string());
+        assert_eq!(records(), ["atomics-live", "atomics-making", "atomics-tampered"]);
+        // The ledger forgets what it dropped, so loading the records it notes still works next start.
+        let owned = ownership::owned(&home).unwrap();
+        for (name, kept) in
+            [("atomics-clean", false), ("atomics-plain", false), ("atomics-deleted", false), ("atomics-tampered", true)]
+        {
+            assert_eq!(owned.get(name).is_some_and(|entry| entry.pins.is_some()), kept, "{name}");
+        }
+        assert!(owned["atomics-making"].pins.is_some() && owned["atomics-live"].pins.is_some());
+        load_owned_pins(&home).unwrap();
+        git::unpin(&git::pinned(&making).unwrap().work_tree);
         assert!(git::git(&plain, &["status"]).is_err_and(|e| format!("{e:#}").contains("not a git repository")));
         assert!(git::pinned(&clean).is_none() && git::pinned(&plain).is_none());
         assert!(git::pinned(&live).is_some() && git::pinned(&tampered).is_some());

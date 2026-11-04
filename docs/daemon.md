@@ -80,7 +80,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `hello` | Supported versions, capabilities, client ID, prior epoch and last applied event cursor. |
 | Host → client | `welcome` | Chosen version, capabilities, limits, epoch, client role, what it may change (`may`) and resume/reset decision. |
 | Client → host | `subscribe`, `unsubscribe` | Session screens, worktree diffs/files and plans of interest; visible/focused hints. |
-| Host → client | `state_snapshot` | Sessions, projects, plan summaries and pending approvals at a single event cursor. |
+| Host → client | `state_snapshot` | Sessions, projects, plan summaries and pending approvals at a single event cursor, and the host's own state (`host`, in every part). |
 | Host → client | `skipped` | An event cursor the client's `diff`/`plan` topics left out, so cursors stay consecutive. |
 | Host → client | `session_upsert`, `session_removed` | Stable session ID, agent, title, cwd, worktree, status, chief flag and task link. |
 | Client → host | `session_command` | Start, close, steer or open an editor; return `command_result` with delivery state. |
@@ -94,7 +94,9 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `diff_get`, `file_get`, `review_command` | Bounded content request, or add/remove/send comments against a diff revision. |
 | Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch, report, and the key of the ticket a plan or task follows (`ticket`, optional). |
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
-| Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. |
+| Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. An optional `warning` is what the host tells whoever decides, such as whose shared stash entries the command drops. |
+| Host → client | `host_upsert` | The host's own state (`host` capability): the open workspace, the saved ones, and the ticket system's sign-in (`signed_in`, `signed_out`, `expired`, `partial` when it lacks a resource such as the ticket API, `signing_in` with the address to open and why a pasted one was refused, or `unavailable`). Never a token. |
+| Client → host | `host_command` | `sign_in`, `sign_in_paste` (the address a browser ended on), `sign_in_cancel`, or `open_workspace` by name (`host` and `mutations`; grant `host`). |
 | Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |
@@ -170,6 +172,11 @@ Lease expiry/disconnect fences late input with a new lease token. Opening a tab 
 Approvals are shared host transactions: the first valid decision for an unexpired ID wins, and every
 client sees the resolution. A stale decision cannot approve the next request in that session.
 Keep the existing hook timeout/fallback behavior and held-message rules when no client answers.
+A session's approval list is the one source of truth for a waiting prompt. A hook request fills it; with no
+hook request, the host's screen check puts the agent's own command menu there (Codex's "Would you like to run
+the following command?", Claude's "Bash command … Do you want to proceed?"), under one ID while the menu stays.
+A decision on it presses that agent's keys only while the screen still shows the reviewed command. Raw input
+is refused only while a decision can answer the prompt; any other menu takes raw keys.
 
 ## Remote authentication and isolation
 
@@ -474,8 +481,11 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   decision answers it and is recorded; a later one for the same ID, from any client or the desktop, is refused
   `already_resolved` with how it ended, and every client gets `approval_resolved` with the disposition. A decision
   for an answered request never answers the session's next one; one for a request queued behind another is
-  `rejected`; one for an ID absent from both pending requests and recent resolutions is `not_found`. Expiry and
-  hook timeouts are as before.
+  `rejected`; one for an ID absent from both pending requests and recent resolutions is `not_found`. A decision that
+  would let a command drop shared stash entries lists the stash again first: when the command would now drop other
+  entries than its `warning` named, it is `stale_revision` and nothing is answered. The old ID is withdrawn
+  (`approval_resolved`, `withdrawn`), and the request is pending again under a new ID with the warning as it reads
+  now. Expiry and hook timeouts are as before.
 - **Plans.** `plan_command` names the plan and an `action`: `set`, `approve`, `dispatch`, `update`, `integrate`,
   `archive`, as ctl's `plan_*` do. `approve`, and `set` of an existing plan, carry the plan's `digest` from the board
   (`PlanInfo.digest`, the approval scope the remote conversation's `/approve` uses, published for open plans): a plan
@@ -547,7 +557,9 @@ about 1.05 ms to 0.4 ms in the macOS test profile.
 Phase F of `docs/decisions/2026-11-02-embedded-atomics.md`, brought forward so the host can run in the NixOS VM.
 `atomics host [-w WORKSPACE] [PROJECT]...` runs `host::Host` (the runtime thread, the local socket and, with
 `[remote] enabled = true`, the protocol thread above) with no window, egui, display or GPU. Plain `atomics` is the
-desktop exactly as before.
+desktop exactly as before. With neither a workspace nor a project named, it opens the workspace open last, as the
+desktop does (`docs/configuration.md`, "The open workspace"); clients see which in `host_upsert` and may open
+another with `host_command`.
 
 - **Service construction without egui.** `State::build(options, window)` builds the runtime model and its services;
   the runtime asks a window for repaints, focus and its size only through `host::Window`, an optional
@@ -579,9 +591,75 @@ desktop exactly as before.
   `[remote]` port first and expects exit 1, an accurate log line, no advert or socket left, and a healthy host on that
   port once it is free. `app::host_tests` checks the refusals and the drained client
   events in process, and `instance::tests` the lock both ways.
-- **Not yet.** The desktop cannot attach to a running host as a client (phase 3). Terminals keep the size they
-  started with unless a lease holder asks for its own (H3), and are seen and typed into through ctl, MCP and
-  `atomics.v1` (H2, H3). The container profile stays in Phase F.
+- **A service's own port.** `atomics host --remote-port PORT` turns the protocol server on, on that loopback
+  port, whatever `[remote]` says, and keeps it on across config reloads: the NixOS VM's `atomics-host` service
+  relies on it (docs/nixos-vm.md, "The host in the VM").
+- **Paired clients.** Besides the per-start token in `protocol.json`, the server takes the token of a client
+  paired with `atomics ctl '{"cmd":"pair_client","name":…}'` (`protocol/clients.rs`): minted once, answered
+  once, kept as a SHA-256 digest in `paired-clients.json` (0600), replaced by pairing the name again and
+  forgotten by `unpair_client`. Such a client is a controller under its own name (the lease holder others see,
+  and the journal's `device:` key). The upgrade's `Host` must still name the loopback, on any port, so a
+  client can come through a forward that listens on another one; a page a DNS-rebinding attack drives names
+  its own host and is refused, and a browser cannot send the bearer token anyway.
+- **A headless credential store.** `ATOMICS_CREDENTIALS_DIR` (Linux only) keeps what ATOMICS would put in the
+  OS credential store (the ticket sign-in, MCP sign-ins, rendezvous keys) as private files instead: a 0700
+  folder of 0600 files, an item each. For a machine without a keyring that is one trust domain, as the VM is.
+- **Not yet.** Terminals keep the size they started with unless a lease holder asks for its own (H3), and are
+  seen and typed into through ctl, MCP and `atomics.v1` (H2, H3). The container profile stays in Phase F.
+
+## The desktop as a client
+
+Phase 3's native client. `atomics --connect <address>`, or `[client] connect` in the config, opens the native
+window as a client of an `atomics host` instead of a host of its own:
+
+```toml
+[client]
+connect = "local"     # the `atomics host` on this machine; "vm": the host in this Mac's ATOMICS VM;
+                      # "ws://127.0.0.1:PORT": a host this machine paired with; "" (default): the desktop
+```
+
+`atomics --connect ""` opens the desktop for one run whatever the config says. A value it cannot connect to stops
+it with a message naming the file that sets it, in a dialog too when there is no terminal (opened from the Dock or
+a launcher).
+
+- **The browser client's own path, run natively** (`crates/atomics/src/client.rs`). atomics-web's `Driver`
+  (connecting, reconnecting with the same jittered waits, replaying from the cursor), its `RemoteBackend` (the
+  board on `atomics_core::mirror`, diffs file by file, terminals, leases, mutations and their journal of
+  operations) and its views (the desktop's own frame drawn by atomics-ui on a wide window, the phone layout on a
+  narrow one) are the client; `client.rs` only carries out the driver's outputs. So terminals, diffs, the
+  board, approvals, the chief and comment boxes are the browser's, and offer what `atomics.v1` carries: the
+  host's own items (Settings, sandboxes, credentials, the ticket sign-in) stay on the host.
+- **Direct, not through a broker** (`Driver::direct`). The client dials the host's server itself (`client/link.rs`,
+  a WebSocket on a thread of its own, over TCP with `TCP_NODELAY` or a forward's Unix socket), offering
+  `atomics.v1` with the bearer token in the upgrade, and says `hello` as soon as it is through. The address and the
+  token are found again for every dial (`client/target.rs`): `local` reads the host's `protocol.json` in
+  `ATOMICS_HOME`, so a host that restarted with a new token is reached again; an address reads the token this
+  machine paired with from the OS credential store; `vm` starts the bundle's forward on a Unix socket in a folder
+  only this user can enter, and pairs once (docs/nixos-vm.md). A token the VM's host refuses is kept until the user
+  says to pair again.
+- **Input.** Instead of the page's `<textarea>` overlay, `client/input.rs` takes the terminal's share of each
+  frame's raw input before egui sees it: a click on the cells gives the terminal the keyboard (and asks for the
+  lease, as a tap does), keys and text go to it while it has the keyboard, a click anywhere else or a text box
+  taking the keyboard lets go, the wheel over the cells scrolls this client's history, Copy copies the
+  selection, and Command-key shortcuts stay the window's.
+- **Closing the window** ends only the connection: the host's agents, terminals, plans and approvals go on, and
+  a window opened again finds them as they are. The client takes no lock on the home and starts no runtime.
+- **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop
+  reading, and the host then treats it as the slow client it is (a fresh snapshot, or a drop and a reconnect),
+  rather than the window holding an unbounded backlog.
+- **When waiting cannot help, it stops and says why**: a refused token ("pair this window again"; the VM's window
+  asks whether to, with **Pair again**), or a host of another major version (a frame it cannot decode as such, or
+  the host's `unsupported_version` refusal of the `hello`). Anything else, a host that is not there included, is a
+  drop it dials again after.
+- **Tests.** `app::client_tests` runs the real host in process with its protocol server and the client's own
+  driver, link and backend: a shell started through ctl and a plan show in a first window, which types into the
+  shell under the lease; the window closes, and the shell's process (same pid, alive) and its terminal stay; a
+  second window shows the same session, its screen as it was and the plan, and types there too. Two windows
+  share one board and one lease (taking over moves it, and both see what the other typed), and a window that
+  stops reading while 300 plans change catches up with every one. `client::tests` runs it against servers that
+  misbehave: malformed frames are skipped (it still answers a ping), another major version stops it (a frame,
+  or a refusal of its `hello`), a refused token stops it, and a host that is not there is tried again.
+  `client::input` covers the input routing, and `driver::tests` the direct mode's dials, waits and stops.
 
 ## Rendezvous
 
@@ -858,7 +936,8 @@ time is up, on the host's sealed refusal (and forgets the key), a bare `not_pair
 not authenticate (the host's key is not the one this browser paired with).
 
 **What it offers.** What the desktop offers wherever `atomics.v1` can carry it, asked for in `hello` with `board`,
-`plans`, `approvals`, `diffs`, `terminals`, `input` and `mutations`. A command is offered when
+`plans`, `approvals`, `diffs`, `terminals`, `input`, `mutations` and `host`. A host that does not offer `host` sends
+`skipped` in place of `host_upsert`, its snapshots carry no host state, and the page offers no sign-in or workspace. A command is offered when
 `Command::remote` has mutations for it and `welcome`'s `may` grants them all, so a viewer, or a browser that is not
 connected, sees no action it cannot take. The shared views ask `Backend::available` and draw no button, menu entry
 or tab for the others:
@@ -866,7 +945,19 @@ or tab for the others:
 - **Offered:** answering approvals; approving a plan, Dispatch, a card's start, accept, send back, unblock and reopen,
   integrate and Integrate; a tile's close and the sidebar's Close, asking where the desktop asks; review comments and
   Send review; the steer bar, to the active session or the selected, and "Include in selected" (wide only: a phone's
-  terminal is right there); typing into terminals.
+  terminal is right there); typing into terminals; the ticket system's sign-in (**Sign in to <system>**, or
+  **Reconnect** once the server refused the saved one) and opening a saved workspace (`host_command`).
+- **The ticket sign-in** is the desktop's banner (`atomics_ui::signin`), on an open plan's board, above AGENTS while
+  no plan is open (the wide sidebar, the phone's Agents and Board panes), and in the popup of the wide top bar's
+  sign-in item. The host opens no browser for a page: the page shows the address with **Open link** (a new tab;
+  the hosting iframe needs `allow-popups`) and **Copy link** (`clipboard-write`), and a paste box for the address the
+  browser ends on (`http://127.0.0.1:…/callback?…`, which does not load there), sent with `sign_in_paste`. The host
+  checks it, says under the box why one was refused, and once signed in its ticket worker connects again. A viewer
+  sees where the sign-in stands and the address, and nothing to press. The pasted address goes only in that one
+  mutation; no notice repeats it.
+- **The workspace** the host has open is the top bar's **Workspace: <name>** item (the phone's ⋯ menu), with the
+  saved workspaces to open another (`open_workspace`); it is not drawn while none is open and none is saved. The
+  Project menu (opening folders, saving workspaces) stays on the computer.
 - **Close plan…** offers Archive alone: `atomics.v1` has no way to complete a plan. An open plan's tab closes the same
   way; a finished plan's tab has no close, and its board's Archive does that. A closed plan's board stays read-only.
   A plan that closes while it shows gives way to the first open plan, as on the desktop.
@@ -901,9 +992,10 @@ for a moment, so the draft stays and the keyboard takes a click. A diff on scree
 as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
 plan tabs and the chief's pill, the sidebar where the window has room for it, the tiled terminals with their
 headers and approval banners, the steer bar, the board or a worktree's diff in the right panel, and the chief docked
-(at first) or floating. The items only a host has (Settings, sandboxes, credentials, the ticket sign-in, GitHub, the
-load gauge, USAGE, Project) are hooks the browser leaves empty; the connection's state takes the place of the
-desktop's Remote item, and the ⋯ layout menu that of Settings. What the desktop keeps in its
+(at first) or floating. The items only a host has (Settings, sandboxes, credentials, GitHub, the load gauge, USAGE,
+Project) are hooks the browser leaves empty; the connection's state takes the place of the desktop's Remote item,
+followed in the same hook by the shared sign-in and Workspace items the host's state gives, and the ⋯ layout menu
+that of Settings. What the desktop keeps in its
 host's model about its window (the tab, the active session, the right panel, the chief's window) the browser keeps
 per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view commands; the tabs are the plans'
 and Ungrouped, and a page opens as the desktop does, on the first open plan's with its board beside the agents, and
@@ -919,8 +1011,9 @@ sidebar's AGENTS list; a tap opens the agent's tile), Board (the current plan's 
 from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History, the one picked
 there joining the strip, which scrolls to it and keeps a tap's width of the plan before it), Diffs (the
 worktrees with changes, then the diff panel), Terminal (the active agent's fleet tile at the pane's size: its header,
-its approval banner, its terminal) and Chief (the chief's window, with the request it waits on). The approvals are
-behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
+its approval banner, its terminal); Board and Diffs carry the view switcher's icons and counts. The chief's window
+(with the request it waits on) opens from the CHIEF pill in the middle of the top bar, as on the desktop; a second
+tap goes back to the pane before it. The approvals are behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
 insets (the sides too, for a phone held sideways). The page's own
 controls take the theme's colours as CSS custom properties.
 
@@ -1139,9 +1232,9 @@ History Reopen persisted the open status. The QA process then exited cleanly.
   subscriptions, bounded queues, reconnect/reset handling and slow-client tests.
 - Done for the protocol (H4, "Mutations" above): operation acceptance/outcome journaling, duplicate-command and
   uncertain crash recovery, with hook, ctl and MCP formats unchanged.
-- Change shutdown ownership: closing/reopening the desktop must preserve child
-  PIDs, emulator state and plan progress. Today exiting the entire application
-  still joins the host and shuts down its terminals, as before.
+- Done for a separate host (`atomics --connect`, "The desktop as a client" above): closing and reopening the
+  window keeps child PIDs, emulator state and plan progress. The in-process desktop, still the default, joins
+  its host and shuts down its terminals on quit, as before.
 
 The separate daemon, browser rendering and remote deployment are not shipped by
 phase 2. Their gates remain the phase 3–5 gates above.

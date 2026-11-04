@@ -2,8 +2,10 @@
 //! phone, and what the user asks for reaches the right place.
 
 use atomics_core::approvals::Decision;
+use atomics_core::ops::HostAction;
+use atomics_core::projection::{HostInfo, SignInState};
 use atomics_core::theme::ThemeMode;
-use atomics_core::wire::Message;
+use atomics_core::wire::{ErrorCode, Message, WireError};
 use serde_json::json;
 
 use super::*;
@@ -128,6 +130,107 @@ fn every_tab_draws_over_a_live_host() {
         frame(&ctx, &mut world, &mut client, &mut view);
         assert!(client.commands.is_empty(), "commands are carried out after each frame");
     }
+}
+
+#[test]
+fn the_chiefs_pill_keeps_the_middle_of_the_phones_top_bar_and_opens_the_chiefs_pane() {
+    let (ctx, mut world, mut client, mut view) = live();
+    view.tab = Tab::Diffs;
+    for size in [PHONE, (360.0, 780.0), (430.0, 932.0)] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let width = ctx.content_rect().width();
+        let name = shown.iter().find(|(text, _)| text == "CHIEF").expect("the pill is named on a phone").1;
+        // The name follows the pill's mark, in the middle of the bar.
+        assert!(name.left() > width * 0.4 && name.right() < width * 0.6, "{size:?}: {name:?} in {width}");
+        assert!(name.bottom() <= layout::TOP_BAR + 1.0, "{size:?}: in the top bar");
+        assert!(!has(&shown, "Chief"), "{size:?}: the pane bar has no Chief of its own");
+    }
+    let pill = on(&settled(&ctx, &mut world, &mut client, &mut view, PHONE), "CHIEF");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    assert_eq!(view.tab, Tab::Chief, "a tap opens the chief's pane");
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    assert_eq!(view.tab, Tab::Diffs, "another goes back to the pane it left");
+}
+
+#[test]
+fn the_location_line_says_where_the_window_is_and_back_and_forward_walk_the_places() {
+    use atomics_ui::nav;
+    let (ctx, mut world, mut client, mut view) = live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    // Plan › task › session, under the top bar.
+    let parts: Vec<_> = ["Parse faster", "Task t1", "Fix the parser · needs you"]
+        .map(|part| shown.iter().find(|(text, _)| text == part).unwrap_or_else(|| panic!("{part}: {shown:?}")).1)
+        .into();
+    assert!(parts.windows(2).all(|w| w[0].right() < w[1].left()), "in order: {parts:?}");
+    assert!(parts.iter().all(|r| r.top() > 34.0 && r.bottom() < 34.0 + nav::HEIGHT + 2.0), "{parts:?}");
+    assert!(!client.history.can_go(-1) && !client.history.can_go(1));
+
+    // Another tab is a step; back returns to the plan's, forward goes to it again.
+    // A place is a step once it has shown a while.
+    view.now_ms += 1000.0;
+    client.send(Command::ShowUngrouped);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    view.now_ms += 1000.0;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.ungrouped && client.history.can_go(-1));
+    nav::back(&world.driver.remote, &mut client);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.plan_view && !view.desk.ungrouped, "back on the plan's tab");
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+    assert!(client.history.can_go(1) && !client.history.can_go(-1), "nothing before it, the Ungrouped tab after");
+    nav::forward(&world.driver.remote, &mut client);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.ungrouped, "forward again");
+
+    // Its back arrow does the same as the key.
+    let arrow = back_arrow(&ctx, &mut world, &mut client, &mut view).expect("the location line");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(arrow));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.desk.plan_view, "the ‹ arrow goes back");
+}
+
+/// Where the location line's back arrow is: left of the forward arrow, left of its first part.
+fn back_arrow(ctx: &egui::Context, world: &mut World, client: &mut Client, view: &mut View) -> Option<egui::Pos2> {
+    let shown = settled(ctx, world, client, view, WIDE);
+    let first = shown.iter().find(|(text, _)| text == "Ungrouped" || text == "Parse faster")?.1;
+    Some(egui::pos2(first.left() - 8.0 - 24.0 - 11.0, first.center().y))
+}
+
+#[test]
+fn a_task_cards_click_shows_its_session_and_diff_and_marks_the_card() {
+    let (ctx, mut world, mut client, mut view) = live();
+    view.desk.active = None;
+    view.desk.diff_root = Some("/w/other".into());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    // The card's agent line, which is no button: the card takes the click.
+    let at = on(&shown, "t1 · claude");
+    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(at));
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    let hints = view.desk.hints(&world.driver.remote);
+    assert_eq!(hints.active.as_deref(), Some("s1"), "{hints:?}");
+    assert!(hints.diff_open && hints.panel == PanelMode::Diff, "{hints:?}");
+    // A planned task has no session: its card's click does nothing.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    client.send(Command::ToggleView(PanelMode::Plan));
+    let shown =
+        if has(&shown, "t2 · claude") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, BOARD) };
+    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(on(&shown, "t2 · claude")));
+    settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert_eq!(view.desk.hints(&world.driver.remote).panel, PanelMode::Plan);
+}
+
+#[test]
+fn the_diff_with_nothing_to_show_says_how_to_pick_something() {
+    let (ctx, mut world, mut client, mut view) = live();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    (view.desk.active, view.desk.diff_root) = (None, None);
+    (view.desk.panel, view.desk.diff_open) = (PanelMode::Diff, true);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "No diff to show") && has(&shown, "Pick an agent in the sidebar"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Show the board")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(view.desk.panel, PanelMode::Plan, "its button shows the board");
 }
 
 #[test]
@@ -275,8 +378,8 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "ATOMICS",
         "◆ Parse faster",
         "CHIEF",
-        "Hide diff",
-        "Plan 0/2",
+        "Diff",
+        "Board 0/2",
         "Connected",
         "⋯",
         "◆ CHIEF AGENT",
@@ -299,6 +402,7 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
     for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {
         assert!(!has(host_only), "{host_only} is the host's: {text:?}");
     }
+    assert!(!has("Workspace") && !has("No workspace"), "the host has no workspace to pick: {text:?}");
     assert!(!text.iter().any(|t| t.contains("focuses")), "a page has no chord to focus it: {text:?}");
     // Both terminals are followed, the agent's (the active session) with the page's input over it.
     assert!(world.host.terminals["s1"].followed && world.host.terminals["chief"].followed);
@@ -341,7 +445,7 @@ fn a_wide_window_over_a_host_without_plans_shows_every_agent_and_no_plan_button(
         text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(text.iter().any(|t| t == "Fix the parser"), "{text:?}");
-    assert!(!text.iter().any(|t| t.starts_with("Plan")), "no Plan button without a plan: {text:?}");
+    assert!(!text.iter().any(|t| t.starts_with("Board")), "no board's segment without a plan: {text:?}");
     assert_eq!(view.term.session(), Some("s1"));
 }
 
@@ -352,7 +456,7 @@ fn a_wide_window_shows_a_diff_and_fetches_only_it() {
         sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(!world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the board shows, no diff");
-    client.send(Command::TogglePlan);
+    client.send(Command::ToggleView(PanelMode::Diff));
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert!(world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the active session's diff");
     let text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
@@ -380,7 +484,7 @@ fn a_page_of_many_plans_opens_on_the_open_plan_with_its_board() {
     let hints = view.desk.hints(&world.driver.remote);
     assert_eq!(view.desk.plan.as_deref(), Some("p1"));
     assert!(hints.plan_view && hints.panel == PanelMode::Plan && hints.selected_plan == 23, "{hints:?}");
-    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Plan 0/2", "History"] {
+    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Board 0/2", "History"] {
         assert!(has(&shown, wanted), "{wanted} is missing: {shown:?}");
     }
     assert!(!has(&shown, "Archived"), "no archived plan shows unless it is picked: {shown:?}");
@@ -633,6 +737,42 @@ fn a_wide_window_says_when_the_board_may_be_out_of_date_and_why_it_stopped() {
     assert_eq!(world.driver.status(), &Status::Stopped(Stop::Revoked));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(has(&shown, Stop::Revoked.message()) && has(&shown, "Stopped"), "{shown:?}");
+}
+
+/// A native client's word on why its dial failed shows while it waits for the host: on the status screen
+/// before there is a board, under the reconnecting note over one, and never once the host is back.
+#[test]
+fn why_a_native_client_cannot_reach_its_host_shows_while_it_waits() {
+    use atomics_core::tunnel::close;
+
+    let why = "cannot connect to 127.0.0.1:47800: Connection refused (os error 61)";
+    let mut world = World::new(fake_host::host());
+    world.driver = crate::driver::Driver::direct("op");
+    world.pump();
+    assert!(matches!(world.driver.status(), Status::Reconnecting { .. }));
+    let (ctx, mut client, mut view) = (egui::Context::default(), Client::default(), View::default());
+    view.unreachable = Some(why.into());
+    for size in [WIDE, PHONE] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Connecting to your computer") && has(&shown, why), "{size:?}: {shown:?}");
+    }
+
+    let (ctx, mut world, mut client, mut view) = live();
+    view.unreachable = Some(why.into());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, why), "connected: {shown:?}");
+    world.drop_socket(close::ABNORMAL);
+    for size in [WIDE, PHONE] {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Reconnecting. The board may be out of date") && has(&shown, why), "{size:?}: {shown:?}");
+    }
+
+    let (ctx, mut world, mut client, mut view) = live();
+    view.unreachable = Some(why.into());
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    world.drop_socket(close::REVOKED);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, why), "stopped, which says why itself: {shown:?}");
 }
 
 /// A secondary click at `at`.
@@ -1231,11 +1371,12 @@ fn a_draft_outlasts_the_host_sending_the_whole_board_again() {
     let board = world.host.board.clone();
     let snapshot = Message::StateSnapshot {
         cursor: Seq(9),
-        revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+        revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1), host: Seq(0) },
         sessions: board.sessions,
         plans: board.plans,
         approvals: board.approvals,
         diffs: board.diffs,
+        host: board.host,
         part: None,
     };
     world.driver.remote.receive(Envelope::host("epoch-1", snapshot));
@@ -1630,4 +1771,358 @@ fn a_terminal_taking_the_keyboard_takes_it_from_a_text_box() {
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert_eq!(world.host.terminals["s1"].typed, "ls");
     assert_eq!(client.steer_text, "");
+}
+
+/// What the views draw, as PNGs for a person to look at beside the desktop's QA screenshots: the wide window
+/// and the phone at the browser test's sizes and narrower, over the fake host, through the desktop's CPU
+/// rasterizer. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
+#[test]
+#[ignore]
+fn headless_shots() {
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    // The last ones over a host whose ticket system needs the user to sign in again.
+    let shots: [(&str, (f32, f32), Tab, bool); 10] = [
+        ("wide-1600", WIDE, Tab::Board, false),
+        ("wide-1100", (1100.0, 800.0), Tab::Board, false),
+        ("wide-700", (700.0, 800.0), Tab::Board, false),
+        ("phone-390-board", PHONE, Tab::Board, false),
+        ("phone-390-diffs", PHONE, Tab::Diffs, false),
+        ("phone-390-chief", PHONE, Tab::Chief, false),
+        ("phone-360-agents", (360.0, 780.0), Tab::Agents, false),
+        ("wide-1600-reconnect", WIDE, Tab::Board, true),
+        ("wide-1100-reconnect", (1100.0, 800.0), Tab::Board, true),
+        ("phone-390-reconnect", PHONE, Tab::Board, true),
+    ];
+    for (name, (width, height), tab, reconnect) in shots {
+        let (ctx, mut world, mut client, mut view) =
+            if reconnect { live_with(fake_host::tickets(SignInState::Expired)) } else { live() };
+        view.tab = tab;
+        let mut raster = crate::test_raster::Raster::default();
+        let mut last = None;
+        for _ in 0..6 {
+            view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height))),
+                time: Some(view.now_ms / 1000.0),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        let ppp = output.pixels_per_point;
+        let size = [(width * ppp).round() as usize, (height * ppp).round() as usize];
+        let image = raster.paint(&ctx, output, size, client.palette.background);
+        let path = dir.join(format!("{name}.png"));
+        crate::test_raster::save_png(&path, &image).unwrap();
+        println!("saved {}", path.display());
+    }
+}
+
+/// The address a browser ends on after signing in, with a code nothing but the frame to the host may hold.
+const ENDED_ON: &str = "http://127.0.0.1:53682/callback?code=c0de&state=s1";
+
+#[test]
+fn a_board_offers_the_ticket_sign_in_and_reconnect_in_both_layouts() {
+    for (state, button, headline) in [
+        (SignInState::SignedOut, "Sign in to tracker", "tracker is not signed in"),
+        (SignInState::Expired, "Reconnect", "tracker needs you to sign in again"),
+    ] {
+        for size in [WIDE, PHONE] {
+            let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(state));
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(has(&shown, headline) && has(&shown, "Gives you a link to open"), "{size:?}: {shown:?}");
+            drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, button)));
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert_eq!(world.host.host_commands, [HostAction::SignIn], "{size:?}");
+            // The host's sign-in waits on its link, which opens in a tab here; where the tab ends is pasted back.
+            for wanted in
+                ["Waiting for the sign-in", "https://auth.example.com/", "Open link", "Copy link", "Use it", "Cancel"]
+            {
+                assert!(has(&shown, wanted), "{size:?}: {wanted} is missing: {shown:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sign_in_under_way_takes_the_address_the_browser_ended_on_or_is_cancelled() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SigningIn));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Open this link on any machine") && has(&shown, "Then paste the address"), "{shown:?}");
+        // A click into the box, the address, and Use it.
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "http://127.0.0.1:…")));
+        sized(&ctx, &mut world, &mut client, &mut view, size, Vec::new());
+        sized(&ctx, &mut world, &mut client, &mut view, size, vec![egui::Event::Text(ENDED_ON.into())]);
+        assert_eq!(client.sign_in_paste, ENDED_ON, "{size:?}");
+        assert!(world.host.terminals["s1"].typed.is_empty(), "the terminal got none of it");
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "Use it");
+        assert_eq!(world.host.host_commands, [HostAction::SignInPaste { text: ENDED_ON.into() }], "{size:?}");
+        assert!(client.sign_in_paste.is_empty(), "the box keeps none of it");
+        assert!(!has(&shown, "Waiting for the sign-in") && !has(&shown, "Sign in to"), "signed in: {shown:?}");
+        assert_eq!(world.driver.remote.notice(), None);
+    }
+
+    // Cancel ends it, and the host says it is signed out again.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SigningIn));
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Cancel");
+    assert_eq!(world.host.host_commands, [HostAction::SignInCancel]);
+    assert!(has(&shown, "tracker is not signed in") && has(&shown, "Sign in to tracker"), "{shown:?}");
+
+    // A paste the host refuses says why on the note, and never what was pasted.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SigningIn));
+    world.host.refuse_next = Some(WireError::new(ErrorCode::Rejected, "that address is from another sign-in"));
+    client.sign_in_paste = ENDED_ON.into();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Use it");
+    assert_eq!(world.host.host_commands.len(), 1);
+    assert!(has(&shown, "The host refused: that address is from another sign-in"), "{shown:?}");
+    assert!(has(&shown, "Waiting for the sign-in"), "it still waits: {shown:?}");
+    assert!(!shown.iter().any(|(text, _)| text.contains("c0de")), "{shown:?}");
+}
+
+#[test]
+fn a_viewer_sees_where_the_sign_in_stands_and_nothing_to_press() {
+    let cannot = "This screen cannot start the sign-in now (offline, or view-only); sign in to tracker from ATOMICS";
+    for (state, headline, button) in [
+        (SignInState::SignedOut, "tracker is not signed in", "Sign in to tracker"),
+        (SignInState::Expired, "tracker needs you to sign in again", "Reconnect"),
+    ] {
+        for size in [WIDE, PHONE] {
+            let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(state));
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(has(&shown, headline) && has(&shown, cannot), "{size:?}: {shown:?}");
+            // Neither the banner's button nor the top bar's.
+            assert!(!shown.iter().any(|(text, _)| text == button), "{size:?}: no {button}: {shown:?}");
+            assert!(!has(&shown, "Workspace") && !has(&shown, "No workspace"), "nor a workspace to open: {shown:?}");
+        }
+    }
+    // The phone's menu has no workspace for it either.
+    let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(SignInState::SignedIn));
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    assert!(has(&menu, "Layout") && !has(&menu, "Workspace") && !has(&menu, "No workspace"), "{menu:?}");
+
+    let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(SignInState::SigningIn));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Waiting for the sign-in") && has(&shown, "https://auth.example.com/"), "{shown:?}");
+    for action in ["Cancel", "Use it", "Then paste", "Signing in"] {
+        assert!(!has(&shown, action), "{action} is not a viewer's: {shown:?}");
+    }
+}
+
+/// The middle of the text that is `label` under the top bar: the page's button, not the bar's.
+fn in_page(shown: &[(String, Rect)], label: &str) -> egui::Pos2 {
+    let found = shown.iter().find(|(text, rect)| text == label && rect.top() > NOTE_TOP);
+    found.unwrap_or_else(|| panic!("{label} is not drawn under the top bar: {shown:?}")).1.center()
+}
+
+/// Whether the top bar has a text that is `label`.
+fn in_bar(shown: &[(String, Rect)], label: &str) -> bool {
+    shown.iter().any(|(text, rect)| text == label && rect.bottom() < NOTE_TOP)
+}
+
+#[test]
+fn the_top_bars_reconnect_signs_in_and_opens_the_board_where_the_steps_show() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::Expired));
+    // With the right panel closed, only the top bar says so.
+    client.send(Command::CloseDiff);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!view.desk.diff_open && !has(&shown, "PLAN") && in_bar(&shown, "Reconnect"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(exactly(&shown, "Reconnect")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.host_commands, [HostAction::SignIn]);
+    assert!(view.desk.diff_open && view.desk.panel == PanelMode::Plan, "the board opens");
+    assert!(has(&shown, "Waiting for the sign-in") && has(&shown, "Then paste the address"), "{shown:?}");
+    // While it waits, the item only shows the way back to the steps.
+    assert!(in_bar(&shown, "Signing in…") && !in_bar(&shown, "Reconnect"), "{shown:?}");
+    client.send(Command::CloseDiff);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(exactly(&shown, "Signing in…")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.host_commands, [HostAction::SignIn], "nothing more is sent");
+    assert!(view.desk.diff_open && has(&shown, "Waiting for the sign-in"), "{shown:?}");
+}
+
+#[test]
+fn with_no_open_plan_the_sign_in_shows_by_the_agents_and_on_the_phones_board() {
+    let no_plan = || {
+        let mut host = fake_host::tickets(SignInState::SignedOut);
+        host.board.plans.clear();
+        host
+    };
+    // A wide window: above AGENTS in the sidebar, which has room beside the docked chief, and in the top bar.
+    let (ctx, mut world, mut client, mut view) = live_with(no_plan());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    let (banner, agents) = (on(&shown, "tracker is not signed in"), on(&shown, "AGENTS"));
+    assert!(banner.y < agents.y && (banner.x - agents.x).abs() < 200.0, "above the agents: {shown:?}");
+    assert!(in_bar(&shown, "Sign in to tracker") && !has(&shown, "PLAN"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(in_page(&shown, "Sign in to tracker")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert_eq!(world.host.host_commands, [HostAction::SignIn]);
+    let steps = on(&shown, "Waiting for the sign-in");
+    assert!(steps.y < on(&shown, "AGENTS").y && has(&shown, "Then paste the address"), "{shown:?}");
+
+    // A phone: in its Agents pane and on its Board pane.
+    for (tab, under) in [(Tab::Agents, "AGENTS"), (Tab::Board, "No plans on this computer yet.")] {
+        let (ctx, mut world, mut client, mut view) = live_with(no_plan());
+        view.tab = tab;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+        assert!(on(&shown, "tracker is not signed in").y < on(&shown, under).y, "{tab:?}: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(exactly(&shown, "Sign in to tracker")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+        assert_eq!(world.host.host_commands, [HostAction::SignIn], "{tab:?}");
+        assert!(has(&shown, "Waiting for the sign-in") && has(&shown, "Use it"), "{tab:?}: {shown:?}");
+    }
+}
+
+/// A wide window with the chief docked and no open plan, so no sidebar and no board, signed out of `tracker`.
+fn no_board_nor_sidebar() -> (egui::Context, World, Client, View) {
+    let mut host = fake_host::tickets(SignInState::SignedOut);
+    host.board.plans.clear();
+    live_with(host)
+}
+
+/// A desktop-sized bar too narrow for its items, which fold into Actions.
+const NARROW: (f32, f32) = (720.0, 900.0);
+
+/// A click on the top bar's sign-in item, wide or folded into Actions: the frames after it.
+fn sign_in_from_the_bar(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+) -> Vec<(String, Rect)> {
+    let shown = settled(ctx, world, client, view, size);
+    let docked = view.desk.chief.open && view.desk.chief.dock == atomics_core::config::ChiefDock::Docked;
+    assert!(docked && !has(&shown, "AGENTS") && !has(&shown, "PLAN"), "no sidebar, no board: {shown:?}");
+    assert!(!has(&shown, "tracker is not signed in"), "{shown:?}");
+    if size == NARROW {
+        assert!(in_bar(&shown, "Actions") && !in_bar(&shown, "Sign in to tracker"), "{shown:?}");
+        click_on(ctx, world, client, view, size, "Actions");
+        click_on(ctx, world, client, view, size, "Sign in to tracker")
+    } else {
+        drawn(ctx, world, client, view, size, click(exactly(&shown, "Sign in to tracker")));
+        settled(ctx, world, client, view, size)
+    }
+}
+
+#[test]
+fn the_top_bars_sign_in_shows_its_steps_with_no_board_or_sidebar_on_screen() {
+    for size in [WIDE, NARROW] {
+        let (ctx, mut world, mut client, mut view) = no_board_nor_sidebar();
+        view.layout = LayoutMode::Desktop;
+        let shown = sign_in_from_the_bar(&ctx, &mut world, &mut client, &mut view, size);
+        assert_eq!(world.host.host_commands, [HostAction::SignIn], "{size:?}");
+        // The host says it waits on its link: the item's popup, or its submenu in Actions, holds the steps.
+        assert!(has(&shown, "Signing in…"), "{size:?}: {shown:?}");
+        for wanted in [
+            "Waiting for the sign-in",
+            "https://auth.example.com/",
+            "Open link",
+            "Copy link",
+            "Then paste the address",
+            "http://127.0.0.1:…",
+            "Use it",
+            "Cancel",
+        ] {
+            assert!(has(&shown, wanted), "{size:?}: {wanted} is missing: {shown:?}");
+        }
+    }
+}
+
+#[test]
+fn the_top_bars_sign_in_takes_the_address_in_its_popup() {
+    for size in [WIDE, NARROW] {
+        let (ctx, mut world, mut client, mut view) = no_board_nor_sidebar();
+        view.layout = LayoutMode::Desktop;
+        let shown = sign_in_from_the_bar(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "http://127.0.0.1:…")));
+        let shown = drawn(&ctx, &mut world, &mut client, &mut view, size, Vec::new());
+        assert!(has(&shown, "Use it"), "{size:?}: a click into the box keeps the popup open: {shown:?}");
+        sized(&ctx, &mut world, &mut client, &mut view, size, vec![egui::Event::Text(ENDED_ON.into())]);
+        assert_eq!(client.sign_in_paste, ENDED_ON, "{size:?}");
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "Use it");
+        let sent = [HostAction::SignIn, HostAction::SignInPaste { text: ENDED_ON.into() }];
+        assert_eq!(world.host.host_commands, sent, "{size:?}");
+        assert!(!has(&shown, "Signing in") && !has(&shown, "Waiting for the sign-in"), "signed in: {shown:?}");
+        assert!(world.host.terminals["s1"].typed.is_empty() && client.sign_in_paste.is_empty());
+    }
+}
+
+#[test]
+fn the_workspace_item_names_the_hosts_workspace_and_opens_another() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SignedIn));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(in_bar(&shown, "Workspace: team") && !has(&shown, "Project"), "{shown:?}");
+    assert!(!has(&shown, "Sign in to") && !has(&shown, "Signing in") && !has(&shown, "tracker"), "{shown:?}");
+    let opened = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Workspace: team");
+    for wanted in ["team is open", "Open workspace", "daily"] {
+        assert!(has(&opened, wanted), "{wanted} is missing: {opened:?}");
+    }
+    for absent in ["Open project", "Recent projects", "Save workspace"] {
+        assert!(!has(&opened, absent), "the host's folders stay its own: {opened:?}");
+    }
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "daily");
+    assert_eq!(world.host.host_commands, [HostAction::OpenWorkspace { name: "daily".into() }]);
+    assert!(in_bar(&shown, "Workspace: daily"), "the host opened it: {shown:?}");
+
+    // In a narrow window the bar's items fold into Actions, the workspace among them as a submenu.
+    view.layout = LayoutMode::Desktop;
+    let narrow = (720.0, 900.0);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, narrow);
+    assert!(!view.compact && in_bar(&shown, "Actions") && !has(&shown, "Workspace: daily"), "{shown:?}");
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, narrow, "Actions");
+    let submenu = click_on(&ctx, &mut world, &mut client, &mut view, narrow, "Workspace: daily");
+    assert!(has(&menu, "Workspace: daily") && has(&submenu, "daily is open"), "{submenu:?}");
+    click_on(&ctx, &mut world, &mut client, &mut view, narrow, "team");
+    assert_eq!(world.host.host_commands.last(), Some(&HostAction::OpenWorkspace { name: "team".into() }));
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, narrow, "Actions");
+    assert!(has(&menu, "Workspace: team"), "{menu:?}");
+}
+
+#[test]
+fn a_phones_menu_has_the_hosts_workspace() {
+    let (ctx, mut world, mut client, mut view) = live();
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    assert!(has(&menu, "Automatic") && !has(&menu, "Workspace") && !has(&menu, "No workspace"), "none saved: {menu:?}");
+
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SignedIn));
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    assert!(view.compact && has(&menu, "Layout") && has(&menu, "Workspace: team"), "{menu:?}");
+    let submenu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Workspace: team");
+    assert!(has(&submenu, "team is open") && has(&submenu, "daily"), "{submenu:?}");
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "daily");
+    assert_eq!(world.host.host_commands, [HostAction::OpenWorkspace { name: "daily".into() }]);
+    assert!(!has(&shown, "Layout"), "the menu closes: {shown:?}");
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    assert!(has(&menu, "Workspace: daily"), "{menu:?}");
+}
+
+#[test]
+fn a_host_that_does_not_offer_its_own_state_leaves_the_page_as_it_was() {
+    let mut host = fake_host::tickets(SignInState::SignedOut);
+    host.offers_host = false;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let Message::Hello { capabilities, .. } = &world.sent()[0] else { panic!("hello first") };
+    assert!(capabilities.iter().any(|c| c == "host"), "the browser asks for it: {capabilities:?}");
+    let welcome = world.driver.remote.welcome().expect("welcomed");
+    assert!(!welcome.capabilities.iter().any(|c| c == "host") && !welcome.may.contains(&Grant::Host), "{welcome:?}");
+    // The host's own state changes, and the browser is sent `skipped` in its place.
+    let mut moved = world.host.board.host.clone();
+    moved.workspace = Some("daily".into());
+    let frames = world.host.publish_host(moved);
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let mirror = world.driver.remote.with_mirror(|m| (m.host.clone(), m.cursor));
+    assert_eq!(mirror, (HostInfo::default(), world.host.head()), "the cursor moves on, and nothing else");
+    assert!(!world.sent().iter().any(|m| matches!(m, Message::Resync { .. })), "no gap");
+    for absent in ["tracker", "Sign in", "Reconnect", "Project", "Workspace", "No workspace"] {
+        assert!(!has(&shown, absent), "{absent} shows: {shown:?}");
+    }
+    assert!(has(&shown, "PLAN") && has(&shown, "Approve plan"), "the rest as before: {shown:?}");
 }

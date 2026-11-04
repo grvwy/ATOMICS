@@ -152,10 +152,10 @@ check_host() {
   fi
   if [[ $error == *"(os error 2)"* ]]; then
     skip=true
-    reason="no forwarded socket"
+    reason="no ATOMICS socket here"
     return 1
   fi
-  reason="the forwarded socket does not answer"
+  reason="its socket does not answer"
   return 1
 }
 login_host() {
@@ -212,7 +212,7 @@ fi
 unset step_file
 
 onboard_step private "Credential files private to this user (no group or other access)"
-onboard_step host "ATOMICS host over the forwarded socket"
+onboard_step host "ATOMICS host (in this VM, or the Mac's over the socket forward)"
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 

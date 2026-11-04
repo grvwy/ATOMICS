@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use atomics_core::noise::{KEY_BYTES, PublicKey, Secret};
 use atomics_core::tunnel;
-use atomics_ui::Client;
 use atomics_ui::theme::Palette;
+use atomics_ui::{Client, PanelMode};
 use js_sys::{Array, ArrayBuffer, JSON, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -26,6 +26,7 @@ use web_sys::{BinaryType, CloseEvent, HtmlCanvasElement, MessageEvent, WebSocket
 use zeroize::Zeroizing;
 
 use crate::boot::{self, ParentOrigin};
+use crate::desk;
 use crate::device::{self, Device};
 use crate::driver::{Driver, Output};
 use crate::layout::{self, LayoutMode};
@@ -69,6 +70,10 @@ extern "C" {
     fn load_layout() -> String;
     #[wasm_bindgen(js_name = saveLayout)]
     fn save_layout(name: &str);
+    #[wasm_bindgen(js_name = loadView)]
+    fn load_view() -> String;
+    #[wasm_bindgen(js_name = saveView)]
+    fn save_view(name: &str);
 }
 
 /// The page's own controls (the key bar, the Copy chip) in the theme's colours.
@@ -154,6 +159,8 @@ struct App {
     applied: Overlay,
     /// The layout last kept in the page's storage.
     saved_layout: LayoutMode,
+    /// The view the switcher chose that this browser keeps, as last saved.
+    saved_view: PanelMode,
 }
 
 /// Start the client on the page's `#atomics` canvas.
@@ -253,6 +260,11 @@ impl App {
         let layout = LayoutMode::named(&load_layout());
         let mut view = View::default();
         view.layout = layout;
+        // The view the switcher last showed in this browser.
+        if let Some(panel) = desk::named_view(&load_view()) {
+            view.desk.panel = panel;
+        }
+        let saved_view = view.desk.panel;
         Self {
             driver,
             client,
@@ -266,6 +278,7 @@ impl App {
             _page: page,
             applied: Overlay::default(),
             saved_layout: layout,
+            saved_view,
         }
     }
 
@@ -349,6 +362,8 @@ impl App {
         match output {
             Output::Post(kind) => self.post(kind),
             Output::Dial { socket, url, protocols } => self.dial(socket, &url, &protocols),
+            // Only a native client dials its host directly.
+            Output::DialDirect { socket } => push(&self.inbox, &self.ctx, Input::Closed { socket, code: 1006 }),
             Output::Send { socket, message } => {
                 if let Some(live) = self.socket.as_ref().filter(|live| live.id == socket) {
                     let _ = live.ws.send_with_u8_array(&message);
@@ -465,6 +480,10 @@ impl eframe::App for App {
         if self.view.layout != self.saved_layout {
             save_layout(self.view.layout.name());
             self.saved_layout = self.view.layout;
+        }
+        if self.view.desk.panel != self.saved_view {
+            save_view(desk::view_name(self.view.desk.panel));
+            self.saved_view = self.view.desk.panel;
         }
     }
 }

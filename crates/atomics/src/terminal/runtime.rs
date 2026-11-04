@@ -148,12 +148,25 @@ pub struct Terminal {
     pub shared: Arc<Shared>,
 }
 
-/// Remove instance routing from every terminal, including inherited bundle settings. A session's
-/// own hook pane is set again after the inherited one is removed.
-pub(super) fn isolated_args(program: String, args: Vec<String>, hook_pane: Option<String>) -> Vec<String> {
+/// Remove instance routing from every terminal, including inherited bundle settings, then route it to the
+/// host that runs it: `ATOMICS_SOCKET` names this host's own `socket`, so `atomics queue`, `atomics ctl` and
+/// hooks started there reach this host whatever a login profile does (NixOS sets its session variables once
+/// per login, and the host's own login shell already did). [`HOST_SOCKET_ENV`] marks it as the host's, so an
+/// explicit `ATOMICS_HOME` there is still an instance of its own. A session's own hook pane is set again
+/// after the inherited one is removed.
+///
+/// [`HOST_SOCKET_ENV`]: atomics_core::paths::HOST_SOCKET_ENV
+pub(super) fn isolated_args(
+    program: String,
+    args: Vec<String>,
+    socket: Option<&str>,
+    hook_pane: Option<String>,
+) -> Vec<String> {
     [
         "-u",
         "ATOMICS_SOCKET",
+        "-u",
+        atomics_core::paths::HOST_SOCKET_ENV,
         "-u",
         "ATOMICS_PANE",
         "-u",
@@ -169,6 +182,9 @@ pub(super) fn isolated_args(program: String, args: Vec<String>, hook_pane: Optio
     ]
     .into_iter()
     .map(str::to_string)
+    .chain(socket.into_iter().flat_map(|socket| {
+        [format!("ATOMICS_SOCKET={socket}"), format!("{}={socket}", atomics_core::paths::HOST_SOCKET_ENV)]
+    }))
     .chain(hook_pane.map(|pane| format!("{}={pane}", atomics_core::hook::HOOK_PANE_ENV)))
     .chain([program])
     .chain(args)
@@ -272,8 +288,11 @@ impl Terminal {
         scrollback: usize,
     ) -> Result<Terminal> {
         let hook_pane = env.remove(atomics_core::hook::HOOK_PANE_ENV);
+        // This process is the host whose terminal this is: its socket is the one to reach.
+        let socket = atomics_core::paths::socket_path();
+        let args = isolated_args(program, args, socket.to_str(), hook_pane);
         let options = tty::Options {
-            shell: Some(tty::Shell::new("/usr/bin/env".into(), isolated_args(program, args, hook_pane))),
+            shell: Some(tty::Shell::new("/usr/bin/env".into(), args)),
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: true,
             env,

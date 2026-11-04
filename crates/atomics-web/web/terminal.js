@@ -13,6 +13,7 @@ const NAMED = new Set([
 const SLOP = 8;
 const TAP_MS = 450;
 const LAYOUT_KEY = "atomics.layout";
+const VIEW_KEY = "atomics.view";
 
 let report = null;
 let ta = null;
@@ -373,4 +374,13 @@ export function loadLayout() {
 
 export function saveLayout(name) {
   try { localStorage.setItem(LAYOUT_KEY, name); } catch (_) { /* a browser that keeps nothing */ }
+}
+
+/** The view (board or diff) the switcher last showed on this browser, if any. */
+export function loadView() {
+  try { return localStorage.getItem(VIEW_KEY) || ""; } catch (_) { return ""; }
+}
+
+export function saveView(name) {
+  try { localStorage.setItem(VIEW_KEY, name); } catch (_) { /* a browser that keeps nothing */ }
 }

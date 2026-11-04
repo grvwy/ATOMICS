@@ -40,6 +40,7 @@ impl Session {
             held: Vec::new(),
             approval_hold: false,
             menu_absent_since: None,
+            answered_menu: None,
             chief,
             pending: None,
             sandbox: None,
@@ -50,6 +51,7 @@ impl Session {
             scratch,
             naming,
             mcp_needed: Vec::new(),
+            warning: None,
         }
     }
 
@@ -266,33 +268,18 @@ impl State {
             self.activate(&id, false);
             return Ok(id);
         }
-        let version = if codex {
+        if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(program);
-            match ready.get().copied() {
-                Some(supported) => {
-                    if supported.is_none() {
-                        self.toast("Codex version probe failed; starting without hooks and retrying detection on the next start");
-                    }
-                    Some(supported.unwrap_or(false))
-                }
-                None => {
-                    self.sessions.push(Session::starting(
-                        id.clone(),
-                        &launch.agent,
-                        launch.cwd.clone(),
-                        chief,
-                        &self.wake,
-                    ));
-                    self.pending_codex.push((launch, ready));
-                    self.activate(&id, false);
-                    return Ok(id);
-                }
-            }
-        } else {
-            None
-        };
-        self.launch_agent(launch, version)
+            let Some(supported) = ready.get().copied() else {
+                self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+                self.pending_codex.push((launch, ready));
+                self.activate(&id, false);
+                return Ok(id);
+            };
+            return self.launch_codex(launch, supported);
+        }
+        self.launch_agent(launch, None)
     }
 
     /// The sandbox `agent` gets in `cwd`, or `None` to run it bare: the isolation in effect for
@@ -418,13 +405,33 @@ impl State {
                 let result = ready.clone();
                 let wake = self.wake.clone();
                 std::thread::spawn(move || {
-                    let supported = crate::setup::codex_supports_hooks(&program, CODEX_VERSION_TIMEOUT);
+                    // `codex` can be a Node script: `env node` needs the login shell's PATH, which
+                    // a window started from the Dock may not have taken on yet.
+                    let path = crate::setup::child_path();
+                    let supported =
+                        crate::setup::codex_supports_hooks(&program, path.as_deref(), CODEX_VERSION_TIMEOUT);
                     let _ = result.set(supported);
                     wake.notify();
                 });
                 ready
             })
             .clone()
+    }
+
+    /// Starts a Codex agent with ATOMICS's hooks when its version probe found them supported. A
+    /// probe that failed or timed out leaves support unknown: Codex starts without the hook flags,
+    /// which an older Codex refuses, and its tile says that its approvals stay in its terminal.
+    /// The probe runs again at the next start.
+    pub(super) fn launch_codex(&mut self, launch: AgentLaunch, supported: Option<bool>) -> Result<String, String> {
+        let id = self.launch_agent(launch, Some(supported == Some(true)))?;
+        let warning = supported.is_none().then(|| CODEX_HOOKS_UNKNOWN.to_string());
+        if let Some(index) = self.find(&id) {
+            self.sessions[index].warning = warning.clone();
+        }
+        if let Some(warning) = warning {
+            self.toast(warning);
+        }
+        Ok(id)
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
@@ -449,7 +456,7 @@ impl State {
                 .collect();
         env.insert("COLORFGBG".into(), self.theme.colorfgbg().into());
         if sandboxed.is_none() && agent.kind != AgentKind::Shell {
-            env.extend(instance_agent_env());
+            env.extend(crate::setup::instance_agent_env());
         }
         if sandboxed.is_none()
             && let Some(granted) = &relay
@@ -799,6 +806,7 @@ impl State {
         let mut finished = Vec::new();
         let mut credential_errors = Vec::new();
         let mut ref_checks = Vec::new();
+        let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let Some(terminal) = &session.terminal else { continue };
             if !session.approvals.is_empty() {
@@ -814,6 +822,21 @@ impl State {
                 session.last_message = Some(reason);
                 session.activity.observe(session.status);
                 continue;
+            }
+            // A command menu drawn with no hook asking is the session's pending approval.
+            if session.is_agent()
+                && session.sandbox.is_none()
+                && !terminal.exited()
+                && matches!(
+                    session.status,
+                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+                )
+            {
+                let screen = terminal.screen_text(60);
+                if atomics_core::approvals::native_menu(&screen).is_some() {
+                    menus.push((index, screen));
+                    continue;
+                }
             }
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
@@ -871,6 +894,9 @@ impl State {
                 self.pending_questions.remove(&session.id);
             }
             session.activity.observe(session.status);
+        }
+        for (index, screen) in menus {
+            self.sync_native(index, &screen, Instant::now());
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();
@@ -1229,15 +1255,6 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
                     && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
         })
         .map(|line| format!("Credential error: {}", line.trim()))
-}
-
-/// An explicit instance home must also isolate mutable provider trust and settings.
-fn instance_agent_env() -> Vec<(String, String)> {
-    let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
-    [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
-        .into_iter()
-        .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
-        .collect()
 }
 
 fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
@@ -1718,7 +1735,7 @@ fi
                 for script in ["#!/bin/sh\nexec sleep 30\n", "#!/bin/sh\nexit 1\n"] {
                     crate::test_support::write_program(&program, script);
                     let failed = Arc::new(OnceLock::new());
-                    failed.set(crate::setup::codex_supports_hooks(&name, Duration::from_millis(100))).unwrap();
+                    failed.set(crate::setup::codex_supports_hooks(&name, None, Duration::from_millis(100))).unwrap();
                     assert_eq!(failed.get(), Some(&None));
                     app.runtime.codex_versions.insert(name.clone(), failed.clone());
                     crate::test_support::write_program(
@@ -1750,6 +1767,63 @@ fi
                     assert_eq!(retried.get(), Some(&Some(true)));
                     assert!(Arc::ptr_eq(&retried, &app.runtime.codex_version(name.clone())));
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn codex_whose_probe_fails_starts_with_a_warning_on_its_tile_until_a_probe_answers() {
+        with_app(
+            "app::sessions::tests::codex_whose_probe_fails_starts_with_a_warning_on_its_tile_until_a_probe_answers",
+            |app, _ctx| {
+                use atomics_ui::Backend;
+                let dir = crate::test_support::tempdir().unwrap();
+                let program = dir.path().join("codex");
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "probed".into(),
+                    command: vec![program.to_string_lossy().into_owned()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: None,
+                });
+                let launch = |app: &mut Desktop<'_>, version: &str| {
+                    crate::test_support::write_program(
+                        &program,
+                        format!(
+                            "#!/bin/sh\nif [ \"$1\" = --version ]; then {version}; else printf '%s\\n' \"$@\" > launch-args; fi\n"
+                        ),
+                    );
+                    let _ = std::fs::remove_file(dir.path().join("launch-args"));
+                    let id = app.runtime.start("probed", dir.path().into(), None, vec![], None).unwrap();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while app.runtime.sessions[app.runtime.find(&id).unwrap()]
+                        .terminal
+                        .as_ref()
+                        .is_none_or(|terminal| !terminal.exited())
+                    {
+                        assert!(Instant::now() < deadline, "Codex must start whatever its probe found");
+                        app.runtime.runtime_tick();
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let index = app.runtime.find(&id).unwrap();
+                    let warning = app.runtime.backend().tile(index).unwrap().warning;
+                    (std::fs::read_to_string(dir.path().join("launch-args")).unwrap(), warning)
+                };
+                // As Codex fails when the interpreter it names is not on PATH.
+                let (args, warning) = launch(app, "echo 'env: node: No such file or directory' >&2; exit 127");
+                assert!(!args.contains("hooks.PermissionRequest"), "{args}");
+                assert_eq!(warning.as_deref(), Some(CODEX_HOOKS_UNKNOWN));
+                assert_eq!(app.runtime.toast.as_ref().unwrap().0, CODEX_HOOKS_UNKNOWN);
+                // Unknown is not unsupported: the next start asks again.
+                let (args, warning) = launch(app, "printf 'codex-cli 0.165.0\\n'");
+                assert!(args.contains("hooks.PermissionRequest"), "{args}");
+                assert_eq!(warning, None);
+                // A version too old for hooks is known: no hooks, and nothing to warn of.
+                app.runtime.codex_versions.clear();
+                let (args, warning) = launch(app, "printf 'codex-cli 0.164.0\\n'");
+                assert!(!args.contains("hooks.PermissionRequest"), "{args}");
+                assert_eq!(warning, None);
+                app.runtime.sessions.clear();
             },
         );
     }

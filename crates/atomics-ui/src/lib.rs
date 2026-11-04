@@ -27,10 +27,13 @@ pub mod diff_view;
 pub mod fleet;
 pub mod keys;
 pub mod markdown;
+pub mod nav;
 pub mod panel_nav;
 pub mod shell;
 pub mod sidebar;
+pub mod signin;
 pub mod status;
+pub mod switcher;
 pub mod tabs;
 pub mod terminal;
 pub mod terminal_surface;
@@ -41,8 +44,8 @@ pub mod touch;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot, Heartbeat,
-    Notices, PanelMode, PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TileView, UiConfig,
-    ViewHints, WorktreeRow,
+    Notices, PanelMode, PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TaskLink,
+    TicketsPanel, TileView, UiConfig, ViewHints, WorktreeRow,
 };
 pub use client::Client;
 pub use command::{Command, Remote};

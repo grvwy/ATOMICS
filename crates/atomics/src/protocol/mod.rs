@@ -13,6 +13,7 @@
 //! arrive through a rendezvous service (`rendezvous/`) are served by the same session code
 //! ([`Sessions`]).
 
+pub mod clients;
 #[cfg(test)]
 mod echo_bench;
 mod hub;
@@ -74,6 +75,9 @@ pub struct ServerConfig {
     /// What this listener's clients may do. They hold the bearer token from `protocol.json`, so
     /// on loopback they are controllers; view-only devices arrive with the rendezvous.
     pub role: Role,
+    /// Clients paired by a token of their own (`clients.rs`), which they present instead of the
+    /// per-start one: a desktop reaching this host through a forward.
+    pub paired: Option<Arc<clients::PairedClients>>,
     pub write_timeout: Duration,
     pub poll_interval: Duration,
     pub queue_frames: usize,
@@ -96,6 +100,7 @@ impl Default for ServerConfig {
             max_pre_auth: 4,
             upgrade_deadline: Duration::from_secs(5),
             role: Role::Controller,
+            paired: None,
             write_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
             queue_frames: MAX_QUEUED_FRAMES,
@@ -172,7 +177,6 @@ impl Server {
         let accept = Accept {
             shared: shared.clone(),
             token: token.clone(),
-            addr,
             config: config.clone(),
             active: active.clone(),
             pending: pending.clone(),
@@ -297,7 +301,6 @@ fn write_advertisement(path: &Path, advert: &Advertisement) -> io::Result<()> {
 struct Accept {
     shared: Arc<session::Shared>,
     token: String,
-    addr: SocketAddr,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
     pending: Arc<AtomicUsize>,
@@ -325,7 +328,7 @@ impl Drop for Slot {
 /// What the upgrade of one connection needs.
 struct Upgrade {
     token: String,
-    addr: SocketAddr,
+    paired: Option<Arc<clients::PairedClients>>,
     role: Role,
     origins: Vec<String>,
     write_timeout: Duration,
@@ -343,7 +346,7 @@ impl Accept {
         };
         let upgrade = Upgrade {
             token: self.token.clone(),
-            addr: self.addr,
+            paired: self.config.paired.clone(),
             role: self.config.role,
             origins: self.config.allowed_origins.clone(),
             write_timeout: self.config.write_timeout,
@@ -366,11 +369,16 @@ fn serve_stream(stream: TcpStream, shared: &session::Shared, up: &Upgrade, pre_a
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(up.write_timeout))?;
     let claimed: Cell<Option<Slot>> = Cell::new(None);
+    let peer: Cell<Option<Peer>> = Cell::new(None);
     #[allow(clippy::result_large_err)] // the error type is tungstenite's callback contract
     let authenticate = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let response = authorise(request, response, &up.token, up.addr, &up.origins)?;
+        let (response, who) = authorise(request, response, &up.token, up.paired.as_deref(), &up.origins)?;
         // Authenticated: only now does the connection take one of the client places.
         claimed.set(Some(Slot::take(&up.active, up.max_clients).ok_or_else(|| refuse(503, "too many clients"))?));
+        peer.set(Some(match who {
+            Some(device) => Peer { role: Role::Controller, device: Some(device) },
+            None => Peer::local(up.role),
+        }));
         Ok(response)
     };
     let stream = link::Stream::new(stream)?.with_deadline(up.deadline);
@@ -391,7 +399,8 @@ fn serve_stream(stream: TcpStream, shared: &session::Shared, up: &Upgrade, pre_a
     drop(pre_auth);
     let _client = claimed.take();
     let mut link = link::WsLink::new(socket, up.write_timeout)?;
-    session::serve(&mut link, &Peer::local(up.role), shared);
+    let peer = peer.take().unwrap_or_else(|| Peer::local(up.role));
+    session::serve(&mut link, &peer, shared);
     Ok(())
 }
 
@@ -404,22 +413,30 @@ fn refuse(status: u16, why: &str) -> ErrorResponse {
     http::Response::builder().status(status).body(Some(why.to_string())).expect("static response")
 }
 
+/// Whether a `Host` header names this machine's loopback: a browser a DNS-rebinding page drives
+/// sends the page's own host name. Any port: a client may reach the server through a forward that
+/// listens on another one (an ssh forward from a Mac to its VM).
+fn loopback_host(host: &str) -> bool {
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => return false,
+    };
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
+}
+
 #[allow(clippy::result_large_err)] // `ErrorResponse` is the type tungstenite's callback requires
 /// The upgrade itself is authenticated: a loopback Host header (against DNS rebinding), an exact
-/// Origin when one is sent, the bearer token, and the `atomics.v1` subprotocol.
+/// Origin when one is sent, the bearer token (this start's, or a paired client's), and the
+/// `atomics.v1` subprotocol. A paired client's token says which one it is.
 fn authorise(
     request: &Request,
     mut response: Response,
     token: &str,
-    addr: SocketAddr,
+    paired: Option<&clients::PairedClients>,
     origins: &[String],
-) -> Result<Response, ErrorResponse> {
+) -> Result<(Response, Option<PeerDevice>), ErrorResponse> {
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
-    let port = addr.port();
-    let host_ok = header("host").is_some_and(|h| {
-        [format!("127.0.0.1:{port}"), format!("localhost:{port}")].iter().any(|ok| h.eq_ignore_ascii_case(ok))
-    });
-    if !host_ok {
+    if !header("host").is_some_and(loopback_host) {
         return Err(refuse(403, "unexpected Host"));
     }
     if let Some(origin) = header("origin")
@@ -428,13 +445,18 @@ fn authorise(
         return Err(refuse(403, "Origin not allowed"));
     }
     let presented = header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-    if !same_secret(presented.as_bytes(), token.as_bytes()) {
-        return Err(refuse(401, "a bearer token is required"));
-    }
+    let device = if same_secret(presented.as_bytes(), token.as_bytes()) {
+        None
+    } else {
+        match paired.and_then(|paired| paired.find(presented)) {
+            Some(device) => Some(device),
+            None => return Err(refuse(401, "a bearer token is required")),
+        }
+    };
     let offers = header("sec-websocket-protocol").is_some_and(|v| v.split(',').any(|p| p.trim() == wire::SUBPROTOCOL));
     if !offers {
         return Err(refuse(400, "subprotocol atomics.v1 is required"));
     }
     response.headers_mut().insert("Sec-WebSocket-Protocol", http::HeaderValue::from_static(wire::SUBPROTOCOL));
-    Ok(response)
+    Ok((response, device))
 }

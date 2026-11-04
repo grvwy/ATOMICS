@@ -518,3 +518,47 @@ fn text_waiting_for_the_grant_is_bounded() {
     world.pump();
     assert_eq!(world.host.terminals["s1"].typed, most);
 }
+
+/// A session the host has on its board before its terminal starts: its screen is refused, not asked for
+/// again at every frame, and asked for again once the session changes, when the terminal is there.
+#[test]
+fn a_screen_whose_terminal_has_not_started_is_asked_for_again_when_its_session_changes() {
+    use atomics_core::projection::SessionInfo;
+    use atomics_core::session::AgentStatus;
+    let mut world = live();
+    let mut starting = SessionInfo {
+        id: "new".into(),
+        agent: "shell".into(),
+        title: "new".into(),
+        cwd: "/w/repo".into(),
+        worktree: None,
+        branch: None,
+        status: AgentStatus::Starting,
+        chief: false,
+        task: None,
+        pending_approvals: 0,
+    };
+    let subscribes = |world: &World| {
+        world
+            .sent()
+            .iter()
+            .filter(|m| matches!(m, Message::Subscribe { topics } if topics.iter().any(|t| matches!(t, Topic::Screen { session, .. } if session == "new"))))
+            .count()
+    };
+    let session = starting.clone();
+    let frames = world.host.event(|cursor| Message::SessionUpsert { cursor, session });
+    world.deliver(frames);
+    for _ in 0..3 {
+        show(&mut world, "new");
+    }
+    assert_eq!(subscribes(&world), 1, "refused once, not again at every frame");
+    assert!(world.driver.remote.with_screen("new", |s| s.is_none()));
+
+    world.host.terminals.insert("new".into(), fake_host::FakeTerminal::new(40, 5, "$ "));
+    starting.status = AgentStatus::Idle;
+    let frames = world.host.event(|cursor| Message::SessionUpsert { cursor, session: starting });
+    world.deliver(frames);
+    show(&mut world, "new");
+    assert_eq!(subscribes(&world), 2, "asked again once the session changed");
+    assert!(screen_text(&world, "new").contains('$'), "{}", screen_text(&world, "new"));
+}

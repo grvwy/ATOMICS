@@ -42,6 +42,8 @@ pub enum Scope {
     Open,
     Diff(String),
     Plan(String),
+    /// The host's own state: only to a client that negotiated `host`.
+    Host,
 }
 
 fn scope_of(message: &Message) -> Scope {
@@ -50,6 +52,7 @@ fn scope_of(message: &Message) -> Scope {
         Message::PlanRemoved { id, .. } => Scope::Plan(id.clone()),
         Message::TaskReport { plan, .. } => Scope::Plan(plan.clone()),
         Message::DiffSummary { summary, .. } => Scope::Diff(summary.worktree.clone()),
+        Message::HostUpsert { .. } => Scope::Host,
         _ => Scope::Open,
     }
 }
@@ -426,6 +429,11 @@ impl Hub {
         self.ring.front().map_or(self.head + 1, |(_, frame)| frame.cursor)
     }
 
+    /// Whether the board as published holds session `id`.
+    pub fn has_session(&self, id: &str) -> bool {
+        self.state.sessions.data.iter().any(|s| s.id == id)
+    }
+
     /// Read the published projections and turn what changed into events for every client.
     pub fn poll(&mut self, projections: &Projections) {
         self.expire_ring();
@@ -542,6 +550,9 @@ impl Hub {
                 out.push(Message::DiffSummary { cursor: zero, summary: tombstone });
             }
         }
+        if new.host.revision != old.host.revision && new.host.data != old.host.data {
+            out.push(Message::HostUpsert { cursor: zero, host: new.host.data.clone() });
+        }
         out
     }
 
@@ -598,7 +609,8 @@ fn with_cursor(mut message: Message, to: Cursor) -> Message {
         | Message::TaskReport { cursor, .. }
         | Message::ApprovalPending { cursor, .. }
         | Message::ApprovalResolved { cursor, .. }
-        | Message::DiffSummary { cursor, .. } => *cursor = to,
+        | Message::DiffSummary { cursor, .. }
+        | Message::HostUpsert { cursor, .. } => *cursor = to,
         _ => {}
     }
     message

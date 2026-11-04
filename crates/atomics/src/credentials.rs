@@ -1194,4 +1194,34 @@ pub(crate) mod tests {
         let head = Chunks { generation: 'b', count: 3, digest: "0".repeat(64) };
         assert_eq!(Chunks::parse(&head.to_string()), Some(head));
     }
+
+    /// The headless host in the VM has no OS credential store: a private folder holds the sign-ins
+    /// instead (`ATOMICS_CREDENTIALS_DIR`), each item its own file, readable by this user only.
+    #[test]
+    fn a_private_folder_stands_in_for_the_credential_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        let folder = dir.path().join("credentials");
+        let store = Store::new(Keychain::in_folder(&folder));
+        store.put("linear", "lin_api_PRIVATE", None).unwrap();
+        assert_eq!(store.token("linear").unwrap().as_deref(), Some("lin_api_PRIVATE"));
+        let slot = "tokens-0123abcd";
+        let big = token_set(2500, "big");
+        store.put_oauth_item(slot, &big).unwrap();
+        assert_eq!(store.oauth_item(slot).unwrap().as_deref(), Some(big.as_str()));
+        assert_eq!(std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777, 0o700);
+        let files: Vec<_> = std::fs::read_dir(&folder).unwrap().flatten().collect();
+        assert!(files.len() > 2, "the catalog, the sign-in's head and its chunks");
+        for file in &files {
+            let name = file.file_name().to_string_lossy().into_owned();
+            assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-@%".contains(&b)), "{name}");
+            if !name.ends_with(".lock") {
+                assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+            }
+        }
+        store.remove_oauth_item(slot).unwrap();
+        assert_eq!(store.oauth_item(slot).unwrap(), None);
+        store.remove("linear").unwrap();
+        assert_eq!(store.token("linear").unwrap(), None);
+    }
 }

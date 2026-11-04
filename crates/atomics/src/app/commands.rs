@@ -205,7 +205,18 @@ impl Local<'_> {
             }
             Command::OpenProject(root) => state.post(move |state| state.open_project(&root)),
             Command::CloseProject(root) => state.post(move |state| state.close_project(&root)),
-            Command::OpenWorkspace(name) => state.post(move |state| state.open_workspace(&name)),
+            Command::OpenWorkspace(name) => state.post(move |state| {
+                let _ = state.open_workspace(&name);
+            }),
+            Command::SignInTickets => state.post(State::start_sign_in),
+            Command::PasteSignIn(text) => state.post(move |state| {
+                if let Err(error) = state.paste_signin(&text) {
+                    state.toast(error);
+                }
+            }),
+            Command::CancelSignIn => state.post(|state| {
+                let _ = state.cancel_sign_in();
+            }),
             Command::SaveWorkspace(name) => state.post(move |state| state.save_workspace(&name)),
             Command::OpenCleanup { repo, preselect } => state.post(move |state| state.open_cleanup(repo, preselect)),
             Command::CleanupFetch => state.post(|state| state.cleanup_action("fetch")),
@@ -320,6 +331,18 @@ impl Desktop<'_> {
             }
             Command::ViewPlanHistory(plan) => self.view_plan_history(plan),
             Command::TogglePlan => self.runtime.toggle_plan(),
+            Command::ToggleView(view) => {
+                self.runtime.toggle_view(view);
+                // The Tickets panel takes the keyboard where it opens; the terminal gets it back where it closes.
+                if view == PanelMode::Tickets {
+                    if self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
+                        self.client.focus_terminal = None;
+                        self.client.focus_editor = false;
+                    } else {
+                        self.client.focus_terminal = self.runtime.active.clone();
+                    }
+                }
+            }
             Command::OpenTicket(link) => {
                 self.runtime.open_ticket(link, tickets_panel::Nav::Fresh);
                 self.runtime.tickets.panel.from_board = true;

@@ -500,6 +500,7 @@ dependencies = [
  "anyhow",
  "atomics-core",
  "atomics-ui",
+ "atomics-web",
  "base64 0.22.1",
  "clap",
  "cpal",
@@ -568,6 +569,7 @@ dependencies = [
 name = "atomics-web"
 version = "0.1.4"
 dependencies = [
+ "anyhow",
  "atomics-core",
  "atomics-ui",
  "eframe",

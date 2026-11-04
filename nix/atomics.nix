@@ -26,11 +26,23 @@ let
     else
       lib.fileset.difference root
         (lib.fileset.unions (map (name: lib.fileset.maybeMissing (root + "/${name}")) [ ".git" ".atomics" "target" ]));
+  # Of those, what the build reads: an edit to the docs, the Nix files or another script then leaves
+  # the package (and every VM image built with it) as it was.
+  buildInputsOnly = lib.fileset.intersection tracked (lib.fileset.unions [
+    (root + "/Cargo.toml")
+    (root + "/Cargo.lock")
+    (root + "/crates")
+    (root + "/assets")
+    # The guest check `atomics vm setup` runs in the VM.
+    (root + "/scripts/check-atomics-vm.sh")
+    # Shared test support, which test builds of the crates name.
+    (root + "/tests")
+  ]);
 in
 rustPlatform.buildRustPackage {
   pname = "atomics";
   version = "0.1.0";
-  src = lib.fileset.toSource { inherit root; fileset = tracked; };
+  src = lib.fileset.toSource { inherit root; fileset = buildInputsOnly; };
 
   cargoLock.lockFile = ../Cargo.lock;
   cargoBuildFlags = [ "-p" "atomics" ];

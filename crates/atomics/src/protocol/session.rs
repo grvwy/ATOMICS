@@ -273,6 +273,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         terminals,
         input: terminals && capabilities.iter().any(|c| c == INPUT),
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
+        host: capabilities.iter().any(|c| c == wire::HOST),
         may: may.clone(),
         client_id: client_id.clone(),
         device: peer.device.clone(),
@@ -346,9 +347,12 @@ impl Narrowed {
         }
     }
 
-    fn admits(&self, scope: &Scope) -> bool {
+    /// Whether a client that narrowed itself to `self` gets an event about `scope`; `host` is whether
+    /// it negotiated the `host` capability, without which it is never sent the host's own state.
+    fn admits(&self, scope: &Scope, host: bool) -> bool {
         match scope {
             Scope::Open => true,
+            Scope::Host => host,
             Scope::Diff(worktree) => self.diffs.is_empty() || self.diffs.contains(worktree),
             Scope::Plan(id) => self.plans.is_empty() || self.plans.contains(id),
         }
@@ -373,6 +377,8 @@ struct Follows {
     input: bool,
     /// It negotiated `mutations`.
     mutations: bool,
+    /// It negotiated `host`: it is sent `host_upsert`.
+    host: bool,
     /// What its role and capabilities let it change, as its `welcome` said.
     may: Vec<Grant>,
     /// The ID it said hello with, which names its operations in the journal.
@@ -455,7 +461,7 @@ fn conversation(
         match outbox.take() {
             Taken::Frames { board, screens } => {
                 for frame in board {
-                    if subscriptions.board.admits(&frame.scope) {
+                    if subscriptions.board.admits(&frame.scope, subscriptions.host) {
                         out.raw(&frame.text).map_err(link_ended)?;
                     } else {
                         // Left out, but its cursor still counts.
@@ -696,9 +702,11 @@ fn handle(
                     }
                     let terminals = shared.screens.terminals();
                     if terminals.control(session).is_none() {
-                        // Its terminal may have closed since the client heard of it.
-                        let closed = terminals.closed(session);
-                        return Err(if closed { gone(no_terminal()) } else { refused(no_terminal()) });
+                        // Its terminal may have closed since the client heard of it, or (a session on the
+                        // board) not have started yet: the client could not know, and asks again when the
+                        // session changes.
+                        let expected = terminals.closed(session) || lock(&shared.hub).has_session(session);
+                        return Err(if expected { gone(no_terminal()) } else { refused(no_terminal()) });
                     }
                 }
                 if !subscriptions.has(topic) {
@@ -861,7 +869,8 @@ fn handle(
         message @ (Message::ApprovalDecide(_)
         | Message::PlanCommand(_)
         | Message::ReviewCommand(_)
-        | Message::SessionCommand(_)) => {
+        | Message::SessionCommand(_)
+        | Message::HostCommand(_)) => {
             let command = Command::from_message(message).expect("a mutation");
             mutate(out, shared, subscriptions, command, id)
         }

@@ -127,6 +127,8 @@ impl World {
                         self.host.join();
                         self.driver.socket_open(socket, tunnel::SUBPROTOCOL);
                     }
+                    // The world is a browser's; a direct client's tests drive their own host.
+                    Output::DialDirect { socket } => self.driver.socket_closed(socket, 1006),
                     Output::Send { socket, message } => {
                         if Some(socket) != self.socket {
                             continue;

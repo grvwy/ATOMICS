@@ -56,44 +56,77 @@ impl Desktop<'_> {
         }
     }
 
-    /// This host's items after the top bar's Plan button: Tickets, the GitHub counter, Remote, and in the
-    /// Actions menu (`in_menu`) the ticket system's sign-in.
-    pub(super) fn host_top_bar_items(&mut self, ui: &mut egui::Ui, in_menu: bool) {
-        if self.runtime.ticket_config().is_some() {
-            // A dot says the ticket system wants a sign-in.
-            let signed_out = self.runtime.tickets.panel.signin;
-            let text = RichText::new(if signed_out { "Tickets ●" } else { "Tickets" }).color(if signed_out {
-                self.palette().warning
-            } else {
-                self.palette().foreground
-            });
-            let open = self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open;
-            let response = ui.selectable_label(open, text);
-            record_item(ui, "Tickets", &response);
-            if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_tickets)).clicked() {
-                self.runtime.toggle_tickets();
-                if in_menu {
-                    ui.close();
-                }
+    /// The ATOMICS VM on a Mac with its bundle installed (docs/nixos-vm.md): "VM" with its state, and a
+    /// menu that starts or stops it. Agents of this window run on this Mac unless the config's agents
+    /// are the bundle's wrappers; `atomics --connect vm` runs the window on the VM's host instead.
+    fn vm_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
+        use crate::vm::Status;
+        let Some(monitor) = self.runtime.vm.clone() else { return };
+        let Some(view) = monitor.view() else { return };
+        let palette = self.palette();
+        let (text, color) = match (&view.status, view.busy) {
+            (_, Some("stopping")) => ("VM …", palette.muted),
+            (Status::Starting, _) | (_, Some(_)) => ("VM …", palette.muted),
+            (Status::Running, _) => ("VM ●", palette.success),
+            (Status::Stopped, _) => ("VM ○", palette.muted),
+            (Status::NotSetUp | Status::Unknown(_), _) => ("VM ●", palette.warning),
+        };
+        let state = match view.busy {
+            Some(busy) => busy.to_string(),
+            None => view.status.label().to_string(),
+        };
+        let label = RichText::new(text).color(color);
+        let items = |ui: &mut egui::Ui| {
+            ui.label(RichText::new(format!("ATOMICS VM {}: {state}", view.instance)).strong());
+            if let Some(error) = &view.error {
+                ui.label(RichText::new(error).color(palette.warning));
             }
-        }
+            let run = match view.status {
+                Status::NotSetUp => {
+                    ui.label("Set it up from a terminal: atomics vm setup --from <build folder>");
+                    None
+                }
+                Status::Stopped | Status::Unknown(_) if view.busy.is_none() => {
+                    ui.button("Start").clicked().then_some(true)
+                }
+                Status::Running if view.busy.is_none() => {
+                    ui.button("Stop").on_hover_text("Agents running in the VM stop with it").clicked().then_some(false)
+                }
+                _ => None,
+            };
+            if let Some(run) = run {
+                monitor.set_running(run);
+                ui.close();
+            }
+        };
+        // Folded into the Actions menu where the bar has no room for it, as Settings is.
+        let (response, _) = if in_menu || egui::containers::menu::is_in_menu(ui) {
+            egui::containers::menu::SubMenuButton::new(label).ui(ui, items)
+        } else {
+            egui::containers::menu::MenuButton::new(label).ui(ui, items)
+        };
+        record_item(ui, "VM", &response);
+        response.on_hover_text(format!("The ATOMICS VM {} is {state}", view.instance));
+    }
+
+    /// This host's items after `+ New`: Sign in or Reconnect while the ticket system needs it, the workspace,
+    /// the GitHub counter, Remote, the VM, and in the Actions menu (`in_menu`) the ticket system's sign-in
+    /// entries. The Tickets panel is the view switcher's (`atomics_ui::switcher`).
+    pub(super) fn host_top_bar_items(&mut self, ui: &mut egui::Ui, in_menu: bool) {
+        // The shared items: Sign in or Reconnect while the ticket system needs it, and the workspace.
+        self.draw(|backend, client| atomics_ui::signin::top_bar_item(ui, backend, client));
+        self.draw(|backend, client| atomics_ui::topbar::workspace_menu(ui, backend, client));
         self.github_counter(ui, in_menu);
         self.rendezvous_indicator(ui, in_menu);
+        self.vm_indicator(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
-            let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)
-                && !self.runtime.tickets.panel.signin;
-            let label = if signed_in {
-                format!("Tickets: sign out of {system}")
-            } else {
-                format!("Tickets: sign in to {system}")
-            };
-            if ui.button(label).clicked() {
-                if signed_in {
-                    self.runtime.start_sign_out();
-                } else {
-                    self.runtime.show_signin();
-                }
+            let signed_in = self
+                .runtime
+                .sign_in_info()
+                .is_some_and(|info| info.state == atomics_core::projection::SignInState::SignedIn);
+            if signed_in && ui.button(format!("Tickets: sign out of {system}")).clicked() {
+                self.runtime.start_sign_out();
                 ui.close();
             }
             if signed_in
@@ -224,6 +257,103 @@ mod tests {
     }
 
     #[test]
+    fn the_bar_shows_the_open_workspace_and_reconnect_and_both_work() {
+        with_app("app::topbar::tests::the_bar_shows_the_open_workspace_and_reconnect_and_both_work", |app, ctx| {
+            let dir = atomics_core::workspace::workspaces_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["team", "daily"] {
+                std::fs::write(dir.join(format!("{name}.toml")), "projects = []\n").unwrap();
+            }
+            app.runtime.workspace = Some("team".into());
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (_keys, oauth) = crate::mcp_client::oauth_test_machine();
+            app.runtime.config.tickets = toml::from_str("system = \"tracker\"").unwrap();
+            app.runtime.config.tickets.server = fake.server();
+            app.runtime.tickets.sign.override_oauth(oauth);
+            app.runtime.tickets.sign.headless = true;
+            app.runtime.apply_ticket_config();
+            app.runtime.poll_signin();
+            app.runtime.ticket_job_failed("sign-in required again: the server refused the saved sign-in");
+            app.runtime.poll_signin();
+            app.runtime.toast = None;
+
+            // In a narrower window they fold into the Actions menu beside the centered pill, and show there.
+            let (items, output) = render(app, ctx, 1100.0, vec![]);
+            output.drop_without_applying_deltas();
+            assert!(items.iter().any(|(item, _)| item == "Actions"), "{items:?}");
+            assert!(!items.iter().any(|(item, _)| item == "Workspace" || item == "sign-in"), "{items:?}");
+            click(app, ctx, 1100.0, "Actions");
+            render(app, ctx, 1100.0, vec![]).1.drop_without_applying_deltas();
+            let (_, output) = render(app, ctx, 1100.0, vec![]);
+            let menu: Vec<String> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            output.drop_without_applying_deltas();
+            for label in ["Reconnect", "Workspace: team"] {
+                assert!(menu.iter().any(|text| text == label), "{label} in the Actions menu: {menu:?}");
+            }
+            render(
+                app,
+                ctx,
+                1100.0,
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            )
+            .1
+            .drop_without_applying_deltas();
+
+            // With room, right of the pill; the switcher's Tickets segment shows the sign-in it waits for.
+            let (items, output) = render(app, ctx, 2400.0, vec![]);
+            let tickets = items.iter().find(|(name, _)| name == "view:Tickets").expect("the Tickets segment").1;
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.text() == "●" && tickets.contains(text.visual_bounding_rect().center()))),
+                "a sign-in dot on the Tickets segment"
+            );
+            output.drop_without_applying_deltas();
+            for name in ["Workspace", "sign-in", "chief"] {
+                assert!(items.iter().any(|(item, _)| item == name), "{name}: {items:?}");
+            }
+            let chief = items.iter().find(|(name, _)| name == "chief").unwrap().1;
+            for (name, rect) in items.iter().filter(|(name, _)| name == "Workspace" || name == "sign-in") {
+                assert!(rect.min.x >= chief.max.x, "{name} is right of the chief's pill: {items:?}");
+            }
+
+            // Reconnect starts the sign-in and opens the panel that shows its steps.
+            click(app, ctx, 2400.0, "sign-in");
+            assert!(app.runtime.tickets.sign.job.is_some());
+            assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
+            let _ = app.runtime.cancel_sign_in();
+
+            // The workspace item names the open one and opens another.
+            click(app, ctx, 2400.0, "Workspace");
+            click(app, ctx, 2400.0, "daily");
+            assert_eq!(app.runtime.workspace.as_deref(), Some("daily"));
+            let (items, output) = render(app, ctx, 2400.0, vec![]);
+            let labels: Vec<String> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            output.drop_without_applying_deltas();
+            assert!(labels.iter().any(|label| label == "Workspace: daily"), "{labels:?}; {items:?}");
+        });
+    }
+
+    #[test]
     fn top_bar_items_never_overlap() {
         with_app("app::topbar::tests::top_bar_items_never_overlap", |app, ctx| {
             for count in [0, 3, 6] {
@@ -253,14 +383,15 @@ mod tests {
                             }
                         }
                         let collapsed = items.iter().any(|(name, _)| name == "Actions");
+                        // The view switcher stays in the bar when the actions fold; it drops its names.
                         let required: &[&str] = if collapsed {
-                            &["chief", "Actions", "Tabs"]
+                            &["chief", "Actions", "Tabs", "view:Board", "view:Diff"]
                         } else {
-                            &["chief", "Settings", "Project", "Plan", "+ New", "diff"]
+                            &["chief", "Settings", "Project", "+ New", "view:Board", "view:Diff"]
                         };
                         for &name in required {
                             assert_eq!(items.iter().filter(|(n, _)| n == name).count(), 1, "{case}: {name}");
-                            if name != "chief" {
+                            if name != "chief" && !name.starts_with("view:") {
                                 let width = items.iter().find(|(n, _)| n == name).unwrap().1.width();
                                 let natural = action_widths.entry(name).or_insert(width);
                                 assert!((width - *natural).abs() < 0.5, "{case}: {name} shrank");
@@ -294,10 +425,8 @@ mod tests {
                                 text_rects.push((text.galley.text(), rect));
                             }
                         }
-                        if width == 5120.0 {
-                            let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
-                            assert!((chief.center().x - width / 2.0).abs() < 1.0, "wide pill remains centered");
-                        }
+                        let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
+                        assert!((chief.center().x - width / 2.0).abs() < 1.0, "{case}: the pill is centered");
                         if width == 5120.0 {
                             assert!(!items.iter().any(|(n, _)| n == "Tabs"));
                             assert_eq!(items.iter().filter(|(n, _)| n.starts_with("Repos ·")).count(), 1);
@@ -313,6 +442,101 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn the_chief_keeps_its_place_whatever_it_and_the_plans_do() {
+        with_app("app::topbar::tests::the_chief_keeps_its_place_whatever_it_and_the_plans_do", |app, ctx| {
+            for width in [480.0, 700.0, 1100.0, 1600.0, 2400.0] {
+                let mut places = Vec::new();
+                for (count, status, heartbeat, open, toast) in [
+                    (0, None, false, false, false),
+                    (0, Some(AgentStatus::Starting), false, true, false),
+                    (3, Some(AgentStatus::Working), true, true, true),
+                    (6, Some(AgentStatus::NeedsInput), true, false, true),
+                    (6, Some(AgentStatus::Done), false, true, false),
+                ] {
+                    fixture(app, count);
+                    match status {
+                        Some(status) => app.runtime.sessions[0].status = status,
+                        None => app.runtime.sessions.clear(),
+                    }
+                    if !heartbeat {
+                        app.runtime.heartbeat.last = None;
+                    }
+                    if !toast {
+                        app.runtime.toast = None;
+                    }
+                    app.runtime.chief_open = open;
+                    // Twice: the first frame of a menu or a tab measures itself.
+                    render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    let (items, output) = render(app, ctx, width, vec![]);
+                    output.drop_without_applying_deltas();
+                    let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
+                    places.push((chief, format!("plans={count} status={status:?} heartbeat={heartbeat}")));
+                }
+                for (rect, case) in &places[1..] {
+                    assert_eq!(*rect, places[0].0, "width={width}: the pill moved with {case}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn the_view_switcher_shows_each_view_with_its_count_and_the_window_remembers_the_choice() {
+        with_app(
+            "app::topbar::tests::the_view_switcher_shows_each_view_with_its_count_and_the_window_remembers_the_choice",
+            |app, ctx| {
+                fixture(app, 3);
+                app.runtime.toast = None;
+                let plan = app.runtime.selected_plan;
+                app.runtime.plans[plan].tasks[0].status = TaskStatus::Review;
+                let shown = |app: &mut Desktop<'_>| {
+                    render(app, ctx, 2400.0, vec![]).1.drop_without_applying_deltas();
+                    let (items, output) = render(app, ctx, 2400.0, vec![]);
+                    let text: Vec<String> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|s| {
+                            if let egui::Shape::Text(t) = &s.shape { Some(t.galley.text().into()) } else { None }
+                        })
+                        .collect();
+                    output.drop_without_applying_deltas();
+                    (items.into_iter().map(|(name, _)| name).collect::<Vec<_>>(), text)
+                };
+                let (items, text) = shown(app);
+                assert!(items.contains(&"view:Board".into()) && items.contains(&"view:Diff".into()), "{items:?}");
+                assert!(!items.contains(&"view:Tickets".into()), "no Tickets without a ticket system: {items:?}");
+                assert!(
+                    text.contains(&"Board 0/1".into()) && text.contains(&"1".into()),
+                    "the task in review: {text:?}"
+                );
+                for old in ["Show diff", "Hide diff", "Plan 0/1", "Tickets"] {
+                    assert!(!text.contains(&old.into()), "{old} is the switcher's now: {text:?}");
+                }
+                app.runtime.tickets.config = Some(std::sync::Arc::new(atomics_core::tickets::TicketConfig {
+                    system: "demo".into(),
+                    ..Default::default()
+                }));
+                assert!(shown(app).0.contains(&"view:Tickets".into()));
+                app.runtime.diff_open = false;
+                click(app, ctx, 2400.0, "view:Tickets");
+                assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
+                assert_eq!(app.runtime.store.panel_view.as_deref(), Some("tickets"), "the window remembers it");
+                assert_eq!(Store::load(&paths::store_file()).panel_view.as_deref(), Some("tickets"));
+                // Another plan's tab keeps the view; the editor counts as the diff's.
+                app.send(Command::ShowPlan(0));
+                assert!(app.runtime.panel == PanelMode::Tickets && app.runtime.diff_open);
+                app.runtime.panel = PanelMode::Editor;
+                click(app, ctx, 2400.0, "view:Diff");
+                assert!(
+                    app.runtime.panel == PanelMode::Editor && !app.runtime.diff_open,
+                    "the diff's segment hides it"
+                );
+                click(app, ctx, 2400.0, "view:Diff");
+                assert!(app.runtime.panel == PanelMode::Editor && app.runtime.diff_open, "and shows the editor again");
+            },
+        );
     }
 
     #[test]
@@ -392,7 +616,8 @@ mod tests {
                             .clip_rect;
                         assert!(clip.expand(0.5).contains_rect(bounds), "width={width}: important label was clipped");
                     }
-                    if width >= 900.0 {
+                    // The pill keeps the middle, so the plans share the left half of the bar with the brand.
+                    if width >= 1400.0 {
                         assert!(needs_visible, "width={width}: needs-you should fit");
                         assert!(
                             items.iter().any(|(name, _)| name.starts_with("● ")
@@ -495,16 +720,22 @@ mod tests {
             app.runtime.toast = None;
             app.runtime.config_error = None;
             app.runtime.hook_error = None;
-            for width in [480.0, 550.0, 700.0] {
+            for width in [480.0, 550.0, 700.0, 1200.0] {
                 fixture(app, 6);
                 app.client.new_dialog = None;
-                let collapsed = width < 700.0;
-                let was_open = app.runtime.diff_open;
-                if collapsed {
-                    click(app, ctx, width, "Actions");
+                let (items, output) = render(app, ctx, width, vec![]);
+                output.drop_without_applying_deltas();
+                let collapsed = items.iter().any(|(name, _)| name == "Actions");
+                assert_eq!(collapsed, width < 1000.0, "width={width}: the actions fold beside a centered pill");
+                // The switcher's segments are in the bar at every width: one shows its view, again hides it.
+                for (segment, view) in [("view:Diff", PanelMode::Diff), ("view:Board", PanelMode::Plan)] {
+                    app.runtime.panel = PanelMode::Tickets;
+                    app.runtime.diff_open = true;
+                    click(app, ctx, width, segment);
+                    assert!(app.runtime.panel == view && app.runtime.diff_open, "width={width}: {segment} shows");
+                    click(app, ctx, width, segment);
+                    assert!(app.runtime.panel == view && !app.runtime.diff_open, "width={width}: {segment} hides");
                 }
-                click(app, ctx, width, "diff");
-                assert_ne!(app.runtime.diff_open, was_open, "width={width}: diff action");
                 click(app, ctx, width, "Tabs");
                 click(app, ctx, width, "Plan 0:");
                 assert_eq!(app.runtime.selected_plan, 0, "width={width}: Tabs selection");
@@ -514,16 +745,6 @@ mod tests {
                 }
                 click(app, ctx, width, "+ New");
                 assert!(app.client.new_dialog.is_some(), "width={width}: new action");
-                if collapsed {
-                    click(app, ctx, width, "Actions");
-                }
-                let panel_was_open = app.runtime.panel == PanelMode::Plan && app.runtime.diff_open;
-                click(app, ctx, width, "Plan");
-                assert_ne!(
-                    app.runtime.panel == PanelMode::Plan && app.runtime.diff_open,
-                    panel_was_open,
-                    "width={width}: plan action"
-                );
                 for (action, entry) in [("Project", "Open project…"), ("Settings", "Edit config")] {
                     if collapsed {
                         click(app, ctx, width, "Actions");

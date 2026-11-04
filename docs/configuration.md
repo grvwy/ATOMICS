@@ -20,6 +20,22 @@ a diff until you apply or reject it.
 machine name. See [Using ATOMICS on several machines](../README.md#using-atomics-on-several-machines) for host
 names and portable paths.
 
+### The open workspace
+
+`atomics --workspace NAME` (or `-w NAME`) opens a saved workspace; the top bar's **Workspace: NAME** item names the
+one open and opens another from the saved ones (the Project menu lists them too, and saves the open projects as
+one). ATOMICS remembers the workspace open last (`workspace` in `state/store.json`). A start that names neither a
+project nor a workspace, such as from the Dock or `atomics` in a folder outside any repository, opens it again with
+the projects that were open, so its `[tickets]`, `[workflow]` and chief settings apply as before. Naming a project
+(`atomics ~/repos/app`), or starting `atomics` in a repository or a folder below its root, opens just that project,
+with no workspace, as it always has: another repository's workspace settings never apply to it, and the next bare
+start opens that project again rather than the earlier workspace. A workspace whose file is gone
+is not opened again. `atomics_restart` relaunches with the workspace open at that moment in place of any
+`--workspace` the first start had, so a workspace picked after the start survives the restart.
+
+With no ticket system in effect, every ticket tool and the Tickets panel say why: no workspace is open (and which
+saved ones have `[tickets]`), the open workspace has no `[tickets]`, or its section does not load.
+
 The scope of a proposed change is `main`, `host`, `workspace` or `theme`. Use `host` for anything that is true of one
 machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]`, `[workflow]`,
 `[isolation]` and `[chief] prompt`; open and close its projects in ATOMICS instead. A theme change writes one theme file; showing
@@ -152,7 +168,8 @@ secrets. At most five proposals wait at once.
 
 Runs the same checks as `atomics doctor` and returns them as JSON: `checks`, each with `ok`, the `check`,
 a `hint` when it failed and whether it is only a `warning`, and `facts` such as the host name and the loaded
-files. `ok` is true when the required checks pass: git, and a config that loads.
+files. `ok` is true when the required checks pass: git, and a config that loads; every other failed check is a
+`warning`.
 
 ## Reviewing a proposal
 
