@@ -2,6 +2,25 @@ use super::*;
 
 const MAX_BRANCH_ALLOCATION_ATTEMPTS: usize = 100;
 
+/// Why tasks of `plan` can never start: its dependency cycles, which plan_set refuses. A plan
+/// saved before that refusal can still hold one.
+pub(super) fn cycle_problems(plan: &Plan) -> Vec<String> {
+    let cycles = plan.dependency_cycles();
+    let mut problems: Vec<_> = cycles
+        .iter()
+        .map(|cycle| {
+            format!(
+                "Dependency cycle {}: each task waits for the next, so none of them can ever start.",
+                cycle.join(" → ")
+            )
+        })
+        .collect();
+    if cycles.iter().flatten().any(|id| id == atomics_core::plan::REVIEW_TASK) {
+        problems.push("The final review waits for every other task, so no task can depend on review.".into());
+    }
+    problems
+}
+
 impl State {
     pub(super) fn show_plan_fleet(&mut self) {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
@@ -363,16 +382,8 @@ impl State {
         if let Some(note) = self.remote_note(&self.plans[index].id) {
             value["remote"] = json!(note);
         }
-        if let Some(tasks) = value["tasks"].as_array_mut() {
-            for (task, value) in self.plans[index].tasks.iter().zip(tasks) {
-                if task.integrated.is_some() {
-                    value["integration_verified"] = json!(task.integration_verified);
-                }
-                if let Some(note) = self.integration_check_note(index, task) {
-                    value["integration_check"] = json!(note);
-                }
-            }
-        }
+        value["tasks"] =
+            json!(self.plans[index].tasks.iter().map(|task| self.task_json(index, task)).collect::<Vec<_>>());
         if let Some(board) = self.ticket_summary(&self.plans[index].id).and_then(|s| s.get("board").cloned()) {
             value["ticket_board"] = board;
         }
@@ -462,17 +473,7 @@ impl State {
     /// a task may name it to bring that work into the plan, though dispatching it there would fail.
     /// Each branch problem names a free branch.
     pub(super) fn plan_problems(&self, index: Option<usize>, candidate: &Plan) -> (Vec<String>, Vec<String>) {
-        let mut refused = Vec::new();
-        let cycles = candidate.dependency_cycles();
-        for cycle in &cycles {
-            refused.push(format!(
-                "Dependency cycle {}: each task waits for the next, so none of them can ever start.",
-                cycle.join(" → ")
-            ));
-        }
-        if cycles.iter().flatten().any(|id| id == atomics_core::plan::REVIEW_TASK) {
-            refused.push("The final review waits for every other task, so no task can depend on review.".into());
-        }
+        let mut refused = cycle_problems(candidate);
         let mut notes = Vec::new();
         fn pinned(task: &Task) -> Option<&str> {
             task.branch.as_deref().filter(|branch| task.status == TaskStatus::Planned && !branch.trim().is_empty())
@@ -2147,12 +2148,29 @@ mod tests {
                     );
                     assert!(integrated.result.to_string().len() < 1024);
                 }
-                let full = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                let compact = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                assert!(compact.ok);
+                assert_eq!(compact.result["ready"], json!(["b"]));
+                assert_eq!(compact.result["tasks"][0]["notes"], 1003);
+                assert!(compact.result["tasks"][0].get("brief").is_none());
+                assert!(atomics_core::control::shown_len(&compact.result) < atomics_core::control::MAX_PLAN_VIEW_CHARS);
+                // One task in full, cut to what a tool answer holds; the plan keeps the whole history.
+                let full = request(app, json!({"cmd":"plan_get", "plan":plan, "task":"a"}));
                 assert!(full.ok);
-                assert_eq!(full.result["tasks"][0]["brief"], brief);
-                assert_eq!(full.result["tasks"][0]["report"]["summary"], brief);
-                assert_eq!(full.result["tasks"][0]["notes"].as_array().unwrap().len(), 1003);
-                assert_eq!(full.result["ready"], json!(["b"]));
+                assert!(atomics_core::control::shown_len(&full.result) < atomics_core::control::MAX_TOOL_TEXT);
+                let task = &full.result["task"];
+                assert!(task["brief"].as_str().unwrap().starts_with("long brief"));
+                assert!(task["report"]["summary"].as_str().unwrap().ends_with("more characters]"));
+                assert!(task["cut"].as_str().unwrap().contains(&format!("{}.json", plan.as_str().unwrap())));
+                let notes = task["notes"].as_array().unwrap();
+                assert_eq!(notes.len() + task["notes_omitted"].as_u64().unwrap() as usize, 1003);
+                assert_eq!(
+                    notes.last(),
+                    app.runtime.plans[index].tasks[0].notes.last().map(|note| json!(note)).as_ref()
+                );
+                assert_eq!(task["ready"], false);
+                assert_eq!(app.runtime.plans[index].tasks[0].notes.len(), 1003);
+                assert_eq!(app.runtime.plans[index].tasks[0].brief, brief);
                 let closed = request(app, json!({"cmd":"plan_close", "plan":plan, "status":"completed"}));
                 assert!(closed.ok);
                 assert_eq!(
@@ -2162,9 +2180,9 @@ mod tests {
                     })
                 );
                 assert!(closed.result.to_string().len() < 1024);
-                let full = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                let full = request(app, json!({"cmd":"plan_get", "plan":plan, "task":"a"}));
                 assert_eq!(full.result["status"], "completed");
-                assert_eq!(full.result["tasks"][0]["brief"], brief);
+                assert!(full.result["task"]["brief"].as_str().unwrap().starts_with("long brief"));
             },
         );
     }

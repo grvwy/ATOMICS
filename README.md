@@ -587,7 +587,10 @@ brief, acceptance checks, dependencies, and which agent and model should do them
 plan and returns its unique id; pass `plan: "<id>"` to update that plan and to get, update, dispatch or integrate its
 tasks. Rewording an existing plan’s goal preserves its task progress and integration branch.
 With several open plans, update/dispatch/integrate require the id and errors list the open plans.
-`atomics_plan_get` without `plan` lists open plans with their goal, done/total, approval and waiting tasks. Select a
+`atomics_plan_get` without `plan` lists open plans with their goal, done/total, approval and waiting tasks. With `plan` it
+gives a compact view that fits the MCP client's limit for one tool answer: per task its status, dependencies, session,
+branch, and its latest note and report summary cut short. Add `task` to read that task in full: brief, acceptance,
+report and its newest notes. Select a
 plan’s tab, then open its **plan board** with `cmd+b` or **Plan** in the top bar. It has columns for planned, running,
 blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
@@ -613,7 +616,11 @@ its own approval and automatic final review. Use `atomics_plan_close {plan, stat
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
 **Closed plans** beside the plan tabs; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
-`atomics_wait` events include `plan` and `task` ids for sessions belonging to a task.
+`atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. A wait answers within 100 s
+(default 90), inside the MCP client's 120 s limit for one call, and one answer carries what fits the client's limit
+for tool text: when more events wait, it says so in `more`, and its cursor reads on from the last event shown.
+`atomics_list`, `atomics_result`, `atomics_read`, `atomics_diff` and `atomics_exec` cut long texts the same way and say
+how much they left out; `atomics_diff` takes `path` to read one file's hunks of a patch that was cut.
 
 Open a completed plan’s ✓ tab and its board. **Clean up plan…** previews only its recorded
 task and integration branches and their worktrees. Once the integration branch or every task branch is contained
@@ -632,7 +639,7 @@ that build on them. Returning a task to running clears its integration marker. B
 task's branch tip is in the integration branch with nothing left uncommitted, again whenever a ref changes, so new commits
 must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
 finish within 150 s, says why on the task card and in `atomics_plan_get`, and runs again within 30 s. Dispatching checks
-such dependencies afresh and answers once their checks have.
+such dependencies afresh and answers once their checks have, or after 100 s, inside the MCP client's limit for one call.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
 The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count

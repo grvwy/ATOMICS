@@ -3,7 +3,10 @@
 
 use std::io::{BufRead, Write};
 
-use atomics_core::control::ControlRequest;
+use atomics_core::control::{
+    ControlRequest, DEFAULT_WAIT_SECS, MAX_DIFF_FILES, MAX_PATCH_CHARS, MAX_PLAN_VIEW_CHARS, MAX_READ_LINES,
+    MAX_TOOL_TEXT, MAX_WAIT_CHARS, MAX_WAIT_SECS,
+};
 use serde_json::{Value, json};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -144,7 +147,7 @@ fn call_agent(params: &Value) -> Value {
             json!({ "content": [{ "type": "text", "text": "Reported. The orchestrator and the user can see it." }], "isError": false })
         }
         Ok(response) if response.ok => {
-            json!({ "content": [{"type":"text", "text": response.result.to_string()}], "isError":false })
+            json!({ "content": [{"type":"text", "text": fit_text(response.result.to_string())}], "isError":false })
         }
         Ok(response) => tool_error(response.error.unwrap_or_else(|| "failed".into())),
         Err(err) => tool_error(format!("{err:#}")),
@@ -274,7 +277,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_list",
-            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch and diff size.",
+            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch and diff size. Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -309,7 +312,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_set",
-            "description": "Write the plan for a goal as tasks. It appears on ATOMICS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short and unique in the plan, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Passing the id of a completed plan reopens it (archived plans stay closed): its tasks' progress and integration branch are kept, and any added or changed task needs the user's approval again. Tasks are merged into the integration branch (default atomics/plan-<plan-id>, kept unless explicitly overridden). Every plan ends with a final review task (id review) that depends on all other tasks, so no task can depend on it. A plan whose dependencies form a cycle is refused, naming the cycle; so is a planned task's branch that another task of the plan or of an open plan already has, with a free name to use instead. Leave branch out to let ATOMICS choose one at dispatch. warnings in the reply name branches that already exist outside any open plan: dispatching a task on one would fail.",
+            "description": "Write the plan for a goal as tasks. It appears on ATOMICS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short and unique in the plan, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Passing the id of a completed plan reopens it (archived plans stay closed): its tasks' progress and integration branch are kept, and any added or changed task needs the user's approval again. Tasks are merged into the integration branch (default atomics/plan-<plan-id>, kept unless explicitly overridden). Every plan ends with a final review task (id review) that depends on all other tasks, so no task can depend on it. A plan whose dependencies form a cycle is refused, naming the cycle; so is a planned task's branch that another task of the plan or of an open plan already has, with a free name to use instead. Leave branch out to let ATOMICS choose one at dispatch. warnings in the reply name branches that already exist outside any open plan: dispatching a task on one would fail. A refusal or warnings list shows its first 20 problems and counts the rest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -350,8 +353,11 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_get",
-            "description": "Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, returns the full plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start. Integrated tasks carry integration_verified, and integration_check says why one is not verified yet.",
-            "inputSchema": { "type": "object", "properties": { "plan": plan } }
+            "description": format!("Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, a compact view (at most about {MAX_PLAN_VIEW_CHARS} characters): whether the user approved it, which tasks are ready to start, and per task its status (planned, running, blocked, review, done), dependencies, agent session, branch, number of notes, and its latest note and report summary cut short. Large plans get shorter texts, and the largest list their last tasks only by id and status (more_tasks). Integrated tasks carry integration_verified, and integration_check says why one is not verified yet. With plan and task, that task in full: brief, acceptance, report, and its newest notes (notes_omitted counts older ones)."),
+            "inputSchema": { "type": "object", "properties": {
+                "plan": plan,
+                "task": { "type": "string", "description": "A task id in this plan, to read that task in full" }
+            } }
         },
         {
             "name": "atomics_plan_update",
@@ -370,7 +376,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_dispatch",
-            "description": "Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks. Agents report back with atomics_report, which wakes atomics_wait.",
+            "description": format!("Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {MAX_WAIT_SECS} s. Agents report back with atomics_report, which wakes atomics_wait."),
             "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } } }
         },
         {
@@ -380,20 +386,20 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_wait",
-            "description": "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with report summaries cut to 8000 and other texts to 2000; when more wait it says so in `more`, and its cursor reads on from the last event shown."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
                     "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan"] } },
                     "after": { "type": "integer" },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 280 }
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECS }
                 }
             }
         },
         {
             "name": "atomics_result",
-            "description": "What an agent produced: status, its last prompt, its final message (Claude), the tail of its screen, and its diff size. Read this when atomics_wait reports a turn done.",
+            "description": "What an agent produced: status, its last prompt, its final message (Claude), the tail of its screen, and its diff size. Read this when atomics_wait reports a turn done. Long texts are cut and say how much was left out.",
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         },
         {
@@ -407,19 +413,23 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_read",
-            "description": "Read what an agent's terminal shows right now (the last `lines` lines), with its status.",
+            "description": format!("Read what an agent's terminal shows right now (the last `lines` lines, default 60, at most {MAX_READ_LINES}), with its status."),
             "inputSchema": {
                 "type": "object",
-                "properties": { "session": session, "lines": { "type": "integer", "minimum": 1 } },
+                "properties": { "session": session, "lines": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES } },
                 "required": ["session"]
             }
         },
         {
             "name": "atomics_diff",
-            "description": "The agent's worktree diff against the merge-base with main: committed, uncommitted and untracked changes. patch=true includes the hunks.",
+            "description": format!("The agent's worktree diff against the merge-base with main: committed, uncommitted and untracked changes, listing at most {MAX_DIFF_FILES} files. patch=true includes the hunks, up to {MAX_PATCH_CHARS} characters; a longer patch is cut and names the files left out. path keeps only that file, or the files under that folder, to read the rest."),
             "inputSchema": {
                 "type": "object",
-                "properties": { "session": session, "patch": { "type": "boolean" } },
+                "properties": {
+                    "session": session,
+                    "patch": { "type": "boolean" },
+                    "path": { "type": "string", "description": "A file or folder in the worktree, relative to its root" }
+                },
                 "required": ["session"]
             }
         },
@@ -490,7 +500,7 @@ fn tools() -> Value {
 fn exec_tool(session: &Value) -> Value {
     json!({
         "name": "atomics_exec",
-        "description": "Chief only: run a shell command (bash -lc) in a sandboxed session's sandbox, in its worktree, to verify its work. Builds and tests run the agent's code: for sandboxed sessions run them here, never on this machine. Waits up to timeout_secs for a free test slot (class qa for QA instances), the same slots as `atomics queue`, then runs for at most timeout_secs (default 600, max 3600). Returns the exit code, whether it timed out, and the last 40000 bytes of stdout and stderr with their full sizes. Refused for bare sessions, whose checks run on this machine.",
+        "description": "Chief only: run a shell command (bash -lc) in a sandboxed session's sandbox, in its worktree, to verify its work. Builds and tests run the agent's code: for sandboxed sessions run them here, never on this machine. Waits up to timeout_secs for a free test slot (class qa for QA instances), the same slots as `atomics queue`, then runs for at most timeout_secs (default 600, max 3600). Returns the exit code, whether it timed out, and the last 24000 bytes of stdout and stderr with their full sizes. Refused for bare sessions, whose checks run on this machine.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -564,7 +574,7 @@ fn call(params: &Value) -> Value {
     };
     match crate::ipc::request(&request) {
         Ok(response) if response.ok => {
-            let text = response_text(name, &response.result);
+            let text = fit_text(response_text(name, &response.result));
             let mut reply = json!({ "content": [{ "type": "text", "text": text }], "isError": false });
             if matches!(
                 name,
@@ -594,6 +604,19 @@ fn response_text(name: &str, result: &Value) -> String {
         return exec_text(result);
     }
     serde_json::to_string_pretty(result).unwrap_or_default()
+}
+
+/// Text cut to what a client takes from one tool call, saying so. Tools bound their own
+/// answers; this catches only what they could not.
+fn fit_text(text: String) -> String {
+    match text.char_indices().nth(MAX_TOOL_TEXT) {
+        None => text,
+        Some((cut, _)) => format!(
+            "{}\n… [cut at {MAX_TOOL_TEXT} characters, {} more: ask for less, such as one task, file or session]",
+            &text[..cut],
+            text[cut..].chars().count()
+        ),
+    }
 }
 
 /// A sandbox command's outcome as it would read in a terminal: how it ended, then each stream.
@@ -834,6 +857,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn chief_tools_fit_the_clients_limits_for_one_call() {
+        let tools = tools();
+        let tool = |name: &str| tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap().clone();
+        let wait = tool("atomics_wait");
+        assert_eq!(wait["inputSchema"]["properties"]["timeout_secs"]["maximum"], MAX_WAIT_SECS);
+        let description = wait["description"].as_str().unwrap();
+        assert!(description.contains(&format!("defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}")));
+        assert!(description.contains("120 s") && description.contains("`more`"), "{description}");
+
+        let plan_get = tool("atomics_plan_get");
+        assert!(plan_get["inputSchema"]["properties"]["task"].is_object());
+        assert!(plan_get["description"].as_str().unwrap().contains("With plan and task, that task in full"));
+        match request_for_tool("atomics_plan_get", json!({"plan":"p", "task":"a"})).unwrap() {
+            ControlRequest::PlanGet { plan, task } => {
+                assert_eq!((plan.as_deref(), task.as_deref()), (Some("p"), Some("a")))
+            }
+            _ => panic!("wrong plan_get request"),
+        }
+        assert!(matches!(
+            request_for_tool("atomics_plan_get", json!({})).unwrap(),
+            ControlRequest::PlanGet { plan: None, task: None }
+        ));
+        assert!(tool("atomics_diff")["inputSchema"]["properties"]["path"].is_object());
+        assert!(matches!(
+            request_for_tool("atomics_diff", json!({"session":"s", "patch":true, "path":"src"})).unwrap(),
+            ControlRequest::Diff { patch: true, path: Some(path), .. } if path == "src"
+        ));
+        assert_eq!(tool("atomics_read")["inputSchema"]["properties"]["lines"]["maximum"], MAX_READ_LINES);
+
+        // Whatever a tool returns, the client gets at most MAX_TOOL_TEXT characters, told so.
+        assert_eq!(fit_text("short".into()), "short");
+        let cut = fit_text("é".repeat(MAX_TOOL_TEXT + 500));
+        assert!(cut.chars().count() < MAX_TOOL_TEXT + 200);
+        assert!(
+            cut.ends_with("characters, 500 more: ask for less, such as one task, file or session]"),
+            "{}",
+            &cut[cut.len() - 120..]
+        );
+
+        // A sandbox command's two full streams fit as they are, keeping the end of stderr.
+        let full = "x".repeat(crate::sandbox::exec::MAX_OUTPUT as usize);
+        let result = json!({"exit_code":1, "timed_out":false, "secs":3, "sandbox":"atomics-a", "workdir":"/home/user/repo",
+            "waited_secs":0, "class":"test", "stdout":full, "stdout_bytes":900_000, "stderr":format!("{full}error: last line"),
+            "stderr_bytes":900_000});
+        let text = response_text("atomics_exec", &result);
+        assert!(text.chars().count() < MAX_TOOL_TEXT, "{}", text.chars().count());
+        assert_eq!(fit_text(text.clone()), text);
+        assert!(text.ends_with("error: last line\n"));
+    }
 
     fn example(schema: &Value, required_only: bool) -> Value {
         if let Some(choices) = schema.get("oneOf").and_then(Value::as_array) {

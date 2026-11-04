@@ -185,7 +185,8 @@ impl State {
                 self.integration_retries.insert(key, Instant::now());
             }
         }
-        let deadline = Instant::now() + INTEGRATION_CHECK_LIMIT;
+        // The answer comes within the chief's call limit even when a check takes longer.
+        let deadline = Instant::now() + INTEGRATION_CHECK_LIMIT.min(MAX_WAIT);
         self.dispatch_waiters.push(DispatchWaiter { plan, only, reply, deadline });
         self.serve_dispatches();
     }

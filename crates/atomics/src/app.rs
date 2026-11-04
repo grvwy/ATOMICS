@@ -61,6 +61,7 @@ mod mutations;
 mod open_link;
 mod pairing;
 mod plan_cleanup;
+mod plan_read;
 mod plan_view;
 mod plans;
 pub(crate) mod projection;
@@ -413,7 +414,8 @@ struct Waiter {
     reply: Sender<ControlOutcome>,
 }
 
-const MAX_WAIT: Duration = Duration::from_secs(280);
+/// A wait answers well inside the MCP client's limit for one call.
+const MAX_WAIT: Duration = Duration::from_secs(atomics_core::control::MAX_WAIT_SECS);
 
 struct QuickOpen {
     query: String,
