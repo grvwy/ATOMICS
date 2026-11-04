@@ -11,6 +11,16 @@ let
   cfg = config.atomics.vm;
   stepFiles = lib.mapAttrs' (name: path: lib.nameValuePair "atomics/onboard.d/${name}.sh" { source = path; });
   checkFiles = lib.mapAttrs' (name: path: lib.nameValuePair "atomics/check.d/${name}.sh" { source = path; });
+  home = "/home/${cfg.user}";
+  hostSocket = "/run/atomics/atomics.sock";
+  credentials = "${home}/.local/share/atomics/credentials";
+  # The host starts in the first writable Mac folder, the repositories.
+  hostFolder = lib.head (lib.filter (path: config.programs.atomics.macDesktop.shares.${path}.writable)
+    (lib.attrNames config.programs.atomics.macDesktop.shares) ++ [ home ]);
+  hostArgs = lib.concatStringsSep " " (map lib.escapeShellArg (
+    [ "--remote-port" (toString cfg.host.port) ]
+    ++ lib.optionals (cfg.host.workspace != null) [ "-w" cfg.host.workspace ]
+    ++ cfg.host.projects));
 in
 {
   imports = [
@@ -64,6 +74,34 @@ in
       '';
     };
 
+    host = {
+      enable = lib.mkEnableOption ''
+        the ATOMICS host in this VM (recommended). `atomics host` runs here as the VM's user: agents,
+        the chief, hooks, MCP, git and builds all run in the VM, and ATOMICS on the Mac is only its
+        window, a client over atomics.v1 through an ssh forward with a paired token (docs/nixos-vm.md)
+      '';
+
+      port = mkOption {
+        type = types.port;
+        default = 47800;
+        description = "The host's protocol server port, on the guest's loopback only. The Mac's forward opens the same one.";
+      };
+
+      workspace = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "daily";
+        description = "A saved workspace (a set of projects) the host opens: `atomics host -w <workspace>`.";
+      };
+
+      projects = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "/Users/alice/repos/app" ];
+        description = "Projects the host opens, in the shared folders. Empty: the last session's, or none.";
+      };
+    };
+
     checks = mkOption {
       type = types.attrsOf types.path;
       default = { };
@@ -106,7 +144,7 @@ in
 
     users.users.${cfg.user} = {
       isNormalUser = true;
-      home = "/home/${cfg.user}";
+      inherit home;
       createHome = true;
       uid = 1000;
       extraGroups = [ "wheel" "docker" ];
@@ -181,6 +219,39 @@ in
 
     programs.atomics.enable = true;
     programs.atomics.user = cfg.user;
+    # The VM is the agents' boundary: they run bare here, as with the Mac's wrappers. Seeded only
+    # when the user has no config yet.
+    programs.atomics.settings = lib.mkIf cfg.host.enable { isolation.mode = "bare"; };
+
+    # The ATOMICS host (atomics.vm.host): `atomics host` in a login shell of the VM's user, so agents get
+    # the PATH and variables an interactive session has, in the Mac's shared folders. Its socket and
+    # its sign-ins are this VM's; the protocol server listens on the guest's loopback only.
+    environment.sessionVariables = lib.mkIf cfg.host.enable {
+      ATOMICS_SOCKET = hostSocket;
+      ATOMICS_CREDENTIALS_DIR = credentials;
+    };
+    systemd.services.atomics-host = lib.mkIf cfg.host.enable {
+      description = "ATOMICS host (agents, chief, hooks and git for the Mac's ATOMICS)";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "atomics-mac-shares.service" ];
+      after = [ "atomics-mac-shares.service" "network.target" ];
+      environment = {
+        ATOMICS_SOCKET = hostSocket;
+        ATOMICS_CREDENTIALS_DIR = credentials;
+        HOME = home;
+      };
+      serviceConfig = {
+        User = cfg.user;
+        Group = "users";
+        WorkingDirectory = hostFolder;
+        RuntimeDirectory = "atomics";
+        RuntimeDirectoryMode = "0700";
+        ExecStart = "${pkgs.bash}/bin/bash --login -c ${lib.escapeShellArg "exec atomics host ${hostArgs}"}";
+        Restart = "on-failure";
+        RestartSec = 5;
+        TimeoutStopSec = 30;
+      };
+    };
 
     image.repart.imageSize = "${toString cfg.diskGiB}G";
 
@@ -188,6 +259,7 @@ in
     programs.atomics.macDesktop = {
       enable = true;
       user = cfg.macUser;
+      hostPort = if cfg.host.enable then cfg.host.port else null;
       lima.settings = {
         minimumLimaVersion = "2.2.0";
         vmType = "vz";

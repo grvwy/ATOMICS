@@ -6,7 +6,7 @@ test "$(uname -m)" = aarch64
 test "$(findmnt -n -o FSTYPE /)" = btrfs
 grep -q 'flags: .*F' /proc/sys/fs/binfmt_misc/rosetta
 
-for tool in node git gh claude codex cargo rustc rustup docker atomics-onboard jq; do
+for tool in node git gh claude codex cargo rustc rustup docker atomics-onboard jq ss; do
   command -v "$tool"
 done
 
@@ -36,15 +36,47 @@ if [ -r /etc/atomics/mac-desktop.env ]; then
   for exe in $ATOMICS_MAC_EXECUTABLES; do
     test "$(readlink -f "$exe")" = "$(readlink -f "$(command -v atomics)")"
   done
-  test "$ATOMICS_SOCKET" = "$ATOMICS_MAC_SOCKET"
   test "$(stat -c '%U %a' "${ATOMICS_MAC_SOCKET%/*}")" = "$(id -un) 700"
   grep -qix 'streamlocalbindunlink yes' <<<"$sshd_config"
   command -v atomics-vm-exec
-  if [ -S "$ATOMICS_MAC_SOCKET" ]; then
-    atomics ctl '{"cmd":"list"}' >/dev/null
-    printf 'forwarded socket: ATOMICS on the Mac answers\n'
+  if [ -n "${ATOMICS_HOST_PORT-}" ]; then
+    # The ATOMICS host runs here (atomics.vm.host): its own socket, its protocol server on this
+    # machine's loopback alone, and an agent it starts runs here, in a Mac folder.
+    systemctl is-active --quiet atomics-host
+    test "$ATOMICS_SOCKET" != "$ATOMICS_MAC_SOCKET"
+    test "$(stat -c '%U %a' "${ATOMICS_SOCKET%/*}")" = "$(id -un) 700"
+    remote=$(atomics ctl '{"cmd":"remote"}')
+    test "$(jq -r .result.protocol.url <<<"$remote")" = "ws://127.0.0.1:$ATOMICS_HOST_PORT"
+    listeners=$(ss -Hltn "sport = :$ATOMICS_HOST_PORT" | awk '{print $4}')
+    test "$listeners" = "127.0.0.1:$ATOMICS_HOST_PORT"
+    printf 'ATOMICS host: running, atomics.v1 on 127.0.0.1:%s only\n' "$ATOMICS_HOST_PORT"
+    share=
+    for entry in $ATOMICS_MAC_SHARES; do
+      [ "${entry##*:}" = rw ] && { share=${entry%:*}; break; }
+    done
+    test -n "$share"
+    probe=$(mktemp -d "$share/.atomics-vm-check.XXXXXX")
+    started=$(atomics ctl "$(jq -cn --arg folder "$probe" '{cmd:"start",agent:"shell",folder:$folder,isolation:"bare"}')")
+    session=$(jq -r '.result.id // empty' <<<"$started")
+    test -n "$session"
+    pid=
+    for _ in $(seq 50); do
+      pid=$(atomics ctl '{"cmd":"list"}' | jq -r --arg id "$session" '.result.sessions[] | select(.id == $id) | .pid // empty')
+      [ -n "$pid" ] && break
+      sleep 0.2
+    done
+    test "$(readlink -f "/proc/$pid/cwd")" = "$(readlink -f "$probe")"
+    atomics ctl "$(jq -cn --arg id "$session" '{cmd:"close",session:$id}')" >/dev/null
+    rm -rf -- "$probe"
+    printf 'ATOMICS host: an agent ran here (pid %s) in %s\n' "$pid" "$share"
   else
-    printf 'forwarded socket: off (the default; docs/nixos-vm.md, The socket forward)\n'
+    test "$ATOMICS_SOCKET" = "$ATOMICS_MAC_SOCKET"
+    if [ -S "$ATOMICS_MAC_SOCKET" ]; then
+      atomics ctl '{"cmd":"list"}' >/dev/null
+      printf 'forwarded socket: ATOMICS on the Mac answers\n'
+    else
+      printf 'forwarded socket: off (the default; docs/nixos-vm.md, The socket forward)\n'
+    fi
   fi
 fi
 

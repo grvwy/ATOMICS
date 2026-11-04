@@ -49,6 +49,8 @@ pub(crate) struct RemoteView {
     pub devices: Option<Arc<Devices>>,
     /// `[remote.rendezvous] pair_url`, the template of the pairing link.
     pub pair_url: String,
+    /// Clients paired by a token (`protocol::clients`), while the protocol server runs.
+    pub clients: Option<Arc<protocol::clients::PairedClients>>,
 }
 
 impl Host {
@@ -66,13 +68,13 @@ impl Host {
             Some(error) => Err(error),
             None => start_protocol(&mut state, &remote, &projections, &bodies),
         };
-        let (protocol, terminals, protocol_error) = match started {
-            Ok(Some((server, terminals))) => (Some(server), Some(terminals), None),
-            Ok(None) => (None, None, None),
+        let (protocol, terminals, clients, protocol_error) = match started {
+            Ok(Some((server, terminals, clients))) => (Some(server), Some(terminals), Some(clients), None),
+            Ok(None) => (None, None, None, None),
             Err(error) => {
                 // The desktop is useful without it; say why and carry on. `atomics host` stops instead.
                 eprintln!("atomics: the protocol server did not start: {error}");
-                (None, None, Some(error.to_string()))
+                (None, None, None, Some(error.to_string()))
             }
         };
         let (rendezvous, profile, status, devices) =
@@ -84,6 +86,7 @@ impl Host {
             rendezvous: status,
             devices,
             pair_url: remote.rendezvous.pair_url.clone(),
+            clients,
         });
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -207,6 +210,9 @@ impl Drop for Host {
     }
 }
 
+/// The protocol server, the terminals it may stream and the clients paired with it.
+type Protocol = (protocol::Server, Arc<protocol::Terminals>, Arc<protocol::clients::PairedClients>);
+
 /// `Ok(None)` when `[remote]` is off: then there is no thread, no socket and no journal file.
 /// `state` carries out the server's mutations; `config` is its `[remote]`, read once by `start`.
 fn start_protocol(
@@ -214,23 +220,25 @@ fn start_protocol(
     config: &atomics_core::config::RemoteAccessConfig,
     projections: &Arc<Projections>,
     bodies: &Arc<DiffBodies>,
-) -> std::io::Result<Option<(protocol::Server, Arc<protocol::Terminals>)>> {
+) -> std::io::Result<Option<Protocol>> {
     if !config.enabled {
         return Ok(None);
     }
     let home = atomics_core::paths::atomics_home();
     let terminals = Arc::new(protocol::Terminals::default());
+    let clients = Arc::new(protocol::clients::PairedClients::open(home.join("paired-clients.json"))?);
     let server_config = protocol::ServerConfig {
         port: config.port,
         allowed_origins: config.allowed_origins.clone(),
         advertise: Some(home.join("protocol.json")),
+        paired: Some(clients.clone()),
         ..protocol::ServerConfig::default()
     };
     let commands = Arc::new(state.op_sender());
     let server =
         protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone(), commands)?;
     state.serve_commands(&home.join("protocol-ops.jsonl"));
-    Ok(Some((server, terminals)))
+    Ok(Some((server, terminals, clients)))
 }
 
 /// Kept open for the lifetime of all remote services; never remove the lock file.

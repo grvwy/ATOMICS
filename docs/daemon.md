@@ -579,6 +579,19 @@ desktop exactly as before.
   `[remote]` port first and expects exit 1, an accurate log line, no advert or socket left, and a healthy host on that
   port once it is free. `app::host_tests` checks the refusals and the drained client
   events in process, and `instance::tests` the lock both ways.
+- **A service's own port.** `atomics host --remote-port PORT` turns the protocol server on, on that loopback
+  port, whatever `[remote]` says, and keeps it on across config reloads: the NixOS VM's `atomics-host` service
+  relies on it (docs/nixos-vm.md, "The host in the VM").
+- **Paired clients.** Besides the per-start token in `protocol.json`, the server takes the token of a client
+  paired with `atomics ctl '{"cmd":"pair_client","name":…}'` (`protocol/clients.rs`): minted once, answered
+  once, kept as a SHA-256 digest in `paired-clients.json` (0600), replaced by pairing the name again and
+  forgotten by `unpair_client`. Such a client is a controller under its own name (the lease holder others see,
+  and the journal's `device:` key). The upgrade's `Host` must still name the loopback, on any port, so a
+  client can come through a forward that listens on another one; a page a DNS-rebinding attack drives names
+  its own host and is refused, and a browser cannot send the bearer token anyway.
+- **A headless credential store.** `ATOMICS_CREDENTIALS_DIR` (Linux only) keeps what ATOMICS would put in the
+  OS credential store (the ticket sign-in, MCP sign-ins, rendezvous keys) as private files instead: a 0700
+  folder of 0600 files, an item each. For a machine without a keyring that is one trust domain, as the VM is.
 - **Not yet.** The desktop cannot attach to a running host as a client (phase 3). Terminals keep the size they
   started with unless a lease holder asks for its own (H3), and are seen and typed into through ctl, MCP and
   `atomics.v1` (H2, H3). The container profile stays in Phase F.

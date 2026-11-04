@@ -3,7 +3,7 @@
 # aarch64-linux Nix container (docs/nixos-vm.md, "Build on a Mac with Docker").
 #
 #   scripts/macos-vm-build.sh [--out DIR] [--instance NAME] [--mac-user NAME]
-#                             [--cpus N] [--memory-gib N] [--disk-gib N]
+#                             [--cpus N] [--memory-gib N] [--disk-gib N] [--host]
 #
 # - The Nix store is a named Docker volume (ATOMICS_NIX_VOLUME, default atomics-nix-store), so a
 #   second run rebuilds only what changed and a run with nothing changed copies nothing.
@@ -16,6 +16,8 @@
 #   Building as the container's root without that `unshare` would need a patched image builder,
 #   whose output no other builder shares.
 # - It runs through `atomics queue --class test` when ATOMICS is on PATH, so it waits for a slot.
+# - --host builds the VM with the ATOMICS host in it (atomics.vm.host, recommended): agents run
+#   there and the Mac's ATOMICS shows them.
 #
 # It prints the image and bundle paths. DIR (default target/atomics-vm) gets atomics-vm.raw (a
 # sparse disk), bundle/ (the Mac side, no /nix/store reference) and build.json.
@@ -30,6 +32,7 @@ mac_user=$(id -un)
 cpus=4
 memory=8
 disk=100
+host=false
 while [ "$#" -gt 0 ]; do
   case $1 in
     --out) out=$2; shift 2 ;;
@@ -38,6 +41,7 @@ while [ "$#" -gt 0 ]; do
     --cpus) cpus=$2; shift 2 ;;
     --memory-gib) memory=$2; shift 2 ;;
     --disk-gib) disk=$2; shift 2 ;;
+    --host) host=true; shift ;;
     -h|--help) usage ;;
     *) echo "macos-vm-build: unknown argument $1" >&2; usage 64 ;;
   esac
@@ -52,15 +56,16 @@ done
 if [ -z "${ATOMICS_VM_BUILD_QUEUED-}" ] && command -v atomics >/dev/null 2>&1; then
   export ATOMICS_VM_BUILD_QUEUED=1
   exec atomics queue --class test -- "${BASH_SOURCE[0]}" --out "$out" --instance "$instance" \
-    --mac-user "$mac_user" --cpus "$cpus" --memory-gib "$memory" --disk-gib "$disk"
+    --mac-user "$mac_user" --cpus "$cpus" --memory-gib "$memory" --disk-gib "$disk" \
+    $([ "$host" = true ] && echo --host)
 fi
 
 command -v docker >/dev/null || { echo "macos-vm-build: needs Docker" >&2; exit 69; }
 volume=${ATOMICS_NIX_VOLUME:-atomics-nix-store}
 # nixos/nix 2.35.4, arm64 and amd64, pinned by digest. An empty volume starts from its /nix.
 image=${ATOMICS_NIX_IMAGE:-nixos/nix@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0}
-settings=$(printf '{"macUser":"%s","cpus":%s,"memoryGiB":%s,"diskGiB":%s,"instance":"%s"}' \
-  "$mac_user" "$cpus" "$memory" "$disk" "$instance")
+settings=$(printf '{"macUser":"%s","cpus":%s,"memoryGiB":%s,"diskGiB":%s,"instance":"%s","host":%s}' \
+  "$mac_user" "$cpus" "$memory" "$disk" "$instance" "$host")
 
 mkdir -p -- "$out"
 out=$(cd -- "$out" && pwd -P)

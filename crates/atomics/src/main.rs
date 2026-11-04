@@ -150,6 +150,9 @@ enum Command {
     Host {
         /// Projects (git repositories) to open, as `atomics <path>` does
         projects: Vec<PathBuf>,
+        /// Serve `atomics.v1` on this loopback port whatever `[remote]` says (a service's own setting)
+        #[arg(long, value_name = "PORT")]
+        remote_port: Option<u16>,
     },
     /// The ATOMICS VM on a Mac: set it up from a built image and bundle, start, stop and check it
     /// (docs/nixos-vm.md). macOS only.
@@ -396,11 +399,12 @@ fn main() -> eframe::Result {
                 atomics_core::governor::SlotClass::parse(&class).unwrap_or(atomics_core::governor::SlotClass::Test);
             std::process::exit(governor::run_queued(&atomics_core::paths::socket_path(), class, &command));
         }
-        Some(Command::Host { projects }) => {
+        Some(Command::Host { projects, remote_port }) => {
             let options = app::Options {
                 projects: projects.iter().map(|p| atomics_core::paths::expand(&p.to_string_lossy())).collect(),
                 workspace: cli.workspace,
                 migration_errors,
+                remote_port,
                 ..app::Options::default()
             };
             std::process::exit(headless::run(options));
@@ -480,6 +484,7 @@ fn main() -> eframe::Result {
         screenshot: cli.screenshot,
         screenshot_delay: cli.screenshot_delay,
         migration_errors,
+        remote_port: None,
     };
     let icon = load_icon();
     let mut native = eframe::NativeOptions {
@@ -586,7 +591,8 @@ mod cli_tests {
     #[test]
     fn host_takes_projects_and_the_workspace_and_plain_atomics_stays_the_desktop() {
         let cli = Cli::try_parse_from(["atomics", "host", "-w", "daily", "~/repos/a", "/repos/b"]).unwrap();
-        let Some(Command::Host { projects }) = cli.command else { panic!("host command") };
+        let Some(Command::Host { projects, remote_port }) = cli.command else { panic!("host command") };
+        assert_eq!(remote_port, None);
         assert_eq!(projects, [PathBuf::from("~/repos/a"), PathBuf::from("/repos/b")]);
         assert_eq!(cli.workspace.as_deref(), Some("daily"));
         let cli = Cli::try_parse_from(["atomics"]).unwrap();

@@ -107,6 +107,8 @@ pub struct Options {
     pub migration_errors: Vec<String>,
     /// An `atomics://open` link the launch was given, handled once the app has loaded.
     pub link: Option<crate::open_link::Incoming>,
+    /// `atomics host --remote-port`: `[remote]` on, on this port, whatever the config file says.
+    pub remote_port: Option<u16>,
 }
 
 pub struct Session {
@@ -438,6 +440,8 @@ pub(crate) struct State {
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
     remote: crate::host::RemoteView,
+    /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
+    remote_port: Option<u16>,
     wake: crate::host::Wake,
     control_tx: crate::host::Sender<ControlMessage>,
     client_commands: Vec<ControlRequest>,
@@ -917,10 +921,11 @@ impl State {
         crate::sandbox::load_pins(&paths::git_pins_dir());
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
-        let (config, config_error) = match Config::load_or_create(&config_path) {
+        let (mut config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
         };
+        with_remote_port(&mut config, options.remote_port);
         let config_problems = github::config_problems(&config);
         let (theme, theme_errors) = Theme::load(&config.theme, &theme::themes_dir(&config_path));
         let theme_error = theme_error(&theme_errors);
@@ -982,6 +987,7 @@ impl State {
         let mut app = State {
             window,
             remote: crate::host::RemoteView::default(),
+            remote_port: options.remote_port,
             wake: wake.clone(),
             control_tx,
             client_commands: Vec::new(),
@@ -1360,6 +1366,15 @@ impl State {
             notes.extend(removed.err().map(|err| format!("Scratch session {}: {err:#}", dir.display())));
         }
         crate::lifecycle::record_leftovers(&home, &notes);
+    }
+}
+
+/// `atomics host --remote-port`: the protocol server on that port, on loopback as always, whatever the
+/// config file says, so a service can rely on it (the NixOS VM's host, docs/nixos-vm.md).
+pub(crate) fn with_remote_port(config: &mut Config, port: Option<u16>) {
+    if let Some(port) = port {
+        config.remote.enabled = true;
+        config.remote.port = port;
     }
 }
 

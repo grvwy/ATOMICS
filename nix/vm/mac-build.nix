@@ -12,7 +12,10 @@ let
   vm = flake.nixosConfigurations.atomics-vm.extendModules {
     modules = [
       {
-        atomics.vm = { inherit (s) macUser cpus memoryGiB diskGiB; };
+        atomics.vm = {
+          inherit (s) macUser cpus memoryGiB diskGiB;
+          host.enable = s.host or false;
+        };
         programs.atomics.macDesktop.lima.instance = s.instance;
       }
     ];
