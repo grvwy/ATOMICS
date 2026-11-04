@@ -477,14 +477,23 @@ fn codex_menu(screen: &str) -> Option<NativeMenu> {
     Some(NativeMenu { kind: MenuKind::Codex, command, reason: reason.filter(|reason| !reason.is_empty()) })
 }
 
-/// The command Codex shows after its `$`, a line per screen line, or `None` when it shows none.
+/// The command Codex shows after its `$`, a line per screen line, or `None` when it shows none or
+/// the screen cannot tell where it ends. Codex lists its choices right below the command (0.165)
+/// or after a blank row. A blank row inside the command, or a line of it that reads as a choice
+/// (`1. text`), looks like the end of the command: the part above it would be reviewed and
+/// approved while Codex runs all of it. Such a command is expanded or left to the terminal.
 fn codex_shown(menu: &str) -> Option<String> {
     let line = menu.lines().find(|line| line.trim_start().starts_with('$'))?;
     let shown = menu[menu.find(line)?..].trim_start().strip_prefix('$')?;
-    let shown = shown.split("\n\n").next()?;
-    // Codex 0.165 lists the choices right below the command, without a blank line.
-    let lines = shown.lines().take_while(|line| choice(line).is_none()).map(str::trim);
-    Some(lines.collect::<Vec<_>>().join("\n").trim().to_string())
+    let lines: Vec<&str> = shown.lines().collect();
+    // The menu's own first choice is the last one numbered 1: the choices come last.
+    let menu_start = lines.iter().rposition(|line| choice(line).is_some_and(|(number, _)| number == "1"))?;
+    let end = lines[..menu_start].iter().rposition(|line| !line.trim().is_empty()).map_or(0, |last| last + 1);
+    let command = &lines[..end];
+    if command.iter().any(|line| line.trim().is_empty() || choice(line).is_some()) {
+        return None;
+    }
+    Some(command.iter().map(|line| line.trim()).collect::<Vec<_>>().join("\n").trim().to_string())
 }
 
 fn claude_menu(screen: &str) -> Option<NativeMenu> {
@@ -1098,6 +1107,46 @@ mod tests {
         assert_eq!(native_key(&moved, &claude, Decision::Deny).as_deref(), Some("\x1b"));
         let sandbox = CLAUDE_SCREEN.replace(" Bash command\n", " Bash command (unsandboxed)\n");
         assert!(native_menu(&sandbox).unwrap().same(&claude));
+    }
+
+    #[test]
+    fn a_codex_command_with_a_blank_or_numbered_line_is_never_approved_in_part() {
+        const SHOWN: &str = "  $ atomics queue --class test -- ./check.sh\n";
+        // The recorded menu, for commands whose blank row or `1. ` line reads as the command's end.
+        let blank = "python3 - <<'PY'\nimport shutil\n\nshutil.rmtree('fixture')\nPY";
+        let numbered = "cat > notes.md <<'EOF'\n1. Write the fixture\nEOF\nrm -rf fixture";
+        for (command, part) in [(blank, "python3 - <<'PY'\nimport shutil"), (numbered, "cat > notes.md <<'EOF'")] {
+            let lines: Vec<String> = command.lines().map(|line| format!("  {line}").trim_end().to_string()).collect();
+            let screen = CODEX_SCREEN.replace(SHOWN, &format!("  $ {}\n", lines.join("\n").trim_start()));
+            assert!(screen.contains(command.lines().last().unwrap()), "{screen}");
+            // Neither the whole command nor the part above that line becomes a request, and no key goes
+            // to Codex for either: the menu stays in its terminal.
+            assert_eq!(native_menu(&screen), None, "{screen}");
+            for decision in [Decision::Allow, Decision::AllowAlways, Decision::Deny] {
+                assert_eq!(menu_key(&screen, Some(command), decision), None, "{screen}");
+                assert_eq!(menu_key(&screen, Some(part), decision), None, "{screen}");
+            }
+            // Where Codex offers to show it all, ATOMICS expands it rather than guess.
+            let expandable = screen.replace(
+                "  access the ATOMICS test queue socket?\n",
+                "  access the ATOMICS test queue socket?\n  [… 2 lines] ⌃a view all\n",
+            );
+            let menu = native_menu(&expandable).unwrap();
+            assert_eq!((menu.kind, menu.command.as_deref()), (MenuKind::Codex, None));
+            assert_eq!(native_key(&expandable, &menu, Decision::Allow).as_deref(), Some("\x01"));
+            assert_eq!(menu_key(&expandable, Some(part), Decision::Allow).as_deref(), Some("\x01"));
+        }
+        // The recorded command itself, and one that has a numbered line only as part of a longer one,
+        // still read whole.
+        assert_eq!(
+            native_menu(CODEX_SCREEN).unwrap().command.as_deref(),
+            Some("atomics queue --class test -- ./check.sh")
+        );
+        let inline = CODEX_SCREEN.replace("./check.sh\n›", "./check.sh 1. 2.\n›");
+        assert_eq!(
+            native_menu(&inline).unwrap().command.as_deref(),
+            Some("atomics queue --class test -- ./check.sh 1. 2.")
+        );
     }
 
     #[test]
