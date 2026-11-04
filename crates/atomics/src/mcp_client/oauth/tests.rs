@@ -118,6 +118,8 @@ pub(crate) struct State {
     pub(crate) token_delay: Duration,
     /// The resource refuses every token, even one just issued.
     pub(crate) refuse_access: bool,
+    /// The MCP server answers 403 to its own valid tokens, as to a person without the right.
+    pub(crate) mcp_forbids: bool,
     /// What each code and refresh token's grant holds.
     pub(crate) code_resources: HashMap<String, Vec<String>>,
     pub(crate) grant_resources: HashMap<String, Vec<String>>,
@@ -366,6 +368,9 @@ impl Fake {
                 ));
             }
             return Resp(401, headers, "unauthorized".into());
+        }
+        if st.mcp_forbids {
+            return Resp(403, vec![], "forbidden".into());
         }
         let body: Value = serde_json::from_str(&r.body).unwrap();
         if let Some(tickets) = &self.tickets {
@@ -696,6 +701,21 @@ fn a_rest_read_refused_with_a_403_says_the_sign_in_lacks_the_right() {
     assert!(!text.contains("token_env"), "{text}");
     assert!(!is_sign_in_required(&text), "{text}");
     assert_eq!(refresh_requests(&fake).len(), refreshes, "a new token would not help");
+}
+
+#[test]
+fn an_mcp_request_refused_with_a_403_says_the_sign_in_lacks_the_right() {
+    let fake = Fake::start();
+    let (_dir, oauth) = machine();
+    let server = fake.server();
+    sign_in(&oauth, &server).unwrap();
+
+    fake.state.lock().unwrap().mcp_forbids = true;
+    let error = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).err().unwrap();
+    assert!(!error.needs_sign_in(), "another sign-in would not help: {error:?}");
+    let text = error.to_string();
+    assert!(text.contains("HTTP 403 (the sign-in lacks the right to this)"), "{text}");
+    assert!(!text.contains("token_env"), "{text}");
 }
 
 #[test]

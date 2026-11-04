@@ -79,6 +79,16 @@ impl McpError {
     }
 }
 
+/// What a refused request's error says a person can do. A sign-in's 401 is answered before this is
+/// asked, and with no token sent there is none to check.
+fn refusal_hint(status: u16, signed_in: bool, token_sent: bool) -> &'static str {
+    match (status, signed_in, token_sent) {
+        (403, true, _) => " (the sign-in lacks the right to this)",
+        (401 | 403, false, true) => " (check server.token_env)",
+        _ => "",
+    }
+}
+
 impl std::fmt::Display for McpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -491,7 +501,7 @@ impl HttpServer {
                     self.url
                 )));
             }
-            let hint = if matches!(status, 401 | 403) { " (check server.token_env)" } else { "" };
+            let hint = refusal_hint(status, self.oauth.is_some(), self.token.is_some());
             let body: String = body.chars().take(300).collect();
             return Err(McpError::http(status, format!("{} answered HTTP {status}{hint}: {}", self.url, body.trim())));
         }
@@ -1057,12 +1067,25 @@ pub(crate) mod tests {
         );
         assert!(!seen[0].to_ascii_lowercase().contains("mcp-session-id"));
 
-        let (url, _) = http_server(|_| (401, vec![], "unauthorized".into()));
-        let failed =
-            McpClient::connect(&McpServer { url: Some(url), ..McpServer::default() }, Duration::from_secs(5), |_| None);
-        assert!(
-            matches!(failed, Err(McpError::Transport { message: m, .. }) if m.contains("HTTP 401 (check server.token_env)"))
-        );
+        let refusals: [fn(&Value) -> HttpAnswer; 2] =
+            [|_| (401, vec![], "unauthorized".into()), |_| (403, vec![], "forbidden".into())];
+        for answer in refusals {
+            let status = answer(&Value::Null).0;
+            let (url, _) = http_server(answer);
+            // A static token cannot sign in: the person checks the token.
+            let token =
+                McpServer { url: Some(url.clone()), token_env: Some("TRACKER_TOKEN".into()), ..McpServer::default() };
+            let failed = McpClient::connect(&token, Duration::from_secs(5), |_| Some("s3cret".into()));
+            assert!(
+                matches!(failed, Err(McpError::Transport { message: m, .. }) if m.contains(&format!("HTTP {status} (check server.token_env)")))
+            );
+            // No token was sent, so there is none to check.
+            let none = McpServer { url: Some(url), ..McpServer::default() };
+            let failed = McpClient::connect(&none, Duration::from_secs(5), |_| None);
+            assert!(
+                matches!(failed, Err(McpError::Transport { message: m, .. }) if m.contains(&format!("HTTP {status}")) && !m.contains("token_env"))
+            );
+        }
     }
 
     fn start_event_stream(stream: &mut TcpStream) {
