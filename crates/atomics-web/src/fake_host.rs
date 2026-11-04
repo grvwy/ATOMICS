@@ -1556,11 +1556,18 @@ pub fn ticket_card(key: &str) -> atomics_core::tickets::TicketCard {
             title: Some(format!("Fix ticket {key}")),
             state: Some("Todo".into()),
             url: Some(format!("https://tickets.example.com/{key}")),
+            updated_at: Some("2026-11-04T08:50:34Z".into()),
             ..TicketLink::default()
         },
         body: Some(
             "# Description\nRead this ticket inside the app.\n\n[Documentation](https://example.com/docs)".into(),
         ),
+        links: vec![atomics_core::tickets::DevLink {
+            label: Some("Fix the parser".into()),
+            url: Some("https://example.com/pull/7".into()),
+            status: Some("Merged".into()),
+            ci: Some("Succeeded".into()),
+        }],
         comments: vec![Comment {
             author: Some("Example author".into()),
             text: "The reproduction is attached.".into(),
