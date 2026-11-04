@@ -497,6 +497,7 @@ impl Worker {
             }
             TicketOp::List(board) => {
                 let name = config.list_operation().unwrap_or("list");
+                let board = self.addressed(config, name, board)?;
                 let output = self.call(config, name, &Vars::new(system).ticket(&board).board(Some(&board)))?;
                 let links = config.operation(name).expect("called").tickets(&output, system)?;
                 Ok(TicketOutput::Tickets(
