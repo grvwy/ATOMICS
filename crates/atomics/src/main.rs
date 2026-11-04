@@ -39,6 +39,7 @@ mod theme;
 mod ticket_signin;
 mod tickets;
 mod usage;
+mod vm;
 mod voice;
 mod watcher;
 
@@ -150,6 +151,12 @@ enum Command {
         /// Projects (git repositories) to open, as `atomics <path>` does
         projects: Vec<PathBuf>,
     },
+    /// The ATOMICS VM on a Mac: set it up from a built image and bundle, start, stop and check it
+    /// (docs/nixos-vm.md). macOS only.
+    Vm {
+        #[command(subcommand)]
+        command: VmCommand,
+    },
     /// Run a heavy command, such as a full test run or a QA instance, once ATOMICS has a free slot
     Queue {
         #[arg(long, default_value = "test", value_parser = ["test", "qa"])]
@@ -157,6 +164,36 @@ enum Command {
         /// The command, after `--`
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmCommand {
+    /// Install the bundle, create the Lima instance from the image, start and check it, list the
+    /// sign-ins left and show the config change for this Mac (written only by `vm config --apply`)
+    Setup {
+        /// The build's folder, with atomics-vm.raw and bundle/ (scripts/macos-vm-build.sh prints it)
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
+        /// Delete and recreate an instance of the bundle's name that this setup did not create
+        #[arg(long)]
+        replace: bool,
+        /// Confirm --replace without asking
+        #[arg(long, requires = "replace")]
+        yes: bool,
+    },
+    /// Start the VM (waits for a QA slot)
+    Start,
+    /// Stop the VM
+    Stop,
+    /// Whether the VM is set up, stopped, starting or running
+    Status,
+    /// Run the guest check and list the sign-ins left
+    Check,
+    /// Show this Mac's config change for the VM; --apply writes it, keeping a backup
+    Config {
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -367,6 +404,21 @@ fn main() -> eframe::Result {
                 ..app::Options::default()
             };
             std::process::exit(headless::run(options));
+        }
+        Some(Command::Vm { command }) => {
+            let result = match command {
+                VmCommand::Setup { from, replace, yes } => vm::setup::setup(vm::setup::Setup { from, replace, yes }),
+                VmCommand::Start => vm::setup::start(),
+                VmCommand::Stop => vm::setup::stop(),
+                VmCommand::Status => vm::setup::status(),
+                VmCommand::Check => vm::setup::check_command(),
+                VmCommand::Config { apply } => vm::setup::config(apply),
+            };
+            if let Err(error) = result {
+                eprintln!("atomics vm: {error:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Some(Command::Ctl { json }) => {
             let response = serde_json::from_str::<atomics_core::control::ControlRequest>(&json)

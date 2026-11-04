@@ -268,6 +268,16 @@ let
     portForwards = [ { guestIP = "0.0.0.0"; guestPortRange = [ 1 65535 ]; proto = "any"; ignore = true; } ];
   };
 
+  # What `atomics vm` on the Mac reads about this VM (crates/atomics/src/vm.rs, BundleInfo).
+  bundleInfo = builtins.toJSON {
+    version = 1;
+    instance = cfg.lima.instance;
+    user = atomics.user;
+    home = vmUser.home;
+    macUser = cfg.user;
+    installDir = cfg.installDir;
+  };
+
   textFile = name: text: executable: pkgs.writeTextFile { inherit name text executable; };
   bundle = pkgs.runCommand "atomics-vm-mac" {
     nativeBuildInputs = [ pkgs.shellcheck ];
@@ -288,6 +298,7 @@ let
     install -m 0644 ${textFile "atomics-vm-config" configSnippet false} $out/config.d.toml
     install -m 0644 ${textFile "atomics-vm-plist" plist false} $out/launchd/${launchdLabel}.plist
     install -m 0644 ${yaml.generate "lima.yaml" limaDefinition} $out/lima.yaml
+    install -m 0644 ${textFile "atomics-vm.json" bundleInfo false} $out/atomics-vm.json
     shellcheck --shell=sh $out/bin/* $out/install.sh
   '';
 in

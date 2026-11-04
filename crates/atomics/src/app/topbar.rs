@@ -56,6 +56,59 @@ impl Desktop<'_> {
         }
     }
 
+    /// The ATOMICS VM on a Mac with its bundle installed (docs/nixos-vm.md): "VM" with its state, and a
+    /// menu that starts or stops it. Agents of this window run on this Mac unless the config's agents
+    /// are the bundle's wrappers; `atomics --connect vm` runs the window on the VM's host instead.
+    fn vm_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
+        use crate::vm::Status;
+        let Some(monitor) = self.runtime.vm.clone() else { return };
+        let Some(view) = monitor.view() else { return };
+        let palette = self.palette();
+        let (text, color) = match (&view.status, view.busy) {
+            (_, Some("stopping")) => ("VM …", palette.muted),
+            (Status::Starting, _) | (_, Some(_)) => ("VM …", palette.muted),
+            (Status::Running, _) => ("VM ●", palette.success),
+            (Status::Stopped, _) => ("VM ○", palette.muted),
+            (Status::NotSetUp | Status::Unknown(_), _) => ("VM ●", palette.warning),
+        };
+        let state = match view.busy {
+            Some(busy) => busy.to_string(),
+            None => view.status.label().to_string(),
+        };
+        let label = RichText::new(text).color(color);
+        let items = |ui: &mut egui::Ui| {
+            ui.label(RichText::new(format!("ATOMICS VM {}: {state}", view.instance)).strong());
+            if let Some(error) = &view.error {
+                ui.label(RichText::new(error).color(palette.warning));
+            }
+            let run = match view.status {
+                Status::NotSetUp => {
+                    ui.label("Set it up from a terminal: atomics vm setup --from <build folder>");
+                    None
+                }
+                Status::Stopped | Status::Unknown(_) if view.busy.is_none() => {
+                    ui.button("Start").clicked().then_some(true)
+                }
+                Status::Running if view.busy.is_none() => {
+                    ui.button("Stop").on_hover_text("Agents running in the VM stop with it").clicked().then_some(false)
+                }
+                _ => None,
+            };
+            if let Some(run) = run {
+                monitor.set_running(run);
+                ui.close();
+            }
+        };
+        // Folded into the Actions menu where the bar has no room for it, as Settings is.
+        let (response, _) = if in_menu || egui::containers::menu::is_in_menu(ui) {
+            egui::containers::menu::SubMenuButton::new(label).ui(ui, items)
+        } else {
+            egui::containers::menu::MenuButton::new(label).ui(ui, items)
+        };
+        record_item(ui, "VM", &response);
+        response.on_hover_text(format!("The ATOMICS VM {} is {state}", view.instance));
+    }
+
     /// This host's items after the top bar's Plan button: Tickets, the GitHub counter, Remote, and in the
     /// Actions menu (`in_menu`) the ticket system's sign-in.
     pub(super) fn host_top_bar_items(&mut self, ui: &mut egui::Ui, in_menu: bool) {
@@ -79,6 +132,7 @@ impl Desktop<'_> {
         }
         self.github_counter(ui, in_menu);
         self.rendezvous_indicator(ui, in_menu);
+        self.vm_indicator(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
             let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)

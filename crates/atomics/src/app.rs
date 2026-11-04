@@ -501,6 +501,8 @@ pub(crate) struct State {
     usage: crate::usage::UsagePanel,
     /// Account usage that sandboxed agents saw, read back from their VMs.
     sandbox_pull: crate::usage::SandboxPull,
+    /// The ATOMICS VM on a Mac with its bundle installed, for the top bar (`vm.rs`).
+    vm: Option<crate::vm::Monitor>,
     control_rx: Receiver<ControlMessage>,
     /// Mutations from protocol clients, carried out in turn with everything else (`mutations.rs`).
     op_tx: crate::host::Sender<crate::protocol::OpRequest>,
@@ -931,6 +933,7 @@ impl State {
         let (action_tx, action_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(window.clone());
         let sandbox_pull = crate::usage::SandboxPull::new(usage_tx.clone());
+        let vm = crate::vm::Monitor::start(window.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
@@ -1024,6 +1027,7 @@ impl State {
             hub,
             hook_rx,
             usage,
+            vm,
             sandbox_pull,
             control_rx,
             op_tx,
