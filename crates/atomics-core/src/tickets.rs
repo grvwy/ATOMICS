@@ -595,6 +595,9 @@ pub struct Operation {
     /// For lists: how the Tickets panel's "More" asks for the next page.
     #[serde(skip_serializing_if = "Paging::is_empty")]
     pub paging: Paging,
+    /// For `semantic_search`: how an answer says it came from keyword search instead.
+    #[serde(skip_serializing_if = "Fallback::is_empty")]
+    pub fallback: Fallback,
 }
 
 /// Cursor paging: the argument that takes a cursor, and the result path of the next one.
@@ -608,6 +611,21 @@ pub struct Paging {
 impl Paging {
     pub fn is_empty(&self) -> bool {
         self.cursor.is_empty() && self.next.is_empty()
+    }
+}
+
+/// Where an answer keeps a status, and the values of it that mean a meaning search was answered
+/// by keyword. Any other value, or none, is an ordinary answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fallback {
+    pub path: String,
+    pub values: Vec<String>,
+}
+
+impl Fallback {
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty() && self.values.is_empty()
     }
 }
 
@@ -797,6 +815,16 @@ pub fn card_reply(card: &TicketCard) -> Value {
 
 pub fn cards_reply(cards: &[TicketCard]) -> Value {
     serde_json::json!({"cards": cards})
+}
+
+/// A search's reply: its cards, which mode ran, and why when a meaning search came back by keyword.
+pub fn search_reply(cards: &[TicketCard], semantic: bool, fell_back: Option<&str>) -> Value {
+    let mut reply = cards_reply(cards);
+    reply["mode"] = Value::from(if semantic { "meaning" } else { "keyword" });
+    if let Some(why) = fell_back {
+        reply["fell_back"] = Value::from(why);
+    }
+    reply
 }
 
 pub fn reply_cards(reply: &Value) -> Result<Vec<TicketCard>, String> {
@@ -1965,7 +1993,8 @@ impl TicketConfig {
         let mut text =
             format!("Tickets: this workspace tracks its work in {system}, which ATOMICS reaches over MCP.\n");
         text.push_str(
-            "Use ATOMICS's chief ticket tools: atomics_ticket_search (query, optional semantic and take; \
+            "Use ATOMICS's chief ticket tools: atomics_ticket_search (query, optional take, and semantic: true for meaning, false for keyword; \
+             a profile with one search uses it either way and the reply's mode says which ran; \
              a ticket key or its bare number finds that ticket first), \
              atomics_ticket_read (ticket key or link, including description and comments), \
              atomics_ticket_children (direct children) and atomics_ticket_related (related tickets). \
@@ -2232,6 +2261,11 @@ impl Operation {
             return None;
         }
         mapped_field(result, &self.paging.next).filter(|cursor| !cursor.is_empty())
+    }
+
+    /// The status that says this answer came from keyword search, when `fallback` finds one.
+    pub fn fell_back(&self, result: &Value) -> Option<String> {
+        mapped_field(result, &self.fallback.path).filter(|status| self.fallback.values.contains(status))
     }
 
     /// The tool arguments with `extra` replacing any of the same name and placeholders filled in.
