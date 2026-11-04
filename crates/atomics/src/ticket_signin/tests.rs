@@ -313,15 +313,45 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
 }
 
 #[test]
-fn a_lapsed_sign_in_is_told_apart_from_other_ticket_failures() {
-    // ATOMICS's own refusal, as the worker reports it inside a job's error.
-    assert!(asks_for_sign_in("sign-in required: https://tickets.example.com/mcp needs a sign-in"));
-    assert!(asks_for_sign_in("reading the ticket failed: sign-in required: the server refused the saved sign-in"));
-    // A server that says so in its own words while the keychain still holds a sign-in.
-    for words in ["tool error: needs-refresh", "{\"error\":\"invalid_grant\"}", "Token has expired; log in again"] {
-        assert!(asks_for_sign_in(&format!("reading the ticket failed: {words}")), "{words}");
+fn the_doctor_says_what_a_sign_in_covers_by_host() {
+    let fake = Fake::start();
+    let (_dir, oauth) = machine();
+    let mut config: TicketConfig = toml::from_str(
+        "system = \"echo\"\n[operations.read]\nhttp = { method = \"GET\", path = \"/items/{id}\" }\nresult = { id = \"id\" }",
+    )
+    .unwrap();
+    config.server = fake.server();
+    config.http.url = fake.api_url.clone();
+    let server = config.sign_in_server();
+
+    let line = doctor_line(&oauth, &config).unwrap();
+    assert!(line.starts_with("· credential MCP sign-in (127.0.0.1): absent"), "{line}");
+
+    // A sign-in from before the profile read over the API: signed in, and asked for once more.
+    oauth.sign_in_via(&fake.server(), Duration::from_secs(10), &crate::mcp_client::oauth_test_open).unwrap();
+    assert_eq!(SignState::of(&oauth, &server), SignState::Partial);
+    assert_eq!(SignState::of(&oauth, &fake.server()), SignState::SignedIn);
+    let line = doctor_line(&oauth, &config).unwrap();
+    assert!(line.contains("present, without 127.0.0.1") && line.contains("once more"), "{line}");
+
+    oauth.sign_in_via(&server, Duration::from_secs(10), &crate::mcp_client::oauth_test_open).unwrap();
+    let line = doctor_line(&oauth, &config).unwrap();
+    assert!(line.starts_with("✓ credential MCP sign-in (127.0.0.1): present, with a token per resource"), "{line}");
+    assert!(line.ends_with("(values hidden)"), "{line}");
+
+    // Refused, signed in again, refused again: the line says signing in will not help.
+    fake.state.lock().unwrap().refuse_api_tokens = true;
+    assert!(oauth.session_for(&server, &fake.api_url, Duration::from_secs(5)).is_err());
+    assert!(doctor_line(&oauth, &config).unwrap().contains("without 127.0.0.1"));
+    oauth.sign_in_via(&server, Duration::from_secs(10), &crate::mcp_client::oauth_test_open).unwrap();
+    assert!(oauth.session_for(&server, &fake.api_url, Duration::from_secs(5)).is_err());
+    let line = doctor_line(&oauth, &config).unwrap();
+    assert!(line.contains("refuses it") && line.contains("did not change that"), "{line}");
+
+    // No line ever holds a token, an endpoint or a client id.
+    let state = fake.state.lock().unwrap();
+    for secret in state.access.iter().chain(&state.refresh).chain(state.clients.keys()) {
+        assert!(!line.contains(secret.as_str()), "{line}");
     }
-    for other in ["ENG-123 was not found", "request to https://tickets.example.com/mcp timed out", "HTTP 500"] {
-        assert!(!asks_for_sign_in(other), "{other}");
-    }
+    assert!(!line.contains("/api") && !line.contains("/token"), "{line}");
 }

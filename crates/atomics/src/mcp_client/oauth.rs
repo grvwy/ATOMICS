@@ -3,10 +3,16 @@
 //! (RFC 7591) as a public client, S256 PKCE and a resource indicator (RFC 8707), with the code
 //! delivered to a loopback listener (RFC 8252). Nothing here knows a server by name.
 //!
+//! One sign-in can cover further resources (`McpServer::resources`): the authorization request names
+//! each, and each gets a token of its own from the saved refresh token, which rotates in one shared
+//! item under one lock. A server may end a whole grant when a rotated refresh token is used twice, so
+//! nothing spends one outside that lock.
+//!
 //! Tokens and the client id live in the OS keychain only (see `credentials::Store`). They are never
 //! logged, printed, put in an error, or written to disk. Nothing in this module opens a browser
 //! except `OAuth::sign_in`, which a person asks for.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,13 +41,27 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// What a failed or refused sign-in says first; the ticket worker's errors start with it too.
 pub const SIGN_IN_REQUIRED: &str = "sign-in required";
+/// Why a further resource gets no token: only a person signing in can change this.
+const NOT_COVERED: &str = "is not covered by this sign-in: sign in once more";
 
 /// Whether a server is signed in, from what the keychain holds. It never touches the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInStatus {
     SignedIn,
+    /// Signed in, but the sign-in holds no consent for a resource the server now asks for.
+    Partial,
     NeedsSignIn,
     Error(String),
+}
+
+/// What a sign-in holds for one further resource, from what the keychain says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceAccess {
+    Consented,
+    /// Consented to, then refused, and a sign-in since has not changed that.
+    Refused,
+    /// Only a new sign-in can add it.
+    Missing,
 }
 
 /// Whether a ticket worker's error string says the server needs a sign-in.
@@ -87,13 +107,15 @@ pub struct OAuth {
     store: Store,
     browser: Browser,
     callback_timeout: Duration,
-    trace_secrets: std::sync::Arc<std::sync::Mutex<Option<TraceSecrets>>>,
+    /// Per server key, so that a job moving between servers does not read the keychain each time.
+    trace_secrets: std::sync::Arc<std::sync::Mutex<HashMap<String, TraceSecrets>>>,
 }
 
 // Never Debug: cached redaction credentials stay in memory only.
 struct TraceSecrets {
-    key: String,
-    heads: (Option<String>, Option<String>),
+    /// The further resources the tokens item named, whose head is the first of `heads`.
+    extras: Vec<String>,
+    heads: Vec<Option<String>>,
     secrets: Vec<String>,
 }
 
@@ -109,6 +131,29 @@ struct Tokens {
     /// RFC 7009, when the authorization server publishes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revocation_endpoint: Option<String>,
+    /// The further resources the person consented to. Only a sign-in adds to this: whatever a config
+    /// names, a resource outside it gets no token. A sign-in from before this field holds none.
+    #[serde(default)]
+    extra_resources: Vec<String>,
+    /// Further resources refused since a person last had the chance to sign in again. Refused once,
+    /// a resource leaves `extra_resources` and the person is offered a sign-in. Back in by that
+    /// sign-in and refused again, it stays, and signing in is not offered a second time. Only the
+    /// resource accepting a token clears it, or signing out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused_resources: Vec<String>,
+}
+
+impl Tokens {
+    /// Every further resource that may have a token saved.
+    fn extras(&self) -> Vec<String> {
+        let refused = self.refused_resources.iter().filter(|r| !self.extra_resources.contains(r));
+        self.extra_resources.iter().chain(refused).cloned().collect()
+    }
+
+    /// Whether the consent reaches everything `server` asks for.
+    fn covers(&self, server: &McpServer) -> bool {
+        configured_extras(server).iter().all(|r| *r == self.resource || self.extra_resources.contains(r))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +161,13 @@ struct Access {
     token: String,
     /// Unix seconds.
     expires_at: u64,
+}
+
+impl Access {
+    /// No token yet: `due`, so the first use asks for one.
+    fn none() -> Access {
+        Access { token: String::new(), expires_at: 0 }
+    }
 }
 
 /// A registered client and the loopback redirect it was registered with.
@@ -154,13 +206,17 @@ impl OAuth {
         self
     }
 
-    /// Signed in, needs sign-in, or the keychain's error.
+    /// Signed in with all `server` asks for, signed in with less, needs sign-in, or the keychain's error.
     pub fn status(&self, server: &McpServer) -> SignInStatus {
         let Some(key) = server_key(server) else { return SignInStatus::NeedsSignIn };
         match self.load(&key) {
             Ok(Some((tokens, access))) => {
                 let fresh = access.as_ref().is_some_and(|a| a.expires_at > unix_now());
-                if tokens.refresh_token.is_some() || fresh { SignInStatus::SignedIn } else { SignInStatus::NeedsSignIn }
+                match (tokens.refresh_token.is_some() || fresh, tokens.covers(server)) {
+                    (false, _) => SignInStatus::NeedsSignIn,
+                    (true, false) => SignInStatus::Partial,
+                    (true, true) => SignInStatus::SignedIn,
+                }
             }
             Ok(None) => SignInStatus::NeedsSignIn,
             Err(err) => SignInStatus::Error(err.to_string()),
@@ -169,28 +225,55 @@ impl OAuth {
 
     /// Credentials used by the current sign-in, for the ticket/trace cleaner only.
     /// This never refreshes, opens a browser, or returns keychain errors containing data.
-    /// Call only on a background worker: the fingerprint reads the two keychain heads.
+    /// Every further resource's token is one of them, consented to now or not.
+    /// Call only on a background worker: the fingerprint reads the keychain heads.
     pub(crate) fn secrets(&self, server: &McpServer) -> anyhow::Result<Vec<String>> {
         let Some(key) = server_key(server) else { return Ok(Vec::new()) };
         let _lock = self.store.oauth_lock(&key)?;
-        let heads = (
-            self.store.oauth_fingerprint(&slot("tokens", &key))?,
-            self.store.oauth_fingerprint(&slot("access", &key))?,
-        );
         let mut cache = self.trace_secrets.lock().unwrap();
-        if let Some(cached) = cache.as_ref().filter(|cached| cached.key == key && cached.heads == heads) {
+        // The tokens item names the further resources, and its head is among the heads compared.
+        if let Some(cached) = cache.get(&key)
+            && self.heads(&key, &cached.extras)? == cached.heads
+        {
             return Ok(cached.secrets.clone());
         }
-        let secrets: Vec<String> = self
-            .load(&key)?
-            .map(|(tokens, access)| tokens.refresh_token.into_iter().chain(access.map(|access| access.token)).collect())
-            .unwrap_or_default();
-        *cache = Some(TraceSecrets { key, heads, secrets: secrets.clone() });
+        let Some((tokens, access)) = self.load(&key)? else {
+            let (extras, heads) = (Vec::new(), self.heads(&key, &[])?);
+            cache.insert(key, TraceSecrets { extras, heads, secrets: Vec::new() });
+            return Ok(Vec::new());
+        };
+        let extras = tokens.extras();
+        let heads = self.heads(&key, &extras)?;
+        let mut secrets: Vec<String> = tokens.refresh_token.into_iter().chain(access.map(|a| a.token)).collect();
+        for resource in &extras {
+            secrets.extend(self.read_json::<Access>(&extra_slot(&key, resource))?.map(|a| a.token));
+        }
+        cache.insert(key, TraceSecrets { extras, heads, secrets: secrets.clone() });
         Ok(secrets)
     }
 
+    fn heads(&self, key: &str, extras: &[String]) -> anyhow::Result<Vec<Option<String>>> {
+        let slots = [slot("tokens", key), slot("access", key)];
+        let further = extras.iter().map(|resource| extra_slot(key, resource));
+        slots.into_iter().chain(further).map(|slot| self.store.oauth_fingerprint(&slot)).collect()
+    }
+
     fn clear_trace_secrets(&self) {
-        *self.trace_secrets.lock().unwrap() = None;
+        self.trace_secrets.lock().unwrap().clear();
+    }
+
+    /// Where each of `server`'s further resources stands, for the doctor. It never touches the network.
+    pub(crate) fn resource_access(&self, server: &McpServer) -> Vec<(String, ResourceAccess)> {
+        let tokens = server_key(server).and_then(|key| self.read_json::<Tokens>(&slot("tokens", &key)).ok().flatten());
+        let of = |resource: &String| match &tokens {
+            Some(tokens) if !tokens.extra_resources.contains(resource) => ResourceAccess::Missing,
+            Some(tokens) if tokens.refused_resources.contains(resource) => ResourceAccess::Refused,
+            Some(_) => ResourceAccess::Consented,
+            None => ResourceAccess::Missing,
+        };
+        let own = tokens.as_ref().map(|tokens| tokens.resource.clone());
+        let extras = configured_extras(server).into_iter().filter(|resource| own.as_ref() != Some(resource));
+        extras.map(|resource| (resource.clone(), of(&resource))).collect()
     }
 
     /// Forgets the server's tokens, after telling the authorization server to revoke them (RFC 7009)
@@ -201,9 +284,18 @@ impl OAuth {
         // A refresh in another ATOMICS finishes first, or it would store its tokens after this cleared them.
         let _lock = self.store.oauth_lock(&key).map_err(storage)?;
         let revocation = match self.load(&key) {
-            Ok(Some((tokens, access))) => revoke(&tokens, access.as_ref()),
+            Ok(Some((tokens, access))) => {
+                let further: Vec<Access> = tokens
+                    .extras()
+                    .iter()
+                    .filter_map(|resource| self.read_json(&extra_slot(&key, resource)).ok().flatten())
+                    .collect();
+                revoke(&tokens, access.iter().chain(&further))
+            }
             _ => Revocation::NotOffered,
         };
+        // An unreadable record names nothing: what is configured is known either way.
+        self.remove_further_tokens(&key, &configured_extras(server))?;
         self.clear(&key)?;
         Ok(revocation)
     }
@@ -244,12 +336,16 @@ impl OAuth {
         let url = url.ok_or_else(|| McpError::Server("sign-in needs an HTTP server: set server.url".into()))?;
         let key = server_key(server).expect("has a url");
         let resource = parse_secure(url)?;
+        let extras = requested_extras(server, &resource)?;
         let agent = agent(timeout);
 
-        // 1. Discovery.
+        // 1. Discovery. Each further resource must name the authorization server in use.
         let (metadata_url, scope) = protected_resource_metadata_url(&agent, &resource, server.oauth)?;
         let issuer = resource_issuer(&agent, &metadata_url, &resource)?;
         let auth = authorization_server(&agent, &issuer)?;
+        for extra in &extras {
+            check_further_resource(&agent, extra, &auth.issuer)?;
+        }
 
         // 2. Registration. A client is reused only if the loopback port it was registered with is free.
         let cached = self.read_json::<Client>(&client_slot(&auth.issuer)).map_err(storage)?;
@@ -286,7 +382,11 @@ impl OAuth {
                 .append_pair("code_challenge_method", "S256")
                 .append_pair("state", &state)
                 .append_pair("resource", &canonical_resource(&resource));
-            if let Some(scope) = &scope {
+            for extra in &extras {
+                query.append_pair("resource", &canonical_resource(extra));
+            }
+            // Scopes would have to name one for every resource. Without any, each offers what it has.
+            if let Some(scope) = scope.as_ref().filter(|_| extras.is_empty()) {
                 query.append_pair("scope", scope);
             }
         }
@@ -303,7 +403,8 @@ impl OAuth {
         }
         let code = await_callback(&listener, &state, &auth, self.callback_timeout, control)?;
 
-        // 4. Code exchange.
+        // 4. Code exchange, for the server's own resource. A code works once, so a further resource's
+        // token comes from the refresh token, when it is first needed.
         let form = [
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -318,16 +419,25 @@ impl OAuth {
             }
             TokenError::Transport(err) => err,
         })?;
-        let tokens = Tokens {
+        let mut tokens = Tokens {
             issuer: auth.issuer.clone(),
             client_id: client.client_id,
             token_endpoint: auth.token_endpoint.to_string(),
             resource: canonical_resource(&resource),
             refresh_token: grant.refresh_token,
             revocation_endpoint: auth.revocation_endpoint.as_ref().map(Url::to_string),
+            extra_resources: extras.iter().map(canonical_resource).collect(),
+            refused_resources: Vec::new(),
         };
         let _lock = self.store.oauth_lock(&key).map_err(storage)?;
-        self.save(&key, &tokens, &grant.access)
+        // The last sign-in's further tokens go with it; what it was refused stays remembered, so that
+        // this sign-in is the one more chance and not the start of another round.
+        if let Ok(Some(previous)) = self.read_json::<Tokens>(&slot("tokens", &key)) {
+            let refused = previous.refused_resources.iter().filter(|r| tokens.extra_resources.contains(r));
+            tokens.refused_resources = refused.cloned().collect();
+            self.remove_further_tokens(&key, &previous.extras())?;
+        }
+        self.save(&key, &tokens, &slot("access", &key), &grant.access)
     }
 
     fn load(&self, key: &str) -> anyhow::Result<Option<(Tokens, Option<Access>)>> {
@@ -336,16 +446,28 @@ impl OAuth {
         Ok(Some((tokens, access)))
     }
 
-    fn save(&self, key: &str, tokens: &Tokens, access: &Access) -> Result<(), McpError> {
+    /// The refresh token first: stopping between the two leaves one that works, where the other order
+    /// would leave a spent one, whose reuse may end the whole grant.
+    fn save(&self, key: &str, tokens: &Tokens, access_slot: &str, access: &Access) -> Result<(), McpError> {
         self.clear_trace_secrets();
-        self.write_json(&slot("access", key), access)?;
-        self.write_json(&slot("tokens", key), tokens)
+        self.write_json(&slot("tokens", key), tokens)?;
+        self.write_json(access_slot, access)
     }
 
     fn clear(&self, key: &str) -> Result<(), McpError> {
         self.clear_trace_secrets();
+        if let Ok(Some(tokens)) = self.read_json::<Tokens>(&slot("tokens", key)) {
+            self.remove_further_tokens(key, &tokens.extras())?;
+        }
         for kind in ["tokens", "access"] {
             self.store.remove_oauth_item(&slot(kind, key)).map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    fn remove_further_tokens(&self, key: &str, resources: &[String]) -> Result<(), McpError> {
+        for resource in resources {
+            self.store.remove_oauth_item(&extra_slot(key, resource)).map_err(storage)?;
         }
         Ok(())
     }
@@ -373,9 +495,44 @@ impl OAuth {
             oauth: self.clone(),
             key,
             tokens,
-            access: access.unwrap_or(Access { token: String::new(), expires_at: 0 }),
+            access: access.unwrap_or_else(Access::none),
             agent: agent(timeout),
             url: url.to_string(),
+            extra: None,
+        };
+        session.refresh_if_due()?;
+        Ok(session)
+    }
+
+    /// The session for `resource`, one of the further resources `server`'s sign-in covers. It shares
+    /// that sign-in's refresh token, its lock and its sign-out, and holds a token of its own. Without
+    /// the person's consent to this resource it is `SignInRequired` and nothing is sent.
+    pub(crate) fn session_for(
+        &self,
+        server: &McpServer,
+        resource: &str,
+        timeout: Duration,
+    ) -> Result<Session, McpError> {
+        let key = server_key(server).ok_or_else(|| McpError::Server("no MCP server url".into()))?;
+        let resource = canonical_resource(&parse_secure(resource)?);
+        let need = |why: &str| McpError::SignInRequired(format!("{resource} {why}"));
+        let tokens =
+            self.read_json::<Tokens>(&slot("tokens", &key)).map_err(storage)?.ok_or_else(|| need("needs a sign-in"))?;
+        if tokens.resource == resource {
+            return self.session(server, timeout);
+        }
+        if !tokens.extra_resources.contains(&resource) {
+            return Err(need(NOT_COVERED));
+        }
+        let access = self.read_json::<Access>(&extra_slot(&key, &resource)).map_err(storage)?;
+        let mut session = Session {
+            oauth: self.clone(),
+            key,
+            tokens,
+            access: access.unwrap_or_else(Access::none),
+            agent: agent(timeout),
+            url: resource.clone(),
+            extra: Some(resource),
         };
         session.refresh_if_due()?;
         Ok(session)
@@ -390,11 +547,25 @@ pub(crate) struct Session {
     access: Access,
     agent: ureq::Agent,
     url: String,
+    /// The further resource this session's token is for; `None` for the server's own.
+    extra: Option<String>,
 }
 
 impl Session {
     pub(crate) fn access_token(&self) -> &str {
         &self.access.token
+    }
+
+    /// Whether this session belongs to `server`'s sign-in.
+    pub(crate) fn belongs_to(&self, server: &McpServer) -> bool {
+        server_key(server).as_deref() == Some(self.key.as_str())
+    }
+
+    fn access_slot(&self) -> String {
+        match &self.extra {
+            Some(resource) => extra_slot(&self.key, resource),
+            None => slot("access", &self.key),
+        }
     }
 
     /// Refreshes when the access token is missing or about to expire.
@@ -404,7 +575,8 @@ impl Session {
 
     /// Exchanges the refresh token for a new pair, stores it, and uses it. The refresh token may
     /// rotate; the new one is stored before the old one is dropped. A refusal clears the sign-in
-    /// and says `SignInRequired`; a network failure leaves it for the next try.
+    /// and says `SignInRequired`; a network failure leaves it for the next try. For a further resource
+    /// a refusal leaves the sign-in alone: it says nothing about the server's own resource.
     ///
     /// Other ATOMICS processes refresh the same sign-in: each refresh holds the server's sign-in lock
     /// and starts from what the keychain holds then, so a refresh token is spent once. When another
@@ -413,8 +585,16 @@ impl Session {
         self.oauth.clear_trace_secrets();
         let need = |why: &str| McpError::SignInRequired(format!("{} {why}", self.url));
         let _lock = self.oauth.store.oauth_lock(&self.key).map_err(storage)?;
-        let (tokens, access) = self.oauth.load(&self.key).map_err(storage)?.ok_or_else(|| need("needs a sign-in"))?;
+        let tokens = self
+            .oauth
+            .read_json::<Tokens>(&slot("tokens", &self.key))
+            .map_err(storage)?
+            .ok_or_else(|| need("needs a sign-in"))?;
+        let access = self.oauth.read_json::<Access>(&self.access_slot()).map_err(storage)?;
         self.tokens = tokens;
+        if self.extra.as_ref().is_some_and(|extra| !self.tokens.extra_resources.contains(extra)) {
+            return Err(need(NOT_COVERED));
+        }
         if let Some(access) = access
             && access.token != self.access.token
             && !due(&access)
@@ -422,7 +602,11 @@ impl Session {
             self.access = access;
             return Ok(());
         }
+        let resource = self.extra.clone().unwrap_or_else(|| self.tokens.resource.clone());
         let Some(refresh_token) = self.tokens.refresh_token.clone() else {
+            if let Some(extra) = self.extra.clone() {
+                return Err(self.refuse_locked(&extra));
+            }
             let _ = self.oauth.clear(&self.key);
             return Err(need("needs a sign-in again: its token expired and the server gave no refresh token"));
         };
@@ -431,7 +615,7 @@ impl Session {
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.as_str()),
             ("client_id", self.tokens.client_id.as_str()),
-            ("resource", self.tokens.resource.as_str()),
+            ("resource", resource.as_str()),
         ];
         match token_request(&self.agent, &endpoint, &form) {
             Ok(grant) => {
@@ -439,14 +623,73 @@ impl Session {
                     self.tokens.refresh_token = Some(rotated);
                 }
                 self.access = grant.access;
-                self.oauth.save(&self.key, &self.tokens, &self.access)
+                self.oauth.save(&self.key, &self.tokens, &self.access_slot(), &self.access)
             }
-            Err(TokenError::Rejected(_)) => {
-                let _ = self.oauth.clear(&self.key);
-                Err(need("needs a sign-in again: the server refused the saved sign-in"))
-            }
+            Err(TokenError::Rejected(_)) => match self.extra.clone() {
+                Some(extra) => Err(self.refuse_locked(&extra)),
+                None => {
+                    let _ = self.oauth.clear(&self.key);
+                    Err(need("needs a sign-in again: the server refused the saved sign-in"))
+                }
+            },
             Err(TokenError::Transport(err)) => Err(err),
         }
+    }
+
+    /// The resource itself answered 401 to a token just refreshed, as a refused one does. Asking for
+    /// a new sign-in every time would loop when it refuses for a reason no sign-in changes.
+    pub(crate) fn refused_by_resource(&mut self) -> McpError {
+        let Some(extra) = self.extra.clone() else {
+            return McpError::SignInRequired(format!("{} rejected the saved sign-in", self.url));
+        };
+        let _lock = match self.oauth.store.oauth_lock(&self.key) {
+            Ok(lock) => lock,
+            Err(err) => return storage(err),
+        };
+        match self.oauth.read_json::<Tokens>(&slot("tokens", &self.key)) {
+            Ok(Some(tokens)) if tokens.extra_resources.contains(&extra) => self.tokens = tokens,
+            Ok(Some(_)) => return McpError::SignInRequired(format!("{} {NOT_COVERED}", self.url)),
+            Ok(None) => return McpError::SignInRequired(format!("{} needs a sign-in", self.url)),
+            Err(err) => return storage(err),
+        }
+        self.refuse_locked(&extra)
+    }
+
+    /// The resource accepted this session's token, so an earlier refusal is over.
+    pub(crate) fn accepted_by_resource(&mut self) {
+        let Some(extra) = self.extra.clone().filter(|extra| self.tokens.refused_resources.contains(extra)) else {
+            return;
+        };
+        let Ok(_lock) = self.oauth.store.oauth_lock(&self.key) else { return };
+        if let Ok(Some(mut tokens)) = self.oauth.read_json::<Tokens>(&slot("tokens", &self.key)) {
+            tokens.refused_resources.retain(|resource| *resource != extra);
+            if self.oauth.write_json(&slot("tokens", &self.key), &tokens).is_ok() {
+                self.tokens = tokens;
+            }
+        }
+    }
+
+    /// `extra` is refused, with this session's lock held. The sign-in stays. Refused for the first
+    /// time, it drops out of the consent, so asking a person is right: one more sign-in may hold it.
+    /// Refused after that sign-in, asking again would never end, so this is an error like any other.
+    fn refuse_locked(&mut self, extra: &str) -> McpError {
+        self.access = Access::none();
+        self.oauth.clear_trace_secrets();
+        if let Err(err) = self.oauth.store.remove_oauth_item(&extra_slot(&self.key, extra)) {
+            return storage(err);
+        }
+        if self.tokens.refused_resources.iter().any(|resource| resource == extra) {
+            return McpError::Server(format!(
+                "{} refuses this sign-in, and signing in again did not change that; ask whoever runs it",
+                self.url
+            ));
+        }
+        self.tokens.extra_resources.retain(|resource| resource != extra);
+        self.tokens.refused_resources.push(extra.to_string());
+        if let Err(err) = self.oauth.write_json(&slot("tokens", &self.key), &self.tokens) {
+            return err;
+        }
+        McpError::SignInRequired(format!("{} {NOT_COVERED}", self.url))
     }
 }
 
@@ -477,6 +720,12 @@ fn client_slot(issuer: &str) -> String {
     slot("client", &digest_hex(issuer))
 }
 
+/// A further resource's access token, beside the server's own. It holds only that resource's token:
+/// the refresh token is the sign-in's, in the one tokens item.
+fn extra_slot(key: &str, resource: &str) -> String {
+    format!("{}-{}", slot("access", key), &digest_hex(resource)[..16])
+}
+
 fn digest_hex(text: &str) -> String {
     digest::digest(&digest::SHA256, text.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -499,7 +748,29 @@ fn canonical_resource(url: &Url) -> String {
     url.as_str().trim_end_matches('/').to_string()
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
+/// The further resources `server` asks for, as resource indicators. An address that does not parse
+/// is left out here: signing in says what is wrong with it.
+fn configured_extras(server: &McpServer) -> Vec<String> {
+    let parsed = server.resources.iter().filter_map(|resource| Url::parse(resource.trim()).ok());
+    parsed.map(|resource| canonical_resource(&resource)).collect()
+}
+
+/// The further resources to sign in to, each once and none the server's own. They are held to the
+/// rules of the address a token goes to, and the refusal does not repeat an address.
+fn requested_extras(server: &McpServer, own: &Url) -> Result<Vec<Url>, McpError> {
+    let own = canonical_resource(own);
+    let mut extras: Vec<Url> = Vec::new();
+    for resource in &server.resources {
+        let extra = super::http_operation::http_base(resource.trim())?;
+        let id = canonical_resource(&extra);
+        if id != own && !extras.iter().any(|seen| canonical_resource(seen) == id) {
+            extras.push(extra);
+        }
+    }
+    Ok(extras)
+}
+
+pub(super) fn agent(timeout: Duration) -> ureq::Agent {
     // No redirects: metadata URLs come from the server, and a redirect must not lead elsewhere.
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -510,7 +781,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 /// A URL that may carry tokens or metadata: https, or http only to this machine.
-fn parse_secure(text: &str) -> Result<Url, McpError> {
+pub(super) fn parse_secure(text: &str) -> Result<Url, McpError> {
     let url = Url::parse(text).map_err(|_| McpError::Server(format!("{text} is not a URL")))?;
     let local = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -579,19 +850,43 @@ fn protected_resource_metadata_url(
     } else if !configured {
         return Err(McpError::Server(format!("{resource} did not ask for a sign-in (HTTP {})", probed.status)));
     }
-    // Well-known fallbacks, path-inserted first (RFC 9728 §3.1).
-    let mut candidates = Vec::new();
+    for url in well_known_metadata(resource) {
+        if get_json(agent, &url, "protected-resource metadata")?.is_some() {
+            return Ok((url, None));
+        }
+    }
+    Err(McpError::Server(format!("{resource} does not publish OAuth protected-resource metadata")))
+}
+
+/// Where a resource's metadata may be, path-inserted first (RFC 9728 §3.1).
+fn well_known_metadata(resource: &Url) -> Vec<Url> {
     let origin = resource.origin().ascii_serialization();
     let path = resource.path().trim_end_matches('/');
+    let mut candidates = Vec::new();
     if !path.is_empty() {
         candidates.push(format!("{origin}/.well-known/oauth-protected-resource{path}"));
     }
     candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
-    for candidate in candidates {
-        let url = Url::parse(&candidate).expect("built from a parsed url");
-        if get_json(agent, &url, "protected-resource metadata")?.is_some() {
-            return Ok((url, None));
+    candidates.iter().map(|candidate| Url::parse(candidate).expect("built from a parsed url")).collect()
+}
+
+/// A further resource must describe itself and name `issuer` (RFC 9728), or the person is not asked
+/// to consent to it. Its metadata is read with a GET: this resource need not speak MCP.
+fn check_further_resource(agent: &ureq::Agent, resource: &Url, issuer: &str) -> Result<(), McpError> {
+    let same = |one: &str, other: &str| one.trim_end_matches('/') == other.trim_end_matches('/');
+    for url in well_known_metadata(resource) {
+        let Some(value) = get_json(agent, &url, "protected-resource metadata")? else { continue };
+        let declared = value["resource"].as_str().and_then(|r| Url::parse(r).ok());
+        if declared.as_ref().map(canonical_resource) != Some(canonical_resource(resource)) {
+            return Err(McpError::Server(format!("the protected-resource metadata at {url} is for another resource")));
         }
+        let servers = value["authorization_servers"].as_array();
+        return match servers.is_some_and(|all| all.iter().filter_map(Value::as_str).any(|one| same(one, issuer))) {
+            true => Ok(()),
+            false => {
+                Err(McpError::Server(format!("{resource} does not name the authorization server of this sign-in")))
+            }
+        };
     }
     Err(McpError::Server(format!("{resource} does not publish OAuth protected-resource metadata")))
 }
@@ -803,19 +1098,18 @@ fn pasted_code(pasted: &str, state: &str, auth: &AuthServer) -> Result<String, S
     answer_code(|name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()), state, auth)
 }
 
-/// RFC 7009: asks the authorization server to forget the refresh and access tokens. Best effort.
-fn revoke(tokens: &Tokens, access: Option<&Access>) -> Revocation {
+/// RFC 7009: asks the authorization server to forget the refresh token and every access token, one
+/// per resource. Best effort.
+fn revoke<'a>(tokens: &Tokens, access: impl Iterator<Item = &'a Access>) -> Revocation {
     let Some(endpoint) = tokens.revocation_endpoint.as_deref().and_then(|e| parse_secure(e).ok()) else {
         return Revocation::NotOffered;
     };
     let agent = agent(Duration::from_secs(10));
     let mut failed = false;
-    let sent = [
-        tokens.refresh_token.as_deref().map(|t| ("refresh_token", t)),
-        access.map(|a| a.token.as_str()).filter(|t| !t.is_empty()).map(|t| ("access_token", t)),
-    ];
+    let refresh = tokens.refresh_token.as_deref().map(|t| ("refresh_token", t));
+    let access = access.map(|a| a.token.as_str()).filter(|t| !t.is_empty()).map(|t| ("access_token", t));
     let mut any = false;
-    for (hint, token) in sent.into_iter().flatten() {
+    for (hint, token) in refresh.into_iter().chain(access) {
         any = true;
         let form = [("token", token), ("token_type_hint", hint), ("client_id", tokens.client_id.as_str())];
         let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();

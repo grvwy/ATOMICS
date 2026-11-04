@@ -52,7 +52,9 @@ pub fn top_bar_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
     let p = client.palette.clone();
     let info = &view.info;
     let (text, color) = match info.state {
-        SignInState::SignedOut | SignInState::Expired | SignInState::Unavailable => (button_label(info), p.warning),
+        SignInState::SignedOut | SignInState::Expired | SignInState::Partial | SignInState::Unavailable => {
+            (button_label(info), p.warning)
+        }
         SignInState::SigningIn => ("Signing in…".to_string(), p.muted),
         SignInState::SignedIn | SignInState::Unknown => return,
     };
@@ -131,11 +133,12 @@ pub fn banner(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> 
             signing_in(ui, &view, can, client);
             return true;
         }
-        SignInState::SignedOut | SignInState::Expired | SignInState::Unavailable => {}
+        SignInState::SignedOut | SignInState::Expired | SignInState::Partial | SignInState::Unavailable => {}
     }
     client.sign_in_manual = false;
     let headline = match info.state {
         SignInState::Expired => format!("{} needs you to sign in again", info.system),
+        SignInState::Partial => format!("{} needs one more sign-in", info.system),
         SignInState::Unavailable => format!("{}: the sign-in could not be read", info.system),
         _ => format!("{} is not signed in", info.system),
     };

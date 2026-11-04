@@ -237,6 +237,7 @@ mod tests {
             app.runtime.apply_ticket_config();
             app.runtime.poll_signin();
             app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+            app.runtime.poll_signin();
             app.runtime.toast = None;
 
             let (items, output) = render(app, ctx, 1500.0, vec![]);

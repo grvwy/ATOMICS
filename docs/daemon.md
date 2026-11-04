@@ -95,7 +95,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch, report, and the key of the ticket a plan or task follows (`ticket`, optional). |
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. |
-| Host → client | `host_upsert` | The host's own state (`host` capability): the open workspace, the saved ones, and the ticket system's sign-in (`signed_in`, `signed_out`, `expired`, `signing_in` with the address to open and why a pasted one was refused, or `unavailable`). Never a token. |
+| Host → client | `host_upsert` | The host's own state (`host` capability): the open workspace, the saved ones, and the ticket system's sign-in (`signed_in`, `signed_out`, `expired`, `partial` when it lacks a resource such as the ticket API, `signing_in` with the address to open and why a pasted one was refused, or `unavailable`). Never a token. |
 | Client → host | `host_command` | `sign_in`, `sign_in_paste` (the address a browser ended on), `sign_in_cancel`, or `open_workspace` by name (`host` and `mutations`; grant `host`). |
 | Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |

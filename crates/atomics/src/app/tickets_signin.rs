@@ -70,9 +70,16 @@ fn url_of(server: &McpServer) -> String {
 }
 
 impl State {
-    /// The configured server when it signs in with OAuth.
+    /// The configured server when it signs in with OAuth, with what its sign-in also asks for.
     pub(super) fn sign_server(&self) -> Option<McpServer> {
-        self.tickets.config.as_ref().map(|c| c.server.clone()).filter(McpServer::uses_oauth)
+        self.tickets.config.as_ref().map(|config| config.sign_in_server()).filter(McpServer::uses_oauth)
+    }
+
+    /// A job said a sign-in is required: the banner shows, and the state is read again, since a
+    /// sign-in can stop covering a resource and still be there.
+    pub(super) fn ask_sign_in(&mut self) {
+        self.tickets.panel.signin = true;
+        self.tickets.sign.state = None;
     }
 
     /// Reads the sign-in state once per server, and collects a finished sign-in or sign-out. Called
@@ -126,7 +133,7 @@ impl State {
         let checking = self.tickets.sign.job.is_none() && self.tickets.sign.out.is_none();
         if checking && self.tickets.sign.state.as_ref().is_none_or(|(url, _)| *url != url_of(&server)) {
             let state = SignState::of(&self.tickets.sign.oauth(), &server);
-            if state == SignState::SignedOut {
+            if matches!(state, SignState::SignedOut | SignState::Partial) {
                 self.tickets.panel.signin = true;
             }
             self.tickets.sign.state = Some((url_of(&server), state));
@@ -202,10 +209,12 @@ impl State {
         Ok(())
     }
 
-    /// A ticket job failed: when the server wants a sign-in again, every place that shows the tickets
-    /// offers it ("Reconnect"), and the panel's banner shows.
+    /// A ticket job failed: when it says a sign-in is required (the server, or a resource the sign-in
+    /// stands for, refused the saved one), every place that shows the tickets offers it ("Reconnect"),
+    /// through the same `ask_sign_in` as the panel. Only that signal counts: a refusal the OAuth layer
+    /// already turned into an ordinary error stays one, so nothing brings the banner back by itself.
     pub(super) fn ticket_job_failed(&mut self, error: &str) {
-        if self.sign_server().is_none() || !ticket_signin::asks_for_sign_in(error) {
+        if self.sign_server().is_none() || !crate::mcp_client::is_sign_in_required(error) {
             return;
         }
         let reason = error
@@ -213,7 +222,7 @@ impl State {
             .map_or(error, |rest| rest.trim_start_matches(':').trim_start());
         let reason = atomics_ui::text::truncate(&self.scrub(reason), 200).to_string();
         self.tickets.sign.expired = Some(reason);
-        self.tickets.panel.signin = true;
+        self.ask_sign_in();
     }
 
     /// A ticket job got through: a sign-in made meanwhile (say with `atomics tickets login`) is in use.
@@ -227,7 +236,8 @@ impl State {
     /// The sign-in as every client sees it; `None` without an OAuth server or before its state is read.
     pub(crate) fn sign_in_info(&self) -> Option<SignInInfo> {
         let config = self.ticket_config()?;
-        let server = Some(config.server.clone()).filter(McpServer::uses_oauth)?;
+        // The one sign-in, with every resource it stands for (the ticket API's too).
+        let server = self.sign_server()?;
         let sign = &self.tickets.sign;
         let known = sign.state.as_ref().filter(|(url, _)| *url == url_of(&server)).map(|(_, state)| state);
         let mut info = SignInInfo {
@@ -250,6 +260,13 @@ impl State {
             SignState::Unavailable(why) => {
                 info.reason = Some(why.clone());
                 SignInState::Unavailable
+            }
+            // Signed in without a resource the profile now reads from: one more sign-in covers it.
+            SignState::Partial => {
+                let hosts = ticket_signin::resource_hosts(&server);
+                let lacks = format!("This sign-in does not cover {hosts}, which {} reads tickets from.", config.system);
+                info.reason = info.reason.or(Some(lacks));
+                SignInState::Partial
             }
             _ if sign.expired.is_some() => {
                 info.reason = info.reason.or_else(|| sign.expired.clone());
@@ -316,9 +333,16 @@ impl Desktop<'_> {
             }
             return;
         }
+        // A sign-in that does not cover every resource the profile reads from asks for one more there too;
+        // what it does cover keeps working, so the banner may be put away, and its tokens signed out.
+        let partial = self.runtime.tickets.sign.state() == Some(&SignState::Partial);
         let drew = self.draw(|backend, client| atomics_ui::signin::banner(ui, backend, client));
-        if !drew && ui.small_button("Try again").clicked() {
+        if (!drew || partial) && ui.small_button("Try again").clicked() {
             self.runtime.tickets.panel.signin = false;
+        }
+        // The chip is for a sign-in that covers everything; this one still holds tokens to forget.
+        if partial && ui.small_button("Sign out").clicked() {
+            self.runtime.start_sign_out();
         }
     }
 
@@ -451,9 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn a_server_that_says_its_sign_in_lapsed_offers_reconnect_until_a_job_gets_through() {
+    fn only_a_required_sign_in_offers_reconnect_and_a_job_that_gets_through_ends_it() {
         with_app(
-            "app::tickets_signin::tests::a_server_that_says_its_sign_in_lapsed_offers_reconnect_until_a_job_gets_through",
+            "app::tickets_signin::tests::only_a_required_sign_in_offers_reconnect_and_a_job_that_gets_through_ends_it",
             |app, _| {
                 let fake = FakeOAuthServer::start();
                 let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
@@ -461,24 +485,72 @@ mod tests {
                 app.runtime.config.tickets.server = fake.server();
                 app.runtime.tickets.sign.override_oauth(oauth);
                 app.runtime.apply_ticket_config();
-                app.runtime.tickets.sign.state = Some((url_of(&fake.server()), SignState::SignedIn));
+                let signed_in = |app: &mut Desktop<'_>| {
+                    app.runtime.tickets.sign.state = Some((url_of(&fake.server()), SignState::SignedIn));
+                    app.runtime.tickets.panel.signin = false;
+                };
+                signed_in(app);
                 assert_eq!(app.runtime.sign_in_info().unwrap().state, SignInState::SignedIn);
-                // The keychain still holds a sign-in, but the server answers that it needs refreshing.
-                app.runtime.ticket_job_failed("reading the ticket failed: tool error: needs-refresh");
+                // An ordinary failure is not about the sign-in, whatever its words: the OAuth layer says
+                // `sign-in required` when one would help, and only once for a resource that keeps refusing.
+                for error in [
+                    "reading the ticket failed: ENG-123 was not found",
+                    "reading the ticket failed: tool error: needs-refresh",
+                    "reading the ticket failed: the API refused the sign-in again; signing in again did not change it",
+                ] {
+                    app.runtime.ticket_job_failed(error);
+                    assert_eq!(app.runtime.sign_in_info().unwrap().state, SignInState::SignedIn, "{error}");
+                    assert!(!app.runtime.tickets.panel.signin, "{error}");
+                }
+                // A required sign-in asks, through the panel's own `ask_sign_in`, and the state is read again.
+                app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+                assert!(app.runtime.tickets.panel.signin && app.runtime.tickets.sign.state.is_none());
+                app.runtime.poll_signin();
                 let info = app.runtime.sign_in_info().unwrap();
                 assert_eq!(info.state, SignInState::Expired);
-                assert!(info.reason.as_deref().is_some_and(|r| r.contains("needs-refresh")), "{info:?}");
-                // Any other failure is not about the sign-in.
-                app.runtime.tickets.sign.expired = None;
-                app.runtime.ticket_job_failed("reading the ticket failed: ENG-123 was not found");
-                assert_eq!(app.runtime.sign_in_info().unwrap().state, SignInState::SignedIn);
+                assert_eq!(info.reason.as_deref(), Some("the server refused the saved sign-in"));
                 // A sign-in made elsewhere (`atomics tickets login`) is noticed by the next job that gets through.
-                app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
-                assert_eq!(app.runtime.sign_in_info().unwrap().state, SignInState::Expired);
                 app.runtime.ticket_job_succeeded();
-                app.runtime.tickets.sign.state = Some((url_of(&fake.server()), SignState::SignedIn));
+                signed_in(app);
                 assert_eq!(app.runtime.sign_in_info().unwrap().state, SignInState::SignedIn);
-                assert!(!app.runtime.tickets.panel.signin);
+            },
+        );
+    }
+
+    #[test]
+    fn a_sign_in_that_does_not_cover_the_ticket_api_asks_for_one_more_naming_it() {
+        with_app(
+            "app::tickets_signin::tests::a_sign_in_that_does_not_cover_the_ticket_api_asks_for_one_more_naming_it",
+            |app, _| {
+                let fake = FakeOAuthServer::start();
+                let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+                app.runtime.config.tickets = toml::from_str(
+                    "system = \"tracker\"\n[operations.read]\nhttp = { method = \"GET\", path = \"/items/{id}\" }\nresult = { id = \"id\" }",
+                )
+                .unwrap();
+                app.runtime.config.tickets.server = fake.server();
+                app.runtime.config.tickets.http.url = fake.api_url.clone();
+                app.runtime.tickets.sign.override_oauth(oauth);
+                app.runtime.apply_ticket_config();
+                // The one sign-in stands for the server and the API: the shared state says so.
+                let server = app.runtime.sign_server().unwrap();
+                assert!(!server.resources.is_empty(), "{server:?}");
+                app.runtime.tickets.sign.state = Some((url_of(&server), SignState::Partial));
+                let info = app.runtime.sign_in_info().unwrap();
+                assert_eq!(info.state, SignInState::Partial);
+                assert!(info.needs_sign_in());
+                assert_eq!(atomics_ui::signin::button_label(&info), "Sign in to tracker");
+                let hosts = ticket_signin::resource_hosts(&server);
+                assert!(info.reason.as_deref().is_some_and(|r| r.contains(&hosts)), "{info:?}");
+
+                // A client's sign-in is the same one: it asks for the server and the API together.
+                assert!(matches!(host_command(app, "o1", HostAction::SignIn), Outcome::Done { .. }));
+                work(app, "the address", |r| r.sign_in_info().and_then(|i| i.url).is_some());
+                let url = app.runtime.sign_in_info().unwrap().url.unwrap();
+                let resources =
+                    url::Url::parse(&url).unwrap().query_pairs().filter(|(key, _)| key == "resource").count();
+                assert_eq!(resources, 2, "{url}");
+                app.runtime.cancel_sign_in().unwrap();
             },
         );
     }

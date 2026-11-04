@@ -464,6 +464,7 @@ fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
 
             // The server refused the saved sign-in: the same place offers Reconnect, and says why.
             app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+            app.runtime.poll_signin();
             let rendered = frame(app, ctx, 1400.0, 0.1, vec![]);
             let texts = labels(&rendered);
             assert!(texts.contains(&"tracker needs you to sign in again".to_string()), "{texts:?}");

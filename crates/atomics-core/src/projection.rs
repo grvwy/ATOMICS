@@ -166,6 +166,9 @@ pub enum SignInState {
     SignedOut,
     /// It was signed in, but the server refused the saved sign-in or it ran out: "Reconnect".
     Expired,
+    /// Signed in, but not for a resource the profile now reads from (its ticket API, say): one more
+    /// sign-in covers it, and `reason` names it. What the sign-in covers keeps working.
+    Partial,
     /// A sign-in is under way; `url` and `rejected` say how far.
     SigningIn,
     /// The host's keychain could not be read; `reason` says why.
@@ -178,7 +181,7 @@ pub enum SignInState {
 impl SignInInfo {
     /// Whether the ticket tools need the person: anything but signed in (or under way).
     pub fn needs_sign_in(&self) -> bool {
-        matches!(self.state, SignInState::SignedOut | SignInState::Expired)
+        matches!(self.state, SignInState::SignedOut | SignInState::Expired | SignInState::Partial)
     }
 }
 
