@@ -58,7 +58,17 @@ fn approval() -> ApprovalInfo {
         command: Some("ls".into()),
         cwd: "/w/a".into(),
         reason: None,
+        warning: Some("stash@{0} (On atomics/t2: t2), which belongs to task t2".into()),
     }
+}
+
+#[test]
+fn an_approval_without_a_warning_reads_as_before() {
+    let mut info = approval();
+    info.warning = None;
+    let json = serde_json::to_value(&info).unwrap();
+    assert!(json.get("warning").is_none(), "{json}");
+    assert_eq!(serde_json::from_value::<ApprovalInfo>(json).unwrap(), info);
 }
 
 fn summary() -> DiffSummary {

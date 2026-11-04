@@ -144,7 +144,73 @@ impl State {
                 ErrorCode::Rejected,
                 "an earlier permission request in that session waits for an answer first",
             )),
-            Some((index, _)) => self.approve(index, approval, decision, message).map(|()| disposition(decision)),
+            // How it ended, as `approve` recorded it: "Allow always" can end as a one-time allow.
+            Some((index, _)) => self
+                .approve(index, approval, decision, message)
+                .map(|()| self.resolution(approval).unwrap_or(disposition(decision))),
+        }
+    }
+
+    /// What an approval of `request` from the session at `index` warns about when its command drops
+    /// shared stash entries: those entries as git lists them now, in the repository the command runs
+    /// git in, and whose they are.
+    pub(super) fn stash_warning(&self, index: usize, request: &ApprovalRequest) -> Option<String> {
+        use atomics_core::stash;
+        let drops = request.stash_drops();
+        if drops.is_empty() {
+            return None;
+        }
+        let base = if request.cwd.as_os_str().is_empty() { self.sessions[index].root() } else { request.cwd.clone() };
+        let dirs: Vec<PathBuf> =
+            drops.iter().map(|drop| drop.dirs.iter().fold(base.clone(), |dir, d| dir.join(d))).collect();
+        let mut listed: Vec<(&PathBuf, Result<Vec<stash::Entry>, String>)> = Vec::new();
+        for dir in &dirs {
+            if !listed.iter().any(|(listed, _)| *listed == dir) {
+                listed.push((dir, stash::list(dir).map_err(|error| format!("{error:#}"))));
+            }
+        }
+        let entries = |dir: &PathBuf| &listed.iter().find(|(listed, _)| *listed == dir).expect("listed").1;
+        let drops = drops.iter().zip(&dirs).map(|(drop, dir)| (drop, entries(dir).as_deref().map_err(String::as_str)));
+        Some(stash::warning(drops, |entry| self.stash_owner(index, entry)))
+    }
+
+    /// Whose stash `entry` is: the session whose worktree has its branch checked out, or else whose
+    /// task its message names (`git stash push -m <task id>`); a task whose session has ended, by its
+    /// branch or id; `requester` itself when it is that session.
+    fn stash_owner(&self, requester: usize, entry: &atomics_core::stash::Entry) -> atomics_core::stash::Owner {
+        use atomics_core::stash::Owner;
+        let branch = entry.branch();
+        let tag = entry.message().and_then(|message| message.split_whitespace().next());
+        let tasks = || self.plans.iter().flat_map(|plan| &plan.tasks);
+        let task_of = |session: &Session| tasks().find(|task| task.session.as_deref() == Some(&session.id));
+        let by_branch: Vec<usize> =
+            (0..self.sessions.len()).filter(|&i| branch.is_some() && self.sessions[i].branch() == branch).collect();
+        let owners = if by_branch.is_empty() {
+            (0..self.sessions.len())
+                .filter(|&i| tag.is_some_and(|tag| task_of(&self.sessions[i]).is_some_and(|task| task.id == tag)))
+                .collect()
+        } else {
+            by_branch
+        };
+        if owners.contains(&requester) {
+            return Owner::Requester;
+        }
+        if let Some(&owner) = owners.first() {
+            let session = &self.sessions[owner];
+            return Owner::Known(match task_of(session) {
+                _ if session.chief => "the main checkout, the chief's or yours".into(),
+                Some(task) => format!("task {} (session {})", task.id, session.id),
+                None => format!("session {}", session.id),
+            });
+        }
+        let ended: Vec<_> = tasks()
+            .filter(|task| {
+                (branch.is_some() && task.branch.as_deref() == branch) || tag.is_some_and(|tag| task.id == tag)
+            })
+            .collect();
+        match ended[..] {
+            [task] => Owner::Known(format!("task {}", task.id)),
+            _ => Owner::Unknown,
         }
     }
 
@@ -179,6 +245,11 @@ impl State {
                 "stale permission decision: review the current request",
             ));
         }
+        // "Allow always" answers once a request ATOMICS must not remember, such as a stash drop.
+        let decision = match decision {
+            Decision::AllowAlways if !pending.request.may_allow_always() => Decision::Allow,
+            decision => decision,
+        };
         let reply = HookReply { stdout: Some(decision.output(message)) };
         let azure = pending.request.tool == "Azure REST";
         let answered = pending.reply.take().is_some_and(|sender| sender.answer(reply));
@@ -205,7 +276,7 @@ impl State {
         }
         let pending = session.approvals.remove(0);
         let id = pending.id.clone();
-        if decision == Decision::AllowAlways && !azure {
+        if decision == Decision::AllowAlways {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
@@ -262,6 +333,7 @@ mod tests {
                         cwd: app.runtime.launch_dir.clone(),
                         reason: None,
                         input: json!({}),
+                        warning: None,
                     },
                     reply: None,
                 });
@@ -370,6 +442,7 @@ mod tests {
                         cwd: app.runtime.launch_dir.clone(),
                         reason: None,
                         input: json!({}),
+                        warning: None,
                     },
                     reply: Some(reply),
                 });
@@ -519,6 +592,7 @@ mod tests {
                             cwd: app.runtime.launch_dir.clone(),
                             reason: Some("Verify permission controls".into()),
                             input: json!({}),
+                            warning: None,
                         },
                         reply: Some(reply.clone()),
                     });
@@ -970,6 +1044,167 @@ mod tests {
                 assert!(app.runtime.sessions[0].approvals.is_empty());
                 assert_eq!(app.runtime.plans[one].tasks[0].status, TaskStatus::Running);
                 assert_eq!(app.runtime.plans[two].tasks[0].status, TaskStatus::Running);
+            },
+        );
+    }
+
+    #[test]
+    fn the_banner_shows_a_stash_warning_and_offers_no_allow_always() {
+        with_app("app::approvals::tests::the_banner_shows_a_stash_warning_and_offers_no_allow_always", |app, ctx| {
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            let warning = "stash@{1} (On atomics/t2: t2), which belongs to task t2 (session worker-two)";
+            worker.approvals.push(PendingApproval {
+                id: "pending".into(),
+                request: ApprovalRequest {
+                    tool: "Bash".into(),
+                    command: Some("git stash pop 1".into()),
+                    cwd: app.runtime.launch_dir.clone(),
+                    reason: None,
+                    input: json!({}),
+                    warning: Some(warning.into()),
+                },
+                reply: Some(Arc::new(ipc::ApprovalReply::default())),
+            });
+            app.runtime.sessions = vec![worker];
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let layout = layout::compute(1400.0, 900.0, 1, 0, false, 0.0, &app.runtime.config.layout);
+                        app.tiles(ui, ui.max_rect(), &layout, &[0]);
+                    });
+                },
+            );
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            output.drop_without_applying_deltas();
+            for label in ["Permission requested", "Allow", "Deny", warning, "git stash pop 1"] {
+                assert!(text.iter().any(|text| text == label), "{label}: {text:?}");
+            }
+            assert!(!text.iter().any(|text| text == "Allow always"), "{text:?}");
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn a_stash_drop_waits_names_the_entrys_owner_and_is_never_allowed_always() {
+        with_app(
+            "app::approvals::tests::a_stash_drop_waits_names_the_entrys_owner_and_is_never_allowed_always",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let repo = dir.path().canonicalize().unwrap().join("app");
+                std::fs::create_dir(&repo).unwrap();
+                let git = |dir: &Path, args: &[&str]| git::git(dir, args).unwrap();
+                git(&repo, &["init", "-q", "-b", "main"]);
+                git(&repo, &["config", "user.name", "test"]);
+                git(&repo, &["config", "user.email", "test@example.com"]);
+                std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+                git(&repo, &["add", "a.txt"]);
+                git(&repo, &["commit", "-q", "-m", "base"]);
+                let (one, two) = (repo.with_file_name("one"), repo.with_file_name("two"));
+                git::add_worktree(&repo, &two, "atomics/two", "main").unwrap();
+                git::add_worktree(&repo, &one, "atomics/one", "main").unwrap();
+                // Oldest first: task t2's entry, then task t1's, then one made in the main checkout.
+                for (checkout, message) in [(&two, Some("t2")), (&one, Some("t1 before rebase")), (&repo, None)] {
+                    std::fs::write(checkout.join("a.txt"), format!("{message:?}\n")).unwrap();
+                    match message {
+                        Some(message) => git(checkout, &["stash", "push", "-q", "-m", message]),
+                        None => git(checkout, &["stash", "push", "-q"]),
+                    };
+                }
+                app.runtime.config.approvals.allow = vec!["git".into()];
+                app.runtime.sessions = ["one", "two"]
+                    .into_iter()
+                    .map(|name| {
+                        let root = repo.with_file_name(name);
+                        let mut worker =
+                            session(&format!("worker-{name}"), AgentKind::Generic, AgentStatus::Working, &root);
+                        worker.worktree = Some(Worktree { root, branch: Some(format!("atomics/{name}")) });
+                        worker
+                    })
+                    .collect();
+                let task =
+                    |id: &str, session: &str| Task { id: id.into(), session: Some(session.into()), ..Task::default() };
+                app.runtime.plans =
+                    vec![Plan { tasks: vec![task("t1", "worker-one"), task("t2", "worker-two")], ..Plan::default() }];
+                let permission = |command: &str| {
+                    let reply = Arc::new(ipc::ApprovalReply::default());
+                    let message = HookMessage {
+                        pane: Some("worker-one".into()),
+                        ancestors: vec![],
+                        delivered: 0,
+                        approval_reply: Some(reply.clone()),
+                        event: atomics_core::hook::HookEvent::from_payload(&json!({
+                            "hook_event_name":"PermissionRequest", "session_id":"worker-one", "cwd":one,
+                            "tool_name":"Bash", "tool_input":{"command":command}
+                        }))
+                        .unwrap(),
+                    };
+                    (message, reply)
+                };
+
+                // Allowed by the list, a drop still waits, and says the entry is task t2's.
+                let (message, reply) = permission("git stash drop stash@{2}");
+                app.runtime.on_hook(message);
+                assert!(!reply.expired(), "the drop must wait for a decision");
+                let pending = &app.runtime.sessions[0].approvals[0];
+                let warning = pending.request.warning.clone().unwrap();
+                assert!(warning.starts_with(atomics_core::stash::SHARED), "{warning}");
+                assert!(
+                warning.ends_with(
+                    "git stash drop drops stash@{2} (On atomics/two: t2), which belongs to task t2 (session worker-two), \
+                     not to this agent."
+                ),
+                "{warning}"
+            );
+                // The chief's event and every client see it too.
+                let event = app.runtime.events.iter().rev().find(|event| event.session == "worker-one").unwrap();
+                assert_eq!(event.approval.as_ref().unwrap().warning.as_ref(), Some(&warning));
+                assert_eq!(app.runtime.approval_infos()[0].warning.as_ref(), Some(&warning));
+
+                // "Allow always" answers it once, and is not remembered.
+                let id = pending.id.clone();
+                assert_eq!(app.runtime.decide(&id, Decision::AllowAlways, None).unwrap(), Disposition::Allowed);
+                assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                assert!(app.runtime.sessions[0].allowed.is_empty());
+                let (message, reply) = permission("git stash drop stash@{2}");
+                app.runtime.on_hook(message);
+                assert!(!reply.expired() && app.runtime.sessions[0].approvals.len() == 1, "asked again");
+                let id = app.runtime.sessions[0].approvals[0].id.clone();
+                app.runtime.decide(&id, Decision::Deny, None).unwrap();
+
+                // A clear names every entry's owner: the main checkout's no session accounts for.
+                let (message, reply) = permission("git stash list && git stash clear");
+                app.runtime.on_hook(message);
+                let warning = app.runtime.sessions[0].approvals[0].request.warning.clone().unwrap();
+                assert!(warning.contains("git stash clear drops all 3 entries: stash@{0} (WIP on main: "), "{warning}");
+                assert!(
+                warning.contains(
+                    "), whose owner ATOMICS cannot tell; stash@{1} (On atomics/one: t1 before rebase), this agent's own; \
+                     stash@{2} (On atomics/two: t2), which belongs to task t2 (session worker-two), not to this agent."
+                ),
+                "{warning}"
+            );
+                let id = app.runtime.sessions[0].approvals[0].id.clone();
+                app.runtime.decide(&id, Decision::Deny, None).unwrap();
+                assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
+
+                // Other commands carry no warning, and the allow list answers them.
+                let (message, reply) = permission("git stash list");
+                app.runtime.on_hook(message);
+                assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                assert!(app.runtime.sessions[0].approvals.is_empty());
+                app.runtime.sessions.clear();
+                app.runtime.plans.clear();
             },
         );
     }

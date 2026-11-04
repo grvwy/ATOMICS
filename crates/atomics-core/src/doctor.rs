@@ -140,6 +140,38 @@ pub fn worktree_checks(repo: &Path, base_ref: &str) -> Vec<String> {
     }
 }
 
+/// The most stash entries the doctor lists for a repository.
+#[cfg(feature = "native")]
+const STASH_SHOWN: usize = 20;
+
+/// The stash `repo`'s worktrees share, one fact line per entry with its message, newest first.
+/// Agents stash with their task id as the message, so an entry names whose it is.
+#[cfg(feature = "native")]
+pub fn stash_lines(repo: &Path) -> Vec<String> {
+    let entries = match crate::stash::list(repo) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return vec![check_line(
+                false,
+                &format!("cannot list the stash of {} (warning): {err:#}", repo.display()),
+                "check repository access",
+            )];
+        }
+    };
+    if entries.is_empty() {
+        return vec![format!("Stash of {}: empty", repo.display())];
+    }
+    let count = crate::stash::entries(entries.len());
+    let mut lines = vec![format!("Stash of {}, shared by its worktrees: {count}", repo.display())];
+    lines.extend(
+        entries.iter().take(STASH_SHOWN).map(|entry| format!("  stash@{{{}}}: {}", entry.index, entry.subject)),
+    );
+    if entries.len() > STASH_SHOWN {
+        lines.push(format!("  … and {} more: git stash list", entries.len() - STASH_SHOWN));
+    }
+    lines
+}
+
 pub fn check_line(passed: bool, label: &str, hint: &str) -> String {
     let line = if passed { format!("✓ {label}") } else { format!("✗ {label} — {hint}") };
     line.lines().collect::<Vec<_>>().join(" ")
@@ -276,6 +308,34 @@ mod tests {
         assert!(lines[0].contains("Clean up…"));
         assert_eq!(lines[0].lines().count(), 1);
         assert!(done.exists() && dirty.exists() && unmerged.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn stash_lines_list_every_worktrees_entries_with_their_messages() {
+        let (dir, repo) = crate::git::tests::project();
+        assert_eq!(stash_lines(&repo), [format!("Stash of {}: empty", repo.display())]);
+        let linked = dir.path().join("linked");
+        git::add_worktree(&repo, &linked, "atomics/t2", "main").unwrap();
+        std::fs::write(repo.join("a.txt"), "main change\n").unwrap();
+        git::git(&repo, &["stash", "push", "-q", "-m", "t1"]).unwrap();
+        std::fs::write(linked.join("a.txt"), "linked change\n").unwrap();
+        git::git(&linked, &["stash", "push", "-q", "-m", "ENG-123 before rebase"]).unwrap();
+        let expected = [
+            format!("Stash of {}, shared by its worktrees: 2 entries", repo.display()),
+            "  stash@{0}: On atomics/t2: ENG-123 before rebase".to_string(),
+            "  stash@{1}: On main: t1".to_string(),
+        ];
+        assert_eq!(stash_lines(&repo), expected);
+        for again in 0..STASH_SHOWN {
+            std::fs::write(repo.join("a.txt"), format!("again {again}\n")).unwrap();
+            git::git(&repo, &["stash", "push", "-q", "-m", "again"]).unwrap();
+        }
+        let lines = stash_lines(&repo);
+        assert_eq!(lines.len(), STASH_SHOWN + 2, "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "  … and 2 more: git stash list");
+        let missing = stash_lines(&dir.path().join("missing"));
+        assert!(missing[0].starts_with("✗ cannot list the stash of") && missing.len() == 1, "{missing:?}");
     }
 
     #[test]

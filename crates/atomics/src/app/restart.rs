@@ -304,6 +304,7 @@ mod tests {
                         cwd: app.runtime.launch_dir.clone(),
                         reason: None,
                         input: json!({}),
+                        warning: None,
                     },
                 });
                 refused(app, "approval or question");

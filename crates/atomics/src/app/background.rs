@@ -637,6 +637,11 @@ impl State {
             }
         };
 
+        // A command that drops shared stash entries says whose, for whoever decides. A sandboxed
+        // session's requests are not ATOMICS's to answer.
+        let stash_warning = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
+            .then(|| self.stash_warning(index, &ApprovalRequest::from_event(&event)))
+            .flatten();
         let session = &mut self.sessions[index];
         if session.sandbox.is_some() {
             if let Some(reply) = message.approval_reply {
@@ -651,7 +656,7 @@ impl State {
         session.hooks_active = true;
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
-            let request = ApprovalRequest::from_event(&event);
+            let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
             if (self.config.approvals.allows(&request, &session.root())
                 || session.allowed.iter().any(|allowed| allowed.same_command(&request)))
                 && message

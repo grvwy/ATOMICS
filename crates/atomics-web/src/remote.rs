@@ -1031,6 +1031,7 @@ impl Backend for RemoteBackend {
                 cwd: PathBuf::from(&approval.cwd),
                 reason: approval.reason.clone(),
                 input: serde_json::Value::Null,
+                warning: approval.warning.clone(),
             },
         })
     }

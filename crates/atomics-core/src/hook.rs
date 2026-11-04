@@ -121,6 +121,12 @@ pub fn claude_settings(atomics_exe: &Path) -> Value {
     json!({ "hooks": hooks })
 }
 
+/// Claude permission rules that make a Claude agent ATOMICS starts on this machine ask before it drops
+/// entries of the stash every worktree shares, whatever else its settings allow. Claude asks in its own
+/// terminal: its permission prompts do not reach ATOMICS's approval policy, which handles Codex's.
+pub const CLAUDE_STASH_ASK: [&str; 4] =
+    ["Bash(git stash drop:*)", "Bash(git stash pop:*)", "Bash(git stash clear:*)", "Bash(git stash branch:*)"];
+
 /// Session-local handlers carry their destination without exporting it to the agent.
 pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bool) -> Value {
     let mut command = format!(
@@ -158,6 +164,7 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
         .collect();
     let mut settings = json!({ "hooks": hooks });
     if !codex {
+        settings["permissions"] = json!({ "ask": CLAUDE_STASH_ASK });
         settings["statusLine"] = json!({
             "type": "command",
             "command": format!("{} statusline --socket {}", shell_quote(&atomics_exe.to_string_lossy()), shell_quote(&socket.to_string_lossy()))
@@ -276,7 +283,7 @@ fn is_cox_hook(handler: &Value) -> bool {
         && words.get(1).is_some_and(|arg| arg == "hook")
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     if text.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {
         text.to_string()
     } else {
@@ -335,7 +342,10 @@ mod tests {
             if codex {
                 assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 600);
                 assert!(settings.get("statusLine").is_none());
+                assert!(settings.get("permissions").is_none());
             } else {
+                // Claude asks before it drops shared stash entries, even where its settings allow git.
+                assert_eq!(settings["permissions"]["ask"], json!(CLAUDE_STASH_ASK));
                 assert_eq!(settings["statusLine"]["type"], "command");
                 assert_eq!(
                     shlex::split(settings["statusLine"]["command"].as_str().unwrap()).unwrap(),

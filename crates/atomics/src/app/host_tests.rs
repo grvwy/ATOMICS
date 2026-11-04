@@ -74,6 +74,7 @@ fn expired_approval(state: &mut State) -> Arc<ipc::ApprovalReply> {
             cwd: state.launch_dir.clone(),
             reason: None,
             input: json!({}),
+            warning: None,
         },
         reply: Some(reply.clone()),
     });
@@ -1010,6 +1011,7 @@ fn waiting_approval(session: &mut Session, id: &str) -> Arc<ipc::ApprovalReply> 
             cwd: session.cwd.clone(),
             reason: None,
             input: json!({}),
+            warning: None,
         },
         reply: Some(reply.clone()),
     });

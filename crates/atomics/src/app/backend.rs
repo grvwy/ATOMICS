@@ -610,6 +610,7 @@ mod tests {
                     cwd: dir.path().into(),
                     reason: None,
                     input: json!({}),
+                    warning: None,
                 },
                 reply: None,
             };

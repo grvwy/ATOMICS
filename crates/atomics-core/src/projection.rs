@@ -127,6 +127,9 @@ pub struct ApprovalInfo {
     pub command: Option<String>,
     pub cwd: String,
     pub reason: Option<String>,
+    /// What the host warns whoever decides about, such as whose shared stash entries the command drops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +343,7 @@ mod tests {
             command: None,
             cwd: "/w".into(),
             reason: None,
+            warning: None,
         }]));
         assert_eq!((p.approvals.load().revision, p.cursor()), (1, 3));
     }

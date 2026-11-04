@@ -420,6 +420,7 @@ impl Inner {
             cwd: PathBuf::new(),
             reason: Some("Allow this Azure request once? It can change Azure resources.".into()),
             input: serde_json::json!({}),
+            warning: None,
         };
         // Register under the grants lock so revoke cannot miss a write being enqueued.
         {

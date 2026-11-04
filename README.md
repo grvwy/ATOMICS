@@ -388,7 +388,8 @@ uses the repository fixture and reports explicitly that VM isolation and KVM wer
 
 Run `atomics doctor` to check git, Claude Code, Codex, the configured editor, the config, the running ATOMICS socket and global Claude hooks.
 It also checks Codex hook support (0.165+), reports hook trust as unverified with `/hooks` instructions, reads plan files,
-warns about cargo entries in `[approvals].allow`, and lists merged worktrees safe to review for cleanup. It changes nothing.
+warns about cargo entries in `[approvals].allow`, lists merged worktrees safe to review for cleanup, and lists each
+repository's stash, which all its worktrees share, entry by entry with its message. It changes nothing.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
 agents, Helix, a running ATOMICS or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
 
@@ -499,6 +500,21 @@ An explicit `ATOMICS_HOME` also gives bare agents their own `CODEX_HOME` (`<home
 `CLAUDE_CONFIG_DIR` (`<home>/claude`). Codex's per-event hook trust slots and Claude's folder trust
 then belong to that instance. Sign in separately in those provider homes when needed.
 
+### The shared stash
+
+All worktrees of a repository share one git stash, so `stash@{1}` names whichever entry is second when git runs,
+possibly another agent's. A Codex request to run `git stash drop`, `pop`, `branch` or `clear` always waits for the
+chief or you, whatever `allow` says, including inside chains, pipes, substitutions and `sh -c`. It carries a `warning` that lists
+the entries the command would drop as git lists them now, each with whose it is: this agent's own, another session's
+or task's (by the branch it was stashed on, or the task id it was stashed with), or one ATOMICS cannot tell. The
+banner shows the warning above the command and offers no **Allow always**; `allow_always` from the chief answers once
+and is not remembered, because the same index names another entry once anyone stashes. Every brief tells agents
+to stash with `git stash push -m <task id>`, to find their entry by that message and restore it with
+`git stash apply <commit>`, and to drop, pop or clear nothing without approval. Claude agents ATOMICS starts on this
+machine ask in their own terminal before these commands (`permissions.ask` in their session settings), even where
+their settings allow git; sandboxed agents run unattended and have only the brief. `atomics doctor` lists every
+repository's stash.
+
 ## The chief agent
 
 Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: Claude in a large window in the middle of the
@@ -567,6 +583,7 @@ Changing only branch names keeps approval; changing the goal or task requirement
 first message is the brief. Every agent ATOMICS starts gets a `atomics_report` tool, pre-approved, to say when it is done,
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
 `atomics_wait`, which then reads `atomics_result` and `atomics_diff`, reviews, steers, and accepts with `atomics_plan_update`.
+The brief also tells the agent that every worktree shares one git stash: see [The shared stash](#the-shared-stash).
 
 Plans are stored separately in `plans/<id>.json` under the state directory, with status `open`, `completed` or `archived`. The old
 `plan.json` in that directory migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done

@@ -32,6 +32,9 @@ pub struct ApprovalRequest {
     pub cwd: PathBuf,
     pub reason: Option<String>,
     pub input: Value,
+    /// What the host adds for whoever decides, such as whose shared stash entries the command drops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -47,7 +50,22 @@ impl ApprovalRequest {
                 .unwrap_or_default(),
             reason: text("description").or_else(|| text("justification")),
             input: event.tool_input.clone(),
+            warning: None,
         }
+    }
+
+    /// The shared stash entries this request's command drops, by the entry they name.
+    pub fn stash_drops(&self) -> Vec<crate::stash::StashDrop> {
+        match &self.command {
+            Some(command) if self.tool == "Bash" => crate::stash::drops(command),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether "Allow always" may answer it. Never for an Azure request, nor for a command that drops
+    /// shared stash entries: the same `stash@{n}` names another entry once anyone stashes.
+    pub fn may_allow_always(&self) -> bool {
+        self.tool != "Azure REST" && self.stash_drops().is_empty()
     }
 
     pub fn same_command(&self, other: &Self) -> bool {
@@ -82,6 +100,10 @@ impl ApprovalPolicy {
             return false;
         }
         let Some(command) = &request.command else { return false };
+        // Whatever the allow list says, dropping shared stash entries waits for the chief or the user.
+        if !request.stash_drops().is_empty() {
+            return false;
+        }
         let Some(commands) = shell_commands(command) else { return false };
         commands.iter().all(|words| self.allows_command(words, &request.cwd, root))
     }
@@ -424,7 +446,32 @@ mod tests {
             cwd: cwd.into(),
             reason: None,
             input: Value::Null,
+            warning: None,
         }
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn dropping_shared_stash_entries_always_waits_and_is_never_allowed_always() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let policy = ApprovalPolicy { allow: vec!["git".into(), "git stash".into()], env: Vec::new() };
+        for command in ["git stash list", "git stash push -m ENG-123", "git stash apply 0", "git stash"] {
+            let request = request(command, dir.path());
+            assert!(policy.allows(&request, dir.path()), "{command}");
+            assert!(request.may_allow_always(), "{command}");
+        }
+        for command in
+            ["git stash drop", "git stash drop 1", "git stash pop", "git stash clear", "git status; git stash pop 0"]
+        {
+            let request = request(command, dir.path());
+            assert!(!policy.allows(&request, dir.path()), "{command}");
+            assert!(!request.may_allow_always(), "{command}");
+        }
+        let azure = ApprovalRequest { tool: "Azure REST".into(), ..request("PUT https://example.com/", dir.path()) };
+        assert!(!azure.may_allow_always());
+        // Only a shell command drops entries: an edit's text that says so does not.
+        let edit = ApprovalRequest { tool: "Edit".into(), ..request("git stash clear", dir.path()) };
+        assert!(edit.stash_drops().is_empty() && edit.may_allow_always());
     }
 
     #[test]
