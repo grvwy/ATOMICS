@@ -363,7 +363,7 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
     if panel.dialog && client.touch.is_none() && ui.memory(|m| m.has_focus(panel_nav::focus_id())) {
         ui.memory_mut(|m| m.request_focus(plan_extra_id()));
     }
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt("tickets-panel"), |ui| {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 6.0))).id_salt("tickets-panel"), |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Tickets");
             ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).small().color(p.muted));
@@ -514,7 +514,16 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
             " by keyword".into()
         }
     });
-    ui.label(if busy { "Loading tickets…".into() } else { format!("{count} ticket{suffix}{how}") });
+    let status = if busy {
+        "Loading tickets…".to_string()
+    } else if panel.searched.is_some() {
+        format!("{count} ticket{suffix}{how}")
+    } else if active {
+        "Type a query and press Enter.".to_string()
+    } else {
+        String::new()
+    };
+    ui.label(RichText::new(status).size(11.5).color(client.palette.muted));
     if let Some(query) = &panel.chief_query {
         ui.label(format!("from the chief: “{query}”"));
     }
@@ -602,18 +611,28 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
     }
 }
 
+/// What a ticket is at a glance: its state in that state's color, then its kind, assignee and last update.
 fn facts(ui: &mut egui::Ui, card: &TicketCard, info: &TicketsInfo, p: &Palette) {
+    if let Some(state) = &card.link.state {
+        ui.label(RichText::new(format!("[{state}]")).size(12.0).color(state_color(&info.states, state, p)));
+    }
     let facts = [
-        card.link.state.as_deref(),
-        card.assignee.as_ref().map(|a| a.as_deref().unwrap_or("unassigned")),
-        card.kind.as_deref(),
+        card.kind.clone(),
+        card.assignee.as_ref().map(|a| a.clone().unwrap_or_else(|| "unassigned".into())),
+        card.link.updated_at.as_ref().map(|at| format!("updated {at}")),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
     .join(" · ");
-    let color = card.link.state.as_deref().map_or(p.muted, |state| state_color(&info.states, state, p));
-    ui.label(RichText::new(facts).small().color(color));
+    ui.label(RichText::new(facts).size(11.5).color(p.muted));
+}
+
+/// A section title in the reader, under the ticket's own text.
+fn section_title(ui: &mut egui::Ui, text: &str, p: &Palette) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(text).strong().size(12.5).color(p.muted));
+    ui.separator();
 }
 
 fn read(
@@ -677,17 +696,46 @@ fn read(
         ui.ctx().request_repaint();
         return;
     }
-    ui.label(panel.crumbs.iter().map(|link| link.label()).chain([card.link.label()]).collect::<Vec<_>>().join(" › "));
-    ui.heading(card.link.title.as_deref().unwrap_or(card.link.label()));
-    facts(ui, &card, info, &client.palette);
-    if panel.busy(Part::Read) {
-        ui.label("loading…");
-    }
+    let p = client.palette.clone();
     let parts = card.body.as_deref().map(markdown::sections).unwrap_or_default();
     let comments_start = parts.len();
     let children_start = comments_start + card.comments.len();
     let related_start = children_start + panel.children.len();
     let stops = related_start + panel.related.len();
+    let trail = panel.crumbs.iter().map(|link| link.label()).chain([card.link.label()]).collect::<Vec<_>>().join(" › ");
+    let place = match stops {
+        0 => trail,
+        stops => format!("{trail} · section {}/{stops}", panel.section.map_or("–".into(), |at| (at + 1).to_string())),
+    };
+    ui.label(RichText::new(place).size(11.5).color(p.muted));
+    let title = card.link.title.as_deref().unwrap_or(card.link.label());
+    ui.add(egui::Label::new(RichText::new(title).size(16.0).strong().color(p.foreground)).wrap());
+    ui.horizontal_wrapped(|ui| {
+        facts(ui, &card, info, &p);
+        if !panel.children.is_empty() {
+            ui.label(RichText::new(format!("· {} children", panel.children.len())).size(11.5).color(p.muted));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        for link in &card.links {
+            let text = [link.label.as_deref(), link.status.as_deref(), link.ci.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let url = link.url.as_deref().filter(|url| markdown::web_url(url).is_some());
+            let button = ui.add_enabled_ui(url.is_some(), |ui| touch::small_button(ui, client.touch, text)).inner;
+            if let Some(url) = url
+                && button.on_hover_text(url).clicked()
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+        }
+    });
+    if panel.busy(Part::Read) {
+        ui.label(RichText::new("loading…").size(11.5).color(p.muted));
+    }
+    ui.separator();
     for key in panel_nav::take_keys(ui, &[Key::PageUp, Key::PageDown, Key::Enter]) {
         match key {
             Key::PageUp | Key::PageDown => {
@@ -742,13 +790,13 @@ fn read(
     let selected = panel.section;
     let jump_section = std::mem::take(&mut panel.jump_section);
     let section = |ui: &mut egui::Ui, index, body: &mut dyn FnMut(&mut egui::Ui)| {
-        let response = ui
-            .scope(|ui| {
-                body(ui);
-            })
-            .response;
+        let frame = egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 2, bottom: 2 });
+        let response = frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            body(ui);
+        });
         if selected == Some(index) {
-            let rect = response.rect;
+            let rect = response.response.rect;
             ui.painter().line_segment([rect.left_top(), rect.left_bottom()], Stroke::new(3.0, client.palette.accent));
             if jump_section {
                 ui.scroll_to_rect(rect, Some(egui::Align::TOP));
@@ -756,39 +804,44 @@ fn read(
         }
     };
     let output = area.show(ui, |ui| {
-        for link in &card.links {
-            if let Some(url) = &link.url {
-                web_link(ui, link.label.as_deref().unwrap_or("Link"), url);
-            }
-        }
         for (index, (_, body)) in parts.iter().enumerate() {
-            section(ui, index, &mut |ui| markdown_text(ui, body));
+            section(ui, index, &mut |ui| markdown_text(ui, body, &p));
         }
         if card.body.is_none() && !panel.busy(Part::Read) {
-            ui.label("No description.");
+            ui.label(RichText::new("No description.").color(p.muted));
         }
-        for (name, value) in &card.fields {
-            ui.label(format!("{name}: {value}"));
+        if card.body.is_none() && !card.fields.is_empty() {
+            egui::Grid::new("ticket-fields").num_columns(2).show(ui, |ui| {
+                for (name, value) in &card.fields {
+                    ui.label(RichText::new(name).color(p.muted).size(11.5));
+                    ui.add(egui::Label::new(value).wrap());
+                    ui.end_row();
+                }
+            });
         }
         if !card.comments.is_empty() {
-            ui.heading("Comments");
+            section_title(ui, &format!("Comments ({})", card.comments.len()), &p);
         }
         for (index, comment) in card.comments.iter().enumerate() {
             section(ui, comments_start + index, &mut |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong(comment.author.as_deref().unwrap_or("someone"));
+                    ui.label(RichText::new(comment.author.as_deref().unwrap_or("someone")).strong().size(12.0));
+                    if let Some(kind) = comment.author_kind.as_deref().or(comment.kind.as_deref()) {
+                        ui.label(RichText::new(kind).size(10.5).color(p.info));
+                    }
                     if let Some(at) = &comment.at {
-                        ui.label(at);
+                        ui.label(RichText::new(at).size(11.0).color(p.muted));
                     }
                 });
                 let lines = comment.text.lines().count();
                 if lines <= 12 || panel.expanded_comments.contains(&index) {
-                    markdown_text(ui, &comment.text);
+                    markdown_text(ui, &comment.text, &p);
                 } else {
-                    markdown_text(ui, &comment.text.lines().take(12).collect::<Vec<_>>().join("\n"));
-                    ui.label(format!("… {} more lines (Enter expands)", lines - 12));
+                    markdown_text(ui, &comment.text.lines().take(12).collect::<Vec<_>>().join("\n"), &p);
+                    ui.label(
+                        RichText::new(format!("… {} more lines (Enter expands)", lines - 12)).size(11.0).color(p.muted),
+                    );
                 }
-                ui.separator();
             });
         }
         for (title, part, start, cards) in [
@@ -796,10 +849,9 @@ fn read(
             ("Related", Part::Related, related_start, &panel.related),
         ] {
             if panel.busy(part) {
-                ui.label(format!("{title}…"));
-            }
-            if !cards.is_empty() {
-                ui.heading(title);
+                section_title(ui, &format!("{title}…"), &p);
+            } else if !cards.is_empty() {
+                section_title(ui, &format!("{title} ({})", cards.len()), &p);
             }
             for (index, related) in cards.iter().enumerate() {
                 section(ui, start + index, &mut |ui| {
@@ -807,10 +859,11 @@ fn read(
                     if ui.add(touch::sized(egui::Button::new(label).wrap(), client.touch)).clicked() {
                         open = Some((related.link.clone(), true));
                     }
-                    facts(ui, related, info, &client.palette);
+                    ui.horizontal_wrapped(|ui| facts(ui, related, info, &p));
                 });
             }
         }
+        ui.add_space(24.0);
     });
     panel.read_offset = output.state.clamped_offset().y;
     panel.read_height = output.content_size.y;
@@ -929,42 +982,63 @@ fn web_link(ui: &mut egui::Ui, label: &str, url: &str) {
     }
 }
 
-fn markdown_text(ui: &mut egui::Ui, source: &str) {
-    let inline = |ui: &mut egui::Ui, parts: &[markdown::Inline], strong: bool| {
+/// The size of a markdown heading, by its level.
+const HEADING_SIZES: [f32; 6] = [20.0, 17.0, 15.0, 14.0, 13.0, 13.0];
+/// The size of markdown's running text.
+const TEXT_SIZE: f32 = 13.0;
+
+/// Markdown as egui text. A link opens only as a web address; any other keeps its text.
+fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
+    let inline = |ui: &mut egui::Ui, parts: &[markdown::Inline], size: f32, strong: bool| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for part in parts {
                 match part {
                     markdown::Inline::Text(text) => {
-                        ui.label(if strong { RichText::new(text).strong() } else { RichText::new(text) });
+                        let text = RichText::new(text).size(size).color(p.foreground);
+                        ui.label(if strong { text.strong() } else { text });
                     }
                     markdown::Inline::Bold(text) => {
-                        ui.strong(text);
+                        ui.label(RichText::new(text).size(size).strong().color(p.foreground));
                     }
                     markdown::Inline::Code(text) => {
-                        ui.monospace(text);
+                        ui.label(RichText::new(text).monospace().size(size - 0.5).background_color(p.raised));
                     }
-                    markdown::Inline::Link { text, url } => web_link(ui, text, url),
+                    markdown::Inline::Link { text, url } => {
+                        let link = ui.link(RichText::new(text).size(size));
+                        if markdown::web_url(url).is_some() && link.on_hover_text(url).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                    }
                 }
             }
         });
     };
     for block in markdown::parse(source) {
         match block {
-            markdown::Block::Heading(_, parts) => {
+            markdown::Block::Heading(level, parts) => {
                 ui.add_space(6.0);
-                inline(ui, &parts, true);
+                inline(ui, &parts, HEADING_SIZES[level as usize - 1], true);
             }
-            markdown::Block::Paragraph(parts) | markdown::Block::Quote(parts) => inline(ui, &parts, false),
+            markdown::Block::Paragraph(parts) => inline(ui, &parts, TEXT_SIZE, false),
+            markdown::Block::Quote(parts) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| inline(ui, &parts, TEXT_SIZE, false));
+                });
+            }
             markdown::Block::Item(depth, marker, parts) => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0 + depth as f32 * 14.0);
-                    ui.label(marker);
-                    ui.vertical(|ui| inline(ui, &parts, false));
+                    ui.label(RichText::new(marker).color(p.muted));
+                    ui.vertical(|ui| inline(ui, &parts, TEXT_SIZE, false));
                 });
             }
             markdown::Block::Code(code) => {
-                ui.add(egui::Label::new(RichText::new(code).monospace()).wrap());
+                egui::Frame::new().fill(p.raised).corner_radius(4).inner_margin(6).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(RichText::new(code).monospace().size(12.0)).wrap());
+                });
             }
             markdown::Block::Rule => {
                 ui.separator();

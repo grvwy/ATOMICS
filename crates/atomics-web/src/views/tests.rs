@@ -2712,6 +2712,47 @@ fn escape_closes_the_window_on_top_and_a_menu_in_it_first() {
 }
 
 #[test]
+fn the_ticket_reader_draws_headings_link_status_the_update_and_keeps_off_the_edge() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
+        view.desk.panel = PanelMode::Tickets;
+        view.desk.diff_open = true;
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        client.send(Command::OpenTicket(fake_host::ticket_card("ENG-123").link));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let at = |label: &str| shown.iter().find(|(text, _)| text.starts_with(label)).map(|(_, rect)| *rect);
+        let at = |label: &str| at(label).unwrap_or_else(|| panic!("{label} is not drawn on {size:?}: {shown:?}"));
+        assert!(
+            at("Description").height() > at("Read this ticket").height() * 1.3,
+            "a heading stands out from its text on {size:?}: {shown:?}"
+        );
+        assert!(has(&shown, "Fix the parser · Merged · Succeeded"), "the link's status on {size:?}: {shown:?}");
+        assert!(
+            shown.iter().any(|(text, _)| text.contains("updated 2026-11-04T08:50:34Z")),
+            "the last update on {size:?}: {shown:?}"
+        );
+        assert!(has(&shown, "[Todo]"), "the state on {size:?}: {shown:?}");
+        assert!(at("Description").left() >= at("Fix ticket ENG-123").left() + 8.0, "sections are set in: {shown:?}");
+        if size == PHONE {
+            assert!(at("Fix ticket ENG-123").left() >= 10.0, "off the screen's edge: {shown:?}");
+        }
+    }
+}
+
+#[test]
+fn the_ticket_search_asks_for_a_query_before_any_search() {
+    for size in [WIDE, PHONE] {
+        let mut host = fake_host::ticket_reader();
+        host.board.host.tickets.as_mut().unwrap().views.clear();
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.send(Command::ToggleView(PanelMode::Tickets));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Type a query and press Enter."), "{size:?}: {shown:?}");
+        assert!(!has(&shown, "0 tickets"), "{size:?}: {shown:?}");
+    }
+}
+
+#[test]
 fn focus_moved_on_a_frame_with_no_input_asks_for_the_frame_that_settles_it() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::ticket_reader());
     view.desk.panel = PanelMode::Tickets;
