@@ -41,13 +41,14 @@ fn pairing_shows_the_hosts_code_then_opens_the_board() {
     // The channel goes on as the session: hello, then the board.
     let Message::Hello { client_id, capabilities, prior_epoch, .. } = &world.sent()[0] else { panic!("hello first") };
     assert_eq!((client_id.as_str(), prior_epoch), ("atomics-web", &None));
-    for wanted in ["mutations", "terminals", "input"] {
+    for wanted in ["mutations", "terminals", "input", "host"] {
         assert!(capabilities.iter().any(|c| c == wanted), "{wanted}: {capabilities:?}");
     }
     let plans = world.driver.remote.plan_list();
     assert_eq!(plans.iter().map(|p| p.goal.as_str()).collect::<Vec<_>>(), ["Parse faster"]);
     let welcome = world.driver.remote.welcome().expect("welcomed");
     assert!(welcome.may.contains(&atomics_core::ops::Grant::Approve), "a controller may approve");
+    assert!(welcome.may.contains(&atomics_core::ops::Grant::Host), "and sign the host in to its tickets");
 }
 
 #[test]

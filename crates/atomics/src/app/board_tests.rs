@@ -212,9 +212,9 @@ fn branch_names_are_single_line_elided_and_show_the_full_name_on_hover() {
 }
 
 #[test]
-fn board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons() {
+fn a_narrow_board_stacks_its_statuses_and_keeps_card_buttons() {
     super::tests::with_app(
-        "app::board_tests::board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons",
+        "app::board_tests::a_narrow_board_stacks_its_statuses_and_keeps_card_buttons",
         |app, ctx| {
             populate(app);
             for i in 0..3 {
@@ -222,7 +222,8 @@ fn board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons() {
             }
             let rendered = frame(app, ctx, 740.0, 3.0, vec![]);
             let first = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 0 ")).unwrap();
-            let original_x = first.pos.x;
+            // Too narrow for five columns: the statuses stack, each card the panel's width, none cut at its edge.
+            assert!(first.pos.x < 60.0, "the first card starts at the panel's left: {:?}", first.pos);
             let pointer = first.pos + vec2(30.0, 8.0);
             frame(
                 app,
@@ -235,7 +236,7 @@ fn board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons() {
                         unit: egui::MouseWheelUnit::Point,
                         phase: egui::TouchPhase::Move,
                         source: egui::MouseWheelSource::Unknown,
-                        delta: vec2(-2000.0, 0.0),
+                        delta: vec2(0.0, -2000.0),
                         modifiers: egui::Modifiers::NONE,
                     },
                 ],
@@ -248,9 +249,8 @@ fn board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons() {
                 .text
                 .iter()
                 .find(|t| t.galley.text().starts_with("Readable 4 "))
-                .expect("last status column must be reachable");
-            assert!(last.pos.x > 0.0 && last.pos.x < 740.0);
-            assert!(!rendered.text.iter().any(|t| t.galley.text().starts_with("Readable 0 ") && t.pos.x == original_x));
+                .expect("the last status must be reachable");
+            assert!(last.pos.x > 0.0 && last.pos.x < 60.0 && last.pos.y < 1000.0, "{:?}", last.pos);
             for label in ["reopen", "integrate"] {
                 assert!(rendered.text.iter().any(|t| t.galley.text() == label), "missing {label} button");
             }
@@ -439,4 +439,92 @@ fn approve_plan_fills_with_the_accent_and_writes_on_accent() {
         assert!(filled, "the button behind the label is filled with the accent");
         output.drop_without_applying_deltas();
     });
+}
+
+#[test]
+fn a_card_says_how_many_notes_it_hides_and_shows_them_all_when_open() {
+    super::tests::with_app(
+        "app::board_tests::a_card_says_how_many_notes_it_hides_and_shows_them_all_when_open",
+        |app, ctx| {
+            populate(app);
+            let plan = app.runtime.selected_plan;
+            app.runtime.plans[plan].tasks[0].notes =
+                vec!["The first note".into(), "The second note".into(), "The last note".into()];
+            let key = (app.runtime.plans[plan].id.clone(), "task-0".to_string());
+            app.client.ui.expanded_tasks.remove(&key);
+            let texts = |app: &mut Desktop<'_>, time: f64| -> Vec<String> {
+                frame(app, ctx, 1600.0, time, vec![]);
+                frame(app, ctx, 1600.0, time + 0.5, vec![]).text.iter().map(|t| t.galley.text().to_string()).collect()
+            };
+            let shown = texts(app, 0.0);
+            assert!(shown.contains(&"The last note".into()), "{shown:?}");
+            assert!(!shown.contains(&"The first note".into()), "a closed card shows the last note");
+            assert!(shown.contains(&"2 earlier notes · click the title".into()), "{shown:?}");
+            app.client.ui.expanded_tasks.insert(key);
+            let shown = texts(app, 2.0);
+            for note in ["The first note", "The second note", "The last note"] {
+                assert!(shown.contains(&note.into()), "an open card shows {note}: {shown:?}");
+            }
+            assert!(!shown.iter().any(|t| t.contains("earlier note")));
+        },
+    );
+}
+
+#[test]
+fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
+    tests::with_app(
+        "app::board_tests::a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again",
+        |app, ctx| {
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+            app.runtime.config.tickets = toml::from_str("system = \"tracker\"").unwrap();
+            app.runtime.config.tickets.server = fake.server();
+            app.runtime.tickets.sign.override_oauth(oauth);
+            app.runtime.tickets.sign.headless = true;
+            app.runtime.apply_ticket_config();
+            app.runtime.poll_signin();
+            app.runtime.plans[0].tasks = vec![Task { id: "a".into(), title: "Work".into(), ..Default::default() }];
+            let labels = |rendered: &BoardFrame| -> Vec<String> {
+                rendered.text.iter().map(|text| text.galley.text().to_string()).collect()
+            };
+            // Never signed in here: the board says so, with the button that signs in.
+            let rendered = frame(app, ctx, 1400.0, 0.0, vec![]);
+            assert!(labels(&rendered).contains(&"Sign in to tracker".to_string()), "{:?}", labels(&rendered));
+
+            // The server refused the saved sign-in: the same place offers Reconnect, and says why.
+            app.runtime.ticket_job_failed("sign-in required: the server refused the saved sign-in");
+            app.runtime.poll_signin();
+            let rendered = frame(app, ctx, 1400.0, 0.1, vec![]);
+            let texts = labels(&rendered);
+            assert!(texts.contains(&"tracker needs you to sign in again".to_string()), "{texts:?}");
+            assert!(texts.contains(&"the server refused the saved sign-in".to_string()), "{texts:?}");
+            let button = rendered.text.iter().find(|text| text.galley.text() == "Reconnect").expect("Reconnect");
+            let at = button.pos + button.galley.rect.center().to_vec2();
+            let press = |pressed| {
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ]
+            };
+            frame(app, ctx, 1400.0, 0.2, press(true));
+            frame(app, ctx, 1400.0, 0.3, press(false));
+            assert!(app.runtime.tickets.sign.job.is_some(), "the click started the sign-in");
+            // With no browser here, the board shows the steps: the link to open and the paste box.
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+            while app.runtime.sign_in_info().and_then(|info| info.url).is_none() {
+                app.runtime.poll_signin();
+                assert!(Instant::now() < deadline, "no sign-in address");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let texts = labels(&frame(app, ctx, 1400.0, 0.4, vec![]));
+            assert!(texts.contains(&"Waiting for the sign-in…".to_string()), "{texts:?}");
+            assert!(texts.contains(&"Open link".to_string()) && texts.contains(&"Use it".to_string()), "{texts:?}");
+            let _ = app.runtime.cancel_sign_in();
+        },
+    );
 }

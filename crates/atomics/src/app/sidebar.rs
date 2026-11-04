@@ -216,7 +216,8 @@ mod tests {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {
-                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1700.0, 1000.0))),
+                            // Wide enough for every tab beside the centered pill.
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(2400.0, 1000.0))),
                             time: Some(time),
                             events,
                             ..Default::default()

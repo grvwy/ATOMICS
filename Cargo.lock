@@ -569,6 +569,7 @@ dependencies = [
 name = "atomics-web"
 version = "0.1.3"
 dependencies = [
+ "anyhow",
  "atomics-core",
  "atomics-ui",
  "eframe",

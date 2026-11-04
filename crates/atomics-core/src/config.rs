@@ -518,6 +518,8 @@ toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
 plan_with_chief = "cmd+enter"   # in a ticket the Tickets panel reads
 voice = "cmd+shift+space"
 github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
+back = "cmd+alt+left"       # back to the place the window showed before (also the location line's ‹)
+forward = "cmd+alt+right"
 
 [client]
 # Open the window as a client of an ATOMICS host instead of running agents in it (docs/daemon.md).
@@ -674,7 +676,8 @@ including yours, and in sandbox mode runs its checks in its own sandbox. Send it
 they concern, and only then ask the user to open the pull requests. Never push, open pull requests or delete branches without the user's OK.
 
 Several plans may be open at once, each with its own tab, agents, approval, integration branch and final review. \
-Start the next plan while another finishes. The chief is never closed. Use atomics_plan_get without plan for summaries.
+Start the next plan while another finishes. The chief is never closed. Use atomics_plan_get without plan for summaries, with plan for a compact view of its tasks, \
+and with plan and task to read one task in full.
 Close finished plans with atomics_plan_close (plan id, status completed or archived); their history remains available by id.
 To configure ATOMICS itself, read atomics_config_get (and atomics_doctor when something fails) and propose changes with \
 atomics_config_propose: the user applies or rejects each one, and the outcome arrives as a config event. Never edit \
@@ -940,6 +943,9 @@ pub struct KeyConfig {
     pub plan_with_chief: String,
     pub voice: String,
     pub github: String,
+    /// Back to the place the window showed before, and forward again.
+    pub back: String,
+    pub forward: String,
 }
 
 /// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere;
@@ -1041,6 +1047,8 @@ impl Default for KeyConfig {
             plan_with_chief: "cmd+enter".into(),
             voice: "cmd+shift+space".into(),
             github: "primary+g".into(),
+            back: "cmd+alt+left".into(),
+            forward: "cmd+alt+right".into(),
         }
     }
 }

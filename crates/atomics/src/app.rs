@@ -61,6 +61,7 @@ mod mutations;
 mod open_link;
 mod pairing;
 mod plan_cleanup;
+mod plan_read;
 mod plan_view;
 mod plans;
 pub(crate) mod projection;
@@ -131,6 +132,9 @@ pub struct Session {
     held: Vec<String>,
     approval_hold: bool,
     menu_absent_since: Option<Instant>,
+    /// The command menu just answered with keys, and when: still on screen until the agent redraws,
+    /// it is not asked again.
+    answered_menu: Option<(atomics_core::approvals::NativeMenu, Instant)>,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
@@ -147,6 +151,8 @@ pub struct Session {
     naming: Naming,
     /// MCP servers this sandboxed agent needs that are not connected: its tile offers to connect them.
     mcp_needed: Vec<connections::Needed>,
+    /// Something about how its agent runs that its tile warns of, such as Codex started without hooks.
+    warning: Option<String>,
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -173,6 +179,9 @@ struct PendingApproval {
     id: String,
     request: ApprovalRequest,
     reply: Option<Arc<ipc::ApprovalReply>>,
+    /// The command menu the agent drew with no hook asking; only its keys answer it, and only
+    /// while the screen still shows it.
+    native: Option<atomics_core::approvals::NativeMenu>,
 }
 
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
@@ -223,6 +232,9 @@ const NEEDS_INPUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
 const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// What a Codex tile says when its version probe failed, so it runs without ATOMICS's hooks.
+const CODEX_HOOKS_UNKNOWN: &str = "Started without ATOMICS hooks: `codex --version` failed, so hook support is \
+                                   unknown. Approvals stay in this terminal; ATOMICS checks again at the next start.";
 /// How long a quit waits for sandboxes being prepared, and then again for those whose creation it
 /// stopped to clean up.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
@@ -404,7 +416,8 @@ struct Waiter {
     reply: Sender<ControlOutcome>,
 }
 
-const MAX_WAIT: Duration = Duration::from_secs(280);
+/// A wait answers well inside the MCP client's limit for one call.
+const MAX_WAIT: Duration = Duration::from_secs(atomics_core::control::MAX_WAIT_SECS);
 
 struct QuickOpen {
     query: String,
@@ -533,6 +546,8 @@ pub(crate) struct State {
     repos: Vec<PathBuf>,
     open_projects: Vec<PathBuf>,
     workspace: Option<String>,
+    /// The saved workspaces, by name, as last read: the host's state lists them for every client.
+    workspace_names: Vec<String>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     title: String,
@@ -687,6 +702,8 @@ struct Client {
     /// The Remote devices window (pairing and revoking), and the device whose Revoke asks.
     remote_devices: bool,
     revoke_confirm: Option<atomics_core::noise::PublicKey>,
+    /// Nothing had the keyboard when the last frame ended: an Escape now is no field's or terminal's.
+    keyboard_idle: bool,
     voice_tx: Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
@@ -740,6 +757,7 @@ impl Client {
             connection_url: String::new(),
             show_settings: None,
             remote_devices: false,
+            keyboard_idle: false,
             revoke_confirm: None,
             voice_tx,
             voice_rx,
@@ -1054,6 +1072,7 @@ impl State {
             repos: Vec::new(),
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),
+            workspace_names: Vec::new(),
             worktree_project: HashMap::new(),
             title: String::new(),
             cleanup: None,
@@ -1116,8 +1135,15 @@ impl State {
             desktop_diff_split: None,
             launch_dir,
         };
+        // The view the window's switcher showed last time; a restart's own state wins below.
+        app.panel = match app.store.panel_view.as_deref() {
+            Some("board") => PanelMode::Plan,
+            Some("tickets") => PanelMode::Tickets,
+            _ => PanelMode::Diff,
+        };
         app.refresh_themes();
         app.open_initial_projects(options.projects, options.workspace);
+        app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
             app.begin_startup_cleanup();
@@ -1236,17 +1262,17 @@ impl State {
             self.store.restart.iter().flat_map(|r| &r.sessions).filter_map(|r| paths::scratch_of(&r.cwd)).collect();
         self.startup_cleanup = Some(std::thread::spawn(move || {
             let sbx = resolve_program(&sbx);
+            let kept = crate::lifecycle::kept_leftovers(&home);
             let scratch_before = cutoff.as_ref().ok().map(crate::lifecycle::Cutoff::files);
-            let mut notes = match cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff))
-            {
-                Ok(notes) => notes,
-                Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
-            };
+            let swept = cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff));
+            let pins_loaded = swept.is_ok();
+            let mut notes = swept.unwrap_or_else(|err| vec![format!("Startup cleanup skipped: {err:#}")]);
             if let Some(before) = scratch_before {
                 notes.extend(crate::lifecycle::sweep_scratch(&home, &resumed, before));
             }
             crate::sandbox::prune_pins(&home, &home.join("git-pins"), &sbx);
-            crate::lifecycle::record_leftovers(&home, &notes);
+            // Replaces the previous start's notes: what this sweep no longer finds is fixed.
+            crate::lifecycle::record_sweep(&home, &notes, pins_loaded, &kept);
             if !notes.is_empty() {
                 let _ = actions.send(Box::new(move |state| state.toast(notes.join("\n"))));
             }
@@ -1337,7 +1363,7 @@ impl State {
         let deadline = Instant::now() + QUIT_JOBS_WAIT;
         let unfinished = self.lifecycle_jobs.drain(..).filter(|job| !job.wait_until(deadline)).count();
         if unfinished > 0 {
-            notes.push(format!("{unfinished} sandbox or worktree cleanup jobs were still running at quit"));
+            notes.push(format!("{unfinished}{}", crate::lifecycle::UNFINISHED_AT_QUIT));
         }
         crate::lifecycle::record_leftovers(&paths::atomics_home(), &notes);
         // Quitting ends scratch sessions for good; a restart resumes them in their folders.
@@ -1597,6 +1623,8 @@ impl Desktop<'_> {
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);
         self.github_modal(&ctx);
+        // egui lets go of a text field on Escape before the next frame's shortcuts see the key.
+        self.client.keyboard_idle = ctx.memory(|m| m.focused().is_none());
     }
 }
 

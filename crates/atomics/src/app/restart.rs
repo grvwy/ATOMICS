@@ -59,8 +59,10 @@ impl State {
         blockers
     }
 
+    /// Relaunches with the arguments ATOMICS started with, but the workspace open now.
     pub(super) fn restart(&mut self, force: bool, reason: Option<String>) -> ControlResponse {
-        self.restart_using(force, reason, crate::restart::Target::current)
+        let workspace = self.workspace.clone();
+        self.restart_using(force, reason, move || crate::restart::Target::current(workspace.as_deref()))
     }
 
     fn restart_using(
@@ -150,7 +152,8 @@ impl State {
             panel: match self.panel {
                 PanelMode::Plan => "plan",
                 PanelMode::Editor => "editor",
-                PanelMode::Diff | PanelMode::Tickets => "diff",
+                PanelMode::Tickets => "tickets",
+                PanelMode::Diff => "diff",
             }
             .into(),
             window_size: viewport.and_then(|viewport| viewport.inner),
@@ -193,7 +196,11 @@ impl State {
         self.diff_open = restart.diff_open;
         self.diff_root = restart.diff_root.clone();
         self.view = restart.view.clone();
-        self.panel = if restart.panel == "plan" { PanelMode::Plan } else { PanelMode::Diff };
+        self.panel = match restart.panel.as_str() {
+            "plan" => PanelMode::Plan,
+            "tickets" if self.ticket_config().is_some() => PanelMode::Tickets,
+            _ => PanelMode::Diff,
+        };
         self.desktop_split = restart.split;
         self.desktop_diff_split = restart.diff_split;
         self.restart_layout = Some(restart);
@@ -304,7 +311,9 @@ mod tests {
                         cwd: app.runtime.launch_dir.clone(),
                         reason: None,
                         input: json!({}),
+                        warning: None,
                     },
+                    native: None,
                 });
                 refused(app, "approval or question");
                 app.runtime.sessions[0].approvals.clear();

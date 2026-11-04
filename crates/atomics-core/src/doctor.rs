@@ -3,29 +3,136 @@
 use std::path::Path;
 
 use crate::approvals::ApprovalPolicy;
+use crate::hook::CodexHookTrust;
 #[cfg(feature = "native")]
 use crate::{git, plan::Plan};
 
-pub fn codex_checks(supports_hooks: Option<bool>) -> [String; 2] {
-    [
-        match supports_hooks {
-            Some(supported) => check_line(
-                supported,
-                "Codex supports ATOMICS hooks (0.165+ required)",
-                "install Codex 0.165 or newer; check with `codex --version`",
-            ),
-            None => check_line(
-                false,
-                "could not determine the Codex version (warning)",
-                "check that `codex --version` completes successfully and try again",
-            ),
-        },
-        check_line(
-            false,
-            "ATOMICS Codex hook trust not verified (warning)",
-            "start Codex in ATOMICS and open /hooks to review and trust ATOMICS hooks; this is a one-time step per install, repeated when definitions change; repository hooks keep their own trust review",
+pub fn codex_version_check(supports_hooks: Option<bool>) -> String {
+    match supports_hooks {
+        Some(supported) => check_line(
+            supported,
+            "Codex supports ATOMICS hooks (0.165+ required)",
+            "install Codex 0.165 or newer; check with `codex --version`",
         ),
-    ]
+        None => check_line(
+            false,
+            "could not determine the Codex version (warning)",
+            "check that `codex --version` completes successfully and try again",
+        ),
+    }
+}
+
+/// How Codex treats one of ATOMICS's hooks, from its `[hooks.state]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    Trusted,
+    Untrusted,
+    /// Trusted once, for a definition that has changed since: a new install path, socket or handler.
+    Changed,
+}
+
+/// Whether Codex runs the `hooks` ATOMICS passes it ([`crate::hook::codex_hook_trust`]), from
+/// `[hooks.state]` in `text`, Codex's user config read from `config`. Codex runs a hook whose
+/// `trusted_hash` matches its current hash, unless `enabled = false`; a missing file trusts nothing.
+pub fn codex_trust_check(hooks: &[CodexHookTrust], config: &Path, text: std::io::Result<String>) -> String {
+    #[derive(serde::Deserialize)]
+    struct State {
+        trusted_hash: Option<String>,
+        enabled: Option<bool>,
+    }
+    let text = match text {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return check_line(
+                false,
+                &format!("cannot read Codex's config {} for ATOMICS hook trust (warning): {err}", config.display()),
+                "fix the file's read permissions",
+            );
+        }
+    };
+    let table = match text.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(err) => {
+            return check_line(
+                false,
+                &format!(
+                    "Codex's config {} does not parse; ATOMICS hook trust unknown (warning): {err}",
+                    config.display()
+                ),
+                "fix the TOML; Codex refuses to start with it too",
+            );
+        }
+    };
+    // Codex trims the keys and skips a state it cannot read.
+    let states: std::collections::HashMap<&str, State> = table
+        .get("hooks")
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, state)| Some((key.trim(), state.clone().try_into().ok()?)))
+        .collect();
+    let mut found: Vec<(&CodexHookTrust, Trust, bool)> = Vec::new();
+    for hook in hooks {
+        let state = states.get(hook.key.as_str());
+        let trust = match state.and_then(|state| state.trusted_hash.as_deref()) {
+            Some(hash) if hash == hook.hash => Trust::Trusted,
+            Some(_) => Trust::Changed,
+            None => Trust::Untrusted,
+        };
+        found.push((hook, trust, state.and_then(|state| state.enabled) != Some(false)));
+    }
+    if found.iter().all(|(_, trust, enabled)| *trust == Trust::Trusted && *enabled) {
+        return check_line(
+            true,
+            &format!("Codex trusts ATOMICS's hooks for all {} events ({})", found.len(), config.display()),
+            "",
+        );
+    }
+    let events = |wanted: &dyn Fn(Trust, bool) -> bool| -> Vec<&CodexHookTrust> {
+        found.iter().filter(|(_, trust, enabled)| wanted(*trust, *enabled)).map(|(hook, _, _)| *hook).collect()
+    };
+    let names = |hooks: &[&CodexHookTrust]| hooks.iter().map(|hook| hook.event.as_str()).collect::<Vec<_>>().join(", ");
+    let review = events(&|trust, _| trust != Trust::Trusted);
+    let disabled = events(&|_, enabled| !enabled);
+    let mut parts = Vec::new();
+    for (name, trust) in
+        [("untrusted", Trust::Untrusted), ("changed since trusted", Trust::Changed), ("trusted", Trust::Trusted)]
+    {
+        let hooks = events(&|other, _| other == trust);
+        if !hooks.is_empty() {
+            parts.push(format!("{name}: {}", names(&hooks)));
+        }
+    }
+    if !disabled.is_empty() {
+        parts.push(format!("disabled: {}", names(&disabled)));
+    }
+    let label = format!("Codex does not run every ATOMICS hook (warning): {} ({})", parts.join("; "), config.display());
+    let mut fixes = Vec::new();
+    if !review.is_empty() {
+        let entries: Vec<_> = review
+            .iter()
+            .map(|hook| format!("[hooks.state.\"{}\"] trusted_hash = \"{}\"", hook.key, hook.hash))
+            .collect();
+        fixes.push(format!(
+            "start a Codex agent in ATOMICS and trust {} at its \"Hooks need review\" prompt or in /hooks \
+             (repository hooks keep their own review), or set in {}: {}",
+            names(&review),
+            config.display(),
+            entries.join("; ")
+        ));
+    }
+    if !disabled.is_empty() {
+        let tables: Vec<_> = disabled.iter().map(|hook| format!("[hooks.state.\"{}\"]", hook.key)).collect();
+        fixes.push(format!(
+            "enable {} in /hooks, or remove enabled = false from {} in {}",
+            names(&disabled),
+            tables.join(", "),
+            config.display()
+        ));
+    }
+    check_line(false, &label, &fixes.join("; also "))
 }
 
 pub fn approvals_check(policy: &ApprovalPolicy) -> String {
@@ -140,6 +247,38 @@ pub fn worktree_checks(repo: &Path, base_ref: &str) -> Vec<String> {
     }
 }
 
+/// The most stash entries the doctor lists for a repository.
+#[cfg(feature = "native")]
+const STASH_SHOWN: usize = 20;
+
+/// The stash `repo`'s worktrees share, one fact line per entry with its message, newest first.
+/// Agents stash with their task id as the message, so an entry names whose it is.
+#[cfg(feature = "native")]
+pub fn stash_lines(repo: &Path) -> Vec<String> {
+    let entries = match crate::stash::list(repo) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return vec![check_line(
+                false,
+                &format!("cannot list the stash of {} (warning): {err:#}", repo.display()),
+                "check repository access",
+            )];
+        }
+    };
+    if entries.is_empty() {
+        return vec![format!("Stash of {}: empty", repo.display())];
+    }
+    let count = crate::stash::entries(entries.len());
+    let mut lines = vec![format!("Stash of {}, shared by its worktrees: {count}", repo.display())];
+    lines.extend(
+        entries.iter().take(STASH_SHOWN).map(|entry| format!("  stash@{{{}}}: {}", entry.index, entry.subject)),
+    );
+    if entries.len() > STASH_SHOWN {
+        lines.push(format!("  … and {} more: git stash list", entries.len() - STASH_SHOWN));
+    }
+    lines
+}
+
 pub fn check_line(passed: bool, label: &str, hint: &str) -> String {
     let line = if passed { format!("✓ {label}") } else { format!("✗ {label} — {hint}") };
     line.lines().collect::<Vec<_>>().join(" ")
@@ -169,24 +308,98 @@ mod tests {
     }
 
     #[test]
-    fn codex_version_passes_or_warns_and_trust_is_explicitly_unverified() {
+    fn codex_version_passes_or_warns() {
         for supported in [true, false] {
-            let [version, trust] = codex_checks(Some(supported));
+            let version = codex_version_check(Some(supported));
             assert_eq!(version.starts_with('✓'), supported);
             assert_eq!(version.contains("install Codex 0.165"), !supported);
-            assert!(trust.starts_with('✗'));
-            assert!(trust.contains("trust not verified"));
-            assert!(trust.contains("start Codex in ATOMICS and open /hooks"));
-            assert!(trust.contains("one-time step per install"));
-            assert!(trust.contains("repository hooks keep their own trust review"));
             assert_eq!(version.lines().count(), 1);
-            assert_eq!(trust.lines().count(), 1);
         }
-        let [version, trust] = codex_checks(None);
+        let version = codex_version_check(None);
         assert!(version.starts_with('✗'));
         assert!(version.contains("could not determine the Codex version"));
         assert!(!version.contains("install Codex"));
-        assert!(trust.contains("trust not verified"));
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn codex_trust_reads_a_codex_home_and_names_each_event_and_its_fix() {
+        let hooks = crate::hook::codex_hook_trust(Path::new("/usr/local/bin/atomics"), Path::new("/run/atomics.sock"));
+        let hook = |event: &str| hooks.iter().find(|hook| hook.event == event).unwrap();
+        let codex_home = crate::test_support::tempdir().unwrap();
+        let config = codex_home.path().join("config.toml");
+        let check = || codex_trust_check(&hooks, &config, std::fs::read_to_string(&config));
+        let entry =
+            |hook: &CodexHookTrust, hash: &str| format!("[hooks.state.\"{}\"]\ntrusted_hash = \"{hash}\"\n", hook.key);
+
+        // A Codex home without a config trusts nothing yet.
+        let line = check();
+        assert!(line.starts_with("✗ Codex does not run every ATOMICS hook (warning): untrusted: "), "{line}");
+        assert!(!line.contains("changed") && !line.contains("disabled") && !line.contains("; trusted:"), "{line}");
+        assert!(line.contains(&config.display().to_string()) && line.contains("/hooks"), "{line}");
+        assert!(line.contains("repository hooks keep their own review"), "{line}");
+        for hook in &hooks {
+            let fix = format!("[hooks.state.\"{}\"] trusted_hash = \"{}\"", hook.key, hook.hash);
+            assert!(line.contains(&fix), "{line}");
+        }
+        assert_eq!(line.lines().count(), 1);
+
+        // Trusted as Codex's review writes it, with unrelated state and padded keys left alone.
+        let mut all: String = hooks.iter().map(|hook| entry(hook, &hook.hash)).collect();
+        all.push_str("[hooks.state.\"/home/user/.codex/hooks.json:stop:0:0\"]\ntrusted_hash = \"sha256:other\"\n");
+        std::fs::write(&config, &all).unwrap();
+        let line = check();
+        assert_eq!(
+            line,
+            format!("✓ Codex trusts ATOMICS's hooks for all {} events ({})", hooks.len(), config.display())
+        );
+        std::fs::write(
+            &config,
+            all.replace(&format!("\"{}\"", hook("Stop").key), &format!("\"  {}  \"", hook("Stop").key)),
+        )
+        .unwrap();
+        assert!(check().starts_with('✓'), "{}", check());
+
+        // A definition trusted before it changed, one disabled and one never trusted.
+        let mut mixed: String = hooks
+            .iter()
+            .filter(|hook| !["SessionStart", "Stop"].contains(&hook.event.as_str()))
+            .map(|hook| entry(hook, &hook.hash))
+            .collect();
+        mixed.push_str(&entry(hook("SessionStart"), "sha256:from-an-older-install"));
+        mixed = mixed.replace(
+            &entry(hook("Interrupt"), &hook("Interrupt").hash),
+            &format!("{}enabled = false\n", entry(hook("Interrupt"), &hook("Interrupt").hash)),
+        );
+        std::fs::write(&config, mixed).unwrap();
+        let line = check();
+        let (label, fix) = line.split_once(" — ").unwrap();
+        assert!(label.starts_with('✗') && label.contains("(warning)"), "{label}");
+        assert!(
+            label.contains("untrusted: Stop;") && label.contains("changed since trusted: SessionStart;"),
+            "{label}"
+        );
+        assert!(label.contains("trusted: ") && label.contains("disabled: Interrupt"), "{label}");
+        for (event, named) in [("Stop", true), ("SessionStart", true), ("Interrupt", false), ("PreToolUse", false)] {
+            let fix_entry = format!("[hooks.state.\"{}\"] trusted_hash = \"{}\"", hook(event).key, hook(event).hash);
+            assert_eq!(fix.contains(&fix_entry), named, "{event}: {fix}");
+        }
+        assert!(fix.contains("trust SessionStart, Stop") || fix.contains("trust Stop, SessionStart"), "{fix}");
+        assert!(
+            fix.contains(&format!(
+                "enable Interrupt in /hooks, or remove enabled = false from [hooks.state.\"{}\"]",
+                hook("Interrupt").key
+            )),
+            "{fix}"
+        );
+
+        // A config Codex cannot read leaves trust unknown rather than claiming it.
+        std::fs::write(&config, "[hooks.state\n").unwrap();
+        let line = check();
+        assert!(line.starts_with('✗') && line.contains("does not parse") && line.contains("trust unknown"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+        let denied = codex_trust_check(&hooks, &config, Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert!(denied.starts_with('✗') && denied.contains("cannot read Codex's config"), "{denied}");
     }
 
     #[test]
@@ -276,6 +489,34 @@ mod tests {
         assert!(lines[0].contains("Clean up…"));
         assert_eq!(lines[0].lines().count(), 1);
         assert!(done.exists() && dirty.exists() && unmerged.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn stash_lines_list_every_worktrees_entries_with_their_messages() {
+        let (dir, repo) = crate::git::tests::project();
+        assert_eq!(stash_lines(&repo), [format!("Stash of {}: empty", repo.display())]);
+        let linked = dir.path().join("linked");
+        git::add_worktree(&repo, &linked, "atomics/t2", "main").unwrap();
+        std::fs::write(repo.join("a.txt"), "main change\n").unwrap();
+        git::git(&repo, &["stash", "push", "-q", "-m", "t1"]).unwrap();
+        std::fs::write(linked.join("a.txt"), "linked change\n").unwrap();
+        git::git(&linked, &["stash", "push", "-q", "-m", "ENG-123 before rebase"]).unwrap();
+        let expected = [
+            format!("Stash of {}, shared by its worktrees: 2 entries", repo.display()),
+            "  stash@{0}: On atomics/t2: ENG-123 before rebase".to_string(),
+            "  stash@{1}: On main: t1".to_string(),
+        ];
+        assert_eq!(stash_lines(&repo), expected);
+        for again in 0..STASH_SHOWN {
+            std::fs::write(repo.join("a.txt"), format!("again {again}\n")).unwrap();
+            git::git(&repo, &["stash", "push", "-q", "-m", "again"]).unwrap();
+        }
+        let lines = stash_lines(&repo);
+        assert_eq!(lines.len(), STASH_SHOWN + 2, "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "  … and 2 more: git stash list");
+        let missing = stash_lines(&dir.path().join("missing"));
+        assert!(missing[0].starts_with("✗ cannot list the stash of") && missing.len() == 1, "{missing:?}");
     }
 
     #[test]

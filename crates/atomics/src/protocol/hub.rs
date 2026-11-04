@@ -42,6 +42,8 @@ pub enum Scope {
     Open,
     Diff(String),
     Plan(String),
+    /// The host's own state: only to a client that negotiated `host`.
+    Host,
 }
 
 fn scope_of(message: &Message) -> Scope {
@@ -50,6 +52,7 @@ fn scope_of(message: &Message) -> Scope {
         Message::PlanRemoved { id, .. } => Scope::Plan(id.clone()),
         Message::TaskReport { plan, .. } => Scope::Plan(plan.clone()),
         Message::DiffSummary { summary, .. } => Scope::Diff(summary.worktree.clone()),
+        Message::HostUpsert { .. } => Scope::Host,
         _ => Scope::Open,
     }
 }
@@ -547,6 +550,9 @@ impl Hub {
                 out.push(Message::DiffSummary { cursor: zero, summary: tombstone });
             }
         }
+        if new.host.revision != old.host.revision && new.host.data != old.host.data {
+            out.push(Message::HostUpsert { cursor: zero, host: new.host.data.clone() });
+        }
         out
     }
 
@@ -603,7 +609,8 @@ fn with_cursor(mut message: Message, to: Cursor) -> Message {
         | Message::TaskReport { cursor, .. }
         | Message::ApprovalPending { cursor, .. }
         | Message::ApprovalResolved { cursor, .. }
-        | Message::DiffSummary { cursor, .. } => *cursor = to,
+        | Message::DiffSummary { cursor, .. }
+        | Message::HostUpsert { cursor, .. } => *cursor = to,
         _ => {}
     }
     message

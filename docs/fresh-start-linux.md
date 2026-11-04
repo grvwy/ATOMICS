@@ -64,7 +64,9 @@ atomics --version
 
 The installer builds a release binary for the native target and atomically replaces `~/.local/bin/atomics`,
 even while ATOMICS runs. It installs a desktop entry and icon under `~/.local/share`, then runs
-`atomics setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so.
+`atomics setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so. Started from the desktop entry,
+ATOMICS adds your login shell's `PATH` to the bare one the launcher gives, so set `PATH` in your shell's startup
+files as usual; `atomics doctor` says where `PATH` came from.
 `scripts/linux-install.sh --uninstall` removes the binary, desktop entry and icon, and keeps config and state.
 
 ## 3. Run `atomics setup`
@@ -123,7 +125,7 @@ Doctor changes nothing. It prints the machine's `Host:` name and the config file
 per check: `✓` passed, `✗` failed with a hint. It exits with 1 only when git is missing or the config does
 not load; everything else is a warning. On a new desktop, expect these until you start ATOMICS or opt in:
 
-- `ATOMICS running` (start it in step 9) and `global Claude hooks installed` (optional, `atomics install-hooks`).
+- `ATOMICS not running` (start it in step 9) and `global Claude hooks not installed` (optional, `atomics install-hooks`).
 - `hx not found` without Helix.
 - `CoW cache cloning … cache warming will be skipped` on ext4.
 - `Azure CLI relay: off` until step 7.
@@ -259,7 +261,8 @@ sbx ls                                    # atomics-<session id> only for sessio
 sbx mcp ls                                # atomics-<session id> for those same sessions, plus servers you added
 git -C ~/repos/myproject worktree list    # the main checkout, plus worktrees of open plans and sessions
 ls ~/.local/state/atomics/scratch           # one folder per open Ungrouped session
-atomics doctor                              # "cleanup leftover (warning)" names anything not removed
+atomics doctor                              # "cleanup leftover (warning)" names anything not removed;
+                                            # what the startup sweep finds is rechecked at every start
 ```
 
 - A stopped `atomics-<session id>` sandbox is kept on purpose while its worktree exists, so the session

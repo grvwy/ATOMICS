@@ -1366,6 +1366,8 @@ fn sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity() {
             let text = task.compose_brief_for("Sandbox task", Some(&config));
             assert!(!text.contains("atomics queue"));
             assert!(text.contains("CPUs and 8g memory"));
+            // A sandbox's git shares the stash too.
+            assert!(text.contains("`git stash push -m task`"), "{text}");
             let id = app.runtime.start("codex", worktree, None, vec![], Some(text.clone())).unwrap();
             tick_until(app, ctx, "the sandboxed agent", |_| bin.path().join("run-ssh").exists());
             let name = format!("atomics-{id}");

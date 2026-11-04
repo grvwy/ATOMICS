@@ -503,7 +503,7 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     socket.hello(1, &mut secure);
     let welcome = socket.envelope(1, &mut secure);
     let Message::Welcome { role, may, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
-    assert_eq!((*role, may.len()), (Role::Controller, 5), "{may:?}");
+    assert_eq!((*role, may.len()), (Role::Controller, 6), "{may:?}");
     let snapshot = socket.envelope(1, &mut secure);
     assert!(matches!(snapshot.message, Message::StateSnapshot { .. }), "{snapshot:?}");
     until(&host.status, "one channel", |s| s.channels == 1);

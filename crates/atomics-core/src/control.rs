@@ -84,10 +84,14 @@ pub enum ControlRequest {
         #[serde(default)]
         lines: Option<usize>,
     },
+    /// The worktree's diff summary; with `patch` its hunks, up to [`MAX_PATCH_CHARS`]. `path`
+    /// keeps only that file, or the files under that folder.
     Diff {
         session: String,
         #[serde(default)]
         patch: bool,
+        #[serde(default)]
+        path: Option<String>,
     },
     /// Runs a shell command in a sandboxed session's sandbox, in its worktree, once a slot of
     /// `class` (default test) is free: the chief's checks of agent code, kept off this machine.
@@ -173,9 +177,13 @@ pub enum ControlRequest {
         plan: String,
         status: crate::plan::PlanStatus,
     },
+    /// Without `plan`, the open plans' summaries. With `plan`, a compact view of every task that
+    /// stays under [`MAX_PLAN_VIEW_CHARS`]; with `task` too, that one task in full.
     PlanGet {
         #[serde(default)]
         plan: Option<String>,
+        #[serde(default)]
+        task: Option<String>,
     },
     /// Approves a reviewed plan so it can dispatch tasks, as the board's Approve action does.
     PlanApprove {
@@ -413,12 +421,94 @@ impl ControlResponse {
     }
 }
 
-const MAX_PATCH_BYTES: usize = 120_000;
+// What an MCP client accepts from one tool call: Claude Code gives a call 120 s and caps its
+// text at about 25,000 tokens. Chief tool answers stay under both.
 
-/// A plain-text rendering of a worktree diff for agents: a file summary, and
-/// with `patch` the hunks themselves.
-pub fn describe_diff(diff: &WorktreeDiff, patch: bool) -> String {
+/// The longest a `wait` blocks, and its default: well inside the client's 120 s for a call.
+pub const MAX_WAIT_SECS: u64 = 100;
+pub const DEFAULT_WAIT_SECS: u64 = 90;
+/// The most text one tool answer carries; the MCP server cuts anything longer.
+pub const MAX_TOOL_TEXT: usize = 60_000;
+/// `plan_get` with a plan, as the chief reads it (pretty-printed JSON).
+pub const MAX_PLAN_VIEW_CHARS: usize = 24_000;
+/// One `wait` answer; later events follow from its cursor.
+pub const MAX_WAIT_CHARS: usize = 32_000;
+/// The hunks `diff` with `patch` shows, after its file list.
+pub const MAX_PATCH_CHARS: usize = 40_000;
+/// Files the diff summary lists by name.
+pub const MAX_DIFF_FILES: usize = 300;
+/// Terminal lines `read` shows.
+pub const MAX_READ_LINES: usize = 400;
+
+// A wait answers inside the client's 120 s, and each bounded answer fits the text limit.
+const _: () = assert!(MAX_WAIT_SECS < 120 && DEFAULT_WAIT_SECS <= MAX_WAIT_SECS);
+const _: () =
+    assert!(MAX_PLAN_VIEW_CHARS < MAX_TOOL_TEXT && MAX_WAIT_CHARS < MAX_TOOL_TEXT && MAX_PATCH_CHARS < MAX_TOOL_TEXT);
+
+/// `text` cut to `max` characters, saying how many more there were.
+pub fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        None => text.to_string(),
+        Some((cut, _)) => format!("{}… [{} more characters]", &text[..cut], text[cut..].chars().count()),
+    }
+}
+
+/// The last `max` characters of `text`, saying how many came before.
+pub fn clip_start(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let (cut, _) = text.char_indices().nth(count - max).expect("count > max");
+    format!("[{} earlier characters] …{}", count - max, &text[cut..])
+}
+
+/// The first `max_items` of `items`, each clipped to `max` characters, and how many more there were.
+pub fn clip_list(items: &[String], max: usize, max_items: usize) -> Vec<String> {
+    let mut shown: Vec<_> = items.iter().take(max_items).map(|item| clip(item, max)).collect();
+    if items.len() > max_items {
+        shown.push(format!("[{} more]", items.len() - max_items));
+    }
+    shown
+}
+
+/// Every string in `value` clipped to `max` characters, and every array to its first `max_items`.
+pub fn clip_json(value: &mut Value, max: usize, max_items: usize) {
+    match value {
+        Value::String(text) if text.chars().nth(max).is_some() => *text = clip(text, max),
+        Value::Array(items) => {
+            let more = items.len().saturating_sub(max_items);
+            items.truncate(max_items);
+            items.iter_mut().for_each(|item| clip_json(item, max, max_items));
+            if more > 0 {
+                items.push(Value::String(format!("[{more} more]")));
+            }
+        }
+        Value::Object(map) => map.values_mut().for_each(|item| clip_json(item, max, max_items)),
+        _ => {}
+    }
+}
+
+/// How long `value` reads once pretty-printed, as the MCP server shows it.
+pub fn shown_len(value: &Value) -> usize {
+    serde_json::to_string_pretty(value).map_or(0, |text| text.len())
+}
+
+/// A plain-text rendering of a worktree diff for agents: a file summary (at most
+/// [`MAX_DIFF_FILES`] names), and with `patch` the hunks, up to [`MAX_PATCH_CHARS`]. `path`
+/// keeps only that file or the files under that folder, so the rest of a cut patch can be read.
+pub fn describe_diff(diff: &WorktreeDiff, patch: bool, path: Option<&str>) -> String {
     let short = &diff.base[..diff.base.len().min(10)];
+    let prefix = path.map(|path| path.trim_end_matches('/')).filter(|path| !path.is_empty());
+    let files: Vec<_> = diff
+        .files
+        .iter()
+        .filter(|file| {
+            prefix.is_none_or(|prefix| {
+                file.path() == prefix || file.path().strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+        .collect();
     let mut out = format!(
         "{} files changed, +{} -{} against {} (merge-base {short})\n",
         diff.files.len(),
@@ -426,7 +516,10 @@ pub fn describe_diff(diff: &WorktreeDiff, patch: bool) -> String {
         diff.deletions(),
         diff.base_ref
     );
-    for file in &diff.files {
+    if let Some(prefix) = prefix {
+        out.push_str(&format!("{} of them under {prefix}\n", files.len()));
+    }
+    for file in files.iter().take(MAX_DIFF_FILES) {
         let status = match file.status {
             FileStatus::Added => "added",
             FileStatus::Untracked => "untracked",
@@ -436,17 +529,21 @@ pub fn describe_diff(diff: &WorktreeDiff, patch: bool) -> String {
         };
         out.push_str(&format!("  {} (+{} -{}, {status})\n", file.path(), file.additions(), file.deletions()));
     }
+    if files.len() > MAX_DIFF_FILES {
+        out.push_str(&format!("  … {} more files; pass path (a folder) to list them\n", files.len() - MAX_DIFF_FILES));
+    }
     if !patch {
         return out;
     }
-    for file in &diff.files {
-        out.push_str(&format!("\n--- {}\n", file.path()));
+    let mut shown = 0;
+    for (position, file) in files.iter().enumerate() {
+        let mut text = format!("\n--- {}\n", file.path());
         if file.binary {
-            out.push_str("(binary)\n");
+            text.push_str("(binary)\n");
         }
         for hunk in &file.hunks {
-            out.push_str(&hunk.header);
-            out.push('\n');
+            text.push_str(&hunk.header);
+            text.push('\n');
             for line in &hunk.lines {
                 let sign = match line.kind {
                     LineKind::Added => '+',
@@ -454,20 +551,37 @@ pub fn describe_diff(diff: &WorktreeDiff, patch: bool) -> String {
                     LineKind::Context => ' ',
                     LineKind::Note => '\\',
                 };
-                out.push(sign);
-                out.push_str(&line.text);
-                out.push('\n');
+                text.push(sign);
+                text.push_str(&line.text);
+                text.push('\n');
             }
         }
-        if out.len() > MAX_PATCH_BYTES {
-            let mut cut = MAX_PATCH_BYTES;
-            while !out.is_char_boundary(cut) {
-                cut -= 1;
+        let size = text.chars().count();
+        if shown + size > MAX_PATCH_CHARS {
+            // Only a first file too long to show whole is shown in part; the rest are named.
+            let partial = shown == 0;
+            if partial {
+                out.push_str(&clip(&text, MAX_PATCH_CHARS));
             }
-            out.truncate(cut);
-            out.push_str("\n… (truncated)\n");
+            out.push_str(&format!("\n… patch cut at {MAX_PATCH_CHARS} characters"));
+            if partial {
+                out.push_str(&format!(", inside {}", file.path()));
+            }
+            out.push('.');
+            let rest: Vec<_> = files[position + usize::from(partial)..].iter().map(|file| file.path()).collect();
+            if !rest.is_empty() {
+                let more = rest.len().saturating_sub(20);
+                out.push_str(&format!(
+                    " Not shown: {}{}. Pass path to read one file's hunks.",
+                    rest[..rest.len() - more].join(", "),
+                    if more > 0 { format!(" and {more} more") } else { String::new() }
+                ));
+            }
+            out.push('\n');
             break;
         }
+        shown += size;
+        out.push_str(&text);
     }
     out
 }
@@ -506,9 +620,69 @@ mod tests {
             files: vec![FileDiff::untracked("a.py".into(), "print(1)\n")],
             partial: false,
         };
-        let text = describe_diff(&diff, true);
+        let text = describe_diff(&diff, true, None);
         assert!(text.starts_with("1 files changed, +1 -0 against main (merge-base 0123456789)"));
         assert!(text.contains("  a.py (+1 -0, untracked)"));
         assert!(text.contains("+print(1)"));
+    }
+
+    fn large_diff(files: usize, lines: usize) -> WorktreeDiff {
+        let content = format!("{}\n", "let value = compute(input, options);").repeat(lines);
+        WorktreeDiff {
+            base_ref: "main".into(),
+            base: "0123456789abcdef".into(),
+            files: (0..files)
+                .map(|i| FileDiff::untracked(format!("src/f{i:03}.rs"), &content))
+                .chain([FileDiff::untracked("srcs/other.rs".into(), "x\n")])
+                .collect(),
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn a_large_diff_is_cut_to_fit_and_names_what_it_left_out() {
+        let diff = large_diff(400, 200);
+        let summary = describe_diff(&diff, false, None);
+        assert!(summary.starts_with("401 files changed"));
+        assert_eq!(summary.lines().filter(|line| line.starts_with("  src")).count(), MAX_DIFF_FILES);
+        assert!(summary.contains("  … 101 more files; pass path (a folder) to list them"), "{summary}");
+
+        let patch = describe_diff(&diff, true, None);
+        let hunks = &patch[summary.len()..];
+        let (shown, note) = hunks.rsplit_once("\n… patch cut at ").unwrap();
+        assert!(shown.chars().count() <= MAX_PATCH_CHARS, "{}", shown.chars().count());
+        assert!(shown.contains("--- src/f000.rs") && !shown.contains("more characters]"), "whole files only");
+        assert!(note.contains("Not shown: src/f00") && note.contains("more. Pass path to read one file's hunks."));
+        assert!(patch.len() < MAX_TOOL_TEXT, "{}", patch.len());
+
+        // path reads one file, or a folder's files, and not a folder that only shares its prefix.
+        let one = describe_diff(&diff, true, Some("src/f399.rs"));
+        assert!(one.contains("1 of them under src/f399.rs") && one.contains("--- src/f399.rs"));
+        assert!(!one.contains("patch cut"), "{}", &one[..200]);
+        let folder = describe_diff(&diff, false, Some("src/"));
+        assert!(folder.contains("400 of them under src") && !folder.contains("srcs/other.rs"));
+
+        // A first file too long to show whole is shown in part.
+        let huge = describe_diff(&large_diff(2, 5000), true, None);
+        assert!(
+            huge.contains(", inside src/f000.rs. Not shown: src/f001.rs, srcs/other.rs."),
+            "{}",
+            &huge[huge.len() - 300..]
+        );
+        assert!(huge.len() < MAX_TOOL_TEXT, "{}", huge.len());
+    }
+
+    #[test]
+    fn clips_say_how_much_they_left_out() {
+        assert_eq!(clip("héllo wörld", 5), "héllo… [6 more characters]");
+        assert_eq!(clip("short", 5), "short");
+        assert_eq!(clip_start("héllo wörld", 5), "[6 earlier characters] …wörld");
+        assert_eq!(clip_start("short", 5), "short");
+        let mut value = serde_json::json!({"input": {"content": "abcdef", "lines": [1, 2, 3, 4]}, "n": 7});
+        clip_json(&mut value, 3, 2);
+        assert_eq!(
+            value,
+            serde_json::json!({"input": {"content": "abc… [3 more characters]", "lines": [1, 2, "[2 more]"]}, "n": 7})
+        );
     }
 }

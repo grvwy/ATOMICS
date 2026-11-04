@@ -91,6 +91,7 @@ pub enum ControlOutcome {
         root: PathBuf,
         base_ref: String,
         patch: bool,
+        path: Option<String>,
         session: Value,
     },
     /// `then` runs once the command has, done or not.
@@ -245,12 +246,12 @@ fn control(request: ControlRequest, channels: &Channels, window: &Window, stream
     window.request_repaint();
     match outcome.recv_timeout(Duration::from_secs(300)) {
         Ok(ControlOutcome::Done(response)) => response,
-        Ok(ControlOutcome::Diff { root, base_ref, patch, session }) => {
+        Ok(ControlOutcome::Diff { root, base_ref, patch, path, session }) => {
             match atomics_core::git::diff_against_base(&root, &base_ref, None) {
                 Ok(diff) => ControlResponse::ok(serde_json::json!({
                     "session": session,
                     "root": root,
-                    "diff": describe_diff(&diff, patch),
+                    "diff": describe_diff(&diff, patch, path.as_deref()),
                 })),
                 Err(err) => ControlResponse::error(format!("{err:#}")),
             }

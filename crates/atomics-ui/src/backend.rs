@@ -7,6 +7,7 @@ use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff_data::{FileView, Prepared};
 use atomics_core::layout::LayoutConfig;
 use atomics_core::plan::{Plan, PlanStatus, Task};
+pub use atomics_core::projection::TaskLink;
 use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::session::AgentStatus;
 use atomics_core::steer::ReviewComment;
@@ -96,6 +97,8 @@ pub struct SessionRow {
     pub project: Option<PathBuf>,
     /// Neither the chief nor in any plan's task: the Ungrouped tab shows it.
     pub ungrouped: bool,
+    /// The plan and the task it works on, by id, if it runs a plan's task.
+    pub task: Option<TaskLink>,
     /// It works in a scratch folder of its own, outside any project.
     pub scratch: bool,
     /// The sandbox it runs in, if any.
@@ -124,6 +127,8 @@ pub struct TileView {
     pub sandbox_error: Option<String>,
     /// What the host's slot queue holds for the session's processes, e.g. "queued for a test slot".
     pub queue_note: Option<String>,
+    /// How its agent runs that the user should know of, such as Codex started without ATOMICS's hooks.
+    pub warning: Option<String>,
     /// The MCP servers the sandboxed session needs and lacks, as its banner offers to connect them.
     pub connect: Vec<ConnectButton>,
     /// Its process exited; the tile stays until it is closed.
@@ -320,6 +325,13 @@ pub struct Notices {
     pub hook_error: Option<String>,
 }
 
+/// The host's Tickets panel, as the view switcher shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TicketsPanel {
+    /// The ticket system wants the user to sign in.
+    pub signed_out: bool,
+}
+
 /// What the sandbox VMs' process trees use on the host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxLoad {
@@ -473,4 +485,14 @@ pub trait Backend {
     /// The folder the host was started in, where the welcome starts agents outside the Ungrouped tab;
     /// `None` when the host does not say.
     fn launch_dir(&self) -> Option<PathBuf>;
+
+    /// The host's Tickets panel, where it has one ([`PanelMode::Tickets`]); `None` without one.
+    fn tickets_panel(&self) -> Option<TicketsPanel> {
+        None
+    }
+
+    /// The ticket system's sign-in, when the host's ticket system signs in with OAuth and says how it stands.
+    fn sign_in(&self) -> Option<crate::signin::SignInView> {
+        None
+    }
 }

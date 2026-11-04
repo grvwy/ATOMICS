@@ -109,7 +109,7 @@ fn a_tab_opens_as_the_desktops_does() {
     settle(&mut desk, &world);
     assert!(!desk.chief.open);
     assert_eq!((desk.active.as_deref(), desk.diff_root.as_deref()), (Some("s1"), None));
-    assert_eq!(desk.hints(remote).panel, PanelMode::Diff);
+    assert_eq!(desk.hints(remote).panel, PanelMode::Plan, "the panel keeps the view the user chose");
     // So does a docked chief the window had no room for.
     desk.apply(Command::SetChiefDock(ChiefDock::Docked), remote);
     desk.apply(Command::ToggleChief, remote);
@@ -129,11 +129,18 @@ fn view_commands_move_the_page_as_they_move_the_desktop() {
     let mut desk = Desk::default();
     settle(&mut desk, &world);
     desk.apply(Command::TogglePlan, remote);
-    assert_eq!((desk.panel, desk.diff_open), (PanelMode::Diff, true), "the Plan button turns to the diff");
+    assert_eq!((desk.panel, desk.diff_open), (PanelMode::Plan, false), "the board's segment again hides the panel");
+    desk.apply(Command::ToggleView(PanelMode::Diff), remote);
+    assert_eq!((desk.panel, desk.diff_open), (PanelMode::Diff, true), "the diff's segment shows the diff");
+    desk.apply(Command::ToggleView(PanelMode::Plan), remote);
+    assert_eq!((desk.panel, desk.diff_open), (PanelMode::Plan, true), "the board's turns to the board");
+    desk.apply(Command::ToggleView(PanelMode::Diff), remote);
     desk.apply(Command::ToggleDiff, remote);
     assert!(!desk.diff_open);
     desk.apply(Command::TogglePlan, remote);
     assert_eq!((desk.panel, desk.diff_open), (PanelMode::Plan, true), "and back to the board, opening the panel");
+    assert_eq!((super::view_name(desk.panel), super::named_view("board")), ("board", Some(PanelMode::Plan)));
+    assert_eq!((super::named_view("diff"), super::named_view("tickets")), (Some(PanelMode::Diff), None));
 
     // A worktree picked on its own: no session is active, and none is picked for it again.
     desk.apply(Command::ShowRoot("/w/other".into()), remote);
@@ -148,7 +155,8 @@ fn view_commands_move_the_page_as_they_move_the_desktop() {
     assert_eq!((desk.ungrouped, desk.plan_view, desk.active.as_deref()), (true, false, None));
     desk.apply(Command::ShowPlan(0), remote);
     settle(&mut desk, &world);
-    assert_eq!((desk.plan_view, desk.panel, desk.active.as_deref()), (true, PanelMode::Diff, Some("s1")));
+    // The panel keeps the view chosen last, the board.
+    assert_eq!((desk.plan_view, desk.panel, desk.active.as_deref()), (true, PanelMode::Plan, Some("s1")));
     assert_eq!(remote.visible_sessions(), [1], "the plan's agent, by its place in the list");
 
     // The chief's window is the page's.

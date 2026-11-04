@@ -892,6 +892,8 @@ pub(super) fn github_shortcut(
         ("toggle_chief", &keys.toggle_chief),
         ("toggle_tickets", &keys.toggle_tickets),
         ("voice", &keys.voice),
+        ("back", &keys.back),
+        ("forward", &keys.forward),
     ]
     .into_iter()
     .filter_map(|(name, text)| Some((format!("[keys] {name}"), shortcut(text)?)))

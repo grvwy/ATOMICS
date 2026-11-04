@@ -44,6 +44,7 @@ pub mod repo_workflow;
 pub mod screen;
 pub mod selfconfig;
 pub mod session;
+pub mod stash;
 pub mod steer;
 pub mod store;
 pub mod theme;

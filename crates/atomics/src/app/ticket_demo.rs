@@ -111,12 +111,10 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         let callback = response.headers().get("location").unwrap().to_str().unwrap().to_string();
         let mut wrong = url::Url::parse(&callback).unwrap();
         wrong.query_pairs_mut().clear().append_pair("code", "wrong").append_pair("state", "wrong");
-        app.runtime.tickets.sign.paste = wrong.into();
-        app.runtime.paste_signin();
+        app.runtime.paste_signin(wrong.as_str()).unwrap();
         demo_wait(app, |r| r.tickets.sign.job.as_ref().is_some_and(|j| j.progress.rejected.is_some()));
         assert!(fake.state.lock().unwrap().token_requests.is_empty());
-        app.runtime.tickets.sign.paste = callback;
-        app.runtime.paste_signin();
+        app.runtime.paste_signin(&callback).unwrap();
         demo_wait(app, |r| r.tickets.sign.job.is_none());
         assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedIn));
         assert!(!app.runtime.tickets.panel.signin);

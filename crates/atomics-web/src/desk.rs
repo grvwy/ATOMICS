@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use atomics_core::config::ChiefDock;
 use atomics_core::plan::PlanStatus;
-use atomics_ui::{Backend, Command, PanelMode, ViewHints};
+use atomics_ui::{Backend, Command, PanelMode, ViewHints, switcher};
 
 /// The chief's window in this page: shown or not, docked or floating, and the width the user dragged.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,6 +76,24 @@ impl Default for Desk {
     }
 }
 
+/// The name a browser keeps a view by.
+pub fn view_name(panel: PanelMode) -> &'static str {
+    match switcher::view_of(panel) {
+        PanelMode::Plan => "board",
+        PanelMode::Tickets => "tickets",
+        _ => "diff",
+    }
+}
+
+/// The view a kept name names: the board or the diff, which a browser shows.
+pub fn named_view(name: &str) -> Option<PanelMode> {
+    match name {
+        "board" => Some(PanelMode::Plan),
+        "diff" => Some(PanelMode::Diff),
+        _ => None,
+    }
+}
+
 /// The commands about the chief's window, which the desktop sends its host (they start a chief, or are saved
 /// in its store) and a page keeps to itself.
 pub fn window_command(command: &Command) -> bool {
@@ -98,6 +116,7 @@ pub fn carries_out(command: &Command, wide: bool) -> bool {
         | Command::CloseDiff
         | Command::SetPanel(PanelMode::Diff | PanelMode::Plan)
         | Command::TogglePlan
+        | Command::ToggleView(PanelMode::Diff | PanelMode::Plan)
         | Command::ShowPlan(_)
         | Command::ShowUngrouped
         | Command::ViewPlanHistory(_)
@@ -208,17 +227,11 @@ impl Desk {
             Command::CloseDiff => self.diff_open = false,
             Command::ToggleDiff => self.diff_open = !self.diff_open,
             Command::SetPanel(panel) => self.panel = panel,
-            Command::TogglePlan => {
-                if self.panel == PanelMode::Plan && self.diff_open {
-                    self.panel = PanelMode::Diff;
-                } else {
-                    self.panel = PanelMode::Plan;
-                    self.diff_open = true;
-                }
-            }
+            Command::TogglePlan => self.toggle_view(PanelMode::Plan),
+            Command::ToggleView(view) => self.toggle_view(view),
+            // The panel keeps the view the user chose: the board shows this plan's.
             Command::ShowPlan(plan) => {
                 self.select(plan, backend);
-                self.panel = PanelMode::Diff;
                 self.pick = true;
                 // The fleet takes the window: a chief that does not sit beside it steps aside.
                 if self.chief.dock == ChiefDock::Floating || !self.dock_fits {
@@ -246,6 +259,16 @@ impl Desk {
         }
         if !self.chief.open {
             self.typing_in = None;
+        }
+    }
+
+    /// The view switcher's segment: show `view`, or hide the panel when it shows `view` already.
+    fn toggle_view(&mut self, view: PanelMode) {
+        if self.diff_open && switcher::view_of(self.panel) == view {
+            self.diff_open = false;
+        } else {
+            self.panel = view;
+            self.diff_open = true;
         }
     }
 

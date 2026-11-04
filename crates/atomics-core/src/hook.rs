@@ -121,6 +121,12 @@ pub fn claude_settings(atomics_exe: &Path) -> Value {
     json!({ "hooks": hooks })
 }
 
+/// Claude permission rules that make a Claude agent ATOMICS starts on this machine ask before it drops
+/// entries of the stash every worktree shares, whatever else its settings allow. Claude asks in its own
+/// terminal: its permission prompts do not reach ATOMICS's approval policy, which handles Codex's.
+pub const CLAUDE_STASH_ASK: [&str; 4] =
+    ["Bash(git stash drop:*)", "Bash(git stash pop:*)", "Bash(git stash clear:*)", "Bash(git stash branch:*)"];
+
 /// Session-local handlers carry their destination without exporting it to the agent.
 pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bool) -> Value {
     let mut command = format!(
@@ -158,6 +164,7 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
         .collect();
     let mut settings = json!({ "hooks": hooks });
     if !codex {
+        settings["permissions"] = json!({ "ask": CLAUDE_STASH_ASK });
         settings["statusLine"] = json!({
             "type": "command",
             "command": format!("{} statusline --socket {}", shell_quote(&atomics_exe.to_string_lossy()), shell_quote(&socket.to_string_lossy()))
@@ -192,6 +199,94 @@ pub fn codex_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<Str
         args.extend(["-c".into(), format!("hooks.{event}={groups}")]);
     }
     args
+}
+
+/// One hook of [`codex_hook_args`] as Codex identifies it for trust. Codex runs it once its user
+/// config holds `[hooks.state."<key>"] trusted_hash = "<hash>"`, which its `/hooks` review writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexHookTrust {
+    /// The event as ATOMICS names it in `-c hooks.<event>=…`.
+    pub event: String,
+    pub key: String,
+    pub hash: String,
+}
+
+/// Codex's name for the config layer `-c` overrides form; its hooks' trust keys start with it.
+pub const CODEX_SESSION_FLAGS_SOURCE: &str = "/<session-flags>/config.toml";
+
+/// The trust key and hash of every hook [`codex_hook_args`] passes, computed as Codex 0.165+ does
+/// (codex-rs/hooks `hook_key`, and `hook_hash` in engine/discovery.rs). The key is the layer, the
+/// event's label and the group and handler index. The hash covers the normalized handler: its
+/// timeout as Codex clamps it, its matcher only for events that take one, and the event's label.
+pub fn codex_hook_trust(atomics_exe: &Path, socket: &Path) -> Vec<CodexHookTrust> {
+    let settings = session_settings(atomics_exe, socket, "", true);
+    let mut hooks = Vec::new();
+    for (event, groups) in settings["hooks"].as_object().expect("hooks") {
+        let label = codex_event_label(event).expect("an event Codex knows");
+        for (group_index, group) in groups.as_array().expect("hook groups").iter().enumerate() {
+            let matcher = group.get("matcher").filter(|_| codex_event_takes_matcher(event));
+            for (handler_index, handler) in group["hooks"].as_array().expect("handlers").iter().enumerate() {
+                let timeout = handler.get("timeout").and_then(Value::as_u64);
+                let timeout = match event.as_str() {
+                    "SessionEnd" | "Interrupt" => timeout.unwrap_or(1).clamp(1, 3),
+                    _ => timeout.unwrap_or(600).max(1),
+                };
+                let mut normalized = json!({
+                    "type": "command",
+                    "command": handler["command"],
+                    "timeout": timeout,
+                    "async": handler.get("async").and_then(Value::as_bool).unwrap_or(false),
+                });
+                if let Some(message) = handler.get("statusMessage") {
+                    normalized["statusMessage"] = message.clone();
+                }
+                let mut identity = json!({ "event_name": label, "hooks": [normalized] });
+                if let Some(matcher) = matcher {
+                    identity["matcher"] = matcher.clone();
+                }
+                hooks.push(CodexHookTrust {
+                    event: event.clone(),
+                    key: format!("{CODEX_SESSION_FLAGS_SOURCE}:{label}:{group_index}:{handler_index}"),
+                    hash: codex_fingerprint(identity),
+                });
+            }
+        }
+    }
+    hooks
+}
+
+/// Codex's `version_for_toml`: SHA-256 of the value as compact JSON with sorted keys.
+fn codex_fingerprint(mut value: Value) -> String {
+    use sha2::{Digest, Sha256};
+    value.sort_all_objects();
+    let digest = Sha256::digest(serde_json::to_vec(&value).expect("JSON"));
+    format!("sha256:{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+}
+
+/// Codex's `hook_event_key_label`.
+fn codex_event_label(event: &str) -> Option<&'static str> {
+    Some(match event {
+        "PreToolUse" => "pre_tool_use",
+        "PermissionRequest" => "permission_request",
+        "PostToolUse" => "post_tool_use",
+        "PreCompact" => "pre_compact",
+        "PostCompact" => "post_compact",
+        "PreModelRequest" => "pre_model_request",
+        "PostModelRequest" => "post_model_request",
+        "SessionStart" => "session_start",
+        "SessionEnd" => "session_end",
+        "UserPromptSubmit" => "user_prompt_submit",
+        "SubagentStart" => "subagent_start",
+        "SubagentStop" => "subagent_stop",
+        "Stop" => "stop",
+        "Interrupt" => "interrupt",
+        _ => return None,
+    })
+}
+
+/// Codex's `matcher_pattern_for_event`: other events ignore a matcher, also in the hash.
+fn codex_event_takes_matcher(event: &str) -> bool {
+    !matches!(event, "PreModelRequest" | "PostModelRequest" | "UserPromptSubmit" | "Stop" | "Interrupt")
 }
 
 /// Walk a ps PID/PPID table, nearest ancestor first. PID identity avoids ambiguous cwd matches.
@@ -276,7 +371,7 @@ fn is_cox_hook(handler: &Value) -> bool {
         && words.get(1).is_some_and(|arg| arg == "hook")
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     if text.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {
         text.to_string()
     } else {
@@ -335,7 +430,10 @@ mod tests {
             if codex {
                 assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 600);
                 assert!(settings.get("statusLine").is_none());
+                assert!(settings.get("permissions").is_none());
             } else {
+                // Claude asks before it drops shared stash entries, even where its settings allow git.
+                assert_eq!(settings["permissions"]["ask"], json!(CLAUDE_STASH_ASK));
                 assert_eq!(settings["statusLine"]["type"], "command");
                 assert_eq!(
                     shlex::split(settings["statusLine"]["command"].as_str().unwrap()).unwrap(),
@@ -353,12 +451,58 @@ mod tests {
             let parsed: toml::Value = toml::from_str(&pair[1]).unwrap();
             assert!(parsed["hooks"].is_table());
         }
+        // The fingerprint vector of Codex's own test (codex-rs/config fingerprint_tests.rs).
+        let table: toml::Table =
+            toml::from_str("rows = [{ z = 2, a = 1 }, { z = 4, a = 3 }]\n[nested]\nz = \"text\"\na = true\n").unwrap();
+        assert_eq!(
+            codex_fingerprint(serde_json::to_value(table).unwrap()),
+            "sha256:a5e4c8fbdbc75d185b0f2b5291bfb2de10e8c523d6c89248876fd78a97c83176"
+        );
         for version in ["codex-cli 0.165.0", "codex-cli 0.166.0-alpha.1", "codex-cli 1.0.0"] {
             assert_eq!(codex_supports_hooks(version), Some(true));
         }
         assert_eq!(codex_supports_hooks("codex-cli 0.164.9"), Some(false));
         for version in ["codex-cli unknown", "unknown"] {
             assert_eq!(codex_supports_hooks(version), None);
+        }
+    }
+
+    #[test]
+    fn codex_trust_keys_and_hashes_match_what_codex_0165_lists_for_our_overrides() {
+        // `hooks/list` of Codex 0.165's app-server, started with these `-c hooks.*` overrides.
+        let listed = [
+            ("session_start", "70afda6b0df1de224a62ba789d785ce775bba60539c4cde83240c360bd840388"),
+            ("user_prompt_submit", "bee828a3ed88aa28c31775a1ab234a64479b938122be97feddabf502d1239c72"),
+            ("pre_tool_use", "ecd947871d1b1c902431f400176051b253ba564c9b4c7436a81009a3f27c4327"),
+            ("permission_request", "5d309a2fef30652bbf24fb3b7b055f20413d195c3752fe281a716c1575327293"),
+            ("post_tool_use", "1ff441fd543ad37d64c79a288a754ac7bf7b366bfc8703d7ae31222b6fad0323"),
+            ("stop", "d9be8d6089da4f6ad97408aa75431b919a2ab718757750c149a0feb479186abf"),
+            ("session_end", "63c738e1fdf1353510101aabe6c4bb99fd5a6f6e29c91c09052ffe7a94476ebc"),
+            ("interrupt", "3535f5fa6d4f34ee23c95d1c63fcca178d284f76813a8366c2ef3f672c2c57be"),
+        ];
+        let (exe, socket) = (Path::new("/usr/local/bin/atomics"), Path::new("/home/user/.atomics/atomics.sock"));
+        let mut computed: Vec<_> =
+            codex_hook_trust(exe, socket).into_iter().map(|hook| (hook.key, hook.hash)).collect();
+        let mut expected: Vec<_> = listed
+            .iter()
+            .map(|(label, hash)| (format!("/<session-flags>/config.toml:{label}:0:0"), format!("sha256:{hash}")))
+            .collect();
+        computed.sort();
+        expected.sort();
+        assert_eq!(computed, expected);
+        // Every pane passes the same hooks, and a new install path or socket asks for trust again.
+        assert_eq!(codex_hook_trust(exe, socket), codex_hook_trust(exe, socket));
+        let moved = codex_hook_trust(Path::new("/opt/atomics"), socket);
+        assert!(moved.iter().zip(codex_hook_trust(exe, socket)).all(|(a, b)| a.key == b.key && a.hash != b.hash));
+        // The hash covers what Codex normalizes; a handler field it does not model would go unhashed.
+        let settings = session_settings(exe, socket, "", true);
+        for groups in settings["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                assert_eq!(group.as_object().unwrap().keys().collect::<Vec<_>>(), ["hooks"]);
+                for handler in group["hooks"].as_array().unwrap() {
+                    assert_eq!(handler.as_object().unwrap().keys().collect::<Vec<_>>(), ["command", "timeout", "type"]);
+                }
+            }
         }
     }
 

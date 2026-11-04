@@ -5,15 +5,17 @@
 //! list read; a task by id, or by its position in the plan the board read.
 //!
 //! Commands are grouped by domain. Approvals, plans, review comments and sessions are the domains of
-//! atomics.v1's `approval_decide`, `plan_command`, `review_command` and `session_command`; the projects,
-//! the chief and the settings have no operation there yet.
+//! atomics.v1's `approval_decide`, `plan_command`, `review_command` and `session_command`; the ticket
+//! sign-in and opening a workspace go as `host_command`; the other project commands, the chief and the
+//! settings have no operation there yet.
 
 use std::path::PathBuf;
 
 use atomics_core::approvals::Decision;
 use atomics_core::config::ChiefDock;
 use atomics_core::ops::{
-    self, ApprovalDecide, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
+    self, ApprovalDecide, HostAction, HostCommand, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction,
+    SessionCommand,
 };
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::steer::ReviewComment;
@@ -161,9 +163,19 @@ pub enum Command {
         text: String,
     },
 
+    // ── The ticket system's sign-in ────────────────────────────────────────────────────────────────────
+    /// Sign in to the ticket system, or again after the server refused the saved sign-in: the host's
+    /// sign-in job, after which its ticket worker connects again. A desktop host may open its browser.
+    SignInTickets,
+    /// The address a browser ended on after signing in, for the sign-in under way.
+    PasteSignIn(String),
+    /// Stop the sign-in under way.
+    CancelSignIn,
+
     // ── Projects and worktrees ───────────────────────────────────────────────────────────────────────
     OpenProject(PathBuf),
     CloseProject(PathBuf),
+    /// Open a saved workspace, by name, in place of the open projects.
     OpenWorkspace(String),
     /// Save the open projects as a workspace.
     SaveWorkspace(String),
@@ -259,6 +271,9 @@ pub enum Command {
     ViewPlanHistory(usize),
     /// Show or hide the plan board.
     TogglePlan,
+    /// The view switcher's segment: show the board, the diff (or the editor) or the tickets in the panel, or
+    /// hide the panel when it shows that view already.
+    ToggleView(PanelMode),
     /// Read a ticket in the app's ticket reader. A platform without one does not offer this.
     OpenTicket(TicketLink),
     /// A task brief on the board has the keyboard this frame: the desktop's host holds off a restart until
@@ -303,6 +318,7 @@ impl Command {
                 | Command::ShowPlan(_)
                 | Command::ViewPlanHistory(_)
                 | Command::TogglePlan
+                | Command::ToggleView(_)
                 | Command::OpenTicket(_)
                 | Command::EditingPlan
                 | Command::ClosePlanTab(_)
@@ -336,6 +352,9 @@ impl Command {
         };
         let session = |action: SessionAction, op: &mut dyn FnMut() -> String| {
             ops::Command::SessionCommand(SessionCommand { op: op(), action })
+        };
+        let host = |action: HostAction, op: &mut dyn FnMut() -> String| {
+            vec![ops::Command::HostCommand(HostCommand { op: op(), action })]
         };
         let sent = match self {
             Command::Decide { approval, decision, .. } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
@@ -418,6 +437,10 @@ impl Command {
                 vec![session(action, op)]
             }
             Command::CloseSession(id) => vec![session(SessionAction::Close { session: id.clone() }, op)],
+            Command::SignInTickets => host(HostAction::SignIn, op),
+            Command::PasteSignIn(text) => host(HostAction::SignInPaste { text: text.clone() }, op),
+            Command::CancelSignIn => host(HostAction::SignInCancel, op),
+            Command::OpenWorkspace(name) => host(HostAction::OpenWorkspace { name: name.clone() }, op),
             _ => return Remote::Unsupported,
         };
         Remote::Send(sent)
