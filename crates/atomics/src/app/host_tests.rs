@@ -135,8 +135,11 @@ fn client_tickets_search_and_read_on_the_host_without_frames() {
             assert_eq!(reply.cards[0].link.label(), "DEMO-1");
         }
         assert_eq!(host.state().tickets.panel.query, query, "a request never changes desktop navigation");
-        let text = serde_json::to_string(&published.data).unwrap();
-        assert!(!text.contains("command") && !text.contains("arguments"), "configuration stays on the host");
+        let text = serde_json::to_string(info).unwrap();
+        assert!(
+            !text.contains("command") && !text.contains("arguments"),
+            "ticket requests and replies expose no credentials or operation arguments"
+        );
     });
 }
 
