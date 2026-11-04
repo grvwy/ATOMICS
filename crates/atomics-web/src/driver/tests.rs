@@ -633,3 +633,51 @@ fn pairing_again_under_another_host_key_asks_first() {
     world.boot(Some(&pairing));
     assert_eq!(world.driver.status(), &Status::Live);
 }
+
+/// A native client reaches its host directly: it dials at once with no boot or ticket, says hello as soon
+/// as the upgrade is through, dials again after a drop with the usual waits, and stops for good on a
+/// refused token or another major version.
+#[test]
+fn a_direct_client_dials_at_once_and_stops_only_when_waiting_cannot_help() {
+    let dial = |driver: &mut Driver| match driver.take_outputs().as_slice() {
+        [Output::DialDirect { socket }] => *socket,
+        other => panic!("one direct dial: {other:?}"),
+    };
+    let mut driver = Driver::direct("t");
+    assert!(driver.is_direct());
+    assert_eq!(driver.status(), &Status::Connecting);
+    let first = dial(&mut driver);
+    driver.socket_open(first, wire::SUBPROTOCOL);
+    assert_eq!(driver.status(), &Status::Live);
+    let sent = driver.take_outputs();
+    let [Output::Send { socket, message }] = sent.as_slice() else { panic!("the hello: {sent:?}") };
+    assert_eq!(*socket, first);
+    let hello = wire::decode(std::str::from_utf8(message).unwrap()).unwrap();
+    assert!(matches!(hello.message, Message::Hello { .. }), "plain text frames on a direct link");
+
+    // A drop: the usual waits, then a fresh dial (the glue finds the address and token again).
+    driver.socket_closed(first, close::ABNORMAL);
+    assert!(matches!(driver.status(), Status::Reconnecting { attempt: 1 }));
+    assert!(driver.take_outputs().is_empty());
+    driver.tick(MAX_RETRY_MS);
+    let second = dial(&mut driver);
+    assert_ne!(first, second);
+
+    // A refused token stops it; retry_now is the user's own "try again".
+    driver.socket_closed(second, close::UNAUTHORISED);
+    assert_eq!(driver.status(), &Status::Stopped(Stop::Unauthorised));
+    driver.tick(10 * MAX_RETRY_MS);
+    assert!(driver.take_outputs().is_empty(), "no dial by itself");
+    driver.retry_now();
+    let third = dial(&mut driver);
+
+    // A subprotocol other than atomics.v1 is not this host's server.
+    driver.socket_open(third, tunnel::SUBPROTOCOL);
+    assert!(matches!(driver.take_outputs().as_slice(), [Output::Close { .. }]));
+    driver.tick(20 * MAX_RETRY_MS);
+    let fourth = dial(&mut driver);
+    driver.socket_open(fourth, wire::SUBPROTOCOL);
+    driver.take_outputs();
+    driver.socket_message(fourth, br#"{"v":{"major":2,"minor":0},"kind":"ping"}"#);
+    assert_eq!(driver.status(), &Status::Stopped(Stop::Version));
+}

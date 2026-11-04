@@ -7,6 +7,11 @@
 //! hosting page for a fresh ticket ([`boot::WANTS_TICKET`]), dials again, and resumes with `hello`'s
 //! prior epoch and cursor, so the host replays what was missed or sends a snapshot.
 //!
+//! A native client reaches its host directly instead ([`Driver::direct`]): on this machine, or through a
+//! forward to another one, with no broker, ticket or Noise channel. The upgrade's bearer token is the
+//! authentication, and the glue finds the address and token afresh for every dial
+//! ([`Output::DialDirect`]), so a host that restarted with a new token is reached again.
+//!
 //! What it trusts: close codes and anything else outside the encrypted channel come through the
 //! broker unauthenticated. So the stored key is forgotten only on the host's refusal sealed into the
 //! channel (`wire::not_paired`); a bare `not_paired` close stops the frame but keeps the key. Only a
@@ -17,7 +22,7 @@ use std::fmt;
 
 use atomics_core::noise::{NoiseError, PAIRING_LIFETIME_SECS, Pairing, Secret};
 use atomics_core::tunnel::{self, close};
-use atomics_core::wire;
+use atomics_core::wire::{self, ErrorCode, Message};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -83,6 +88,10 @@ pub enum Stop {
     KeyMismatch,
     /// This browser could not start: no randomness, or a malformed key.
     Failed,
+    /// A direct link: the host refused this client's token.
+    Unauthorised,
+    /// The host speaks another major version of `atomics.v1`.
+    Version,
 }
 
 impl Stop {
@@ -105,6 +114,10 @@ impl Stop {
             Stop::Revoked => "This computer's registration with the rendezvous service was revoked.",
             Stop::KeyMismatch => "The computer's key does not match the one this browser paired with. Pair again.",
             Stop::Failed => "This browser could not start the connection. Reload the page to try again.",
+            Stop::Unauthorised => "The host did not accept this window's token. Pair this window with the host again.",
+            Stop::Version => {
+                "The host speaks another version of the ATOMICS protocol. Update ATOMICS here or on the host."
+            }
         }
     }
 }
@@ -118,6 +131,12 @@ pub enum Output {
         socket: u64,
         url: String,
         protocols: Vec<Zeroizing<String>>,
+    },
+    /// A direct client: find the host's address and token now and open a WebSocket to it offering
+    /// `atomics.v1`, with the token as its bearer. Messages on it are text frames. A refused token is
+    /// reported as [`close::UNAUTHORISED`], a host that cannot be reached as 1006.
+    DialDirect {
+        socket: u64,
     },
     /// One binary message.
     Send {
@@ -139,6 +158,7 @@ impl fmt::Debug for Output {
         match self {
             Output::Post(kind) => write!(f, "Post({kind})"),
             Output::Dial { socket, url, .. } => write!(f, "Dial({socket}, {url})"),
+            Output::DialDirect { socket } => write!(f, "DialDirect({socket})"),
             Output::Send { socket, message } => write!(f, "Send({socket}, {} bytes)", message.len()),
             Output::Close { socket, code } => write!(f, "Close({socket}, {code})"),
             Output::LoadDevice(host) => write!(f, "LoadDevice({host})"),
@@ -191,6 +211,8 @@ pub struct Driver {
     retry: Retry,
     now_ms: u64,
     outputs: Vec<Output>,
+    /// A native client that reaches its host directly ([`Driver::direct`]).
+    direct: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +221,8 @@ enum End {
     Failure(Failure),
     /// The host's refusal, sealed into the channel.
     HostRefused,
+    /// The host speaks another major version.
+    Version,
 }
 
 impl Driver {
@@ -225,6 +249,33 @@ impl Driver {
             retry: Retry::default(),
             now_ms: 0,
             outputs,
+            direct: false,
+        }
+    }
+
+    /// A native client of a host it reaches directly, on this machine or through a forward: it dials at
+    /// once and again after every drop, with the browser's waits. `op_prefix` starts its operation IDs.
+    pub fn direct(op_prefix: &str) -> Self {
+        let mut driver = Self::new(None, op_prefix, "");
+        driver.direct = true;
+        driver.status = Status::Connecting;
+        driver.dial();
+        driver
+    }
+
+    /// Whether this is a direct client ([`Driver::direct`]).
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Dial again now rather than at the next wait's end: the user asked, or what the host needs is back.
+    pub fn retry_now(&mut self) {
+        if self.socket.is_none() && self.direct {
+            if matches!(self.status, Status::Stopped(_)) {
+                self.status = Status::Connecting;
+                self.retry = Retry::default();
+            }
+            self.dial();
         }
     }
 
@@ -332,6 +383,17 @@ impl Driver {
     }
 
     fn dial(&mut self) {
+        if self.direct {
+            self.sockets += 1;
+            let id = self.sockets;
+            self.outputs.push(Output::DialDirect { socket: id });
+            self.socket = Some(Socket { id, connection: Connection::plain(), open: false });
+            self.retry.due_ms = None;
+            if !matches!(self.status, Status::Reconnecting { .. }) {
+                self.status = Status::Connecting;
+            }
+            return;
+        }
         let Some(boot) = &self.boot else { return };
         let Some(ticket) = self.ticket.take() else { return self.ask_ticket() };
         let connection = match (&self.pairing, &self.device) {
@@ -365,11 +427,20 @@ impl Driver {
 
     /// The WebSocket opened, with the subprotocol the broker chose.
     pub fn socket_open(&mut self, socket: u64, protocol: &str) {
+        let direct = self.direct;
         let Some(current) = self.current(socket) else { return };
-        if protocol != tunnel::SUBPROTOCOL {
+        let expected = if direct { wire::SUBPROTOCOL } else { tunnel::SUBPROTOCOL };
+        if protocol != expected {
             return self.fail(socket, End::Code(close::REFUSED));
         }
         current.open = true;
+        // A direct link is open as soon as the upgrade is: the token authenticated it.
+        if direct {
+            let hello = self.remote.hello(CLIENT_ID);
+            self.queue(&hello);
+            self.status = Status::Live;
+            self.retry.open_ms = Some(self.now_ms);
+        }
         self.flush();
     }
 
@@ -401,7 +472,17 @@ impl Driver {
                 }
                 // A frame this client cannot read (a kind from a newer minor) is skipped.
                 Event::Frame(text) => {
-                    let Ok(envelope) = wire::decode(&text) else { continue };
+                    let envelope = match wire::decode(&text) {
+                        Ok(envelope) => envelope,
+                        // Waiting cannot help: only an update on one side can.
+                        Err(error) if error.code == ErrorCode::UnsupportedVersion => {
+                            return self.fail(socket, End::Version);
+                        }
+                        Err(_) => continue,
+                    };
+                    if let Message::Error { code: ErrorCode::UnsupportedVersion, .. } = &envelope.message {
+                        return self.fail(socket, End::Version);
+                    }
                     if wire::is_not_paired(&envelope) {
                         return self.fail(socket, End::HostRefused);
                     }
@@ -494,6 +575,9 @@ impl Driver {
         let busy = matches!(end, End::Code(close::PAIRING_BUSY)) && pairing && self.now_ms < self.pair_until_ms;
         self.pair_busy = busy;
         let stop = match end {
+            End::Version => Some(Stop::Version),
+            // A direct link's upgrade carries the token; nothing between can forge a refusal of it.
+            End::Code(close::UNAUTHORISED) if self.direct => Some(Stop::Unauthorised),
             // Sealed by the host itself: the one sign to forget the key on.
             End::HostRefused => {
                 if let Some(device) = self.device.take() {

@@ -1610,6 +1610,9 @@ mod board_tests;
 mod host_tests;
 
 #[cfg(test)]
+mod client_tests;
+
+#[cfg(test)]
 mod sandbox_tests;
 
 #[cfg(test)]

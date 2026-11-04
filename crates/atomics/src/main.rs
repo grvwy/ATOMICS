@@ -8,6 +8,7 @@ mod platform_tests;
 mod test_raster;
 
 mod app;
+mod client;
 mod connections;
 mod crash;
 mod credentials;
@@ -72,6 +73,11 @@ struct Cli {
     screenshot: Option<PathBuf>,
     #[arg(long, default_value_t = 4.0)]
     screenshot_delay: f32,
+    /// Open the window as a client of an ATOMICS host: `local` (`atomics host` here), `vm` (the host in
+    /// this Mac's ATOMICS VM) or ws://127.0.0.1:PORT; "" for this window as the host. Default:
+    /// `[client] connect`
+    #[arg(long, value_name = "ADDRESS")]
+    connect: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -439,6 +445,36 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
+    // The window as a client of a host, which owns the agents: nothing here is the host's.
+    let connect = cli.connect.clone().unwrap_or_else(|| {
+        atomics_core::config::Config::load(&atomics_core::paths::config_file())
+            .map(|config| config.client.connect)
+            .unwrap_or_default()
+    });
+    if !connect.trim().is_empty() {
+        let target = match client::target::Target::parse(&connect) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("atomics: {error:#}");
+                std::process::exit(2);
+            }
+        };
+        let size: Option<[f32; 2]> = cli
+            .size
+            .as_deref()
+            .and_then(|s| s.split_once('x'))
+            .and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]));
+        let launch = client::Launch {
+            open: cli
+                .open
+                .iter()
+                .filter_map(|spec| spec.split_once(':'))
+                .map(|(agent, dir)| (agent.to_string(), atomics_core::paths::expand(dir)))
+                .collect(),
+            screenshot: cli.screenshot.clone().map(|path| (path, cli.screenshot_delay)),
+        };
+        return client::run(target, launch, native_options(size, load_icon()));
+    }
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
     let link =
@@ -487,26 +523,7 @@ fn main() -> eframe::Result {
         remote_port: None,
     };
     let icon = load_icon();
-    let mut native = eframe::NativeOptions {
-        // Without --size ATOMICS fills the screen: the layout is built to use all of it.
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ATOMICS")
-            .with_app_id("atomics")
-            .with_icon(icon.clone())
-            .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
-            .with_maximized(size.is_none())
-            .with_min_inner_size([480.0, 320.0]),
-        ..Default::default()
-    };
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup {
-        let device_descriptor = setup.device_descriptor.clone();
-        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
-            let mut descriptor = device_descriptor(adapter);
-            // eframe's 8192-pixel default is too small for wide or tall Retina windows.
-            descriptor.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
-            descriptor
-        });
-    }
+    let native = native_options(size, icon.clone());
     // Before the event loop: the Apple event that launches the app may arrive before the window exists.
     #[cfg(target_os = "macos")]
     open_link::macos::register();
@@ -521,6 +538,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::App::new(cc, options, &icon)))
         }),
     )
+}
+
+/// The window: without `size` it fills the screen, which the layout is built to use.
+fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::NativeOptions {
+    let mut native = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("ATOMICS")
+            .with_app_id("atomics")
+            .with_icon(icon)
+            .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
+            .with_maximized(size.is_none())
+            .with_min_inner_size([480.0, 320.0]),
+        ..Default::default()
+    };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup {
+        let device_descriptor = setup.device_descriptor.clone();
+        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut descriptor = device_descriptor(adapter);
+            // eframe's 8192-pixel default is too small for wide or tall Retina windows.
+            descriptor.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+            descriptor
+        });
+    }
+    native
 }
 
 fn load_icon() -> egui::IconData {

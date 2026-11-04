@@ -592,9 +592,57 @@ desktop exactly as before.
 - **A headless credential store.** `ATOMICS_CREDENTIALS_DIR` (Linux only) keeps what ATOMICS would put in the
   OS credential store (the ticket sign-in, MCP sign-ins, rendezvous keys) as private files instead: a 0700
   folder of 0600 files, an item each. For a machine without a keyring that is one trust domain, as the VM is.
-- **Not yet.** The desktop cannot attach to a running host as a client (phase 3). Terminals keep the size they
-  started with unless a lease holder asks for its own (H3), and are seen and typed into through ctl, MCP and
-  `atomics.v1` (H2, H3). The container profile stays in Phase F.
+- **Not yet.** Terminals keep the size they started with unless a lease holder asks for its own (H3), and are
+  seen and typed into through ctl, MCP and `atomics.v1` (H2, H3). The container profile stays in Phase F.
+
+## The desktop as a client
+
+Phase 3's native client. `atomics --connect <address>`, or `[client] connect` in the config, opens the native
+window as a client of an `atomics host` instead of a host of its own:
+
+```toml
+[client]
+connect = "local"     # the `atomics host` on this machine; "vm": the host in this Mac's ATOMICS VM;
+                      # "ws://127.0.0.1:PORT": a host this machine paired with; "" (default): the desktop
+```
+
+`atomics --connect ""` opens the desktop for one run whatever the config says.
+
+- **The browser client's own path, run natively** (`crates/atomics/src/client.rs`). atomics-web's `Driver`
+  (connecting, reconnecting with the same jittered waits, replaying from the cursor), its `RemoteBackend` (the
+  board on `atomics_core::mirror`, diffs file by file, terminals, leases, mutations and their journal of
+  operations) and its views (the desktop's own frame drawn by atomics-ui on a wide window, the phone layout on a
+  narrow one) are the client; `client.rs` only carries out the driver's outputs. So terminals, diffs, the
+  board, approvals, the chief and comment boxes are the browser's, and offer what `atomics.v1` carries: the
+  host's own items (Settings, sandboxes, credentials, the ticket sign-in) stay on the host.
+- **Direct, not through a broker** (`Driver::direct`). The client dials the host's server itself
+  (`client/link.rs`, a WebSocket on a thread of its own with `TCP_NODELAY`), offering `atomics.v1` with the
+  bearer token in the upgrade, and says `hello` as soon as it is through. The address and the token are found
+  again for every dial (`client/target.rs`): `local` reads the host's `protocol.json` in `ATOMICS_HOME`, so a
+  host that restarted with a new token is reached again; an address reads the token this machine paired with
+  from the OS credential store; `vm` starts the bundle's forward and pairs once (docs/nixos-vm.md).
+- **Input.** Instead of the page's `<textarea>` overlay, `client/input.rs` takes the terminal's share of each
+  frame's raw input before egui sees it: a click on the cells gives the terminal the keyboard (and asks for the
+  lease, as a tap does), keys and text go to it while it has the keyboard, a click anywhere else or a text box
+  taking the keyboard lets go, the wheel over the cells scrolls this client's history, Copy copies the
+  selection, and Command-key shortcuts stay the window's.
+- **Closing the window** ends only the connection: the host's agents, terminals, plans and approvals go on, and
+  a window opened again finds them as they are. The client takes no lock on the home and starts no runtime.
+- **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop
+  reading, and the host then treats it as the slow client it is (a fresh snapshot, or a drop and a reconnect),
+  rather than the window holding an unbounded backlog.
+- **When waiting cannot help, it stops and says why**: a refused token ("pair this window again"), or a host of
+  another major version (a frame it cannot decode as such, or the host's `unsupported_version` refusal of the
+  `hello`). Anything else, a host that is not there included, is a drop it dials again after.
+- **Tests.** `app::client_tests` runs the real host in process with its protocol server and the client's own
+  driver, link and backend: a shell started through ctl and a plan show in a first window, which types into the
+  shell under the lease; the window closes, and the shell's process (same pid, alive) and its terminal stay; a
+  second window shows the same session, its screen as it was and the plan, and types there too. Two windows
+  share one board and one lease (taking over moves it, and both see what the other typed), and a window that
+  stops reading while 300 plans change catches up with every one. `client::tests` runs it against servers that
+  misbehave: malformed frames are skipped (it still answers a ping), another major version stops it (a frame,
+  or a refusal of its `hello`), a refused token stops it, and a host that is not there is tried again.
+  `client::input` covers the input routing, and `driver::tests` the direct mode's dials, waits and stops.
 
 ## Rendezvous
 
@@ -1150,9 +1198,9 @@ History Reopen persisted the open status. The QA process then exited cleanly.
   subscriptions, bounded queues, reconnect/reset handling and slow-client tests.
 - Done for the protocol (H4, "Mutations" above): operation acceptance/outcome journaling, duplicate-command and
   uncertain crash recovery, with hook, ctl and MCP formats unchanged.
-- Change shutdown ownership: closing/reopening the desktop must preserve child
-  PIDs, emulator state and plan progress. Today exiting the entire application
-  still joins the host and shuts down its terminals, as before.
+- Done for a separate host (`atomics --connect`, "The desktop as a client" above): closing and reopening the
+  window keeps child PIDs, emulator state and plan progress. The in-process desktop, still the default, joins
+  its host and shuts down its terminals on quit, as before.
 
 The separate daemon, browser rendering and remote deployment are not shipped by
 phase 2. Their gates remain the phase 3–5 gates above.
