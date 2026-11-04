@@ -4,7 +4,10 @@ use std::process::Command;
 
 use atomics_core::{
     config::Config,
-    doctor::{approvals_check, cache_clone_check, check_line, codex_checks, plans_check, worktree_checks},
+    doctor::{
+        approvals_check, cache_clone_check, check_line, codex_trust_check, codex_version_check, plans_check,
+        worktree_checks,
+    },
     paths,
     selfconfig::{self, Layer, Source},
     tickets::Cleaner,
@@ -20,6 +23,8 @@ use crate::setup::{
 /// checks (git and a config that loads) passed.
 struct Report {
     lines: Vec<String>,
+    /// The lines of the required checks; every other failed check is a warning.
+    required: [usize; 2],
     git_ok: bool,
     config_ok: bool,
 }
@@ -44,12 +49,13 @@ pub fn json(workspace: Option<&str>, projects: &[PathBuf]) -> Value {
     let effective = Config::load(&config_path).unwrap_or_default();
     let cleaner = Cleaner::new(selfconfig::secrets(&effective, &layers, crate::setup::env_var));
     let (mut checks, mut facts) = (Vec::new(), Vec::new());
-    for line in &report.lines {
+    for (index, line) in report.lines.iter().enumerate() {
         if let Some(check) = line.strip_prefix("✓ ") {
             checks.push(json!({ "ok": true, "check": check }));
         } else if let Some(failed) = line.strip_prefix("✗ ") {
             let (check, hint) = failed.rsplit_once(" — ").unwrap_or((failed, ""));
-            checks.push(json!({ "ok": false, "warning": check.contains("(warning)"), "check": check, "hint": hint }));
+            let warning = !report.required.contains(&index);
+            checks.push(json!({ "ok": false, "warning": warning, "check": check, "hint": hint }));
         } else {
             facts.push(json!(line));
         }
@@ -105,17 +111,19 @@ fn spotlight_line(repo: &std::path::Path, output: &str) -> Option<String> {
 /// or an agent's own `isolation`.
 fn sandboxes_wanted(config: &Config, workspace: Option<&str>) -> bool {
     use atomics_core::isolation::IsolationMode;
-    let overrides = workspace.and_then(|name| Workspace::load(name).ok()).and_then(|w| w.isolation().ok().flatten());
-    let isolation = match overrides {
-        Some(overrides) => config.isolation.with_overrides(&overrides).unwrap_or_else(|_| config.isolation.clone()),
-        None => config.isolation.clone(),
-    };
-    isolation.mode == IsolationMode::Sandbox
+    effective_isolation(config, workspace).mode == IsolationMode::Sandbox
         || config.agents.iter().any(|a| a.isolation == Some(IsolationMode::Sandbox))
 }
 
 fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Report {
     let mut lines = Vec::new();
+    // What every check below runs with, and every program ATOMICS starts.
+    let (path_ok, path) = crate::setup::login_path().describe();
+    lines.push(check_line(
+        path_ok,
+        &path,
+        "make your login shell print its PATH quickly when started with -l -i -c, or set SHELL to one that does",
+    ));
     let git_version = Command::new(resolve_program("git"))
         .arg("--version")
         .output()
@@ -125,6 +133,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         .filter(|version| !version.is_empty());
     let git_ok = git_version.is_some();
     let git = git_version.map(|version| format!("git found ({version})")).unwrap_or_else(|| "git not found".into());
+    let git_line = lines.len();
     lines.push(check_line(git_ok, &git, "install git and add it to your login-shell PATH"));
 
     let config_path = paths::config_file();
@@ -145,10 +154,12 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             && let Some(path) = found
         {
             // Like agent launch, tolerate a cold CLI starting while other agents compile.
-            lines.extend(codex_checks(codex_supports_hooks(
-                &path.to_string_lossy(),
-                std::time::Duration::from_secs(10),
-            )));
+            let supported = codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(10));
+            lines.push(codex_version_check(supported));
+            // An older Codex gets no hooks to trust.
+            if supported != Some(false) {
+                lines.push(codex_trust_line(config.as_ref().ok().map(|(config, _)| config), workspace));
+            }
         }
     }
 
@@ -163,6 +174,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         }
         Err(err) => format!("config failed: {err:#}"),
     };
+    let config_line = lines.len();
     lines.push(check_line(config.is_ok(), &label, "create or fix this config; start ATOMICS to create a missing file"));
     if let Ok((_, sources)) = &config {
         for source in sources {
@@ -171,11 +183,21 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     }
 
     lines.extend(plans_check(&paths::atomics_home()));
-    for note in crate::lifecycle::leftovers(&paths::atomics_home()) {
+    let kept = crate::lifecycle::kept_leftovers(&paths::atomics_home());
+    for note in &kept {
         lines.push(check_line(
             false,
             &format!("cleanup leftover (warning): {note}"),
             "review in ATOMICS's Clean up… dialog",
+        ));
+    }
+    for note in
+        crate::lifecycle::sweep_leftovers(&paths::atomics_home()).into_iter().filter(|note| !kept.contains(note))
+    {
+        lines.push(check_line(
+            false,
+            &format!("cleanup leftover (warning): {note}"),
+            "ATOMICS looks again when it next starts and drops it once fixed; review in its Clean up… dialog",
         ));
     }
     let credential_keychain = if cfg!(test) {
@@ -283,10 +305,23 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
 
     let socket_path = paths::socket_path();
     let running = UnixStream::connect(&socket_path).is_ok();
-    let label = format!("ATOMICS running ({})", socket_path.display());
+    let label = if running {
+        format!("ATOMICS running ({})", socket_path.display())
+    } else {
+        format!("ATOMICS not running (warning): nothing answers at {}", socket_path.display())
+    };
     lines.push(check_line(running, &label, "start ATOMICS or check ATOMICS_SOCKET / ATOMICS_HOME"));
 
-    lines.push(check_line(global_hooks_installed(), "global Claude hooks installed", "run `atomics install-hooks`"));
+    let (settings, installed) = (crate::setup::claude_settings_path(), global_hooks_installed());
+    let label = if installed {
+        format!("global Claude hooks installed ({})", settings.display())
+    } else {
+        format!(
+            "global Claude hooks not installed (warning): Claude sessions started outside ATOMICS stay unseen ({})",
+            settings.display()
+        )
+    };
+    lines.push(check_line(installed, &label, "run `atomics install-hooks` if you want them seen"));
     if legacy_hooks_installed() {
         lines.push(check_line(
             false,
@@ -295,7 +330,48 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         ));
     }
 
-    Report { lines, git_ok, config_ok: config.is_ok() }
+    Report { lines, required: [git_line, config_line], git_ok, config_ok: config.is_ok() }
+}
+
+/// Whether Codex runs the hooks ATOMICS passes its bare agents, from the trust in the Codex home
+/// they get. Sandboxed Codex agents get no ATOMICS hooks, so the check is moot while every Codex
+/// agent runs sandboxed.
+fn codex_trust_line(config: Option<&Config>, workspace: Option<&str>) -> String {
+    if let Some(config) = config
+        && !bare_codex_agents(config, workspace)
+    {
+        return check_line(
+            true,
+            "Codex hook trust not needed: Codex agents run sandboxed, where ATOMICS passes no hooks; a bare \
+             Codex agent or task needs it",
+            "",
+        );
+    }
+    // The same command and socket agent launch passes.
+    let exe = crate::setup::executable_path().unwrap_or_else(|_| "atomics".into());
+    let hooks = atomics_core::hook::codex_hook_trust(&exe, &paths::socket_path());
+    let file = crate::setup::agent_codex_home().join("config.toml");
+    codex_trust_check(&hooks, &file, std::fs::read_to_string(&file))
+}
+
+/// Whether a configured Codex agent runs bare by default, with the workspace's `[isolation]`.
+fn bare_codex_agents(config: &Config, workspace: Option<&str>) -> bool {
+    use atomics_core::isolation::IsolationMode;
+    let isolation = effective_isolation(config, workspace);
+    config
+        .agents
+        .iter()
+        .filter(|agent| agent.is_codex())
+        .any(|agent| isolation.mode_for(agent, None) == IsolationMode::Bare)
+}
+
+/// `[isolation]` with the workspace's merged in.
+fn effective_isolation(config: &Config, workspace: Option<&str>) -> atomics_core::isolation::IsolationConfig {
+    let overrides = workspace.and_then(|name| Workspace::load(name).ok()).and_then(|w| w.isolation().ok().flatten());
+    match overrides {
+        Some(overrides) => config.isolation.with_overrides(&overrides).unwrap_or_else(|_| config.isolation.clone()),
+        None => config.isolation.clone(),
+    }
 }
 
 /// The effective `[tickets]` of the main config and the workspace, for commands outside the app.
@@ -657,8 +733,10 @@ mod tests {
                 assert!(stdout.contains(&format!("{prefix} Codex supports ATOMICS hooks")), "{stdout}");
             }
             assert!(stdout.contains(&format!("{prefix} [approvals] allow list")), "{stdout}");
-            assert_eq!(stdout.contains("ATOMICS Codex hook trust not verified"), probe != "missing", "{stdout}");
-            assert_eq!(stdout.contains("/hooks"), probe != "missing", "{stdout}");
+            // Codex agents run sandboxed by default, where ATOMICS passes no hooks; an older Codex gets none.
+            let trust = !matches!(probe, "missing" | "printf 'codex-cli 0.164.0\\n'");
+            assert_eq!(stdout.contains("✓ Codex hook trust not needed: Codex agents run sandboxed"), trust, "{stdout}");
+            assert!(!stdout.contains("Codex does not run every ATOMICS hook"), "{stdout}");
             assert!(stdout.contains(if bad_plan { "unreadable plan" } else { "plan files readable" }));
             let worktree_lines: Vec<_> = stdout.lines().filter(|line| line.contains("merged worktree")).collect();
             let expected = if bad_plan {
@@ -671,6 +749,55 @@ mod tests {
             };
             assert_eq!(worktree_lines, [expected], "{stdout}");
         }
+
+        // Bare Codex agents get the hooks, and their trust lives in this instance's own Codex home.
+        crate::test_support::write_program(&codex, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\n");
+        std::fs::write(&config, "base_ref = \"main\"\n[isolation]\nmode = \"bare\"\n").unwrap();
+        let codex_home = state.join("codex");
+        let doctor = || {
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "doctor::tests::doctor_reports_new_checks_without_changing_warning_exit_codes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env("SHELL", &shell)
+                    .env("ATOMICS_HOME", &state)
+                    .env("ATOMICS_CONFIG", &config)
+                    .env("ATOMICS_SOCKET", dir.path().join("absent.sock"))
+                    .env("CODEX_HOME", dir.path().join("inherited-codex"))
+                    .current_dir(&repo),
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let stdout = doctor();
+        let file = codex_home.join("config.toml").display().to_string();
+        let line = stdout.lines().find(|line| line.contains("Codex does not run every ATOMICS hook")).unwrap();
+        assert!(line.starts_with("✗") && line.contains("(warning): untrusted: ") && line.contains(&file), "{line}");
+        let hooks = atomics_core::hook::codex_hook_trust(
+            &crate::setup::executable_path().unwrap(),
+            &dir.path().join("absent.sock"),
+        );
+        assert_eq!(hooks.len(), 8);
+        for hook in &hooks {
+            assert!(
+                line.contains(&format!("[hooks.state.\"{}\"] trusted_hash = \"{}\"", hook.key, hook.hash)),
+                "{line}"
+            );
+        }
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let trusted: String = hooks
+            .iter()
+            .map(|hook| format!("[hooks.state.\"{}\"]\ntrusted_hash = \"{}\"\n", hook.key, hook.hash))
+            .collect();
+        std::fs::write(codex_home.join("config.toml"), trusted).unwrap();
+        let stdout = doctor();
+        assert!(stdout.contains(&format!("✓ Codex trusts ATOMICS's hooks for all 8 events ({file})")), "{stdout}");
+        assert!(!dir.path().join("inherited-codex").exists());
     }
 
     #[test]
@@ -693,7 +820,7 @@ mod tests {
                 .find(|check| check["check"].as_str().unwrap().starts_with("config failed:"))
                 .unwrap_or_else(|| panic!("{broken}"));
             assert!(config_check["check"].as_str().unwrap().contains("fixture.toml: line 2, column"), "{config_check}");
-            assert_eq!(config_check["ok"], false);
+            assert_eq!((config_check["ok"].clone(), config_check["warning"].clone()), (json!(false), json!(false)));
             assert!(config_check["hint"].as_str().unwrap().contains("fix this config"));
             // The terminal's doctor still shows the user the failing line.
             assert!(report(None, false, &[]).lines.iter().any(|line| line.contains("pw-doctor-secret")));
@@ -714,8 +841,15 @@ mod tests {
             );
             let checks = healthy["checks"].as_array().unwrap();
             assert!(checks.iter().any(|c| c["ok"] == true && c["check"].as_str().unwrap().starts_with("git found")));
-            let socket = checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("ATOMICS running")).unwrap();
-            assert_eq!((socket["ok"].clone(), socket["warning"].clone()), (json!(false), json!(false)));
+            let socket =
+                checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("ATOMICS not running")).unwrap();
+            assert_eq!((socket["ok"].clone(), socket["warning"].clone()), (json!(false), json!(true)));
+            let hooks = checks.iter().find(|c| c["check"].as_str().unwrap().contains("global Claude hooks")).unwrap();
+            assert_eq!((hooks["ok"].clone(), hooks["warning"].clone()), (json!(false), json!(true)));
+            assert!(hooks["check"].as_str().unwrap().starts_with("global Claude hooks not installed"), "{hooks}");
+            assert!(hooks["hint"].as_str().unwrap().contains("atomics install-hooks"), "{hooks}");
+            // Every failed check is a warning except the two required ones, as the answer says.
+            assert!(checks.iter().all(|c| c["ok"] == true || c["warning"] == true), "{healthy}");
             assert_eq!(socket["hint"], "start ATOMICS or check ATOMICS_SOCKET / ATOMICS_HOME");
             let codex = checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("codex not found")).unwrap();
             assert_eq!(codex["warning"], true);

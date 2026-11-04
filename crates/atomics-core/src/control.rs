@@ -454,6 +454,15 @@ pub fn clip_start(text: &str, max: usize) -> String {
     format!("[{} earlier characters] …{}", count - max, &text[cut..])
 }
 
+/// The first `max_items` of `items`, each clipped to `max` characters, and how many more there were.
+pub fn clip_list(items: &[String], max: usize, max_items: usize) -> Vec<String> {
+    let mut shown: Vec<_> = items.iter().take(max_items).map(|item| clip(item, max)).collect();
+    if items.len() > max_items {
+        shown.push(format!("[{} more]", items.len() - max_items));
+    }
+    shown
+}
+
 /// Every string in `value` clipped to `max` characters, and every array to its first `max_items`.
 pub fn clip_json(value: &mut Value, max: usize, max_items: usize) {
     match value {

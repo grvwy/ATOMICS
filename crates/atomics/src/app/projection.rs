@@ -314,6 +314,7 @@ mod tests {
                 input: serde_json::json!({}),
             },
             reply: None,
+            native: None,
         }
     }
 

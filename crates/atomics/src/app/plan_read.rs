@@ -1,6 +1,6 @@
 //! What `plan_get` answers about one plan: a compact view of every task that stays inside what
 //! an MCP client accepts, and one task in full on request.
-use atomics_core::control::{MAX_PLAN_VIEW_CHARS, clip, clip_json, shown_len};
+use atomics_core::control::{MAX_PLAN_VIEW_CHARS, clip, clip_json, clip_list, shown_len};
 
 use super::*;
 
@@ -74,6 +74,10 @@ impl State {
         }
         if let Some(note) = self.remote_note(&plan.id) {
             value["remote"] = json!(clip(&note, 500));
+        }
+        let problems = super::plans::cycle_problems(plan);
+        if !problems.is_empty() {
+            value["problems"] = json!(clip_list(&problems, 300, 10));
         }
         if let Some(board) = self.ticket_summary(&plan.id).and_then(|s| s.get("board").cloned()) {
             let items = board.as_array().map(Vec::as_slice).unwrap_or_default();
@@ -386,6 +390,47 @@ mod tests {
             }
             let first = tasks.len();
             assert_eq!(more[0], format!("t{first} ({})", TaskStatus::ALL[first % TaskStatus::ALL.len()].label()));
+        });
+    }
+
+    #[test]
+    fn plan_set_refusals_and_a_stored_plans_cycles_read_bounded() {
+        with_app("app::plan_read::tests::plan_set_refusals_and_a_stored_plans_cycles_read_bounded", |app, _| {
+            // Thirty tasks that each wait for themselves: thirty refusals, of which the first twenty are listed.
+            let looped: Vec<_> =
+                (0..30).map(|i| json!({"id":format!("t{i}"), "depends_on":[format!("t{i}")]})).collect();
+            let refused = request(app, json!({"cmd":"plan_set", "goal":"Loops", "tasks":looped}));
+            let error = refused.error.unwrap();
+            let lines: Vec<_> = error.lines().filter(|line| line.starts_with("- ")).collect();
+            assert_eq!(lines.len(), 21, "{error}");
+            assert_eq!(
+                lines[0],
+                "- Dependency cycle t0 → t0: each task waits for the next, so none of them can ever start."
+            );
+            assert_eq!(lines[20], "- [10 more]");
+            assert!(app.runtime.plans.iter().all(|plan| plan.goal != "Loops"), "nothing was saved");
+
+            // A plan saved before plan_set refused cycles shows them in plan_get, bounded the same way.
+            let plan = request(app, json!({"cmd":"plan_set", "goal":"Older", "tasks":[{"id":"a"}, {"id":"b"}]})).result
+                ["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let view = request(app, json!({"cmd":"plan_get", "plan":plan}));
+            assert!(view.result.get("problems").is_none(), "{}", view.result);
+            let index = app.runtime.plans.iter().position(|p| p.id == plan).unwrap();
+            let tasks = &mut app.runtime.plans[index].tasks;
+            tasks[0].depends_on = vec!["b".into()];
+            tasks[1].depends_on = vec!["a".into()];
+            for i in 0..20 {
+                tasks.push(Task { id: format!("s{i}"), depends_on: vec![format!("s{i}")], ..Task::default() });
+            }
+            let view = request(app, json!({"cmd":"plan_get", "plan":plan}));
+            let problems = view.result["problems"].as_array().unwrap();
+            assert_eq!(problems.len(), 11, "{problems:?}");
+            assert!(problems[0].as_str().unwrap().starts_with("Dependency cycle a → b → a: "), "{problems:?}");
+            assert_eq!(problems[10], "[11 more]");
+            assert!(shown_len(&view.result) <= MAX_PLAN_VIEW_CHARS);
         });
     }
 

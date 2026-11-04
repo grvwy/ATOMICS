@@ -183,6 +183,7 @@ impl Backend for Local<'_> {
                 .map(|usage| usage.label()),
             sandbox_error: sandboxes.error.clone(),
             queue_note,
+            warning: session.warning.clone(),
             connect: match session.sandbox {
                 Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
                 None => Vec::new(),
@@ -613,6 +614,7 @@ mod tests {
                     input: json!({}),
                 },
                 reply: None,
+                native: None,
             };
             let mut asking = session("asking", AgentKind::Claude, AgentStatus::NeedsInput, dir.path());
             asking.title = "Asking".into();

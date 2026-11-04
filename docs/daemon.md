@@ -170,6 +170,11 @@ Lease expiry/disconnect fences late input with a new lease token. Opening a tab 
 Approvals are shared host transactions: the first valid decision for an unexpired ID wins, and every
 client sees the resolution. A stale decision cannot approve the next request in that session.
 Keep the existing hook timeout/fallback behavior and held-message rules when no client answers.
+A session's approval list is the one source of truth for a waiting prompt. A hook request fills it; with no
+hook request, the host's screen check puts the agent's own command menu there (Codex's "Would you like to run
+the following command?", Claude's "Bash command … Do you want to proceed?"), under one ID while the menu stays.
+A decision on it presses that agent's keys only while the screen still shows the reviewed command. Raw input
+is refused only while a decision can answer the prompt; any other menu takes raw keys.
 
 ## Remote authentication and isolation
 

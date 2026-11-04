@@ -75,6 +75,13 @@ impl Instance {
     }
 
     fn ctl(&self, request: Value) -> Value {
+        let response = self.ctl_response(request.clone());
+        assert_eq!(response["ok"], true, "{request} -> {response}");
+        response["result"].clone()
+    }
+
+    /// The host's whole answer, which may be a refusal.
+    fn ctl_response(&self, request: Value) -> Value {
         let output = test_support::output(&mut self.command(["ctl".to_string(), request.to_string()]));
         assert!(
             output.status.success(),
@@ -82,9 +89,7 @@ impl Instance {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(response["ok"], true, "{request} -> {response}");
-        response["result"].clone()
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     /// Waits for the host to answer ctl, failing with its logs if it exits first.
@@ -271,6 +276,15 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let id = plan["plan"].as_str().unwrap().to_string();
     let saved = instance.home().join("plans").join(format!("{id}.json"));
     eventually("the saved plan", || std::fs::read_to_string(&saved).is_ok_and(|text| text.contains("Headless gate")));
+    // A plan whose tasks could never start is refused, naming why, and not saved.
+    let refused = instance.ctl_response(json!({
+        "cmd":"plan_set", "goal":"Never starts",
+        "tasks":[{"id":"t1","title":"Follow-up","brief":"After the review","depends_on":["review"]}]
+    }));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(refused["error"].as_str().unwrap().contains("Dependency cycle t1 → review → t1"), "{refused}");
+    let open = instance.ctl(json!({"cmd":"plan_get"}));
+    assert!(open["plans"].as_array().unwrap().iter().all(|plan| plan["goal"] != "Never starts"), "{open}");
 
     // A loopback protocol client connects and sees the board: the session and the plan.
     let mirror = board(&instance.home(), |mirror| {
@@ -317,6 +331,87 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     instance.ready(&mut again);
     assert_eq!(unsafe { libc::kill(again.child.id() as i32, libc::SIGINT) }, 0);
     let output = again.wait_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// The chief's two tools as `atomics mcp` serves them, one call each, in order.
+fn mcp_calls(instance: &Instance, calls: &[(&str, Value)]) -> Vec<Value> {
+    let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut stdin = mcp.child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}})
+    )
+    .unwrap();
+    for (id, (name, arguments)) in calls.iter().enumerate() {
+        let call =
+            json!({"jsonrpc":"2.0", "id":id + 1, "method":"tools/call", "params":{"name":name, "arguments":arguments}});
+        writeln!(stdin, "{call}").unwrap();
+    }
+    drop(stdin);
+    let output = mcp.wait_output().unwrap();
+    assert!(output.status.success());
+    let replies: Vec<Value> = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (1..=calls.len()).map(|id| replies.iter().find(|reply| reply["id"] == id).unwrap()["result"].clone()).collect()
+}
+
+#[test]
+fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() {
+    let instance = Instance::new(Some(0));
+    // An agent with no hooks that stops on Codex's recorded command menu.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+    let screen =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures/codex-0.165-approval-screen.txt");
+    let mut config = std::fs::OpenOptions::new().append(true).open(instance.dir.path().join("config.toml")).unwrap();
+    let agent = json!([script, screen]);
+    write!(config, "\n[[agents]]\nname = \"menu\"\ncommand = {agent}\nkind = \"generic\"\n").unwrap();
+    drop(config);
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let started = instance.ctl(json!({"cmd":"start", "agent":"menu", "isolation":"bare"}));
+    let session = started["id"].as_str().unwrap().to_string();
+    let command = "atomics queue --class test -- ./check.sh";
+
+    // ctl and the board both hold the menu as the session's one pending approval.
+    eventually("the native approval", || {
+        let list = instance.ctl(json!({"cmd":"list"}));
+        list["sessions"][0]["approval_menu"] == "codex" && list["sessions"][0]["approval"]["command"] == command
+    });
+    let mirror = board(&instance.home(), |mirror| mirror.approvals.values().any(|a| a.session == session));
+    let approval = mirror.approvals.values().find(|a| a.session == session).unwrap();
+    assert_eq!(approval.command.as_deref(), Some(command));
+    assert_eq!(mirror.sessions[&session].pending_approvals, 1);
+
+    // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu and echoes it.
+    let results = mcp_calls(
+        &instance,
+        &[
+            ("atomics_send", json!({"session":session, "text":"y", "raw":true})),
+            ("atomics_approve", json!({"session":session, "decision":"allow"})),
+        ],
+    );
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    assert!(results[0]["content"][0]["text"].as_str().unwrap().contains("use atomics_approve"), "{}", results[0]);
+    assert_eq!(results[1]["isError"], false, "{}", results[1]);
+    let answered = results[1]["content"][0]["text"].as_str().unwrap();
+    assert!(answered.contains(command) && answered.contains("codex"), "{answered}");
+    eventually("the menu's keys", || {
+        instance.ctl(json!({"cmd":"read", "session":session, "lines":40}))["screen"]
+            .as_str()
+            .is_some_and(|screen| screen.contains("Keys: 31 0d"))
+    });
+    board(&instance.home(), |mirror| {
+        mirror.approvals.is_empty() && mirror.sessions.get(&session).is_some_and(|s| s.pending_approvals == 0)
+    });
+
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
@@ -405,6 +500,52 @@ fn with_remote_on_a_taken_port_the_host_fails_loudly_and_cleans_up() {
     instance.ready(&mut host);
     let url = serde_json::from_str::<Value>(&std::fs::read_to_string(&advert).unwrap()).unwrap()["url"].clone();
     assert_eq!(url, format!("ws://127.0.0.1:{port}"));
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
+    let instance = Instance::new(None);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
+    // An earlier version left the ledger noting a git record whose file and sandbox are gone, so
+    // every start and plan cleanup failed on it, and kept those failures forever.
+    let record = instance.home().join("git-pins/atomics-gone.json");
+    std::fs::write(
+        instance.home().join("sandbox-ownership.json"),
+        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins")}}).to_string(),
+    )
+    .unwrap();
+    let missing = format!("reading {}: No such file or directory (os error 2)", record.display());
+    let alert = "Final ref guard check FAILED: refs/heads/main moved";
+    let notes = [
+        format!("Startup cleanup skipped: {missing}"),
+        format!("Plan cleanup skipped: {missing}"),
+        "Worktrees /home/user/deleted-scratch: git worktree list --porcelain failed: fatal: cannot change to".into(),
+        alert.to_string(),
+    ];
+    std::fs::write(instance.home().join("cleanup-leftovers.json"), json!(notes).to_string()).unwrap();
+
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let kept = || {
+        std::fs::read(instance.home().join("cleanup-leftovers.json"))
+            .map(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).unwrap())
+            .unwrap_or_default()
+    };
+    eventually("the startup sweep to drop what it no longer finds", || kept() == [alert]);
+    assert!(!instance.home().join("cleanup-sweep.json").exists(), "the sweep found nothing to report");
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(instance.home().join("sandbox-ownership.json")).unwrap()).unwrap();
+    assert!(ledger.get("atomics-gone").is_none(), "{ledger}");
+
+    let doctor = test_support::output(&mut instance.command(["doctor"]));
+    let text = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(text.matches("cleanup leftover").count(), 1, "{text}");
+    assert!(text.contains(&format!("✗ cleanup leftover (warning): {alert}")), "{text}");
+
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     let output = host.wait_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
