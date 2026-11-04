@@ -539,7 +539,7 @@ impl State {
             qa: pool(SlotClass::Qa),
             ..self.resources.clone()
         };
-        self.resources != before
+        resources_need_repaint(before, &self.resources)
     }
 
     pub(crate) fn runtime_deadline(&self) -> Instant {
@@ -864,6 +864,25 @@ impl State {
     }
 }
 
+/// Keep the full sample for protocol clients, but only wake the desktop for visible changes.
+fn resources_need_repaint(
+    before: atomics_core::projection::ResourceInfo,
+    after: &atomics_core::projection::ResourceInfo,
+) -> bool {
+    use atomics_core::projection::ResourceInfo;
+    // Match resources::load's one-decimal text and its load-per-core color thresholds.
+    let gauge = |resources: &ResourceInfo| {
+        resources.load.map(|load| {
+            let per_core = load / resources.cores.max(1) as f64;
+            (format!("{load:.1}"), per_core >= 0.7, per_core >= 1.0)
+        })
+    };
+    let load_changed = gauge(&before) != gauge(after);
+    // Fresh timestamps still reach usage age/reset labels through host projections.
+    let before = ResourceInfo { sampled_at: after.sampled_at, load: after.load, ..before };
+    load_changed || before != *after
+}
+
 /// Gives a request nobody here can answer no decision at once: the agent then asks in its own
 /// terminal, which it draws only once the hook has returned.
 fn leave_to_agent(reply: Option<Arc<ipc::ApprovalReply>>) {
@@ -876,6 +895,65 @@ fn leave_to_agent(reply: Option<Arc<ipc::ApprovalReply>>) {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+    use atomics_core::projection::{HostInfo, Projections, ResourceInfo};
+
+    #[test]
+    fn resource_samples_publish_fresh_data_without_repainting_an_unchanged_view() {
+        let before = ResourceInfo { sampled_at: 100, load: Some(4.21), cores: 8, ..Default::default() };
+        let after = ResourceInfo { sampled_at: 102, load: Some(4.24), ..before.clone() };
+        assert!(!resources_need_repaint(before.clone(), &after));
+        assert!(!resources_need_repaint(after.clone(), &before));
+
+        let projections = Projections::default();
+        assert!(projections.publish_host(HostInfo { resources: Some(before), ..Default::default() }));
+        let revision = projections.host.load().revision;
+        assert!(projections.publish_host(HostInfo { resources: Some(after.clone()), ..Default::default() }));
+        let published = projections.host.load();
+        assert_eq!(published.revision, revision + 1);
+        assert_eq!(published.data.resources.as_ref(), Some(&after), "publish the timestamp and unrounded load");
+    }
+
+    #[test]
+    fn resource_samples_repaint_for_load_text_or_color_changes_in_either_direction() {
+        for (old, new, repaint) in [
+            (None, None, false),
+            (None, Some(0.0), true),
+            (Some(4.21), Some(4.24), false),
+            (Some(4.24), Some(4.26), true),
+            // Same text (5.6 / 8.0), different warning / error color on eight cores.
+            (Some(5.59), Some(5.6), true),
+            (Some(7.99), Some(8.0), true),
+        ] {
+            let before = ResourceInfo { sampled_at: 100, load: old, cores: 8, ..Default::default() };
+            let after = ResourceInfo { sampled_at: 102, load: new, ..before.clone() };
+            assert_eq!(resources_need_repaint(before.clone(), &after), repaint, "{old:?} -> {new:?}");
+            assert_eq!(resources_need_repaint(after, &before), repaint, "{new:?} -> {old:?}");
+        }
+    }
+
+    #[test]
+    fn resource_samples_repaint_for_slot_and_account_changes_in_either_direction() {
+        let before = ResourceInfo { cores: 8, ..Default::default() };
+        let changes: [fn(&mut ResourceInfo); 10] = [
+            |r| r.test.slots += 1,
+            |r| r.test.running += 1,
+            |r| r.test.waiting += 1,
+            |r| r.qa.slots += 1,
+            |r| r.qa.running += 1,
+            |r| r.qa.waiting += 1,
+            |r| r.cores += 1,
+            |r| r.compiler_jobs = Some(6),
+            |r| r.claude.observed_at = 100,
+            |r| r.codex.observed_at = 100,
+        ];
+        for change in changes {
+            let mut after = before.clone();
+            change(&mut after);
+            assert!(resources_need_repaint(before.clone(), &after), "{before:?} -> {after:?}");
+            assert!(resources_need_repaint(after.clone(), &before), "{after:?} -> {before:?}");
+            assert!(!resources_need_repaint(after.clone(), &after));
+        }
+    }
 
     #[test]
     fn needs_input_without_a_pending_menu_uses_slow_screen_checks() {
