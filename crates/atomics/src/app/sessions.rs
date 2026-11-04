@@ -1047,7 +1047,7 @@ impl State {
         let message = steer::compose_review(&header, &comments);
         let target = self
             .active_index()
-            .filter(|&i| self.sessions[i].root() == root)
+            .filter(|&i| self.sessions[i].root() == root && self.sessions[i].is_agent())
             .or_else(|| self.sessions.iter().position(|s| s.root() == root && s.is_agent() && s.can_receive()));
         let Some(index) = target else {
             self.toast("No agent is working in this worktree");
@@ -1253,36 +1253,11 @@ fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
     vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
 }
 
+#[cfg(test)]
 impl Desktop<'_> {
-    fn steer_targets(&self) -> Vec<usize> {
-        let indices = 0..self.runtime.sessions.len();
-        match self.client.steer_target {
-            SteerTarget::Active => self.runtime.active_index().into_iter().collect::<Vec<usize>>(),
-            SteerTarget::Agents => indices
-                .filter(|&i| self.runtime.sessions[i].is_agent() && !self.runtime.sessions[i].chief)
-                .collect::<Vec<usize>>(),
-            SteerTarget::Selected => {
-                indices.filter(|&i| self.client.selected.contains(&self.runtime.sessions[i].id)).collect::<Vec<usize>>()
-            }
-        }
-        .into_iter()
-        .filter(|&i| self.runtime.sessions[i].can_receive())
-        .collect()
-    }
-
+    /// Sends the steer bar's message as the bar's Send does (`atomics_ui::chief::send_steer`), for tests.
     pub(super) fn send_steer(&mut self) {
-        let text = self.client.steer_text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let targets = self.steer_targets();
-        if targets.is_empty() {
-            self.runtime.toast("No session to send to");
-            return;
-        }
-        let sessions: Vec<String> = targets.into_iter().map(|i| self.runtime.sessions[i].id.clone()).collect();
-        self.client.steer_text.clear();
-        self.send(Command::Steer { sessions, text });
+        self.draw(atomics_ui::chief::send_steer);
     }
 }
 

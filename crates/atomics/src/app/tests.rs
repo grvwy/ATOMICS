@@ -208,6 +208,134 @@ fn review_followups() {
     });
 }
 
+#[test]
+fn a_review_goes_to_an_agent_and_never_into_a_shell() {
+    with_state("app::tests::a_review_goes_to_an_agent_and_never_into_a_shell", |mut state, _ctx| {
+        let root = state.launch_dir.clone();
+        let elsewhere = root.join("elsewhere");
+        let agent = || session("agent", AgentKind::Claude, AgentStatus::Idle, &root);
+        let shell = || session("shell", AgentKind::Shell, AgentStatus::Idle, &root);
+        let other = || session("other", AgentKind::Claude, AgentStatus::Idle, &elsewhere);
+        let comment = steer::ReviewComment {
+            path: "a.rs".into(),
+            line: Some(1),
+            removed: false,
+            excerpt: "line".into(),
+            body: "Why?".into(),
+        };
+        // Who gets the review of `root`, with the computer's window on `active`.
+        let mut review = |sessions: Vec<Session>, active: &str| {
+            state.sessions = sessions;
+            state.active = Some(active.into());
+            state.diffs.entry(root.clone()).or_default().comments = vec![comment.clone()];
+            state.hub.lock().unwrap().outbox.clear();
+            let answer = state.deliver_review(&root);
+            let delivered: Vec<String> = state.hub.lock().unwrap().outbox.keys().cloned().collect();
+            let kept = state.diffs[&root].comments.len();
+            (answer, delivered, kept)
+        };
+        let to_the_agent = |(answer, delivered, kept): (Result<serde_json::Value, String>, Vec<String>, usize)| {
+            assert_eq!(answer.unwrap()["sent_comments"], 1);
+            assert_eq!(delivered, ["agent"]);
+            assert_eq!(kept, 0);
+        };
+        let refused = |(answer, delivered, kept): (Result<serde_json::Value, String>, Vec<String>, usize)| {
+            assert_eq!(answer.unwrap_err(), "could not deliver the review", "what the browser is told");
+            assert!(delivered.is_empty(), "{delivered:?}");
+            assert_eq!(kept, 1, "the comments stay");
+        };
+
+        to_the_agent(review(vec![agent(), shell()], "shell"));
+        refused(review(vec![shell()], "shell"));
+        refused(review(vec![shell(), other()], "other"));
+        to_the_agent(review(vec![agent(), shell(), other()], "other"));
+        to_the_agent(review(vec![agent(), shell()], "agent"));
+
+        // Through the mutation a client sends: the same refusal, with its reason, and the comments stay.
+        state.sessions = vec![shell()];
+        state.active = Some("shell".into());
+        let worktree = root.to_string_lossy().into_owned();
+        state.diffs.entry(root.clone()).or_default().prepared =
+            Some(std::sync::Arc::new(atomics_core::diff_data::Prepared {
+                diff: atomics_core::diff::WorktreeDiff {
+                    base_ref: "main".into(),
+                    base: "abc".into(),
+                    files: Vec::new(),
+                    partial: false,
+                },
+                highlights: Vec::new(),
+                longest_line: 1,
+                additions: 0,
+                deletions: 0,
+                all_files: Default::default(),
+            }));
+        state.diffs.entry(root.clone()).or_default().comments = vec![comment.clone()];
+        state.hub.lock().unwrap().outbox.clear();
+        let outcome = state.mutate_desktop(|op| {
+            atomics_core::ops::Command::ReviewCommand(atomics_core::ops::ReviewCommand {
+                op,
+                worktree,
+                action: atomics_core::ops::ReviewAction::Send,
+            })
+        });
+        assert!(
+            matches!(&outcome, atomics_core::ops::Outcome::Refused { message, .. }
+                if message == "could not deliver the review"),
+            "{outcome:?}"
+        );
+        assert_eq!(state.diffs[&root].comments.len(), 1);
+        assert!(state.hub.lock().unwrap().outbox.is_empty());
+    });
+}
+
+#[test]
+fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
+    with_app("app::tests::the_steer_bar_offers_all_agents_and_leaves_shells_out", |app, ctx| {
+        let dir = app.runtime.launch_dir.clone();
+        app.runtime.sessions = vec![
+            session("agent", AgentKind::Generic, AgentStatus::Idle, &dir),
+            session("shell", AgentKind::Shell, AgentStatus::Idle, &dir),
+        ];
+        let frame = |app: &mut Desktop<'_>, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                ui.add_space(200.0);
+                app.draw(|backend, client| atomics_ui::chief::steer_bar(ui, backend, client));
+            });
+            output.textures_delta.clear();
+            let text = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                _ => None,
+            });
+            text.collect::<Vec<_>>()
+        };
+        frame(app, Vec::new());
+        let shown = frame(app, Vec::new());
+        let target = shown.iter().find(|(text, _)| text.starts_with("→ ")).expect("the target").1.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(app, vec![egui::Event::PointerMoved(target), button(true), button(false)]);
+        let list = frame(app, Vec::new());
+        assert!(list.iter().any(|(text, _)| text == "All agents (1)"), "{list:?}");
+
+        app.client.steer_target = SteerTarget::Agents;
+        app.client.steer_text = "go on".into();
+        let commands = app.draw(|backend, client| {
+            atomics_ui::chief::send_steer(backend, client);
+            std::mem::take(&mut client.commands)
+        });
+        assert_eq!(commands, [Command::Steer { sessions: vec!["agent".into()], text: "go on".into() }]);
+    });
+}
+
 pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
     app.runtime.control(serde_json::from_value(value).unwrap(), tx);

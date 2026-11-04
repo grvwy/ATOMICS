@@ -1,8 +1,8 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, Notices, PlanRow, ProjectMenu, RecentSession,
-    SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, DiffHeading, DiffSnapshot, Heartbeat, Notices, PlanRow,
+    ProjectMenu, RecentSession, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints, WorktreeRow,
 };
 
 use super::*;
@@ -15,6 +15,16 @@ impl State {
     pub(super) fn backend(&self) -> Local<'_> {
         Local(self)
     }
+}
+
+/// A finished task's worktree is still on disk: its `diff` and `resume` need it.
+pub(super) fn worktree_kept(task: &Task) -> bool {
+    task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir())
+}
+
+/// The task runs a Codex agent (by its program, not its name), which resumes without a saved id.
+pub(super) fn resumes_as_codex(config: &Config, task: &Task) -> bool {
+    config.agent(&task.agent).is_some_and(|agent| agent.is_codex())
 }
 
 impl Local<'_> {
@@ -48,6 +58,7 @@ impl Local<'_> {
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
             outside: session.terminal.is_none(),
+            can_receive: session.can_receive(),
             pending_approvals: session.approvals.len(),
             held_messages: session.held.len(),
             changes: self
@@ -64,6 +75,15 @@ impl Local<'_> {
 impl Backend for Local<'_> {
     fn send(&self, command: atomics_ui::Command) {
         self.run(command);
+    }
+
+    /// The desktop carries out every command.
+    fn available(&self, _command: &atomics_ui::Command) -> bool {
+        true
+    }
+
+    fn launch_dir(&self) -> Option<PathBuf> {
+        Some(self.0.launch_dir.clone())
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {
@@ -106,16 +126,11 @@ impl Backend for Local<'_> {
                 .collect(),
             ticket_config: state.ticket_config(),
             board_counts,
-            worktrees: plan
-                .tasks
-                .iter()
-                .filter(|task| task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir()))
-                .map(|task| task.id.clone())
-                .collect(),
+            worktrees: plan.tasks.iter().filter(|task| worktree_kept(task)).map(|task| task.id.clone()).collect(),
             codex: plan
                 .tasks
                 .iter()
-                .filter(|task| state.config.agent(&task.agent).is_some_and(|agent| agent.is_codex()))
+                .filter(|task| resumes_as_codex(&state.config, task))
                 .map(|task| task.id.clone())
                 .collect(),
             now: atomics_core::store::now(),
@@ -141,6 +156,66 @@ impl Backend for Local<'_> {
         Some(ApprovalRow { session: session.id.clone(), id: pending.id.clone(), request: pending.request.clone() })
     }
 
+    fn tile(&self, index: usize) -> Option<TileView> {
+        let state = self.0;
+        let session = state.sessions.get(index)?;
+        let reported = if matches!(session.status, AgentStatus::Idle | AgentStatus::Done) {
+            state
+                .plans
+                .iter()
+                .flat_map(|p| &p.tasks)
+                .find(|t| t.session.as_deref() == Some(&session.id))
+                .and_then(|t| t.reported_line(atomics_core::store::now()))
+        } else {
+            None
+        };
+        let queue_note = session.terminal.as_ref().and_then(|terminal| {
+            let (running, waiting) = state.governor.snapshot();
+            super::fleet::queue_note(terminal.process_id(), &running, &waiting)
+        });
+        let sandboxes = &state.sandbox_usage;
+        Some(TileView {
+            reported,
+            sandbox_usage: session
+                .sandbox
+                .as_ref()
+                .and_then(|name| sandboxes.usage.get(name))
+                .map(|usage| usage.label()),
+            sandbox_error: sandboxes.error.clone(),
+            queue_note,
+            connect: match session.sandbox {
+                Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
+                None => Vec::new(),
+            },
+            exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()),
+            resumable: session.kind == AgentKind::Claude && session.claude_id.is_some(),
+            folder: paths::display(&session.cwd),
+            last_prompt: session.last_prompt.clone(),
+            last_message: session.last_message.clone(),
+        })
+    }
+
+    fn completed_tasks(&self) -> Vec<CompletedTile> {
+        let state = self.0;
+        let now = atomics_core::store::now();
+        state
+            .completed_tasks()
+            .into_iter()
+            .map(|(plan, index)| {
+                let task = &state.plans[plan].tasks[index];
+                CompletedTile {
+                    plan,
+                    index,
+                    read_only: !state.plans[plan].is_open(),
+                    worktree: worktree_kept(task),
+                    codex: resumes_as_codex(&state.config, task),
+                    now,
+                    task: task.clone(),
+                }
+            })
+            .collect()
+    }
+
     fn diff_roots(&self) -> Vec<PathBuf> {
         self.0.diffs.keys().cloned().collect()
     }
@@ -157,6 +232,21 @@ impl Backend for Local<'_> {
             file: data.file.clone(),
             file_error: data.file_error.clone(),
         })
+    }
+
+    fn chief(&self) -> ChiefView {
+        let state = self.0;
+        ChiefView {
+            session: state.sessions.iter().position(|s| s.chief),
+            open: state.chief_open,
+            dock: state.chief_dock(),
+            width: state.store.chief_width,
+            heartbeat: state.heartbeat.last.as_ref().map(|(at, findings)| Heartbeat {
+                age: atomics_core::store::now().saturating_sub(*at),
+                time: local_time(*at),
+                findings: findings.len(),
+            }),
+        }
     }
 
     fn diff_heading(&self, root: &Path) -> DiffHeading {
@@ -289,6 +379,28 @@ impl Backend for Local<'_> {
             can_save: !state.open_projects.is_empty(),
         }
     }
+}
+
+/// `at`, in seconds since the epoch, as this machine's local date and time; "unavailable" if it cannot tell.
+fn local_time(at: u64) -> String {
+    let timestamp = at as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers are valid; a non-null result points to initialized local.
+    let local = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()).as_ref() };
+    local.map_or_else(
+        || "unavailable".into(),
+        |local| {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                local.tm_year + 1900,
+                local.tm_mon + 1,
+                local.tm_mday,
+                local.tm_hour,
+                local.tm_min,
+                local.tm_sec
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -453,6 +565,34 @@ mod tests {
             );
             assert_eq!((loose.sandbox.as_deref(), loose.pending_approvals, loose.held_messages), (Some("vm"), 0, 1));
             assert!(rows.iter().all(|row| row.outside), "the test's sessions have no terminal in ATOMICS");
+        });
+    }
+
+    #[test]
+    fn the_chief_and_who_can_take_a_steer_follow_the_model() {
+        with_app("app::backend::tests::the_chief_and_who_can_take_a_steer_follow_the_model", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, dir.path());
+            chief.chief = true;
+            chief.claude_id = Some("conversation".into());
+            let mut gone = session("gone", AgentKind::Claude, AgentStatus::Exited, dir.path());
+            gone.claude_id = Some("old".into());
+            app.runtime.sessions = vec![gone, chief];
+            app.runtime.chief_open = true;
+            app.runtime.store.chief_dock = Some(ChiefDock::Docked);
+            app.runtime.store.chief_width = Some(640.0);
+            app.runtime.heartbeat.last = Some((atomics_core::store::now() - 120, Vec::new()));
+
+            let backend = app.runtime.backend();
+            let chief = backend.chief();
+            assert_eq!(chief.session, Some(1));
+            assert_eq!((chief.open, chief.dock, chief.width), (true, ChiefDock::Docked, Some(640.0)));
+            let heartbeat = chief.heartbeat.expect("the heartbeat ran");
+            assert!((120..180).contains(&heartbeat.age), "{}", heartbeat.age);
+            assert_eq!(heartbeat.findings, 0);
+            assert_eq!(heartbeat.time.len(), "2026-11-03 12:00:00".len(), "{}", heartbeat.time);
+            let rows = backend.session_list();
+            assert_eq!(rows.iter().map(|row| row.can_receive).collect::<Vec<_>>(), [false, true]);
         });
     }
 

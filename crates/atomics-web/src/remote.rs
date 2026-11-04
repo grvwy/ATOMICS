@@ -3,9 +3,16 @@
 //! become mutations through [`Command::remote`], each only when the host's `welcome` grants it. I/O free:
 //! frames come in through [`RemoteBackend::receive`] and go out through [`RemoteBackend::take_outgoing`].
 //!
-//! The browser offers everything read-only, answers approvals and approves plans where `may` allows, and
-//! follows and types into terminals ([`crate::screens`]) where it grants `type`. Any other command says so
-//! on the notice line.
+//! The browser offers what atomics.v1 can carry: a command is available when [`Command::remote`] has mutations
+//! for it and `welcome` grants them all, and it follows and types into terminals ([`crate::screens`]) where
+//! it grants `type`. The views draw no action for any other command; one sent anyway says so on the notice
+//! line, and so does a mutation the host refuses or cannot confirm, whose optimistic effects are undone.
+//!
+//! What a host keeps of its own window and atomics.v1 does not send (the tab, the active session, the
+//! right panel, the chief's window) is the page's, set by the views from their [`crate::desk::Desk`]
+//! ([`RemoteBackend::set_view`], [`RemoteBackend::set_chief_window`]); what the host cannot send at all
+//! (its config, projects, worktrees, sandboxes, usage) reads as absent, so the frame's host-only items stay
+//! empty.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -13,24 +20,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomics_core::approvals::ApprovalRequest;
-use atomics_core::config::{AgentKind, FontConfig, KeyConfig};
+use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff::{FileDiff, WorktreeDiff};
 use atomics_core::diff_data::Prepared;
 use atomics_core::layout::LayoutConfig;
 use atomics_core::lease::GridSize;
 use atomics_core::mirror::Mirror;
-use atomics_core::ops::{self, Grant, Outcome, Pending};
+use atomics_core::ops::{
+    self, Grant, Outcome, Pending, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
+};
 use atomics_core::plan::{Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::projection::{DiffFileBody, DiffFileSummary, PlanInfo, SessionInfo, TaskInfo};
 use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
+use atomics_core::steer::ReviewComment;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, Command, DiffHeading, DiffSnapshot, Notices, PanelMode, PlanRow, PlanState,
-    ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, ChiefView, Command, CompletedTile, DiffHeading, DiffSnapshot, Notices, PanelMode,
+    PlanRow, PlanState, ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints,
+    WorktreeRow,
 };
 
+use crate::desk::{self, ChiefWindow};
 use crate::screens::{Lease, Refused, Screens};
 
 /// What this client asks the host for.
@@ -40,6 +52,11 @@ pub const CAPABILITIES: &[&str] =
 const MAX_IN_FLIGHT: usize = 4;
 /// Pages of one file's diff read before the rest is left out.
 const MAX_PAGES: u32 = 16;
+/// The agent name a host gives a plain shell. The mirror has no agent kinds, so this is only the usual shell, for
+/// counting agents and for whether a worktree has one to review; nothing that types can rely on it.
+const SHELL: &str = "shell";
+/// What a command says when the channel is down, until it is back.
+const NOT_CONNECTED: &str = "Not connected to the host. Try again once it is back.";
 
 /// What the host's `welcome` said about this client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,10 +80,19 @@ struct State {
     /// A `resync` is on its way: gaps until its snapshot lands are not reported again.
     resyncing: bool,
     pending: Pending,
-    /// Decisions in flight, by operation: the session and the request each answers.
-    decisions: HashMap<String, (String, String)>,
+    /// What a mutation in flight changed on screen, by operation.
+    flights: HashMap<String, Flight>,
     /// Decisions the host refused or could not confirm, which the approval banner may offer again.
     refused: Vec<(String, String)>,
+    /// The steers on their way, by number, and the last number given.
+    steers: HashMap<u64, Steering>,
+    last_steer: u64,
+    /// A steer that reached none of its targets: its text, for the steer bar to hold again.
+    unsent: Option<String>,
+    /// Comments that did not go through, by worktree, for their boxes to hold again.
+    unsent_comments: Vec<(PathBuf, ReviewComment)>,
+    /// The host started a session this page asked for.
+    started: bool,
     /// Diffs as fetched, by worktree.
     diffs: BTreeMap<String, Fetched>,
     /// The worktrees whose files' hunks to fetch: those on screen.
@@ -78,7 +104,46 @@ struct State {
     notice: Option<String>,
     now_ms: u64,
     view: ViewHints,
+    /// The chief's window in this page, and whether the page draws the wide layout, where it has one.
+    chief: ChiefWindow,
+    wide: bool,
     screens: Screens,
+}
+
+/// What a mutation in flight changed on screen: gone with its outcome, and undone if that is not `done`.
+enum Flight {
+    /// An approval decided here, by session and request: the banner hides it meanwhile.
+    Decision(String, String),
+    /// One target of a steer ([`Steering`]), by the steer's number and the session.
+    Steer(u64, String),
+    /// A comment that left its box, by worktree.
+    Comment(PathBuf, ReviewComment),
+    /// A session being started.
+    Start,
+    /// A task being merged, by plan and task: its card says so meanwhile.
+    Integrate(String, String),
+}
+
+/// A steer on its way, until each of its targets has answered.
+struct Steering {
+    text: String,
+    waiting: usize,
+    reached_any: bool,
+    /// The targets it missed, by title, and why the last of them did.
+    missed: Vec<String>,
+    why: Option<String>,
+}
+
+/// What a mutation that went through did not do yet, where the screen does not show it. The rest shows.
+fn delivery_note(result: &serde_json::Value) -> Option<String> {
+    let yes = |field: &str| result.get(field).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    if yes("held") {
+        Some("Held until the session is ready.".into())
+    } else if yes("queued_until_next_hook") {
+        Some("Queued for an agent outside ATOMICS: it reads it at its next tool call or turn end.".into())
+    } else {
+        None
+    }
 }
 
 /// One worktree's diff at one revision.
@@ -133,8 +198,13 @@ impl RemoteBackend {
             ttl_secs: ops::OP_TTL_SECS,
             resyncing: false,
             pending: Pending::default(),
-            decisions: HashMap::new(),
+            flights: HashMap::new(),
             refused: Vec::new(),
+            steers: HashMap::new(),
+            last_steer: 0,
+            unsent: None,
+            unsent_comments: Vec::new(),
+            started: false,
             diffs: BTreeMap::new(),
             wanted: BTreeSet::new(),
             requests: HashMap::new(),
@@ -143,6 +213,8 @@ impl RemoteBackend {
             notice: None,
             now_ms: 0,
             view: default_hints(),
+            chief: ChiefWindow { open: false, dock: ChiefDock::Floating, width: None },
+            wide: false,
             screens: Screens::default(),
         };
         Self { state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
@@ -210,6 +282,21 @@ impl RemoteBackend {
         std::mem::take(&mut self.state.borrow_mut().refused)
     }
 
+    /// The text of a steer that reached none of its targets, for the steer bar to hold again.
+    pub fn take_unsent(&self) -> Option<String> {
+        self.state.borrow_mut().unsent.take()
+    }
+
+    /// The comments that did not go through, by worktree, for their boxes to hold again.
+    pub fn take_unsent_comments(&self) -> Vec<(PathBuf, ReviewComment)> {
+        std::mem::take(&mut self.state.borrow_mut().unsent_comments)
+    }
+
+    /// Whether the host started a session this page asked for since the last time this was asked.
+    pub fn take_started(&self) -> bool {
+        std::mem::take(&mut self.state.borrow_mut().started)
+    }
+
     pub fn notice(&self) -> Option<String> {
         self.state.borrow().notice.clone()
     }
@@ -226,6 +313,23 @@ impl RemoteBackend {
     /// What is on screen, which the UI reads back through [`Backend::view_hints`].
     pub fn set_view(&self, hints: ViewHints) {
         self.state.borrow_mut().view = hints;
+    }
+
+    /// The chief's window in this page, which the UI reads back through [`Backend::chief`], and whether the
+    /// page draws the wide layout, the only one with a window to show, dock or resize.
+    pub fn set_chief_window(&self, chief: ChiefWindow, wide: bool) {
+        let mut s = self.state.borrow_mut();
+        (s.chief, s.wide) = (chief, wide);
+    }
+
+    /// Fetch the hunks of `worktree`'s files, the diff on screen, and of no other worktree.
+    pub fn set_wanted(&self, worktree: Option<&Path>) {
+        let mut s = self.state.borrow_mut();
+        let wanted: BTreeSet<String> = worktree.map(|w| w.to_string_lossy().into_owned()).into_iter().collect();
+        if s.wanted != wanted {
+            s.wanted = wanted;
+            s.fetch();
+        }
     }
 
     /// Fetch the hunks of `worktree`'s changed files: its diff is on screen.
@@ -278,6 +382,17 @@ impl RemoteBackend {
         rules.iter().find_map(|rule| s.mirror.plans.values().position(rule))
     }
 
+    /// The folders this page can name for a new session, sorted: the open plans' projects and where the host's
+    /// sessions run. The host's own list of projects and worktrees stays on the host.
+    pub fn folders(&self) -> Vec<PathBuf> {
+        let s = self.state.borrow();
+        let projects =
+            s.mirror.plans.values().filter(|p| p.status == PlanStatus::Open).filter_map(|p| p.project.as_ref());
+        let known: BTreeSet<PathBuf> =
+            projects.map(PathBuf::from).chain(s.mirror.sessions.values().map(root)).collect();
+        known.into_iter().collect()
+    }
+
     /// Connected and greeted: frames sent now are read.
     pub fn live(&self) -> bool {
         self.state.borrow().welcome.is_some()
@@ -324,6 +439,13 @@ impl RemoteBackend {
         s.screens.acquire(session, takeover, &mut s.outgoing);
     }
 
+    /// The input left `session`'s terminal: let go of its lease ([`Screens::release`]).
+    pub fn release(&self, session: &str) {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.release(session, &mut s.outgoing);
+    }
+
     /// Type `data` into `session`, already encoded for its modes, while this client holds the lease or is
     /// asking for it ([`Screens::type_text`]). Nothing is sent without the `type` grant or a channel, and
     /// nothing refused is kept for later: typing never asks for the lease.
@@ -357,6 +479,41 @@ impl RemoteBackend {
 }
 
 impl State {
+    /// An operation ended: what it changed on screen goes, undone unless it is `done`.
+    fn land(&mut self, op: &str, done: bool) {
+        match self.flights.remove(op) {
+            Some(Flight::Decision(session, approval)) if !done => self.refused.push((session, approval)),
+            Some(Flight::Steer(steer, session)) => self.steer_answered(steer, session, done),
+            Some(Flight::Comment(root, comment)) if !done => self.unsent_comments.push((root, comment)),
+            Some(Flight::Start) if done => self.started = true,
+            _ => {}
+        }
+    }
+
+    /// One target of a steer answered, with the reason on the notice line if it was missed. Once all have: reached
+    /// by none, the text goes back to the bar. Reached by some, the bar stays empty, since Enter would reach those
+    /// again, and the note names the others.
+    fn steer_answered(&mut self, steer: u64, session: String, done: bool) {
+        let Some(steering) = self.steers.get_mut(&steer) else { return };
+        steering.waiting -= 1;
+        if done {
+            steering.reached_any = true;
+        } else {
+            steering.why = self.notice.clone();
+            steering.missed.push(self.mirror.sessions.get(&session).map_or(session, |s| s.title.clone()));
+        }
+        if steering.waiting > 0 {
+            return;
+        }
+        let Some(steering) = self.steers.remove(&steer) else { return };
+        if !steering.reached_any {
+            self.unsent = Some(steering.text);
+        } else if !steering.missed.is_empty() {
+            let why = steering.why.unwrap_or_default();
+            self.notice = Some(format!("Missed by {}. {why}", steering.missed.join(", ")));
+        }
+    }
+
     fn resync(&mut self) {
         if !self.resyncing {
             self.resyncing = true;
@@ -376,39 +533,45 @@ impl State {
                     // A replay that does not follow the board held: start again from a snapshot.
                     self.resync();
                 }
+                // The connection is back, so what said it was not goes.
+                if self.notice.as_deref() == Some(NOT_CONNECTED) {
+                    self.notice = None;
+                }
                 let (again, expired) = self.pending.resend(self.now_ms, self.ttl_secs);
                 self.outgoing.extend(again.into_iter().map(Envelope::new));
-                for command in &expired {
-                    if let Some(decision) = self.decisions.remove(command.op()) {
-                        self.refused.push(decision);
-                    }
-                }
                 if !expired.is_empty() {
                     self.notice = Some(
                         "Some earlier actions may not have reached the host. Check the board before trying again."
                             .into(),
                     );
                 }
+                for command in &expired {
+                    self.land(command.op(), false);
+                }
             }
             Message::DiffFile { body, truncated, next_offset } => self.diff_page(body, *truncated, *next_offset),
             Message::CommandResult(result) => {
                 let Some(outcome) = self.pending.apply(result) else { return };
-                let decision = self.decisions.remove(&result.op);
-                let notice = match outcome {
+                match &outcome {
                     Outcome::Refused { code: ErrorCode::AlreadyResolved, message } => {
-                        format!("That request was already answered: {message}")
+                        self.notice = Some(format!("That request was already answered: {message}"));
                     }
                     Outcome::Refused { code: ErrorCode::Unauthorised, .. } => {
-                        "The host does not let this device do that.".to_string()
+                        self.notice = Some("The host does not let this device do that.".into());
                     }
-                    Outcome::Refused { message, .. } => format!("The host refused: {message}"),
+                    Outcome::Refused { message, .. } => self.notice = Some(format!("The host refused: {message}")),
                     Outcome::Uncertain { message } => {
-                        format!("The host could not confirm it ({message}). Check the board before trying again.")
+                        self.notice = Some(format!(
+                            "The host could not confirm it ({message}). Check the board before trying again."
+                        ));
                     }
-                    Outcome::Done { .. } | Outcome::Accepted | Outcome::Unknown => return,
-                };
-                self.notice = Some(notice);
-                self.refused.extend(decision);
+                    Outcome::Done { .. } | Outcome::Accepted | Outcome::Unknown => {}
+                }
+                self.land(&result.op, matches!(outcome, Outcome::Done { .. }));
+                // It never takes the place of what went wrong with another.
+                if let Outcome::Done { result } = &outcome {
+                    self.notice = self.notice.take().or_else(|| delivery_note(result));
+                }
             }
             Message::Ping { nonce } => {
                 let pong = Envelope::new(Message::Pong { nonce: nonce.clone() }).reply_to(envelope.request_id.clone());
@@ -647,6 +810,8 @@ fn task(info: &TaskInfo) -> Task {
         branch: info.branch.clone(),
         status: info.status,
         integrated: info.integrated.clone(),
+        // The host checks whether its branch still holds the task; the mirror says what it last found.
+        integration_verified: info.integrated.is_some(),
         session: info.session.clone(),
         additions: info.additions,
         deletions: info.deletions,
@@ -679,7 +844,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         id: session.id.clone(),
         title: session.title.clone(),
         agent: session.agent.clone(),
-        kind: AgentKind::Generic,
+        kind: if session.agent == SHELL { AgentKind::Shell } else { AgentKind::Generic },
         status: session.status,
         chief: session.chief,
         worktree: session.worktree.as_ref().map(PathBuf::from),
@@ -689,6 +854,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         scratch: false,
         sandbox: None,
         outside: false,
+        can_receive: session.status != AgentStatus::Exited,
         pending_approvals: session.pending_approvals as usize,
         held_messages: 0,
         changes: mirror.diffs.get(root.to_string_lossy().as_ref()).map(|d| (d.additions(), d.deletions())),
@@ -696,9 +862,13 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
     }
 }
 
-/// The commands the browser offers in this release: answering approvals and approving plans.
-fn offered(command: &Command) -> bool {
-    matches!(command, Command::Decide { .. } | Command::ApprovePlan(_))
+/// The agents this page can name for a new session, sorted: those the host runs and those its open plans use.
+/// The host's configured list stays on the host, which refuses an agent it no longer has.
+fn known_agents(mirror: &Mirror) -> Vec<String> {
+    let tasks = mirror.plans.values().filter(|p| p.status == PlanStatus::Open).flat_map(|p| &p.tasks);
+    let names = mirror.sessions.values().map(|s| &s.agent).chain(tasks.map(|t| &t.agent));
+    let known: BTreeSet<&String> = names.filter(|name| !name.is_empty()).collect();
+    known.into_iter().cloned().collect()
 }
 
 impl Backend for RemoteBackend {
@@ -706,41 +876,92 @@ impl Backend for RemoteBackend {
         if let Command::RefreshDiff(root) = &command {
             return self.refetch(root);
         }
-        if !offered(&command) {
-            return self.say("That is not available in the browser yet; use ATOMICS on the computer.");
-        }
         if self.welcome().is_none() {
             self.refuse(&command);
-            return self.say("Not connected to the host. Try again once it is back.");
+            return self.say(NOT_CONNECTED);
         }
         let mut op = || self.next_op();
-        let mutations = match command.remote(self, &mut op) {
+        let mutations = match self.remote_of(&command, &mut op) {
             Remote::Send(mutations) => mutations,
-            Remote::Client | Remote::Unsupported => return,
+            Remote::Client => return,
+            // The views do not draw these; this is for a command sent some other way.
+            Remote::Unsupported => {
+                self.refuse(&command);
+                return self.say("That is not available in the browser; use ATOMICS on the computer.");
+            }
         };
+        if mutations.is_empty() {
+            self.refuse(&command);
+            return self.say("That is no longer on the host. Check the board.");
+        }
+        let steer = self.steering(&command, mutations.len());
         for mutation in mutations {
-            if !self.may(mutation.grant()) {
-                self.refuse(&command);
-                self.say("This device may only view this host. Its owner decides what it may change.");
-                continue;
-            }
+            let refusal = if !self.may(mutation.grant()) {
+                Some("This device may only view this host. Its owner decides what it may change.".to_string())
+            } else if let Err(error) = mutation.validate() {
+                // What the host would refuse for its size says so here, and the operation waits for nothing.
+                Some(format!("That was not sent: {}.", error.message))
+            } else if self.state.borrow().pending.len() >= wire::MAX_PENDING_OPS {
+                // As many as the host takes at once (more are `too_many`): what waits stays bounded, offline too.
+                Some("Too many changes are still waiting for the host. Try again once they are answered.".to_string())
+            } else {
+                None
+            };
             let mut s = self.state.borrow_mut();
-            // As many as the host takes at once (more are `too_many`): what waits stays bounded, offline too.
-            if s.pending.len() >= wire::MAX_PENDING_OPS {
-                drop(s);
-                self.refuse(&command);
-                self.say("Too many changes are still waiting for the host. Try again once they are answered.");
-                continue;
+            if let Some(flight) = self.flight(&s.mirror, &mutation, &command, steer) {
+                s.flights.insert(mutation.op().to_string(), flight);
             }
-            if let (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) = (&mutation, &command)
-                && let Some(row) = self.session_row_in(&s.mirror, *session)
-            {
-                s.decisions.insert(decide.op.clone(), (row.id, decide.approval.clone()));
+            if let Some(refusal) = refusal {
+                s.notice = Some(refusal);
+                s.land(mutation.op(), false);
+                continue;
             }
             let now = s.now_ms;
             let message = s.pending.send(mutation, now);
             s.outgoing.push(Envelope::new(message));
         }
+    }
+
+    /// The view commands the frame carries out, a diff's refresh, and what can go to the host now
+    /// ([`RemoteBackend::sends`]). Offline nothing can be sent.
+    fn available(&self, command: &Command) -> bool {
+        let wide = self.state.borrow().wide;
+        let start = || Command::Start { agent: String::new(), folder: None };
+        match command {
+            Command::RefreshDiff(_) => return true,
+            // The changed-files column, beside the wide layout's diff: a click scrolls to the file there.
+            Command::OpenFile { .. } => return wide,
+            // Only the wide layout has a steer bar; a phone's terminal is right there.
+            Command::Steer { .. } if !wide => return false,
+            // The wide layout's picker, of what the mirror names.
+            Command::NewSession => return wide && self.sends(&start()),
+            // An open plan's tab asks, and archives. A finished one's has no close; its board's Archive does that.
+            Command::ClosePlanTab(plan) => {
+                let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
+                return open && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived });
+            }
+            _ => {}
+        }
+        if command.is_view() || desk::window_command(command) {
+            let s = self.state.borrow();
+            let chief = || s.mirror.sessions.values().any(|x| x.chief);
+            // The plan's board and button need a plan to show: a host may have none, or none open.
+            let plan = matches!(command, Command::TogglePlan | Command::SetPanel(PanelMode::Plan));
+            return desk::carries_out(command, s.wide)
+                && (!desk::window_command(command) || chief())
+                && (!plan || s.mirror.plans.values().nth(s.view.selected_plan).is_some());
+        }
+        self.sends(command)
+    }
+
+    /// The mirror has no agent kinds: a shell can run under any name.
+    fn tells_agents_from_shells(&self) -> bool {
+        false
+    }
+
+    /// A page has no keyboard chords of its own: the keyboard goes to the terminal or to the browser.
+    fn has_shortcuts(&self) -> bool {
+        false
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {
@@ -757,13 +978,17 @@ impl Backend for RemoteBackend {
         let s = self.state.borrow();
         let info = s.mirror.plans.values().nth(index)?;
         let plan = plan(info);
+        let integrating = s.flights.values().filter_map(|flight| match flight {
+            Flight::Integrate(plan, task) if *plan == info.id => Some(task.clone()),
+            _ => None,
+        });
         Some(BoardView {
+            integrating: integrating.collect(),
             state: plan_state(info, &s.mirror),
             ready: plan.ready().iter().map(|t| t.id.clone()).collect(),
             sessions: s.mirror.sessions.values().map(|x| (x.id.clone(), (x.title.clone(), x.status))).collect(),
             integration_notes: HashMap::new(),
             checking: false,
-            integrating: HashSet::new(),
             ticket_config: None,
             board_counts: None,
             worktrees: HashSet::new(),
@@ -805,12 +1030,38 @@ impl Backend for RemoteBackend {
         })
     }
 
+    /// The mirror says only whether the session exited and where it runs; reports, the sandbox, the slot
+    /// queue and MCP servers are the host's.
+    fn tile(&self, index: usize) -> Option<TileView> {
+        let s = self.state.borrow();
+        let session = s.mirror.sessions.values().nth(index)?;
+        Some(TileView {
+            exited: session.status == AgentStatus::Exited,
+            folder: session.cwd.clone(),
+            ..TileView::default()
+        })
+    }
+
+    /// None: whether a finished task's worktree is still there is the host's to know.
+    fn completed_tasks(&self) -> Vec<CompletedTile> {
+        Vec::new()
+    }
+
     fn diff_roots(&self) -> Vec<PathBuf> {
         self.state.borrow().mirror.diffs.keys().map(PathBuf::from).collect()
     }
 
     fn diff(&self, root: &Path) -> Option<DiffSnapshot> {
         self.state.borrow_mut().snapshot(root.to_string_lossy().as_ref())
+    }
+
+    /// The chief's session as the mirror has it, in this page's window ([`RemoteBackend::set_chief_window`]).
+    /// The host's heartbeat is not sent.
+    fn chief(&self) -> ChiefView {
+        let s = self.state.borrow();
+        let session = s.mirror.sessions.values().position(|x| x.chief);
+        let ChiefWindow { open, dock, width } = s.chief;
+        ChiefView { session, open: open && session.is_some(), dock, width, heartbeat: None }
     }
 
     fn diff_heading(&self, root: &Path) -> DiffHeading {
@@ -827,7 +1078,9 @@ impl Backend for RemoteBackend {
             .map(|x| x.title.clone())
             .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         let branch = session.and_then(|x| x.branch.clone()).filter(|b| *b != title);
-        DiffHeading { title, branch, can_send: false }
+        let can_send =
+            s.mirror.sessions.values().filter(here).any(|x| x.agent != SHELL && x.status != AgentStatus::Exited);
+        DiffHeading { title, branch, can_send }
     }
 
     fn ui_config(&self) -> UiConfig {
@@ -835,7 +1088,7 @@ impl Backend for RemoteBackend {
             keys: KeyConfig::default(),
             font: FontConfig::default(),
             layout: LayoutConfig::default(),
-            agents: Vec::new(),
+            agents: known_agents(&self.state.borrow().mirror),
         }
     }
 
@@ -843,8 +1096,21 @@ impl Backend for RemoteBackend {
         self.state.borrow().view.clone()
     }
 
+    /// The tab's sessions, as the desktop's rule picks them: a plan's tab its tasks' sessions, the Ungrouped
+    /// tab every session outside a plan, else all; never the chief.
     fn visible_sessions(&self) -> Vec<usize> {
-        (0..self.state.borrow().mirror.sessions.len()).collect()
+        let s = self.state.borrow();
+        let plan = s.view.plan_view.then(|| s.mirror.plans.values().nth(s.view.selected_plan)).flatten();
+        let in_plan = |x: &SessionInfo, plan: &PlanInfo| {
+            x.task.as_ref().is_some_and(|link| link.plan == plan.id)
+                || plan.tasks.iter().any(|t| t.session.as_deref() == Some(x.id.as_str()))
+        };
+        let shown = |x: &SessionInfo| match plan {
+            Some(plan) => in_plan(x, plan),
+            None if s.view.ungrouped => x.task.is_none(),
+            None => true,
+        };
+        s.mirror.sessions.values().enumerate().filter(|(_, x)| !x.chief && shown(x)).map(|(i, _)| i).collect()
     }
 
     fn checkouts(&self) -> Vec<String> {
@@ -879,8 +1145,9 @@ impl Backend for RemoteBackend {
         String::new()
     }
 
+    /// None: the top bar's narrow slot would cut them. The page shows them whole ([`RemoteBackend::notice`]).
     fn notices(&self) -> Notices {
-        Notices { toast: self.notice(), ..Notices::default() }
+        Notices::default()
     }
 
     fn sandbox_load(&self) -> SandboxLoad {
@@ -890,6 +1157,11 @@ impl Backend for RemoteBackend {
     fn project_menu(&self) -> ProjectMenu {
         ProjectMenu::default()
     }
+
+    /// The host's folders are its own.
+    fn launch_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl RemoteBackend {
@@ -897,13 +1169,119 @@ impl RemoteBackend {
         mirror.sessions.values().nth(index).map(|x| session_row(x, mirror))
     }
 
-    /// A decision that will not be sent: the banner may offer it again.
-    fn refuse(&self, command: &Command) {
-        if let Command::Decide { session, approval, .. } = command {
-            let mut s = self.state.borrow_mut();
-            if let Some(id) = s.mirror.sessions.values().nth(*session).map(|x| x.id.clone()) {
-                s.refused.push((id, approval.clone()));
+    /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
+    fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
+        match command {
+            Command::VoiceToSession { .. } => Remote::Unsupported,
+            _ => command.remote(self, op),
+        }
+    }
+
+    /// Whether `command` can go to the host now: connected, with mutations for it, each of them granted. The
+    /// views ask with what they have in hand, a steer with no target yet or a review with no comment yet, so
+    /// these ask as what they will send. A command that names what is gone cannot go.
+    fn sends(&self, command: &Command) -> bool {
+        if !self.live() {
+            return false;
+        }
+        let asked;
+        let command = match command {
+            Command::Steer { .. } => {
+                asked = Command::Steer { sessions: vec![String::new()], text: String::new() };
+                &asked
             }
+            Command::EditComments { root, .. } => {
+                asked = Command::SendReview(root.clone());
+                &asked
+            }
+            Command::IntegrateAccepted(plan) => {
+                asked = Command::IntegrateTask { plan: *plan, task: String::new() };
+                &asked
+            }
+            Command::Start { .. } | Command::StartAgent { .. }
+                if known_agents(&self.state.borrow().mirror).is_empty() =>
+            {
+                return false;
+            }
+            command => command,
+        };
+        match self.remote_of(command, &mut String::new) {
+            Remote::Send(mutations) => !mutations.is_empty() && mutations.iter().all(|m| self.may(m.grant())),
+            Remote::Client | Remote::Unsupported => false,
+        }
+    }
+
+    /// The number of `command` if it is a steer, to `targets` targets; none is 0.
+    fn steering(&self, command: &Command, targets: usize) -> u64 {
+        let Command::Steer { text, .. } = command else { return 0 };
+        let mut s = self.state.borrow_mut();
+        s.last_steer += 1;
+        let steer = s.last_steer;
+        let steering =
+            Steering { text: text.clone(), waiting: targets, reached_any: false, missed: Vec::new(), why: None };
+        s.steers.insert(steer, steering);
+        steer
+    }
+
+    /// What `mutation` of `command` changes on screen while it is in flight; `steer` is the number of a steer.
+    fn flight(&self, mirror: &Mirror, mutation: &ops::Command, command: &Command, steer: u64) -> Option<Flight> {
+        match (mutation, command) {
+            (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) => {
+                let row = self.session_row_in(mirror, *session)?;
+                Some(Flight::Decision(row.id, decide.approval.clone()))
+            }
+            (
+                ops::Command::SessionCommand(SessionCommand { action: SessionAction::Steer { session, .. }, .. }),
+                Command::Steer { .. },
+            ) => Some(Flight::Steer(steer, session.clone())),
+            (
+                ops::Command::SessionCommand(SessionCommand { action: SessionAction::Start { .. }, .. }),
+                Command::Start { .. },
+            ) => Some(Flight::Start),
+            (
+                ops::Command::ReviewCommand(ReviewCommand {
+                    worktree,
+                    action: ReviewAction::Add { path, line, removed, text, .. },
+                    ..
+                }),
+                _,
+            ) => {
+                let comment = ReviewComment {
+                    path: path.clone(),
+                    line: *line,
+                    removed: *removed,
+                    excerpt: String::new(),
+                    body: text.clone(),
+                };
+                Some(Flight::Comment(PathBuf::from(worktree), comment))
+            }
+            (
+                ops::Command::PlanCommand(PlanCommand {
+                    plan: Some(plan), action: PlanAction::Integrate { task }, ..
+                }),
+                _,
+            ) => Some(Flight::Integrate(plan.clone(), task.clone())),
+            _ => None,
+        }
+    }
+
+    /// A command that will not be sent: an approval the banner may offer again, a steer the bar holds again, and
+    /// comments their boxes hold again.
+    fn refuse(&self, command: &Command) {
+        let mut s = self.state.borrow_mut();
+        match command {
+            Command::Decide { session, approval, .. } => {
+                if let Some(id) = s.mirror.sessions.values().nth(*session).map(|x| x.id.clone()) {
+                    s.refused.push((id, approval.clone()));
+                }
+            }
+            Command::Steer { text, .. } => s.unsent = Some(text.clone()),
+            Command::EditComments { root, before, after } => {
+                let unsent = after.iter().filter(|comment| !before.contains(comment));
+                let unsent: Vec<_> = unsent.map(|comment| (root.clone(), comment.clone())).collect();
+                s.unsent_comments.extend(unsent);
+            }
+            _ => {}
         }
     }
 }
