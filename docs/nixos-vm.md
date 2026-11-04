@@ -242,6 +242,15 @@ lock for its lifetime, so deletion refuses a VM any ATOMICS window is using. **O
 starts a separate native process alongside the local desktop. **Use this Mac** retains the existing
 confirmation and config-backup behavior.
 
+### The VM launcher
+
+`scripts/macos-app.sh` installs both `ATOMICS.app` and `ATOMICS VM.app`. The latter has bundle ID
+`ai.atomisk.atomics.vm`, the same icon, and a small native executable that runs the sibling main
+app's current binary with `--connect vm`. The two windows run as separate processes. Run
+`atomics vm launcher` to install or repair it in `~/Applications` without a source checkout
+(the Mac's command-line compiler is required). An existing launcher with that bundle ID is
+replaced only after the new one builds and signs successfully; an unrelated app is kept.
+
 ### By hand
 
 The bundle's `lima.yaml` is the host definition, generated from the settings above: by default

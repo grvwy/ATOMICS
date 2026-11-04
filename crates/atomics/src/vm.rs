@@ -8,6 +8,7 @@
 //! instance `atomics vm setup` did not create (an older one of the same name) is never reused or
 //! replaced unless the user confirms it.
 
+pub mod launcher;
 mod process;
 mod service;
 pub mod setup;

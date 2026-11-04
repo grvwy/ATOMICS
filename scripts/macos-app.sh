@@ -67,3 +67,6 @@ codesign --force --deep --sign - "$app" >/dev/null 2>&1 || echo "codesign failed
 # The bundle builds from before the rename to ATOMICS made.
 rm -rf -- "$dest/IMACS.app"
 echo "$app"
+
+# The guest host has a separate Dock identity while sharing the current main binary.
+/bin/sh "$root/scripts/macos-vm-launcher.sh" "$dest"

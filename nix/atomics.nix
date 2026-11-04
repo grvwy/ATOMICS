@@ -35,6 +35,9 @@ let
     (root + "/assets")
     # The guest check `atomics vm setup` runs in the VM.
     (root + "/scripts/check-atomics-vm.sh")
+    # Embedded so `atomics vm launcher` can repair the app without a checkout.
+    (root + "/scripts/macos-vm-launcher.sh")
+    (root + "/scripts/macos-vm-launcher.c")
     # Shared test support, which test builds of the crates name.
     (root + "/tests")
   ]);

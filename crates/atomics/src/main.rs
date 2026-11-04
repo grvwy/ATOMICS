@@ -191,6 +191,8 @@ enum VmCommand {
         #[arg(long, requires = "replace")]
         yes: bool,
     },
+    /// Install or repair ~/Applications/ATOMICS VM.app
+    Launcher,
     /// Start the VM (waits for a QA slot)
     Start,
     /// Stop the VM
@@ -435,6 +437,7 @@ fn main() -> eframe::Result {
         Some(Command::Vm { command }) => {
             let result = match command {
                 VmCommand::Setup { from, replace, yes } => vm::setup::setup(vm::setup::Setup { from, replace, yes }),
+                VmCommand::Launcher => vm::launcher::install(),
                 VmCommand::Start => vm::setup::start(),
                 VmCommand::Stop => vm::setup::stop(),
                 VmCommand::Status => vm::setup::status(),
