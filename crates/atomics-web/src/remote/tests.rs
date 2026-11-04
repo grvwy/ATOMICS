@@ -200,6 +200,22 @@ fn refresh_fetches_again_and_what_names_nothing_says_so() {
 }
 
 #[test]
+fn a_board_maps_the_ticket_keys_the_projection_carries_and_nothing_else() {
+    let remote = connected(Role::Controller);
+    let board = remote.board(0).unwrap();
+    let keys = |ticket: &Option<TicketLink>| ticket.as_ref().map(|link| link.label().to_string());
+    assert_eq!(keys(&board.plan.ticket).as_deref(), Some("ENG-40"));
+    assert_eq!(keys(&board.plan.tasks[0].ticket).as_deref(), Some("ENG-41"));
+    assert_eq!(board.plan.tasks[1].ticket, None);
+    let link = board.plan.ticket.unwrap();
+    assert_eq!(link, TicketLink { id: "ENG-40".into(), ..TicketLink::default() }, "no address and no system");
+
+    let read = Command::OpenTicket(link);
+    assert_eq!(read.remote(&remote, &mut String::new), atomics_ui::Remote::Client, "nothing for atomics.v1");
+    assert!(!remote.available(&read), "a page has no reader");
+}
+
+#[test]
 fn archive_finished_is_not_sent_as_unconditional_archive() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();
