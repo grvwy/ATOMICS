@@ -182,6 +182,8 @@ struct PendingApproval {
     /// The command menu the agent drew with no hook asking; only its keys answer it, and only
     /// while the screen still shows it.
     native: Option<atomics_core::approvals::NativeMenu>,
+    /// The stash entries the request's warning named, by commit; empty unless its command drops some.
+    stash: approvals::StashPins,
 }
 
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.

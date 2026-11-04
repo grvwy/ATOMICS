@@ -481,8 +481,11 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   decision answers it and is recorded; a later one for the same ID, from any client or the desktop, is refused
   `already_resolved` with how it ended, and every client gets `approval_resolved` with the disposition. A decision
   for an answered request never answers the session's next one; one for a request queued behind another is
-  `rejected`; one for an ID absent from both pending requests and recent resolutions is `not_found`. Expiry and
-  hook timeouts are as before.
+  `rejected`; one for an ID absent from both pending requests and recent resolutions is `not_found`. A decision that
+  would let a command drop shared stash entries lists the stash again first: when the command would now drop other
+  entries than its `warning` named, it is `stale_revision` and nothing is answered. The old ID is withdrawn
+  (`approval_resolved`, `withdrawn`), and the request is pending again under a new ID with the warning as it reads
+  now. Expiry and hook timeouts are as before.
 - **Plans.** `plan_command` names the plan and an `action`: `set`, `approve`, `dispatch`, `update`, `integrate`,
   `archive`, as ctl's `plan_*` do. `approve`, and `set` of an existing plan, carry the plan's `digest` from the board
   (`PlanInfo.digest`, the approval scope the remote conversation's `/approve` uses, published for open plans): a plan

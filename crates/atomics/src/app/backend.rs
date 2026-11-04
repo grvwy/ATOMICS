@@ -628,6 +628,7 @@ mod tests {
                 },
                 reply: None,
                 native: None,
+                stash: Default::default(),
             };
             let mut asking = session("asking", AgentKind::Claude, AgentStatus::NeedsInput, dir.path());
             asking.title = "Asking".into();

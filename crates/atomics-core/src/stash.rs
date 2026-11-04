@@ -230,6 +230,17 @@ pub fn list(dir: &Path) -> anyhow::Result<Vec<Entry>> {
     Ok(parse(&crate::git::git(dir, &["-c", "log.showSignature=false", "stash", "list", &format])?))
 }
 
+/// The commits of `entries` (the stash as listed now) that `drop` takes: the entry at its index (none
+/// while there is no such entry), every entry for a clear, and none for a name ATOMICS cannot place.
+/// What a warning named, by commit: once anyone stashes or drops, the same index names another entry.
+pub fn taken(drop: &StashDrop, entries: &[Entry]) -> Vec<String> {
+    match &drop.target {
+        Target::Index(index) => entries.get(*index).map(|entry| entry.commit.clone()).into_iter().collect(),
+        Target::All => entries.iter().map(|entry| entry.commit.clone()).collect(),
+        Target::Other(_) => Vec::new(),
+    }
+}
+
 /// Whose an entry is, as far as ATOMICS can tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owner {
@@ -395,6 +406,12 @@ mod tests {
             text.contains("stash@{9}") && !text.contains("stash@{10}") && text.ends_with("; and 2 more."),
             "{text}"
         );
+        // What each drop takes, by commit, as the warning names it.
+        let taken = |command: &str| drops(command).iter().map(|drop| super::taken(drop, &entries)).collect::<Vec<_>>();
+        assert_eq!(taken("git stash pop 1"), [vec!["bbb".to_string()]]);
+        assert_eq!(taken("git stash drop"), [vec!["aaa".to_string()]]);
+        assert_eq!(taken("git stash clear"), [vec!["aaa".to_string(), "bbb".into(), "ccc".into()]]);
+        assert_eq!(taken("git stash drop 7; git stash drop stash@{now}"), [Vec::<String>::new(), Vec::new()]);
         let none = drops("git stash clear");
         let empty: &[Entry] = &[];
         assert!(warning([(&none[0], Ok(empty))], owner).ends_with("every entry; there are none now."));
