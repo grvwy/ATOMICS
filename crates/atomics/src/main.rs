@@ -8,6 +8,7 @@ mod platform_tests;
 mod test_raster;
 
 mod app;
+mod client;
 mod connections;
 mod crash;
 mod credentials;
@@ -39,6 +40,7 @@ mod theme;
 mod ticket_signin;
 mod tickets;
 mod usage;
+mod vm;
 mod voice;
 mod watcher;
 
@@ -71,6 +73,11 @@ struct Cli {
     screenshot: Option<PathBuf>,
     #[arg(long, default_value_t = 4.0)]
     screenshot_delay: f32,
+    /// Open the window as a client of an ATOMICS host: `local` (`atomics host` here), `vm` (the host in
+    /// this Mac's ATOMICS VM) or ws://127.0.0.1:PORT; "" for this window as the host. Default:
+    /// `[client] connect`
+    #[arg(long, value_name = "ADDRESS")]
+    connect: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -149,6 +156,15 @@ enum Command {
     Host {
         /// Projects (git repositories) to open, as `atomics <path>` does
         projects: Vec<PathBuf>,
+        /// Serve `atomics.v1` on this loopback port whatever `[remote]` says (a service's own setting)
+        #[arg(long, value_name = "PORT")]
+        remote_port: Option<u16>,
+    },
+    /// The ATOMICS VM on a Mac: set it up from a built image and bundle, start, stop and check it
+    /// (docs/nixos-vm.md). macOS only.
+    Vm {
+        #[command(subcommand)]
+        command: VmCommand,
     },
     /// Run a heavy command, such as a full test run or a QA instance, once ATOMICS has a free slot
     Queue {
@@ -157,6 +173,36 @@ enum Command {
         /// The command, after `--`
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmCommand {
+    /// Install the bundle, create the Lima instance from the image, start and check it, list the
+    /// sign-ins left and show the config change for this Mac (written only by `vm config --apply`)
+    Setup {
+        /// The build's folder, with atomics-vm.raw and bundle/ (scripts/macos-vm-build.sh prints it)
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
+        /// Delete and recreate an instance of the bundle's name that this setup did not create
+        #[arg(long)]
+        replace: bool,
+        /// Confirm --replace without asking
+        #[arg(long, requires = "replace")]
+        yes: bool,
+    },
+    /// Start the VM (waits for a QA slot)
+    Start,
+    /// Stop the VM
+    Stop,
+    /// Whether the VM is set up, stopped, starting or running
+    Status,
+    /// Run the guest check and list the sign-ins left
+    Check,
+    /// Show this Mac's config change for the VM; --apply writes it, keeping a backup
+    Config {
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -376,14 +422,30 @@ fn main() -> eframe::Result {
                 atomics_core::governor::SlotClass::parse(&class).unwrap_or(atomics_core::governor::SlotClass::Test);
             std::process::exit(governor::run_queued(&atomics_core::paths::socket_path(), class, &command));
         }
-        Some(Command::Host { projects }) => {
+        Some(Command::Host { projects, remote_port }) => {
             let options = app::Options {
                 projects: projects.iter().map(|p| atomics_core::paths::expand(&p.to_string_lossy())).collect(),
                 workspace: cli.workspace,
                 migration_errors,
+                remote_port,
                 ..app::Options::default()
             };
             std::process::exit(headless::run(options));
+        }
+        Some(Command::Vm { command }) => {
+            let result = match command {
+                VmCommand::Setup { from, replace, yes } => vm::setup::setup(vm::setup::Setup { from, replace, yes }),
+                VmCommand::Start => vm::setup::start(),
+                VmCommand::Stop => vm::setup::stop(),
+                VmCommand::Status => vm::setup::status(),
+                VmCommand::Check => vm::setup::check_command(),
+                VmCommand::Config { apply } => vm::setup::config(apply),
+            };
+            if let Err(error) = result {
+                eprintln!("atomics vm: {error:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Some(Command::Ctl { json }) => {
             let response = serde_json::from_str::<atomics_core::control::ControlRequest>(&json)
@@ -399,6 +461,36 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         None => {}
+    }
+    // The window as a client of a host, which owns the agents: nothing here is the host's.
+    let connect = cli.connect.clone().unwrap_or_else(|| {
+        atomics_core::config::Config::load(&atomics_core::paths::config_file())
+            .map(|config| config.client.connect)
+            .unwrap_or_default()
+    });
+    if !connect.trim().is_empty() {
+        let target = match client::target::Target::parse(&connect) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("atomics: {error:#}");
+                std::process::exit(2);
+            }
+        };
+        let size: Option<[f32; 2]> = cli
+            .size
+            .as_deref()
+            .and_then(|s| s.split_once('x'))
+            .and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]));
+        let launch = client::Launch {
+            open: cli
+                .open
+                .iter()
+                .filter_map(|spec| spec.split_once(':'))
+                .map(|(agent, dir)| (agent.to_string(), atomics_core::paths::expand(dir)))
+                .collect(),
+            screenshot: cli.screenshot.clone().map(|path| (path, cli.screenshot_delay)),
+        };
+        return client::run(target, launch, native_options(size, load_icon()));
     }
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
@@ -448,28 +540,10 @@ fn main() -> eframe::Result {
         screenshot: cli.screenshot,
         screenshot_delay: cli.screenshot_delay,
         migration_errors,
+        remote_port: None,
     };
     let icon = load_icon();
-    let mut native = eframe::NativeOptions {
-        // Without --size ATOMICS fills the screen: the layout is built to use all of it.
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ATOMICS")
-            .with_app_id("atomics")
-            .with_icon(icon.clone())
-            .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
-            .with_maximized(size.is_none())
-            .with_min_inner_size([480.0, 320.0]),
-        ..Default::default()
-    };
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup {
-        let device_descriptor = setup.device_descriptor.clone();
-        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
-            let mut descriptor = device_descriptor(adapter);
-            // eframe's 8192-pixel default is too small for wide or tall Retina windows.
-            descriptor.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
-            descriptor
-        });
-    }
+    let native = native_options(size, icon.clone());
     // Before the event loop: the Apple event that launches the app may arrive before the window exists.
     #[cfg(target_os = "macos")]
     open_link::macos::register();
@@ -484,6 +558,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::App::new(cc, options, &icon)))
         }),
     )
+}
+
+/// The window: without `size` it fills the screen, which the layout is built to use.
+fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::NativeOptions {
+    let mut native = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("ATOMICS")
+            .with_app_id("atomics")
+            .with_icon(icon)
+            .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
+            .with_maximized(size.is_none())
+            .with_min_inner_size([480.0, 320.0]),
+        ..Default::default()
+    };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup {
+        let device_descriptor = setup.device_descriptor.clone();
+        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut descriptor = device_descriptor(adapter);
+            // eframe's 8192-pixel default is too small for wide or tall Retina windows.
+            descriptor.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+            descriptor
+        });
+    }
+    native
 }
 
 fn load_icon() -> egui::IconData {
@@ -557,7 +655,8 @@ mod cli_tests {
     #[test]
     fn host_takes_projects_and_the_workspace_and_plain_atomics_stays_the_desktop() {
         let cli = Cli::try_parse_from(["atomics", "host", "-w", "daily", "~/repos/a", "/repos/b"]).unwrap();
-        let Some(Command::Host { projects }) = cli.command else { panic!("host command") };
+        let Some(Command::Host { projects, remote_port }) = cli.command else { panic!("host command") };
+        assert_eq!(remote_port, None);
         assert_eq!(projects, [PathBuf::from("~/repos/a"), PathBuf::from("/repos/b")]);
         assert_eq!(cli.workspace.as_deref(), Some("daily"));
         let cli = Cli::try_parse_from(["atomics"]).unwrap();

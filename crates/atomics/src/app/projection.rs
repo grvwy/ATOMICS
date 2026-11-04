@@ -166,7 +166,37 @@ impl State {
             },
             "rendezvous": self.rendezvous_status(),
             "paired": devices,
+            "clients": view.clients.as_ref().map(|clients| {
+                clients.list().into_iter().map(|c| serde_json::json!({ "name": c.name, "paired_at": c.paired_at })).collect::<Vec<_>>()
+            }),
         })
+    }
+
+    /// `pair_client`: a token for a client that reaches the protocol server through a forward. Only
+    /// while the server runs; the token is in this answer and nowhere else.
+    pub(crate) fn pair_client(&self, name: &str) -> atomics_core::control::ControlResponse {
+        use atomics_core::control::ControlResponse;
+        let Some(clients) = &self.remote.clients else {
+            return ControlResponse::error(
+                "the protocol server is off: enable [remote] or start atomics host --remote-port",
+            );
+        };
+        match clients.pair(name) {
+            Ok((name, token)) => ControlResponse::ok(serde_json::json!({ "name": name, "token": token })),
+            Err(error) => ControlResponse::error(format!("pairing failed: {error}")),
+        }
+    }
+
+    pub(crate) fn unpair_client(&self, name: &str) -> atomics_core::control::ControlResponse {
+        use atomics_core::control::ControlResponse;
+        let Some(clients) = &self.remote.clients else {
+            return ControlResponse::error("the protocol server is off");
+        };
+        match clients.unpair(name) {
+            Ok(true) => ControlResponse::ok(serde_json::json!({ "name": name.trim() })),
+            Ok(false) => ControlResponse::error(format!("no client is paired as {name}")),
+            Err(error) => ControlResponse::error(format!("unpairing failed: {error}")),
+        }
     }
 
     /// Publish sessions, plans, approvals and diff summaries. Every pass rebuilds them; each

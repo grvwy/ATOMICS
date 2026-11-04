@@ -13,6 +13,15 @@ pub enum ControlRequest {
     /// The protocol server's address and the rendezvous's status: phase, registered, online,
     /// channels and why it waits. Never a token or pass.
     Remote,
+    /// Pair a client that reaches the protocol server through a forward (a Mac's ATOMICS reaching
+    /// the host in its VM): its token, once, in the answer; pairing a name again replaces it.
+    PairClient {
+        name: String,
+    },
+    /// Forget a client paired as `name`; its token stops working.
+    UnpairClient {
+        name: String,
+    },
     /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
     TraceGet {
         #[serde(default)]

@@ -464,7 +464,8 @@ impl State {
         let themes_changed = stamp[2] != self.config_stamp[2];
         self.config_stamp = stamp;
         match Config::load(&self.config_path) {
-            Ok(config) => {
+            Ok(mut config) => {
+                super::with_remote_port(&mut config, self.remote_port);
                 let (theme, theme_errors) =
                     Theme::load(&config.theme, &atomics_core::theme::themes_dir(&self.config_path));
                 let syntax_changed = theme.syntax != self.theme.syntax;

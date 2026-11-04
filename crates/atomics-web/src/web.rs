@@ -362,6 +362,8 @@ impl App {
         match output {
             Output::Post(kind) => self.post(kind),
             Output::Dial { socket, url, protocols } => self.dial(socket, &url, &protocols),
+            // Only a native client dials its host directly.
+            Output::DialDirect { socket } => push(&self.inbox, &self.ctx, Input::Closed { socket, code: 1006 }),
             Output::Send { socket, message } => {
                 if let Some(live) = self.socket.as_ref().filter(|live| live.id == socket) {
                     let _ = live.ws.send_with_u8_array(&message);

@@ -818,6 +818,9 @@ const ACCOUNT: &str = "atomics";
 pub struct Keychain {
     program: String,
     mac: bool,
+    /// A private folder that stands in for the OS credential store on a machine that has none, such
+    /// as the headless host in the NixOS VM (`ATOMICS_CREDENTIALS_DIR`; docs/nixos-vm.md).
+    files: Option<std::path::PathBuf>,
 }
 
 // App tests run in isolated child processes; count keychain discovery and helper calls across host threads.
@@ -835,12 +838,41 @@ impl Keychain {
             crate::setup::find_program("secret-tool")
                 .map_or_else(|| "/usr/bin/secret-tool".into(), |path| path.to_string_lossy().into_owned())
         };
-        Self { program, mac }
+        // Only where it is asked for, and never on a Mac, whose keychain is always there.
+        let files = atomics_core::paths::env_override("CREDENTIALS_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|dir| !mac && dir.is_absolute());
+        Self { program, mac, files }
     }
 
     /// The keychain tool at `program`, which speaks macOS's `security` when `mac`, else `secret-tool`.
     pub fn at(program: &std::path::Path, mac: bool) -> Self {
-        Self { program: program.to_string_lossy().into_owned(), mac }
+        Self { program: program.to_string_lossy().into_owned(), mac, files: None }
+    }
+
+    /// A folder of private files instead of an OS credential store: each item a file of mode 0600 in
+    /// a folder of mode 0700, readable by this user's processes alone. For a machine that is one
+    /// trust domain and has no credential store, as the VM's tools keep their sign-ins too.
+    #[cfg(test)]
+    pub fn in_folder(dir: &std::path::Path) -> Self {
+        Self { program: String::new(), mac: false, files: Some(dir.to_path_buf()) }
+    }
+
+    /// The file that holds one item in the folder store: its names, with anything but letters, digits,
+    /// `.`, `_` and `-` written as `%XX`.
+    fn item_file(dir: &std::path::Path, service: &str, account: &str) -> std::path::PathBuf {
+        let escape = |name: &str| {
+            name.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"._-".contains(&b) {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect::<String>()
+        };
+        dir.join(format!("{}@{}", escape(service), escape(account)))
     }
 
     fn lookup_args(&self) -> Vec<&'static str> {
@@ -879,6 +911,9 @@ impl Keychain {
     }
 
     pub(crate) fn legacy_token(&self) -> Option<String> {
+        if self.files.is_some() {
+            return None;
+        }
         let output = self.output(&self.lookup_args()).ok()?;
         let token = std::str::from_utf8(&output.stdout).ok()?.trim();
         (output.status.success() && !token.is_empty()).then(|| token.to_string())
@@ -893,6 +928,13 @@ impl Keychain {
     }
 
     pub(crate) fn read_item(&self, service: &str, account: &str) -> Result<Option<String>> {
+        if let Some(dir) = &self.files {
+            return match std::fs::read_to_string(Self::item_file(dir, service, account)) {
+                Ok(text) => Ok(Some(text.trim().to_string())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => anyhow::bail!("the credential folder {} cannot be read", dir.display()),
+            };
+        }
         let args = if self.mac {
             vec!["find-generic-password", "-a", account, "-s", service, "-w"]
         } else {
@@ -914,7 +956,9 @@ impl Keychain {
     }
 
     pub(crate) fn catalog_lock(&self) -> Result<std::fs::File> {
-        let directory = if cfg!(test) {
+        let directory = if let Some(dir) = &self.files {
+            dir.clone()
+        } else if cfg!(test) {
             std::path::Path::new(&self.program).parent().unwrap().to_path_buf()
         } else {
             atomics_core::paths::atomics_home()
@@ -926,7 +970,9 @@ impl Keychain {
     /// user. It lives next to the config rather than in an ATOMICS home: sessions with different homes
     /// share the one keychain, and so the one rotating refresh token.
     pub(crate) fn sign_in_lock(&self, key: &str) -> Result<std::fs::File> {
-        let directory = if cfg!(test) {
+        let directory = if let Some(dir) = self.files.as_ref().filter(|_| cfg!(test)) {
+            dir.clone()
+        } else if cfg!(test) {
             std::path::Path::new(&self.program).parent().unwrap().to_path_buf()
         } else {
             let config = atomics_core::paths::config_file();
@@ -936,6 +982,9 @@ impl Keychain {
     }
 
     pub(crate) fn remove_legacy(&self) -> Result<()> {
+        if self.files.is_some() {
+            return Ok(());
+        }
         let args = if self.mac {
             vec!["delete-generic-password", "-a", ACCOUNT, "-s", CLAUDE_SERVICE]
         } else {
@@ -959,6 +1008,10 @@ impl Keychain {
     /// Writes one keychain item and reads it back. `encoded` is hex, so security's interactive
     /// parser only sees letters and digits; the OS keychain supplies encryption and access control.
     pub(crate) fn write_item(&self, service: &str, account: &str, label: &str, encoded: &str) -> Result<()> {
+        if let Some(dir) = &self.files {
+            return write_private(dir, &Self::item_file(dir, service, account), encoded)
+                .map_err(|e| anyhow::anyhow!("the credential folder {} cannot be written: {e}", dir.display()));
+        }
         let (args, input) = if self.mac {
             (vec!["-i".to_string()], format!("add-generic-password -U -a {account} -s {service} -w {encoded}\n"))
         } else {
@@ -989,6 +1042,13 @@ impl Keychain {
 
     /// Deletes one keychain item; an absent item is fine.
     pub(crate) fn remove_item(&self, service: &str, account: &str) -> Result<()> {
+        if let Some(dir) = &self.files {
+            return match std::fs::remove_file(Self::item_file(dir, service, account)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => anyhow::bail!("the credential folder {} cannot be written", dir.display()),
+            };
+        }
         let args = if self.mac {
             vec!["delete-generic-password", "-a", account, "-s", service]
         } else {
@@ -1004,6 +1064,19 @@ impl Keychain {
         }
         anyhow::bail!("OS credential store unavailable; unlock it and retry")
     }
+}
+
+/// `text` in `file`, through a temporary file of mode 0600, in `dir` made private (0700).
+fn write_private(dir: &std::path::Path, file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let temp = file.with_extension("tmp");
+    let mut out = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temp)?;
+    out.write_all(text.as_bytes())?;
+    out.sync_all()?;
+    std::fs::rename(&temp, file)
 }
 
 /// An exclusive lock on `directory/name`, waiting for it; closing the file releases it. `File::lock`

@@ -368,6 +368,12 @@ impl RemoteBackend {
         if s.screens.receive(&envelope, &mut s.outgoing) {
             return;
         }
+        // A session that changed may have a terminal now that it had not when its screen was asked for.
+        match &envelope.message {
+            Message::SessionUpsert { session, .. } => s.screens.session_changed(Some(&session.id)),
+            Message::StateSnapshot { .. } => s.screens.session_changed(None),
+            _ => {}
+        }
         s.receive(envelope);
         s.fetch();
     }

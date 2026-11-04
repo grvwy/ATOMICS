@@ -162,6 +162,21 @@ let
     exec ssh -N -T ${sshOptions} -o ExitOnForwardFailure=yes "$@" ${host}
   '';
 
+  # The ATOMICS host in the VM (atomics.vm.host): its protocol server listens on the guest's loopback
+  # only, and this forward opens the same port on the Mac's loopback through Lima's ssh. Clients still
+  # need the token they paired with (`atomics ctl '{"cmd":"pair_client",...}'` in the guest); no
+  # port is ever open without one.
+  hostForwardScript = preamble + ''
+    # Holds the forward from this Mac's loopback to the ATOMICS host in the VM until the VM goes away.
+    # ATOMICS.app runs it while it shows the VM's host; the port defaults to the guest's.
+    port=''${1:-${toString cfg.hostPort}}
+    case $port in
+      ""|*[!0-9]*) echo "atomics-vm-host-forward: $port is not a port" >&2; exit 64 ;;
+    esac
+    exec ssh -N -T ${sshOptions} -o ExitOnForwardFailure=yes \
+      -L "127.0.0.1:$port:127.0.0.1:${toString cfg.hostPort}" ${host}
+  '';
+
   tomlValue = value:
     if builtins.isList value then "[${lib.concatMapStringsSep ", " tomlValue value}]" else builtins.toJSON value;
   # Fields in the order a person reads them; null leaves one out.
@@ -179,7 +194,15 @@ let
     command = [ "${cfg.installDir}/bin/${program}" ];
     kind = if program == "claude" then "claude" else "generic";
   } // lib.optionalAttrs (program == "codex") { busyText = "esc to interrupt"; });
-  configSnippet = ''
+  configSnippet = if cfg.hostPort != null then hostConfigSnippet else wrapperConfigSnippet;
+  # The host in the VM runs everything; this Mac's ATOMICS only shows it.
+  hostConfigSnippet = ''
+    # ATOMICS on this Mac shows the ATOMICS host in the Lima VM ${cfg.lima.instance}: agents, the chief,
+    # hooks, git and builds run there, and this Mac draws the window (docs/nixos-vm.md).
+    [client]
+    connect = "vm"
+  '';
+  wrapperConfigSnippet = ''
     # ATOMICS on this Mac with its agents and chief in the Lima VM ${cfg.lima.instance}.
     # Copy into ~/.config/atomics/config.d/<this Mac's host name>.toml: a host file's agents
     # list replaces the main file's. The VM is the agents' boundary, so they run bare.
@@ -264,9 +287,24 @@ let
     mountType = "virtiofs";
     mounts = map (share: { location = share.path; mountPoint = share.path; inherit (share) writable; }) shares;
     # The VM's ports stay in the VM, as in plain mode: no guest listener appears on the Mac's
-    # loopback, where a container's published port would shadow the Mac's own.
-    portForwards = [ { guestIP = "0.0.0.0"; guestPortRange = [ 1 65535 ]; proto = "any"; ignore = true; } ];
+    # loopback, where a container's published port would shadow the Mac's own. A rule for 0.0.0.0
+    # matches only listeners on every address; Lima's default would forward the guest's loopback
+    # ones (the ATOMICS host's among them, which the bundle's own forward carries instead).
+    portForwards = map (guestIP: { inherit guestIP; guestPortRange = [ 1 65535 ]; proto = "any"; ignore = true; })
+      [ "127.0.0.1" "0.0.0.0" ];
   };
+
+  # What `atomics vm` on the Mac reads about this VM (crates/atomics/src/vm.rs, BundleInfo).
+  bundleInfo = builtins.toJSON ({
+    version = 1;
+    instance = cfg.lima.instance;
+    user = atomics.user;
+    home = vmUser.home;
+    macUser = cfg.user;
+    installDir = cfg.installDir;
+  } // lib.optionalAttrs (cfg.hostPort != null) {
+    host.port = cfg.hostPort;
+  });
 
   textFile = name: text: executable: pkgs.writeTextFile { inherit name text executable; };
   bundle = pkgs.runCommand "atomics-vm-mac" {
@@ -284,10 +322,14 @@ let
       description = "Runs a command in the VM ${cfg.lima.instance}, in this folder; with none, a login shell.";
     }) true} $out/bin/atomics-vm-run
     install -m 0755 ${textFile "atomics-vm-forward" forwardScript true} $out/bin/atomics-vm-forward
+    ${lib.optionalString (cfg.hostPort != null) ''
+      install -m 0755 ${textFile "atomics-vm-host-forward" hostForwardScript true} $out/bin/atomics-vm-host-forward
+    ''}
     install -m 0755 ${textFile "atomics-vm-install" installScript true} $out/install.sh
     install -m 0644 ${textFile "atomics-vm-config" configSnippet false} $out/config.d.toml
     install -m 0644 ${textFile "atomics-vm-plist" plist false} $out/launchd/${launchdLabel}.plist
     install -m 0644 ${yaml.generate "lima.yaml" limaDefinition} $out/lima.yaml
+    install -m 0644 ${textFile "atomics-vm.json" bundleInfo false} $out/atomics-vm.json
     shellcheck --shell=sh $out/bin/* $out/install.sh
   '';
 in
@@ -378,6 +420,16 @@ in
       '';
     };
 
+    hostPort = mkOption {
+      type = types.nullOr types.port;
+      default = null;
+      description = ''
+        The port of the ATOMICS host running in this machine (atomics.vm.host), on its loopback. The
+        bundle then gets bin/atomics-vm-host-forward, and its config snippet makes the Mac's ATOMICS
+        a client of that host instead of starting agents here over ssh.
+      '';
+    };
+
     installDir = mkOption {
       type = types.str;
       default = "${cfg.home}/.local/share/atomics-vm";
@@ -438,12 +490,14 @@ in
     ];
 
     environment.systemPackages = [ vmExec ];
-    environment.sessionVariables.ATOMICS_SOCKET = cfg.socket;
+    # The Mac's forwarded socket; the host in this machine (atomics.vm.host) names its own instead.
+    environment.sessionVariables.ATOMICS_SOCKET = lib.mkDefault cfg.socket;
     # What this machine expects of the Mac, for scripts/check-atomics-vm.sh and diagnosis.
     environment.etc."atomics/mac-desktop.env".text = ''
       ATOMICS_MAC_SOCKET=${cfg.socket}
       ATOMICS_MAC_SHARES="${lib.concatMapStringsSep " " (share: "${share.path}:${if share.writable then "rw" else "ro"}") shares}"
       ATOMICS_MAC_EXECUTABLES="${lib.concatStringsSep " " cfg.executables}"
+      ATOMICS_HOST_PORT=${if cfg.hostPort == null then "" else toString cfg.hostPort}
     '';
 
     # A forward that died leaves its socket file behind; the next one replaces it.

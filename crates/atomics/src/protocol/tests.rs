@@ -386,6 +386,67 @@ fn upgrades_without_the_token_a_good_origin_or_the_subprotocol_fail() {
     assert!(TestClient::try_connect(addr, Some(&token), None, true).is_ok());
 }
 
+/// A client that reaches the server through a forward on another port (an ssh forward from a Mac to its
+/// VM) still names the loopback; a page a DNS-rebinding attack drives names its own host and is refused.
+#[test]
+fn the_host_header_must_name_the_loopback_on_any_port() {
+    for (host, ok) in [
+        ("127.0.0.1:47800", true),
+        ("localhost:1", true),
+        ("LOCALHOST:65535", true),
+        ("127.0.0.1", false),
+        ("127.0.0.1:", false),
+        ("127.0.0.1:x", false),
+        ("evil.example:47800", false),
+        ("127.0.0.1.evil.example:80", false),
+        ("[::1]:47800", false),
+    ] {
+        assert_eq!(super::loopback_host(host), ok, "{host}");
+    }
+    let f = start();
+    let token = f.server.token().to_string();
+    let upgrade = |host: &str| {
+        let stream = TcpStream::connect(f.server.addr()).unwrap();
+        stream.set_read_timeout(Some(wait(Duration::from_secs(5)))).unwrap();
+        let mut request = format!("ws://{}", f.server.addr()).into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert("Host", host.parse().unwrap());
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers.insert("Sec-WebSocket-Protocol", wire::SUBPROTOCOL.parse().unwrap());
+        match tungstenite::client(request, stream) {
+            Ok(_) => 101,
+            Err(HandshakeError::Failure(e)) => status_of(e),
+            Err(HandshakeError::Interrupted(_)) => panic!("the upgrade timed out"),
+        }
+    };
+    assert_eq!(upgrade("127.0.0.1:1"), 101, "a forward's own port");
+    assert_eq!(upgrade("rebound.example:80"), 403);
+}
+
+/// A paired client's token gets in across restarts, as a controller under its own name; the per-start
+/// token still works, and a token that was replaced or unpaired does not.
+#[test]
+fn a_paired_client_gets_in_with_its_own_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let clients = Arc::new(super::clients::PairedClients::open(dir.path().join("paired-clients.json")).unwrap());
+    let (_, token) = clients.pair("Mac").unwrap();
+    let f = start_with(ServerConfig { paired: Some(clients.clone()), ..config() });
+    let mut client = TestClient::connect(f.server.addr(), &token);
+    client.hello();
+    client.step();
+    let Some(Message::Welcome { role, .. }) = client.welcome.clone().map(|w| w.message) else { panic!("welcome") };
+    assert_eq!(role, wire::Role::Controller);
+    assert!(TestClient::try_connect(f.server.addr(), Some(f.server.token()), None, true).is_ok());
+    let (_, replaced) = clients.pair("Mac").unwrap();
+    assert_eq!(status_of(TestClient::try_connect(f.server.addr(), Some(&token), None, true).err().unwrap()), 401);
+    assert!(TestClient::try_connect(f.server.addr(), Some(&replaced), None, true).is_ok());
+    clients.unpair("Mac").unwrap();
+    assert_eq!(status_of(TestClient::try_connect(f.server.addr(), Some(&replaced), None, true).err().unwrap()), 401);
+    // Without paired clients only this start's token gets in.
+    let plain = start();
+    assert_eq!(status_of(TestClient::try_connect(plain.server.addr(), Some(&token), None, true).err().unwrap()), 401);
+}
+
 #[test]
 fn malformed_unknown_and_version_mismatched_frames_get_typed_errors() {
     let f = start();

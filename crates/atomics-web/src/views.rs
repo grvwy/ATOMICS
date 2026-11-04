@@ -90,6 +90,22 @@ const NOTICE_MS: f64 = 12_000.0;
 /// How far under the window's top the wide layout's note hangs: clear of the top bar.
 const NOTE_TOP: f32 = 40.0;
 
+/// Where the agents of the host a native client shows run, for the top bar: "Agents in VM atomics-host",
+/// its hover, and an action beside it ("Use this Mac").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Place {
+    pub text: String,
+    pub hover: String,
+    pub action: Option<String>,
+}
+
+/// The place in the top bar, and its action; true when the action was clicked.
+fn place(ui: &mut egui::Ui, place: Option<&Place>, p: &Palette) -> bool {
+    let Some(place) = place else { return false };
+    ui.label(RichText::new(&place.text).color(p.accent).size(11.5)).on_hover_text(&place.hover);
+    place.action.as_ref().is_some_and(|action| ui.small_button(action).on_hover_text(&place.hover).clicked())
+}
+
 /// What this frame shows.
 #[derive(Default)]
 pub struct View {
@@ -117,6 +133,10 @@ pub struct View {
     /// The last frame drew the phone layout.
     pub compact: bool,
     pub looks: Looks,
+    /// A native client's word on where its host's agents run, shown in the top bar ([`Place`]).
+    pub place: Option<Place>,
+    /// The place's action was clicked this frame; the native client takes it.
+    pub place_clicked: bool,
     /// The terminal the page's input goes to, by session id, as the pane on screen says.
     target: Option<String>,
     /// The note on the notice line and when it first showed there.
@@ -343,13 +363,14 @@ impl Platform for Web<'_> {
 
     /// Where the desktop has its Tickets, GitHub and Remote items: how this page's connection is.
     /// Then the shared items the host's state gives: Sign in or Reconnect while its ticket system needs
-    /// it, and the workspace open there with the picker.
+    /// it, and the workspace open there with the picker. Last, where a native client's agents run.
     fn top_bar_items(&mut self, ui: &mut egui::Ui, _in_menu: bool) {
         let (text, good) = status_line(self.driver);
-        let p = &self.client.palette;
-        ui.label(RichText::new(text).color(status_color(good, p)).size(11.5));
+        let p = self.client.palette.clone();
+        ui.label(RichText::new(text).color(status_color(good, &p)).size(11.5));
         self.draw(|backend, client, _| atomics_ui::signin::top_bar_item(ui, backend, client));
         self.draw(|backend, client, _| atomics_ui::topbar::workspace_menu(ui, backend, client));
+        self.view.place_clicked |= place(ui, self.view.place.as_ref(), &p);
     }
 
     /// The chief's window, with the permission request it waits on over its terminal.
@@ -467,7 +488,11 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                     ui.label(RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace());
                     let (text, good) = status_line(driver);
                     ui.label(RichText::new(text).color(status_color(good, &p)).size(11.5));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| layout_menu(ui, view, |_| {}));
+                    // Nothing beside the brand but the connection: where agents run goes right.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        layout_menu(ui, view, |_| {});
+                        view.place_clicked |= place(ui, view.place.as_ref(), &p);
+                    });
                 });
             });
         egui::CentralPanel::default()
@@ -616,7 +641,13 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     topbar::slot(ui, "phone-actions", right, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let backend: &dyn Backend = &driver.remote;
-            layout_menu(ui, view, |ui| atomics_ui::topbar::workspace_menu(ui, backend, client));
+            // The phone's ⋯ menu: the layout, the host's workspace and where a native client's agents run.
+            let (shown, mut clicked) = (view.place.clone(), false);
+            layout_menu(ui, view, |ui| {
+                atomics_ui::topbar::workspace_menu(ui, backend, client);
+                clicked = place(ui, shown.as_ref(), &p);
+            });
+            view.place_clicked |= clicked;
             if approvals > 0 {
                 // Selected while the approvals show, as a pane is in the bar.
                 let badge = RichText::new(format!("◆ {approvals}")).color(p.warning).strong();

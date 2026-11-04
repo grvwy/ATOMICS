@@ -26,6 +26,8 @@ impl State {
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
             "outside_atomics": s.terminal.is_none() && s.status != AgentStatus::Starting,
+            // The agent's process on the machine the host runs on (the VM's, with the host there).
+            "pid": s.terminal.as_ref().map(|t| t.process_id()),
             "claude_session_id": s.claude_id,
             "sandbox": s.sandbox,
             "scratch": s.scratch,
@@ -123,6 +125,8 @@ impl State {
             }
             ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
+            ControlRequest::PairClient { name } => done(self.pair_client(&name)),
+            ControlRequest::UnpairClient { name } => done(self.unpair_client(&name)),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {
                     // What the screen shows now decides, not what the last poll saw.

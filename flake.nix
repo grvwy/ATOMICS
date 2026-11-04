@@ -12,6 +12,10 @@
       vmWithExample = vm.extendModules {
         modules = [ { atomics.examples.dotnetAzure.enable = true; } ];
       };
+      # The recommended layout: the ATOMICS host runs in the VM and the Mac only shows it.
+      vmWithHost = vm.extendModules {
+        modules = [ { atomics.vm.host.enable = true; } ];
+      };
     in
     {
       packages = forAllSystems (system:
@@ -48,6 +52,11 @@
           atomics-vm-mac = import ./nix/tests/mac-desktop.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = vm.config;
+          };
+          atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
+          atomics-vm-host = import ./nix/tests/vm-host.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmWithHost.config;
           };
         });
 

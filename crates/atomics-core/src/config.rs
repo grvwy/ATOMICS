@@ -521,6 +521,11 @@ github = "primary+g"        # the GitHub controls; primary = Command on macOS, C
 back = "cmd+alt+left"       # back to the place the window showed before (also the location line's ‹)
 forward = "cmd+alt+right"
 
+[client]
+# Open the window as a client of an ATOMICS host instead of running agents in it (docs/daemon.md).
+# connect = ""             # "local": the `atomics host` on this machine; "vm": the host in this Mac's
+#                          # ATOMICS VM (docs/nixos-vm.md); "ws://127.0.0.1:PORT": a host paired with
+
 [remote]
 # The atomics.v1 protocol server for other clients on this machine (see docs/daemon.md). Off by default.
 # It listens on 127.0.0.1 only; clients present the token in protocol.json in the ATOMICS state directory.
@@ -563,6 +568,17 @@ pub struct Config {
     pub tickets: crate::tickets::TicketConfig,
     pub github: crate::github::GithubConfig,
     pub remote: RemoteAccessConfig,
+    pub client: ClientConfig,
+}
+
+/// `[client]`: open the window as a client of an ATOMICS host instead of running agents itself
+/// (docs/daemon.md, phase 3; docs/nixos-vm.md). `atomics --connect <address>` does the same for one run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientConfig {
+    /// Empty: this window is the host, as always. `local`: the `atomics host` on this machine. `vm`:
+    /// the host in this Mac's ATOMICS VM. `ws://127.0.0.1:PORT`: a host this machine paired with.
+    pub connect: String,
 }
 
 /// The `atomics.v1` protocol server inside the running app. Off unless `enabled`: with it off there
@@ -981,6 +997,7 @@ impl Default for Config {
             tickets: crate::tickets::TicketConfig::default(),
             github: crate::github::GithubConfig::default(),
             remote: RemoteAccessConfig::default(),
+            client: ClientConfig::default(),
         }
     }
 }

@@ -702,9 +702,11 @@ fn handle(
                     }
                     let terminals = shared.screens.terminals();
                     if terminals.control(session).is_none() {
-                        // Its terminal may have closed since the client heard of it.
-                        let closed = terminals.closed(session);
-                        return Err(if closed { gone(no_terminal()) } else { refused(no_terminal()) });
+                        // Its terminal may have closed since the client heard of it, or (a session on the
+                        // board) not have started yet: the client could not know, and asks again when the
+                        // session changes.
+                        let expected = terminals.closed(session) || lock(&shared.hub).has_session(session);
+                        return Err(if expected { gone(no_terminal()) } else { refused(no_terminal()) });
                     }
                 }
                 if !subscriptions.has(topic) {

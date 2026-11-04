@@ -849,6 +849,13 @@ impl FakeHost {
         let device = self.device.clone();
         match message {
             Message::Subscribe { topics } => {
+                // As the host: a screen with no terminal (yet) is refused, the request named.
+                let missing = topics.iter().any(
+                    |topic| matches!(topic, Topic::Screen { session, .. } if !self.terminals.contains_key(session)),
+                );
+                if missing {
+                    return refuse(ErrorCode::NotFound, "no terminal");
+                }
                 let mut out = Vec::new();
                 for topic in topics {
                     let Topic::Screen { session, .. } = topic else { continue };

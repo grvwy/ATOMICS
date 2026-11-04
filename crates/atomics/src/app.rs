@@ -108,6 +108,8 @@ pub struct Options {
     pub migration_errors: Vec<String>,
     /// An `atomics://open` link the launch was given, handled once the app has loaded.
     pub link: Option<crate::open_link::Incoming>,
+    /// `atomics host --remote-port`: `[remote]` on, on this port, whatever the config file says.
+    pub remote_port: Option<u16>,
 }
 
 pub struct Session {
@@ -451,6 +453,8 @@ pub(crate) struct State {
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
     remote: crate::host::RemoteView,
+    /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
+    remote_port: Option<u16>,
     wake: crate::host::Wake,
     control_tx: crate::host::Sender<ControlMessage>,
     client_commands: Vec<ControlRequest>,
@@ -514,6 +518,8 @@ pub(crate) struct State {
     usage: crate::usage::UsagePanel,
     /// Account usage that sandboxed agents saw, read back from their VMs.
     sandbox_pull: crate::usage::SandboxPull,
+    /// The ATOMICS VM on a Mac with its bundle installed, for the top bar (`vm.rs`).
+    vm: Option<crate::vm::Monitor>,
     control_rx: Receiver<ControlMessage>,
     /// Mutations from protocol clients, carried out in turn with everything else (`mutations.rs`).
     op_tx: crate::host::Sender<crate::protocol::OpRequest>,
@@ -933,10 +939,11 @@ impl State {
         crate::sandbox::load_pins(&paths::git_pins_dir());
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
-        let (config, config_error) = match Config::load_or_create(&config_path) {
+        let (mut config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
         };
+        with_remote_port(&mut config, options.remote_port);
         let config_problems = github::config_problems(&config);
         let (theme, theme_errors) = Theme::load(&config.theme, &theme::themes_dir(&config_path));
         let theme_error = theme_error(&theme_errors);
@@ -949,6 +956,7 @@ impl State {
         let (action_tx, action_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(window.clone());
         let sandbox_pull = crate::usage::SandboxPull::new(usage_tx.clone());
+        let vm = crate::vm::Monitor::start(window.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
@@ -997,6 +1005,7 @@ impl State {
         let mut app = State {
             window,
             remote: crate::host::RemoteView::default(),
+            remote_port: options.remote_port,
             wake: wake.clone(),
             control_tx,
             client_commands: Vec::new(),
@@ -1042,6 +1051,7 @@ impl State {
             hub,
             hook_rx,
             usage,
+            vm,
             sandbox_pull,
             control_rx,
             op_tx,
@@ -1385,6 +1395,15 @@ impl State {
     }
 }
 
+/// `atomics host --remote-port`: the protocol server on that port, on loopback as always, whatever the
+/// config file says, so a service can rely on it (the NixOS VM's host, docs/nixos-vm.md).
+pub(crate) fn with_remote_port(config: &mut Config, port: Option<u16>) {
+    if let Some(port) = port {
+        config.remote.enabled = true;
+        config.remote.port = port;
+    }
+}
+
 fn state_refresh(state: &mut DiffData) {
     state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
 }
@@ -1617,6 +1636,9 @@ mod board_tests;
 
 #[cfg(test)]
 mod host_tests;
+
+#[cfg(test)]
+mod client_tests;
 
 #[cfg(test)]
 mod sandbox_tests;
