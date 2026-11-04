@@ -161,6 +161,8 @@ pub(super) struct TicketsPanel {
     pub read: Option<Read>,
     /// Tickets opened from within a ticket, for Alt+←.
     pub crumbs: Vec<TicketLink>,
+    /// Return to the plan board after following its ticket chip.
+    pub from_board: bool,
     /// The last tickets read, newest first.
     pub recent: Vec<TicketLink>,
     /// The ticket system said it needs a sign-in.
@@ -415,6 +417,10 @@ impl State {
     pub(super) fn tickets_back(&mut self) {
         match self.tickets.panel.crumbs.pop() {
             Some(link) => self.open_ticket(link, Nav::Pop),
+            None if self.tickets.panel.from_board => {
+                self.tickets.panel.from_board = false;
+                self.panel = PanelMode::Plan;
+            }
             None => self.tickets.panel.view = TicketsView::Find,
         }
     }
@@ -533,6 +539,10 @@ impl State {
 
     /// Escape in Read: back to the list, with the ticket read selected there.
     pub(super) fn tickets_to_list(&mut self) {
+        if self.tickets.panel.from_board && self.tickets.panel.crumbs.is_empty() {
+            self.tickets_back();
+            return;
+        }
         let panel = &mut self.tickets.panel;
         panel.view = TicketsView::Find;
         if let Some(read) = &panel.read
@@ -546,6 +556,9 @@ impl State {
 
     /// Reads a ticket in the panel: the card, its children and the tickets related to it.
     pub(super) fn open_ticket(&mut self, link: TicketLink, nav: Nav) {
+        if nav == Nav::Fresh {
+            self.tickets.panel.from_board = false;
+        }
         self.panel = PanelMode::Tickets;
         self.diff_open = true;
         self.window.request_repaint();
@@ -1981,6 +1994,39 @@ mod tests {
     }
 
     #[test]
+    fn tickets_opened_from_a_plan_return_to_the_board_and_fresh_opens_reset_it() {
+        with_app(
+            "app::tickets_panel::tests::tickets_opened_from_a_plan_return_to_the_board_and_fresh_opens_reset_it",
+            |app, ctx| {
+                open_panel(app, ctx, TicketsView::Find);
+                app.runtime.panel = PanelMode::Plan;
+                app.send(Command::OpenTicket(card(1, None).link));
+                assert!(app.runtime.tickets.panel.from_board);
+                app.runtime.open_ticket(card(2, None).link, Nav::Push);
+                app.runtime.tickets_back();
+                assert_eq!(app.runtime.panel, PanelMode::Tickets);
+                assert!(app.runtime.tickets.panel.from_board);
+                app.runtime.tickets_back();
+                assert_eq!(app.runtime.panel, PanelMode::Plan);
+                assert!(!app.runtime.tickets.panel.from_board);
+
+                app.send(Command::OpenTicket(card(1, None).link));
+                frame(app, ctx, vec![]);
+                frame(app, ctx, vec![key(Key::Escape, NONE)]);
+                assert_eq!(app.runtime.panel, PanelMode::Plan, "Escape returns to the board too");
+                assert!(!app.runtime.tickets.panel.from_board);
+
+                app.send(Command::OpenTicket(card(1, None).link));
+                app.runtime.open_ticket(card(2, None).link, Nav::Fresh);
+                assert!(!app.runtime.tickets.panel.from_board);
+                app.runtime.tickets_back();
+                assert_eq!(app.runtime.panel, PanelMode::Tickets);
+                assert_eq!(app.runtime.tickets.panel.view, TicketsView::Find);
+            },
+        );
+    }
+
+    #[test]
     fn the_open_ticket_command_reads_it_with_the_browser_one_click_away() {
         with_app(
             "app::tickets_panel::tests::the_open_ticket_command_reads_it_with_the_browser_one_click_away",
@@ -2576,6 +2622,12 @@ mod tests {
             assert!(row.link.title.as_deref().is_some_and(|title| title.contains("development stages")));
             assert_eq!(row.link.url.as_deref(), Some("https://tickets.example/3"));
             assert_eq!(finds(&state).last().unwrap()["about"], "no ticket holds these words", "the search still ran");
+            for query in ["#DEMO-3", "DEMO-3."] {
+                search_for(app, query);
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert_eq!(labels(app), ["DEMO-3"], "{query}");
+                assert_eq!(lookups(&state).last().unwrap(), "DEMO-3");
+            }
         });
     }
 
