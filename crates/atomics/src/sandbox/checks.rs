@@ -290,6 +290,13 @@ pub(super) fn misfiled_text(misfiled: &[String]) -> String {
     format!("{} misfiled secret{plural} in scope {}", misfiled.len(), scopes.join(", "))
 }
 
+/// MCP secrets use `mcp:<server>:<name>`, with both parts required.
+fn is_mcp_secret(name: &str) -> bool {
+    name.strip_prefix("mcp:")
+        .and_then(|name| name.split_once(':'))
+        .is_some_and(|(server, name)| !server.is_empty() && !name.is_empty())
+}
+
 /// `sandboxes` are the names `sbx ls` knows, or None when it could not say: a scope is then trusted.
 fn secret_names(value: &Value, sandboxes: Option<&[String]>) -> Option<SecretNames> {
     let rows = value.get("secrets").unwrap_or(value).as_array()?;
@@ -310,7 +317,7 @@ fn secret_names(value: &Value, sandboxes: Option<&[String]>) -> Option<SecretNam
             }
         }
         let service = row.get("type").is_none_or(|kind| kind == "service");
-        let unknown = !SERVICES.contains(&name) && name != "CLAUDE_CODE_OAUTH_TOKEN";
+        let unknown = !SERVICES.contains(&name) && name != "CLAUDE_CODE_OAUTH_TOKEN" && !is_mcp_secret(name);
         let orphaned = scope != "global" && sandboxes.is_some_and(|names| !names.iter().any(|known| known == scope));
         if service && (unknown || orphaned) {
             known.misfiled.push(shown_scope(scope, sandboxes));
@@ -835,6 +842,34 @@ mod tests {
         assert!(!text.contains("SCOPED-private"), "{text}");
         std::fs::remove_file(dir.join("misfiled-scoped")).unwrap();
         assert!(line_ok(&report(dir), "sandbox secrets filed under known services"));
+    }
+
+    #[test]
+    fn mcp_secrets_require_a_server_and_name_and_never_show_names() {
+        let sandboxes = ["atomics-live".to_string()];
+        for (name, scope, misfiled) in [
+            ("mcp:server:name", "global", false),
+            ("mcp:PRIVATE-server:PRIVATE-name", "global", false),
+            ("mcp:PRIVATE-server:PRIVATE-name", "atomics-live", false),
+            ("mcp:PRIVATE-server:PRIVATE-name", "atomics-gone", true),
+            ("mcp:", "global", true),
+            ("mcp:x", "global", true),
+            ("mcp:x:", "global", true),
+            ("mcp::PRIVATE-name", "global", true),
+            ("mcp::", "global", true),
+            ("mcp", "global", true),
+            ("MCP:server:name", "global", true),
+            ("sk-ant-PRIVATE-value", "global", true),
+        ] {
+            let value = json!({"secrets":[{"type":"service", "scope":scope, "name":name}]});
+            let names = secret_names(&value, Some(&sandboxes)).unwrap();
+            assert_eq!(names.misfiled.len(), usize::from(misfiled));
+            assert!(!names.anthropic && !names.oauth && !names.openai && !names.github);
+            let text = secret_lines(Some(&names), API_KEY_ROUTE).join("\n");
+            assert_eq!(line_ok(&text, "sandbox secrets"), !misfiled);
+            assert!(!text.contains(name));
+            assert!(!text.contains("PRIVATE") && !text.contains("atomics-gone"));
+        }
     }
 
     #[test]
