@@ -15,8 +15,20 @@ pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_path().
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The login shell's PATH, read once per process: by [`adopt_login_path`] at startup, or else
-/// when something first needs it.
+/// when something first needs it (for a window, a thread [`start_login_path`] starts).
 static LOGIN_PATH: OnceLock<LoginPath> = OnceLock::new();
+
+/// What a window took on at startup, for the read of the login shell that follows it.
+static WINDOW: OnceLock<Window> = OnceLock::new();
+
+/// A window's start without waiting for the login shell ([`start_login_path`]).
+struct Window {
+    /// Folders of the recorded login PATH added to the PATH the window was started with.
+    added: usize,
+    /// Where the login shell's PATH is recorded for the next start.
+    record: PathBuf,
+    timeout: Duration,
+}
 
 /// The login shell's PATH, and what ATOMICS made of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,8 +37,11 @@ pub struct LoginPath {
     /// The login shell's PATH, or why it gave none.
     pub path: Result<String, String>,
     /// How many of its folders ATOMICS added to the PATH it was started with; `None` when this
-    /// process did not take it on (only [`adopt_login_path`] does).
+    /// process did not take it on (only [`adopt_login_path`] and [`start_login_path`] do).
     pub added: Option<usize>,
+    /// How many folders of the shell's PATH this process's own still lacks: a window took on the
+    /// PATH recorded at an earlier start, which the shell has changed since, or none was recorded.
+    pub late: usize,
 }
 
 impl LoginPath {
@@ -35,25 +50,49 @@ impl LoginPath {
         let path = login_shell_path(&shell, timeout);
         let missing = path.as_ref().map_or(0, |login| missing_folders(current, login).len());
         let merged = path.as_ref().ok().filter(|_| missing > 0).map(|login| with_login_path(current, login));
-        (LoginPath { shell, path, added: Some(missing) }, merged)
+        (LoginPath { shell, path, added: Some(missing), late: 0 }, merged)
     }
 
     /// Where the PATH of ATOMICS and of what it runs came from, and whether the login shell gave
     /// its own, for the doctor.
     pub fn describe(&self) -> (bool, String) {
         let shell = &self.shell;
+        let folders = |count: usize| format!("{count} folder{}", if count == 1 { "" } else { "s" });
         match (&self.path, self.added) {
+            (Ok(_), Some(0)) if self.late > 0 => (
+                true,
+                format!(
+                    "PATH as ATOMICS was started; {} of login shell {shell}'s reach agents and servers now, and what \
+                     ATOMICS runs itself at its next start",
+                    folders(self.late)
+                ),
+            ),
+            (Ok(_), Some(added)) if self.late > 0 => (
+                true,
+                format!(
+                    "PATH of login shell {shell} as recorded at an earlier start: {} added to the PATH ATOMICS was \
+                     started with; {} the shell has now reach agents and servers, and what ATOMICS runs itself at \
+                     its next start",
+                    folders(added),
+                    folders(self.late)
+                ),
+            ),
             (Ok(_), Some(0)) => {
                 (true, format!("PATH as ATOMICS was started, which has all of login shell {shell}'s folders"))
             }
             (Ok(_), Some(added)) => (
                 true,
-                format!(
-                    "PATH of login shell {shell}: {added} folder{} added to the PATH ATOMICS was started with",
-                    if added == 1 { "" } else { "s" }
-                ),
+                format!("PATH of login shell {shell}: {} added to the PATH ATOMICS was started with", folders(added)),
             ),
             (Ok(_), None) => (true, format!("PATH as ATOMICS was started; login shell {shell}'s is used where needed")),
+            (Err(reason), Some(added)) if added > 0 => (
+                false,
+                format!(
+                    "PATH of login shell {shell} as recorded at an earlier start: {} added to the PATH ATOMICS was \
+                     started with; the shell gave none now, {reason} (warning)",
+                    folders(added)
+                ),
+            ),
             (Err(reason), _) => {
                 (false, format!("PATH as ATOMICS was started: login shell {shell} gave none, {reason} (warning)"))
             }
@@ -65,7 +104,10 @@ impl LoginPath {
 /// filters and hooks, version probes, MCP and ticket servers. A desktop launcher starts ATOMICS
 /// with a bare PATH that lacks what the user's shell startup files add. A PATH that already has
 /// all the login shell's folders, as one from a terminal does, is left as it is; when the shell
-/// gives none in time, ATOMICS keeps the PATH it was started with.
+/// gives none in time, ATOMICS keeps the PATH it was started with. What the shell gives is
+/// recorded for a window's next start ([`start_login_path`]).
+///
+/// Waits for the shell, up to five seconds: for `atomics host` and the CLI, not for a window.
 ///
 /// # Safety
 ///
@@ -77,7 +119,45 @@ pub unsafe fn adopt_login_path() -> &'static LoginPath {
         // SAFETY: the caller guarantees this process has no other thread.
         unsafe { std::env::set_var("PATH", merged) };
     }
+    if let Ok(login) = &found.path {
+        let _ = record(&record_file(), &found.shell, login);
+    }
     LOGIN_PATH.get_or_init(|| found)
+}
+
+/// Takes on the login shell's PATH for a window without waiting for the shell, which can take
+/// seconds. The PATH the shell gave at an earlier start (see [`adopt_login_path`]) is merged in
+/// now, as the shell's own would be, before any thread or child exists, so git and its filters
+/// and hooks find what they found then; a PATH that already has those folders, as a terminal's
+/// does, is left as it is. The shell is then read on a thread of its own, which records what it
+/// gives for the next start. Agents, MCP and ticket servers and the Codex version probe wait for
+/// that ([`SHELL_PATH`], [`child_path`]), off the window's thread. With nothing recorded yet,
+/// what ATOMICS runs itself has the PATH it was started with until the next start.
+///
+/// # Safety
+///
+/// Changes the process environment: no other thread may exist yet.
+pub unsafe fn start_login_path() {
+    // SAFETY: passed on from the caller.
+    unsafe { start_login_path_with(record_file(), LOGIN_SHELL_TIMEOUT) }
+}
+
+/// [`start_login_path`] with the record kept in `record`, and a shell stopped after `timeout`.
+///
+/// # Safety
+///
+/// Changes the process environment: no other thread may exist yet.
+unsafe fn start_login_path_with(record: PathBuf, timeout: Duration) {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let recorded = recorded(&record, &shell_program());
+    let added = recorded.as_deref().map_or(0, |login| missing_folders(&current, login).len());
+    if let Some(login) = recorded.filter(|_| added > 0) {
+        // SAFETY: the caller guarantees this process has no other thread.
+        unsafe { std::env::set_var("PATH", with_login_path(&current, &login)) };
+    }
+    if WINDOW.set(Window { added, record, timeout }).is_ok() {
+        let _ = std::thread::Builder::new().name("login-path".into()).spawn(login_path);
+    }
 }
 
 /// The login shell's PATH: as [`adopt_login_path`] found it, or read now without changing
@@ -85,9 +165,61 @@ pub unsafe fn adopt_login_path() -> &'static LoginPath {
 pub fn login_path() -> &'static LoginPath {
     LOGIN_PATH.get_or_init(|| {
         let shell = shell_program();
-        let path = login_shell_path(&shell, LOGIN_SHELL_TIMEOUT);
-        LoginPath { shell, path, added: None }
+        let Some(window) = WINDOW.get() else {
+            let path = login_shell_path(&shell, LOGIN_SHELL_TIMEOUT);
+            return LoginPath { shell, path, added: None, late: 0 };
+        };
+        let path = login_shell_path(&shell, window.timeout);
+        let current = std::env::var("PATH").unwrap_or_default();
+        let late = path.as_ref().map_or(0, |login| missing_folders(&current, login).len());
+        if let Ok(login) = &path {
+            let _ = record(&window.record, &shell, login);
+        }
+        LoginPath { shell, path, added: Some(window.added), late }
     })
+}
+
+/// The PATH for a program ATOMICS starts that must find what the login shell's PATH has, such
+/// as the Codex version probe, whose `codex` can run `env node`: this process's PATH, with the
+/// login shell's folders it lacks. In a window that started with a recorded PATH, or none, this
+/// is the shell's current one. Blocks while the shell starts the first time, so call it off the
+/// window's thread.
+pub fn child_path() -> Option<String> {
+    let login = SHELL_PATH.as_ref()?;
+    let current = std::env::var("PATH").unwrap_or_default();
+    (!missing_folders(&current, login).is_empty()).then(|| with_login_path(&current, login))
+}
+
+/// Where ATOMICS keeps the login shell's PATH from its last read.
+fn record_file() -> PathBuf {
+    paths::atomics_home().join("login-path.json")
+}
+
+/// The login shell's PATH as an earlier ATOMICS recorded it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Recorded {
+    shell: String,
+    path: String,
+}
+
+/// The PATH recorded for `shell`. One recorded for another shell is not this one's.
+fn recorded(file: &std::path::Path, shell: &str) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(file).ok()?.take(64 * 1024).read_to_string(&mut text).ok()?;
+    let recorded: Recorded = serde_json::from_str(&text).ok()?;
+    (recorded.shell == shell).then_some(recorded.path)
+}
+
+/// Records `shell`'s PATH whole, so a window starting meanwhile reads the old one or the new.
+fn record(file: &std::path::Path, shell: &str, path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = file.parent().ok_or_else(|| std::io::Error::other("no folder for the record"))?;
+    std::fs::create_dir_all(dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+    temporary.write_all(&serde_json::to_vec(&Recorded { shell: shell.into(), path: path.into() })?)?;
+    temporary.persist(file).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn login_shell_path(shell: &str, timeout: Duration) -> Result<String, String> {
@@ -289,7 +421,8 @@ pub fn resolve_program(program: &str) -> String {
 }
 
 /// Keep the version probe bounded even when a wrapper hangs or another child inherits stdout.
-pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Option<bool> {
+/// `path`, when given, is the probe's PATH ([`child_path`]); else it has this process's own.
+pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::time::Duration) -> Option<bool> {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -298,16 +431,19 @@ pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Opti
 
     let (mut stdout, writer) = UnixStream::pair().ok()?;
     stdout.set_nonblocking(true).ok()?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg("--version")
         // Not wherever ATOMICS was started: a wrapper that runs the agent elsewhere, such as in a
         // VM that has only some of this machine's folders, needs a folder it is sure to have.
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(writer)))
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let mut child = command.spawn().ok()?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -452,13 +588,13 @@ mod tests {
         let program = dir.path().join("codex");
         crate::test_support::write_program(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\nexec sleep 30\n");
         let started = Instant::now();
-        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_millis(100)), None);
+        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), None, Duration::from_millis(100)), None);
         assert!(started.elapsed() < Duration::from_secs(5));
         for script in ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nprintf 'not a version\\n'\n"] {
             crate::test_support::write_program(&program, script);
-            assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(10)), None);
+            assert_eq!(codex_supports_hooks(program.to_str().unwrap(), None, Duration::from_secs(10)), None);
         }
-        assert_eq!(codex_supports_hooks("/no/such/codex", Duration::from_secs(1)), None);
+        assert_eq!(codex_supports_hooks("/no/such/codex", None, Duration::from_secs(1)), None);
     }
 
     #[test]
@@ -470,7 +606,10 @@ mod tests {
             &program,
             "#!/bin/sh\n[ \"$(pwd)\" = / ] || exit 66\nprintf 'codex-cli 0.166.0\\n'\n",
         );
-        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), std::time::Duration::from_secs(10)), Some(true));
+        assert_eq!(
+            codex_supports_hooks(program.to_str().unwrap(), None, std::time::Duration::from_secs(10)),
+            Some(true)
+        );
     }
 
     #[test]
@@ -478,7 +617,10 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("codex");
         crate::test_support::write_program(&program, "#!/bin/sh\nsleep 1.1\nprintf 'codex-cli 0.165.0\\n'\n");
-        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), std::time::Duration::from_secs(10)), Some(true));
+        assert_eq!(
+            codex_supports_hooks(program.to_str().unwrap(), None, std::time::Duration::from_secs(10)),
+            Some(true)
+        );
     }
 
     #[test]
@@ -590,6 +732,121 @@ mod tests {
         }
         let (found, merged) = LoginPath::read("/nonexistent/shell".into(), "/usr/bin", Duration::from_secs(10));
         assert!(found.path.unwrap_err().contains("did not start") && merged.is_none());
+    }
+
+    #[test]
+    fn a_window_takes_on_the_recorded_path_at_once_and_reads_the_shell_in_the_background() {
+        use crate::test_support::{CHILD_TIMEOUT, TestChild};
+        const CHILD: &str = "ATOMICS_WINDOW_LOGIN_PATH_TEST";
+        const RECORDED: &str = "/opt/recorded/bin:/usr/bin";
+        const FRESH: &str = "/opt/fresh/bin:/opt/recorded/bin:/usr/bin";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let record = dir.join("login-path.json");
+            let started_with = std::env::var("PATH").unwrap();
+            // SAFETY: the test harness's own threads only wait for this test; nothing reads the
+            // environment while it changes.
+            unsafe {
+                start_login_path_with(record.clone(), crate::test_support::scaled_timeout(Duration::from_secs(30)))
+            };
+            // The shell cannot finish before `go` exists: a window that waited for it would have
+            // read it (as failed, at its timeout) before getting here.
+            assert!(LOGIN_PATH.get().is_none(), "the window waited for its login shell");
+            let path = std::env::var("PATH").unwrap();
+            std::fs::write(dir.join("go"), "").unwrap();
+
+            let found = login_path();
+            assert_eq!(found.path.as_deref(), Ok(FRESH));
+            let (ok, text) = found.describe();
+            assert!(ok, "{text}");
+            // The next start takes on what the shell gives now.
+            assert_eq!(recorded(&record, &shell_program()).as_deref(), Some(FRESH));
+            match std::fs::read_to_string(dir.join("scenario")).unwrap().as_str() {
+                "dock" => {
+                    assert_eq!(path, "/opt/recorded/bin:/usr/bin:/bin");
+                    assert_eq!((found.added, found.late), (Some(1), 1));
+                    assert!(
+                        text.contains("as recorded at an earlier start") && text.contains("1 folder the shell has now")
+                    );
+                    assert_eq!(child_path().as_deref(), Some("/opt/fresh/bin:/opt/recorded/bin:/usr/bin:/bin"));
+                }
+                "terminal" => {
+                    assert_eq!(path, started_with);
+                    assert_eq!((found.added, found.late), (Some(0), 0));
+                    assert!(text.contains("which has all of login shell"), "{text}");
+                    assert_eq!(child_path(), None);
+                }
+                "first" => {
+                    assert_eq!(path, started_with);
+                    assert_eq!((found.added, found.late), (Some(0), 2));
+                    assert!(text.contains("2 folders of login shell"), "{text}");
+                    assert_eq!(child_path().as_deref(), Some("/opt/fresh/bin:/opt/recorded/bin:/usr/bin:/bin"));
+                }
+                scenario => panic!("{scenario}"),
+            }
+            return;
+        }
+
+        for (scenario, started_with) in [
+            // Started from the Dock or a launcher, with a PATH recorded at an earlier start.
+            ("dock", "/usr/bin:/bin"),
+            // Started from a terminal, whose PATH has all the login shell's folders.
+            ("terminal", "/bin:/opt/fresh/bin:/usr/bin:/opt/recorded/bin"),
+            // Started with nothing recorded.
+            ("first", "/usr/bin:/bin"),
+        ] {
+            let dir = crate::test_support::tempdir().unwrap();
+            // A slow login shell: it gives its PATH only once the test has seen the window start.
+            let shell = dir.path().join("login-shell");
+            crate::test_support::write_program(
+                &shell,
+                format!(
+                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do sleep \
+                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n"
+                ),
+            );
+            std::fs::write(dir.path().join("scenario"), scenario).unwrap();
+            if scenario != "first" {
+                record(&dir.path().join("login-path.json"), &shell.to_string_lossy(), RECORDED).unwrap();
+            }
+            let mut child = TestChild::spawn(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "setup::tests::a_window_takes_on_the_recorded_path_at_once_and_reads_the_shell_in_the_background",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, dir.path())
+                    .env("SHELL", &shell)
+                    .env("PATH", started_with)
+                    .env("ATOMICS_HOME", dir.path().join("state")),
+                CHILD_TIMEOUT,
+            )
+            .unwrap();
+            let output = child.wait_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_path_is_recorded_whole_and_for_its_shell_only() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("state").join("login-path.json");
+        assert_eq!(recorded(&file, "/bin/zsh"), None);
+        record(&file, "/bin/zsh", "/opt/a:/usr/bin").unwrap();
+        assert_eq!(recorded(&file, "/bin/zsh").as_deref(), Some("/opt/a:/usr/bin"));
+        // SHELL changed since: that shell's PATH is not this one's.
+        assert_eq!(recorded(&file, "/bin/bash"), None);
+        record(&file, "/bin/zsh", "/opt/b:/usr/bin").unwrap();
+        assert_eq!(recorded(&file, "/bin/zsh").as_deref(), Some("/opt/b:/usr/bin"));
+        assert_eq!(std::fs::read_dir(file.parent().unwrap()).unwrap().count(), 1, "no temporary file is left");
+        std::fs::write(&file, "not json").unwrap();
+        assert_eq!(recorded(&file, "/bin/zsh"), None);
     }
 
     #[test]

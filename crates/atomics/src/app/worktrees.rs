@@ -526,7 +526,7 @@ mod tests {
 
                 let codex = crate::setup::resolve_program("codex");
                 assert_eq!(codex, tools.join("codex").to_string_lossy());
-                assert_eq!(crate::setup::codex_supports_hooks(&codex, Duration::from_secs(10)), Some(true));
+                assert_eq!(crate::setup::codex_supports_hooks(&codex, None, Duration::from_secs(10)), Some(true));
 
                 state.config.base_ref = "main".into();
                 state.config.agents.push(atomics_core::config::AgentConfig {

@@ -154,7 +154,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             && let Some(path) = found
         {
             // Like agent launch, tolerate a cold CLI starting while other agents compile.
-            let supported = codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(10));
+            let supported = codex_supports_hooks(&path.to_string_lossy(), None, std::time::Duration::from_secs(10));
             lines.push(codex_version_check(supported));
             // An older Codex gets no hooks to trust.
             if supported != Some(false) {

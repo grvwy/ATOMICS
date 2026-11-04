@@ -502,8 +502,10 @@ fn main() -> eframe::Result {
         std::process::exit(code);
     }
     // After a link is forwarded, which needs no shell, and before the desktop starts any thread.
+    // The window never waits for the login shell: it takes on the PATH the shell gave last time,
+    // and reads the shell's current one in the background.
     // SAFETY: no other thread exists yet.
-    unsafe { setup::adopt_login_path() };
+    unsafe { setup::start_login_path() };
     // Shared, so desktops still run side by side; refused only while a headless host owns the home.
     let _instance = match instance::Lock::desktop(&atomics_core::paths::atomics_home()) {
         Ok(lock) => Some(lock),
