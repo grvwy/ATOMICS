@@ -2240,12 +2240,21 @@ fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(has(&shown, "Choose a folder on the host."), "{size:?}: {shown:?}");
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "▸ repo")));
+        view.desk.active = Some("s1".into());
+        view.desk.diff_root = Some(PathBuf::from(WORKTREE));
+        view.desk.diff_open = false;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Open this project or worktree")));
         settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(!client.management.project);
         assert!(world.sent().iter().any(|m| matches!(m, Message::HostCommand(c) if c.action == (HostAction::OpenProject { path: "/home/user/repo".into() }))));
         assert!(world.driver.remote.repos().contains(&PathBuf::from("/home/user/repo")));
+        assert!(view.desk.active.is_none(), "opening a project navigates in this browser");
+        assert_eq!(view.desk.diff_root.as_deref(), Some(Path::new("/home/user/repo")));
+        assert!(view.desk.diff_open);
+        if view.compact {
+            assert_eq!(view.diff.as_deref(), Some(Path::new("/home/user/repo")));
+        }
     }
 }
 

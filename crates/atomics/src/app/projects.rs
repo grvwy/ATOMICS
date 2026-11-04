@@ -95,14 +95,19 @@ impl State {
         format!("No ticket system is configured: {cause}.")
     }
 
+    /// Adds a resolved project root without changing the desktop's view.
+    pub(super) fn add_project(&mut self, root: &Path) {
+        if !self.open_projects.iter().any(|project| project == root) {
+            self.open_projects.push(root.to_path_buf());
+        }
+        self.remember_projects();
+        self.apply_config();
+    }
+
     pub(super) fn open_project(&mut self, dir: &Path) {
         match workspace::project_root(dir) {
             Ok(root) => {
-                if !self.open_projects.contains(&root) {
-                    self.open_projects.push(root.clone());
-                }
-                self.remember_projects();
-                self.apply_config();
+                self.add_project(&root);
                 self.active = None;
                 self.diff_root = Some(root.clone());
                 self.diff_open = true;

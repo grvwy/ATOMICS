@@ -108,10 +108,7 @@ impl State {
             }
             HostAction::OpenProject { path } => {
                 let root = workspace::project_root(&paths::expand(&path)).map_err(|e| rejected(format!("{e:#}")))?;
-                self.open_project(&root);
-                if let Some(worktree) = git::worktree_of(&paths::expand(&path)) {
-                    self.diff_root = Some(worktree.root);
-                }
+                self.add_project(&root);
             }
             HostAction::CloseProject { path } => {
                 let root = PathBuf::from(path);
@@ -338,7 +335,58 @@ fn credential_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{repository, with_state};
+    use crate::app::tests::{repository, session, with_state};
+
+    #[test]
+    fn remote_open_project_preserves_the_desktop_view() {
+        with_state("app::management::tests::remote_open_project_preserves_the_desktop_view", |mut state, _| {
+            let (_desktop_dir, desktop) = repository();
+            let desktop = desktop.canonicalize().unwrap();
+            let (_other_dir, other) = repository();
+            let other = other.canonicalize().unwrap();
+            state.open_project(&desktop);
+            state.sessions = vec![session("desktop-agent", AgentKind::Generic, AgentStatus::Working, &desktop)];
+            state.active = Some("desktop-agent".into());
+            let toast = state.toast.clone();
+
+            for diff_open in [false, true] {
+                state.diff_open = diff_open;
+                state.manage(HostAction::OpenProject { path: other.to_string_lossy().into_owned() }).unwrap();
+                assert_eq!(state.active.as_deref(), Some("desktop-agent"));
+                assert_eq!(state.diff_root.as_deref(), Some(desktop.as_path()));
+                assert_eq!(state.diff_open, diff_open);
+                assert_eq!(state.toast, toast, "a remote open must not toast on the desktop");
+            }
+
+            assert_eq!(state.open_projects, vec![desktop, other.clone()], "reopening must not duplicate it");
+            assert_eq!(Store::load(&paths::store_file()).projects, state.open_projects);
+            assert!(state.repos.contains(&other), "the shared configuration must include the new project");
+        });
+    }
+
+    #[test]
+    fn opening_a_project_on_the_desktop_still_navigates() {
+        with_state("app::management::tests::opening_a_project_on_the_desktop_still_navigates", |mut state, _| {
+            let (_desktop_dir, desktop) = repository();
+            let desktop = desktop.canonicalize().unwrap();
+            let (_other_dir, other) = repository();
+            let other = other.canonicalize().unwrap();
+            state.open_project(&desktop);
+            state.sessions = vec![session("desktop-agent", AgentKind::Generic, AgentStatus::Working, &desktop)];
+            state.active = Some("desktop-agent".into());
+            state.diff_open = false;
+            let below = other.join("src");
+            std::fs::create_dir(&below).unwrap();
+
+            state.open_project(&below);
+
+            assert_eq!(state.open_projects, vec![desktop, other.clone()]);
+            assert!(state.active.is_none());
+            assert_eq!(state.diff_root.as_deref(), Some(other.as_path()));
+            assert!(state.diff_open);
+            assert_eq!(state.toast.as_ref().unwrap().0, format!("Opened {}", paths::display(&other)));
+        });
+    }
 
     #[test]
     fn host_projects_and_proposals_are_visible_and_only_apply_writes() {
