@@ -302,12 +302,33 @@ pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Opti
 }
 
 /// Claude Code's user settings, in `$CLAUDE_CONFIG_DIR` when it is set, as Claude Code reads them.
-fn claude_settings_path() -> PathBuf {
+pub(crate) fn claude_settings_path() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .unwrap_or_else(|| paths::home().join(".claude"))
         .join("settings.json")
+}
+
+/// An explicit instance home also isolates the mutable provider trust and settings of the bare
+/// agents it starts.
+pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
+    let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
+    [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
+        .into_iter()
+        .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// The Codex home of a bare agent ATOMICS starts, where Codex keeps its hook trust: the instance's
+/// own ([`instance_agent_env`]), else the `$CODEX_HOME` it inherits, else `~/.codex`.
+pub(crate) fn agent_codex_home() -> PathBuf {
+    instance_agent_env()
+        .into_iter()
+        .find(|(key, _)| key == "CODEX_HOME")
+        .map(|(_, home)| PathBuf::from(home))
+        .or_else(|| std::env::var_os("CODEX_HOME").filter(|home| !home.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| paths::home().join(".codex"))
 }
 
 pub fn global_hooks_installed() -> bool {

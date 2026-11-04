@@ -494,3 +494,49 @@ fn with_remote_on_a_taken_port_the_host_fails_loudly_and_cleans_up() {
     let output = host.wait_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
+    let instance = Instance::new(None);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
+    // An earlier version left the ledger noting a git record whose file and sandbox are gone, so
+    // every start and plan cleanup failed on it, and kept those failures forever.
+    let record = instance.home().join("git-pins/atomics-gone.json");
+    std::fs::write(
+        instance.home().join("sandbox-ownership.json"),
+        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins")}}).to_string(),
+    )
+    .unwrap();
+    let missing = format!("reading {}: No such file or directory (os error 2)", record.display());
+    let alert = "Final ref guard check FAILED: refs/heads/main moved";
+    let notes = [
+        format!("Startup cleanup skipped: {missing}"),
+        format!("Plan cleanup skipped: {missing}"),
+        "Worktrees /home/user/deleted-scratch: git worktree list --porcelain failed: fatal: cannot change to".into(),
+        alert.to_string(),
+    ];
+    std::fs::write(instance.home().join("cleanup-leftovers.json"), json!(notes).to_string()).unwrap();
+
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let kept = || {
+        std::fs::read(instance.home().join("cleanup-leftovers.json"))
+            .map(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).unwrap())
+            .unwrap_or_default()
+    };
+    eventually("the startup sweep to drop what it no longer finds", || kept() == [alert]);
+    assert!(!instance.home().join("cleanup-sweep.json").exists(), "the sweep found nothing to report");
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(instance.home().join("sandbox-ownership.json")).unwrap()).unwrap();
+    assert!(ledger.get("atomics-gone").is_none(), "{ledger}");
+
+    let doctor = test_support::output(&mut instance.command(["doctor"]));
+    let text = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(text.matches("cleanup leftover").count(), 1, "{text}");
+    assert!(text.contains(&format!("✗ cleanup leftover (warning): {alert}")), "{text}");
+
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    let output = host.wait_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}

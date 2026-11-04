@@ -1237,17 +1237,17 @@ impl State {
             self.store.restart.iter().flat_map(|r| &r.sessions).filter_map(|r| paths::scratch_of(&r.cwd)).collect();
         self.startup_cleanup = Some(std::thread::spawn(move || {
             let sbx = resolve_program(&sbx);
+            let kept = crate::lifecycle::kept_leftovers(&home);
             let scratch_before = cutoff.as_ref().ok().map(crate::lifecycle::Cutoff::files);
-            let mut notes = match cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff))
-            {
-                Ok(notes) => notes,
-                Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
-            };
+            let swept = cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff));
+            let pins_loaded = swept.is_ok();
+            let mut notes = swept.unwrap_or_else(|err| vec![format!("Startup cleanup skipped: {err:#}")]);
             if let Some(before) = scratch_before {
                 notes.extend(crate::lifecycle::sweep_scratch(&home, &resumed, before));
             }
             crate::sandbox::prune_pins(&home, &home.join("git-pins"), &sbx);
-            crate::lifecycle::record_leftovers(&home, &notes);
+            // Replaces the previous start's notes: what this sweep no longer finds is fixed.
+            crate::lifecycle::record_sweep(&home, &notes, pins_loaded, &kept);
             if !notes.is_empty() {
                 let _ = actions.send(Box::new(move |state| state.toast(notes.join("\n"))));
             }
@@ -1338,7 +1338,7 @@ impl State {
         let deadline = Instant::now() + QUIT_JOBS_WAIT;
         let unfinished = self.lifecycle_jobs.drain(..).filter(|job| !job.wait_until(deadline)).count();
         if unfinished > 0 {
-            notes.push(format!("{unfinished} sandbox or worktree cleanup jobs were still running at quit"));
+            notes.push(format!("{unfinished}{}", crate::lifecycle::UNFINISHED_AT_QUIT));
         }
         crate::lifecycle::record_leftovers(&paths::atomics_home(), &notes);
         // Quitting ends scratch sessions for good; a restart resumes them in their folders.

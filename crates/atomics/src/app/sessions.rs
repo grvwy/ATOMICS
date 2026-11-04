@@ -452,7 +452,7 @@ impl State {
                 .collect();
         env.insert("COLORFGBG".into(), self.theme.colorfgbg().into());
         if sandboxed.is_none() && agent.kind != AgentKind::Shell {
-            env.extend(instance_agent_env());
+            env.extend(crate::setup::instance_agent_env());
         }
         if sandboxed.is_none()
             && let Some(granted) = &relay
@@ -1251,15 +1251,6 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
                     && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
         })
         .map(|line| format!("Credential error: {}", line.trim()))
-}
-
-/// An explicit instance home must also isolate mutable provider trust and settings.
-fn instance_agent_env() -> Vec<(String, String)> {
-    let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
-    [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
-        .into_iter()
-        .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
-        .collect()
 }
 
 fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
