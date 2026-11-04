@@ -581,12 +581,19 @@ impl State {
             let result = match result {
                 Ok(TicketOutput::Cards(mut cards)) => {
                     cards.truncate(*take);
-                    if let Some((query, semantic)) = query {
+                    Ok(ticket::cards_reply(&cards))
+                }
+                Ok(TicketOutput::Page(mut cards, _, fell_back)) => {
+                    cards.truncate(*take);
+                    let semantic = query.as_ref().is_some_and(|(_, semantic)| *semantic) && fell_back.is_none();
+                    if let Some((query, _)) = query {
                         let query = self.cleaner().field(query);
                         self.tickets_found(&query, cards.clone(), true);
-                        self.tickets.panel.find.ran = Some((query, *semantic));
+                        let find = &mut self.tickets.panel.find;
+                        find.ran = Some((query, semantic));
+                        find.fell_back.clone_from(&fell_back);
                     }
-                    Ok(ticket::cards_reply(&cards))
+                    Ok(ticket::search_reply(&cards, semantic, fell_back.as_deref()))
                 }
                 Ok(TicketOutput::Card(card)) => Ok(ticket::card_reply(&card)),
                 Ok(_) => Err("unexpected ticket card result".into()),
@@ -1318,9 +1325,12 @@ impl State {
                     reject("query must not be empty and take must be at least 1".into());
                     return;
                 }
-                // A profile may only search by meaning; that is then what a plain search does.
-                *semantic = *semantic
-                    || (config.operation("search").is_none() && config.operation("semantic_search").is_some());
+                // A profile with one search uses it whichever was asked for; the reply says which ran.
+                let (keyword, meaning) =
+                    (config.operation("search").is_some(), config.operation("semantic_search").is_some());
+                if keyword != meaning {
+                    *semantic = meaning;
+                }
                 (if *semantic { "semantic_search" } else { "search" }, Some((self.cleaner().field(query), *semantic)))
             }
             TicketOp::ReadCard(link) | TicketOp::Children(link) | TicketOp::Related(link) => {
@@ -1849,6 +1859,88 @@ mod tests {
             app.runtime.apply_ticket_config();
             let none = chief_tool(app, "atomics_ticket_search", json!({"query":"DEMO-3"}));
             assert!(!none.ok && none.error.unwrap().contains("tickets.operations.search"));
+        });
+    }
+
+    #[test]
+    fn ticket_search_uses_either_mode_over_http_and_says_which_ran() {
+        with_app("app::tickets::tests::ticket_search_uses_either_mode_over_http_and_says_which_ran", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = dir.path().join("demo.json");
+            let (config, _api) = crate::mcp_client::tests::rest_example(&path);
+            app.runtime.config.tickets = config;
+            app.runtime.apply_ticket_config();
+            let search = "/v1/api/v1/tickets/search";
+            let last_target = |path: &Path| -> String {
+                let state = fake(path);
+                state["http_requests"].as_array().unwrap().last().unwrap()["target"].as_str().unwrap().to_string()
+            };
+            let first_key =
+                |response: &ControlResponse| response.result["cards"][0]["key"].as_str().map(str::to_string);
+
+            for (semantic, mode) in [(true, "meaning"), (false, "keyword")] {
+                let found =
+                    chief_tool(app, "atomics_ticket_search", json!({"query":"browser OAuth", "semantic":semantic}));
+                assert!(found.ok, "{found:?}");
+                assert_eq!(found.result["mode"], mode);
+                assert!(found.result.get("fell_back").is_none());
+                assert_eq!(first_key(&found).as_deref(), Some("DEMO-2"));
+                assert_eq!(last_target(&path), format!("{search}?semantic={semantic}"));
+                assert_eq!(app.runtime.tickets.panel.find.ran, Some(("browser OAuth".into(), semantic)));
+                // A key finds its ticket whichever mode runs, and the search still runs.
+                for query in ["DEMO-3", "demo-3", "3"] {
+                    let found = chief_tool(app, "atomics_ticket_search", json!({"query":query, "semantic":semantic}));
+                    assert!(found.ok, "{query}: {found:?}");
+                    assert_eq!(first_key(&found).as_deref(), Some("DEMO-3"), "{query}");
+                    assert_eq!(found.result["mode"], mode, "{query}");
+                    assert_eq!(last_target(&path), format!("{search}?semantic={semantic}"), "{query}");
+                }
+            }
+            // Both mapped and no flag: keyword, as the tool says.
+            let plain = chief_tool(app, "atomics_ticket_search", json!({"query":"browser OAuth"}));
+            assert_eq!(plain.result["mode"], "keyword");
+
+            // The system answered by keyword: the reply and the panel say why.
+            edit_fake(&path, |fake| fake["semantic_state"] = json!("unavailable"));
+            let fell = chief_tool(app, "atomics_ticket_search", json!({"query":"browser OAuth", "semantic":true}));
+            assert!(fell.ok, "{fell:?}");
+            assert_eq!((&fell.result["mode"], &fell.result["fell_back"]), (&json!("keyword"), &json!("unavailable")));
+            let find = &app.runtime.tickets.panel.find;
+            assert_eq!(find.ran, Some(("browser OAuth".into(), false)));
+            assert_eq!(find.fell_back.as_deref(), Some("unavailable"));
+            edit_fake(&path, |fake| fake["semantic_state"] = json!("ready"));
+
+            // A key alone reads and lists through the API, which takes UUIDs.
+            let read = chief_tool(app, "atomics_ticket_read", json!({"ticket":"DEMO-2"}));
+            assert!(read.ok, "{read:?}");
+            assert!(read.result["card"]["body"].as_str().unwrap().contains("## Goal"));
+            assert_eq!(read.result["card"]["comments"].as_array().unwrap().len(), 1);
+            assert_eq!(read.result["card"]["links"][0]["ci"], "Passed");
+            let children = chief_tool(app, "atomics_ticket_children", json!({"ticket":"DEMO-1"}));
+            assert!(children.ok, "{children:?}");
+            assert_eq!(children.result["cards"].as_array().unwrap().len(), 4);
+            let missing = chief_tool(app, "atomics_ticket_read", json!({"ticket":"DEMO-999"}));
+            assert!(!missing.ok, "{missing:?}");
+
+            // One search mapped: that one runs, whichever was asked for.
+            let both = app.runtime.config.tickets.operations.clone();
+            app.runtime.config.tickets.operations.semantic_search = None;
+            app.runtime.apply_ticket_config();
+            for args in [json!({"query":"browser OAuth", "semantic":true}), json!({"query":"browser OAuth"})] {
+                let only = chief_tool(app, "atomics_ticket_search", args);
+                assert!(only.ok, "{only:?}");
+                assert_eq!(only.result["mode"], "keyword");
+                assert_eq!(last_target(&path), format!("{search}?semantic=false"));
+            }
+            app.runtime.config.tickets.operations = both;
+            app.runtime.config.tickets.operations.search = None;
+            app.runtime.apply_ticket_config();
+            for args in [json!({"query":"browser OAuth", "semantic":false}), json!({"query":"browser OAuth"})] {
+                let only = chief_tool(app, "atomics_ticket_search", args);
+                assert!(only.ok, "{only:?}");
+                assert_eq!(only.result["mode"], "meaning");
+                assert_eq!(last_target(&path), format!("{search}?semantic=true"));
+            }
         });
     }
 

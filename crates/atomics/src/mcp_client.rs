@@ -581,9 +581,10 @@ pub(crate) mod tests {
     /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
     pub(crate) fn example_profile(name: &str, state: &std::path::Path) -> atomics_core::tickets::TicketConfig {
         let template = atomics_core::config::DEFAULT_CONFIG;
-        let semantic = match name {
-            "meaning-example" => true,
-            "keyword-example" => false,
+        let wanted = |config: &atomics_core::tickets::TicketConfig| match name {
+            "meaning-example" => config.operation("semantic_search").is_some(),
+            "keyword-example" => config.operation("semantic_search").is_none(),
+            "rest-example" => !config.http.url.is_empty(),
             _ => panic!("unknown example profile {name}"),
         };
         let mut tickets = template
@@ -600,8 +601,8 @@ pub(crate) mod tests {
                     .join("\n");
                 toml::from_str::<atomics_core::config::Config>(&text).unwrap().tickets
             })
-            .find(|config| config.operation("semantic_search").is_some() == semantic)
-            .expect("the commented examples include meaning and keyword profiles");
+            .find(wanted)
+            .expect("the commented examples include meaning, keyword and REST profiles");
         tickets.system = name.into();
         tickets.workflow = "Example ticket workflow.".into();
         if tickets.link_url.is_some() {
@@ -640,6 +641,15 @@ pub(crate) mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    /// The shipped REST example against the fake server: its paths on the fake's REST API, its tools
+    /// on the fake's stdio server.
+    pub(crate) fn rest_example(state: &std::path::Path) -> (atomics_core::tickets::TicketConfig, FakeHttp) {
+        let mut config = example_profile("rest-example", state);
+        let api = FakeHttp::start(state);
+        config.http.url = api.url.clone();
+        (config, api)
     }
 
     /// The same profile with every read that may use `http` moved from its tool to a POST of that

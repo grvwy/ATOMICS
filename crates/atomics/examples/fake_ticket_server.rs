@@ -7,8 +7,16 @@
 //! query string (a repeated key is an array, `status` always is), the JSON body and the path's pairs
 //! are its arguments, and the answer is its result as plain JSON. A tool that fails answers
 //! `fail_status` (default 400). `http_token` in the state makes every request need that bearer
-//! token, and `http_requests` records each request's method, target and `Authorization`. Every
-//! answer carries the header `X-Fake-Request: 1`.
+//! token, and `http_requests` records each request's method, target, body and `Authorization`.
+//! Every answer carries the header `X-Fake-Request: 1`.
+//!
+//! The same port also serves tickets as a REST API under `/v1/api/v1/tickets`, the shape the REST
+//! example profile reads: `POST search` (`semantic=true` in the query string; `query`, `baseViewKey`
+//! and `baseViewValueKey` in the body), `by-key/<key>`, `<uuid>`, `<uuid>/children` and
+//! `<uuid>/comments`. A meaning search answers the header `X-Semantic-State` from the state's
+//! `semantic_state` (default `ready`); `unconfigured` or `unavailable` means it searched by keyword.
+//! A bare number finds the ticket with that number and is not a meaning search. `Done` tickets
+//! are not in `work-active`.
 //!
 //! It speaks three unrelated tool dialects, so tests can swap ticket systems by config
 //! alone: "card_*" tools with nested, structured results, and "issue_*" tools with
@@ -80,16 +88,17 @@ fn serve_http(path: &str) {
     std::io::stdout().flush().unwrap();
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        let Ok((status, body)) = answer_http(path, &mut stream) else { continue };
+        let Ok((status, body, semantic)) = answer_http(path, &mut stream) else { continue };
+        let semantic = semantic.map_or(String::new(), |state| format!("X-Semantic-State: {state}\r\n"));
         let reply = format!(
-            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Fake-Request: 1\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Fake-Request: 1\r\n{semantic}Connection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.write_all(reply.as_bytes());
     }
 }
 
-fn answer_http(path: &str, stream: &mut std::net::TcpStream) -> std::io::Result<(u16, String)> {
+fn answer_http(path: &str, stream: &mut std::net::TcpStream) -> std::io::Result<(u16, String, Option<String>)> {
     let mut reader = std::io::BufReader::new(stream);
     let mut first = String::new();
     reader.read_line(&mut first)?;
@@ -115,19 +124,23 @@ fn answer_http(path: &str, stream: &mut std::net::TcpStream) -> std::io::Result<
     if !state["http_requests"].is_array() {
         state["http_requests"] = json!([]);
     }
-    let log = json!({"method":method, "target":target, "authorization":authorization});
+    let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let log = json!({"method":method, "target":target, "body":sent, "authorization":authorization});
     state["http_requests"].as_array_mut().unwrap().push(log);
     save(path, &state);
     if let Some(token) = state["http_token"].as_str()
         && authorization.as_deref() != Some(format!("Bearer {token}").as_str())
     {
-        return Ok((401, json!({"message":"sign in"}).to_string()));
+        return Ok((401, json!({"message":"sign in"}).to_string(), None));
     }
     let (route, query) = target.split_once('?').unwrap_or((target, ""));
     let segments: Vec<String> = route.split('/').map(decode).collect();
     let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    if let ["", "v1", "api", "v1", "tickets", rest @ ..] = segments.as_slice() {
+        return Ok(answer_rest(&state, rest, query, &sent));
+    }
     let ["", "v1", "tools", tool, pairs @ ..] = segments.as_slice() else {
-        return Ok((404, json!({"message":"no such route"}).to_string()));
+        return Ok((404, json!({"message":"no such route"}).to_string(), None));
     };
     let mut arguments = if body.is_empty() { json!({}) } else { serde_json::from_slice(&body)? };
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
@@ -158,11 +171,72 @@ fn answer_http(path: &str, stream: &mut std::net::TcpStream) -> std::io::Result<
             let refused =
                 result.get("structuredContent").cloned().unwrap_or(json!({"message":result["content"][0]["text"]}));
             let state: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-            (state["fail_status"].as_u64().unwrap_or(400) as u16, refused.to_string())
+            (state["fail_status"].as_u64().unwrap_or(400) as u16, refused.to_string(), None)
         }
-        Ok(result) => (200, atomics_core::tickets::tool_output(&result).to_string()),
-        Err(message) => (400, json!({"message":message}).to_string()),
+        Ok(result) => (200, atomics_core::tickets::tool_output(&result).to_string(), None),
+        Err(message) => (400, json!({"message":message}).to_string(), None),
     })
+}
+
+/// The REST API's routes under `tickets`; the module comment says what each answers.
+fn answer_rest(state: &Value, route: &[&str], query: &str, body: &Value) -> (u16, String, Option<String>) {
+    let tickets = state["tickets"].as_array().map_or(&[][..], Vec::as_slice);
+    let page = |items: Vec<Value>| json!({"totalCount":items.len(), "items":items, "skip":0, "take":50, "facets":[]});
+    let one = |field: &str, value: &str| {
+        let ticket = tickets.iter().find(|ticket| ticket[field] == value);
+        ticket.map_or((404, json!({"message":"no such ticket"})), |ticket| (200, rest_ticket(ticket)))
+    };
+    let mut semantic = None;
+    let (status, answer) = match route {
+        ["search"] => {
+            let text = body["query"].as_str().unwrap_or_default().trim();
+            let number = text.strip_prefix('#').unwrap_or(text).parse::<u64>().ok();
+            if query.split('&').any(|pair| pair == "semantic=true") && !text.is_empty() && number.is_none() {
+                semantic = Some(state["semantic_state"].as_str().unwrap_or("ready").to_string());
+            }
+            let me = state["me"].as_str().unwrap_or("Demo User");
+            let view = |ticket: &&Value| match body["baseViewKey"].as_str() {
+                Some("work-active") => ticket["state"] != "Done",
+                Some("work-my") => body["baseViewValueKey"] != "assigned-to-me" || ticket["assignee"] == me,
+                _ => true,
+            };
+            let named = |ticket: &&Value| {
+                number.is_none_or(|n| ticket["key"].as_str().is_some_and(|key| key.ends_with(&format!("-{n}"))))
+            };
+            let hits: Vec<&Value> = match number {
+                Some(_) => tickets.iter().filter(named).collect(),
+                None => search(state, &json!(text)).collect(),
+            };
+            (200, page(hits.into_iter().filter(|ticket| view(ticket)).map(rest_ticket).collect()))
+        }
+        ["by-key", key] => one("key", key),
+        [id] => one("id", id),
+        [id, "children"] => {
+            (200, page(tickets.iter().filter(|ticket| ticket["parent"] == *id).map(rest_ticket).collect()))
+        }
+        [id, "comments"] => match tickets.iter().find(|ticket| ticket["id"] == *id) {
+            Some(ticket) => {
+                let comments = ticket["comments"].as_array().map_or(&[][..], Vec::as_slice);
+                let comments = comments.iter().enumerate().map(|(index, comment)| {
+                    json!({"sequence":index + 1, "commentId":format!("c{index}"), "body":comment["body"],
+                        "authorUserId":"u1", "authorDisplayName":comment["authorDisplayName"], "authorIdentityKind":comment["authorIdentityKind"],
+                        "createdAtUtc":comment["createdAtUtc"]})
+                });
+                (200, json!({"items":comments.collect::<Vec<_>>(), "nextBeforeSequence":null}))
+            }
+            None => (404, json!({"message":"no such ticket"})),
+        },
+        _ => (404, json!({"message":"no such route"})),
+    };
+    (status, answer.to_string(), semantic)
+}
+
+/// A ticket as the REST API answers it, with its fields under their own names.
+fn rest_ticket(ticket: &Value) -> Value {
+    json!({"id":ticket["id"], "ticketNumber":ticket["key"], "subject":ticket["title"], "status":ticket["state"],
+        "updatedAtUtc":format!("rev-{}", ticket["rev"].as_u64().unwrap_or(0)), "assigneeDisplayName":ticket["assignee"],
+        "parentTicketId":ticket["parent"], "ticketTypeKey":ticket["kind"], "description":ticket["description"],
+        "developmentLinks":ticket["developmentLinks"]})
 }
 
 fn decode(text: &str) -> String {

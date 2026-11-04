@@ -64,8 +64,10 @@ pub(super) struct Find {
     pub selected: Option<usize>,
     pub busy: bool,
     pub error: Option<String>,
-    /// The query that made the results, and whether it searched by meaning.
+    /// The query that made the results, and whether they came by meaning.
     pub ran: Option<(String, bool)>,
+    /// The status that says a meaning search was answered by keyword.
+    pub fell_back: Option<String>,
     /// The chief ran the search; the user's own query box is untouched.
     pub from_chief: bool,
     /// The view whose listing made the results, when no query did.
@@ -751,7 +753,7 @@ impl State {
                     restart = matches!(&result, Err((false, _)));
                 }
                 match result {
-                    Ok(TicketOutput::Page(mut cards, next)) if job == Job::More => {
+                    Ok(TicketOutput::Page(mut cards, next, _)) if job == Job::More => {
                         // A key's ticket, already first, can come up again on a later page.
                         cards.retain(|card| !find.results.iter().any(|row| row.link.same_ticket(&card.link)));
                         if panel.view == TicketsView::Find && !cards.is_empty() {
@@ -762,11 +764,15 @@ impl State {
                         find.next = next;
                         advance = find.read_next.take();
                     }
-                    Ok(TicketOutput::Page(cards, next)) => {
+                    Ok(TicketOutput::Page(cards, next, fell_back)) => {
                         find.selected = (!cards.is_empty()).then_some(0);
                         find.reveal = true;
                         find.results = cards;
                         find.next = next;
+                        if let (Some(ran), true) = (&mut find.ran, fell_back.is_some()) {
+                            ran.1 = false;
+                        }
+                        find.fell_back = fell_back;
                     }
                     Ok(TicketOutput::Cards(cards)) => {
                         find.selected = (!cards.is_empty()).then_some(0);
@@ -1110,9 +1116,10 @@ impl Desktop<'_> {
         let in_box = ui.memory(|m| m.has_focus(query_id));
         let plain = |key: Key| panel_nav::consume_bare(ui, key);
         if in_box {
-            // Tab toggles the mode, ↓ enters the list, Escape leaves the box.
+            // Tab toggles the mode and searches again, ↓ enters the list, Escape leaves the box.
             if both && plain(Key::Tab) {
                 panel.keyword = !panel.keyword;
+                acts.push(Act::Search);
             }
             if plain(Key::ArrowDown) {
                 ui.memory_mut(|m| {
@@ -1174,11 +1181,11 @@ impl Desktop<'_> {
                 acts.push(Act::Search);
             }
             if both {
-                if ui.selectable_label(!panel.keyword, "meaning").clicked() {
-                    panel.keyword = false;
-                }
-                if ui.selectable_label(panel.keyword, "keyword").clicked() {
-                    panel.keyword = true;
+                for (keyword, label) in [(false, "meaning"), (true, "keyword")] {
+                    if ui.selectable_label(panel.keyword == keyword, label).clicked() && panel.keyword != keyword {
+                        panel.keyword = keyword;
+                        acts.push(Act::Search);
+                    }
                 }
             }
         });
@@ -1210,8 +1217,9 @@ impl Desktop<'_> {
         } else if let Some((query, semantic)) = &find.ran {
             let how = if *semantic { "by meaning" } else { "by keyword" };
             let n = find.results.len();
+            let why = find.fell_back.as_ref().map_or(String::new(), |why| format!(" · meaning search: {why}"));
             let who = if find.from_chief { format!(" · from the chief: “{query}”") } else { String::new() };
-            format!("{n} ticket{} {how}{who}", if n == 1 { "" } else { "s" })
+            format!("{n} ticket{} {how}{why}{who}", if n == 1 { "" } else { "s" })
         } else {
             "Type a query and press Enter.".to_string()
         };
@@ -2518,6 +2526,245 @@ mod tests {
         });
     }
 
+    /// The shipped REST example on the fake API; the guard keeps the API running.
+    fn rest_profile(app: &mut Desktop<'_>, state: &Path) -> crate::mcp_client::tests::FakeHttp {
+        let (config, api) = crate::mcp_client::tests::rest_example(state);
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        api
+    }
+
+    /// The last request the fake API received: its target and body.
+    fn last_request(state: &Path) -> (String, serde_json::Value) {
+        let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
+        let last = state["http_requests"].as_array().unwrap().last().unwrap();
+        (last["target"].as_str().unwrap().to_string(), last["body"].clone())
+    }
+
+    const BY_MEANING: &str = "/v1/api/v1/tickets/search?semantic=true";
+    const BY_KEYWORD: &str = "/v1/api/v1/tickets/search?semantic=false";
+
+    /// Where a word is drawn in a frame's output.
+    fn word_at(output: &egui::FullOutput, word: &str) -> Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == word => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{word} is not drawn"))
+    }
+
+    fn click(app: &mut Desktop<'_>, ctx: &egui::Context, at: Pos2) {
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: NONE,
+        };
+        frame(app, ctx, vec![egui::Event::PointerMoved(at), press(true)]);
+        frame(app, ctx, vec![press(false)]);
+    }
+
+    #[test]
+    fn both_searches_over_http_show_the_toggle_and_a_new_mode_searches_again() {
+        with_app(
+            "app::tickets_panel::tests::both_searches_over_http_show_the_toggle_and_a_new_mode_searches_again",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                let _api = rest_profile(app, &state);
+                app.runtime.panel = PanelMode::Tickets;
+                app.runtime.diff_open = true;
+                app.runtime.tickets.panel.view = TicketsView::Find;
+                app.runtime.tickets.panel.focus_query = true;
+                frame(app, ctx, vec![]);
+                settle(app);
+                let shown = frame(app, ctx, vec![]);
+                let text = texts(&shown).join("\n");
+                assert!(text.contains("meaning") && text.contains("keyword"), "{text}");
+                assert!(!app.runtime.tickets.panel.keyword, "meaning first");
+                assert_eq!(last_request(&state).1["baseViewKey"], "work-active", "the first tab lists");
+
+                // Typed and not yet searched: Tab switches and searches.
+                let query = "browser OAuth";
+                app.runtime.tickets.panel.query = query.into();
+                frame(app, ctx, press(Key::Tab, NONE));
+                assert!(app.runtime.tickets.panel.keyword);
+                assert!(app.runtime.tickets.panel.find.busy, "a new mode searches at once");
+                settle(app);
+                assert_eq!(app.runtime.tickets.panel.find.ran, Some((query.to_string(), false)));
+                assert_eq!(last_request(&state).0, BY_KEYWORD);
+                assert_eq!(last_request(&state).1["query"], query);
+                assert_eq!(labels(app), ["DEMO-2"]);
+                assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("1 ticket by keyword"));
+                assert!(ctx.memory(|m| m.has_focus(query_id())), "Tab stays in the box");
+
+                frame(app, ctx, press(Key::Tab, NONE));
+                settle(app);
+                assert!(!app.runtime.tickets.panel.keyword);
+                assert_eq!(app.runtime.tickets.panel.find.ran, Some((query.to_string(), true)));
+                assert_eq!(last_request(&state).0, BY_MEANING);
+                assert_eq!(labels(app), ["DEMO-2"]);
+                assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("1 ticket by meaning"));
+
+                // The labels do the same, and the mode already on does nothing.
+                let requests = |state: &Path| -> usize {
+                    let state: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
+                    state["http_requests"].as_array().unwrap().len()
+                };
+                let shown = frame(app, ctx, vec![]);
+                let (meaning, keyword) = (word_at(&shown, "meaning"), word_at(&shown, "keyword"));
+                let before = requests(&state);
+                click(app, ctx, meaning);
+                settle(app);
+                assert_eq!(requests(&state), before, "already by meaning");
+                click(app, ctx, keyword);
+                settle(app);
+                assert!(app.runtime.tickets.panel.keyword);
+                assert_eq!(last_request(&state).0, BY_KEYWORD);
+
+                // Nothing to search: the mode changes, and the view stays listed.
+                app.runtime.tickets.panel.focus_query = true;
+                app.runtime.tickets.panel.query.clear();
+                frame(app, ctx, vec![]);
+                settle(app);
+                assert_eq!(app.runtime.tickets.panel.find.listed, Some(0));
+                let before = requests(&state);
+                frame(app, ctx, press(Key::Tab, NONE));
+                settle(app);
+                assert!(!app.runtime.tickets.panel.keyword);
+                assert_eq!(app.runtime.tickets.panel.find.listed, Some(0));
+                assert_eq!(requests(&state), before);
+            },
+        );
+    }
+
+    #[test]
+    fn a_key_finds_its_ticket_in_either_mode_over_http() {
+        with_app("app::tickets_panel::tests::a_key_finds_its_ticket_in_either_mode_over_http", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let _api = rest_profile(app, &state);
+            search_for(app, "workspace");
+            edit_state(&state, |state| {
+                let tickets = state["tickets"].as_array_mut().unwrap();
+                let mut mention = tickets[0].clone();
+                mention["id"] = "00000000-0000-4000-8000-000000000040".into();
+                mention["key"] = "DEMO-40".into();
+                mention["title"] = "Follow-up to DEMO-3, ticket 3".into();
+                tickets.insert(0, mention);
+            });
+            for keyword in [false, true] {
+                app.runtime.tickets.panel.keyword = keyword;
+                for (query, found) in [
+                    ("DEMO-3", vec!["DEMO-3", "DEMO-40"]),
+                    ("demo-3", vec!["DEMO-3", "DEMO-40"]),
+                    ("#DEMO-3", vec!["DEMO-3"]),
+                    ("3", vec!["DEMO-3"]),
+                ] {
+                    search_for(app, query);
+                    let find = &app.runtime.tickets.panel.find;
+                    assert!(find.error.is_none(), "{query}: {:?}", find.error);
+                    assert_eq!(labels(app), found, "keyword {keyword}, {query}");
+                    assert_eq!(find.ran.as_ref().unwrap().1, !keyword, "{query}");
+                    let target = if keyword { BY_KEYWORD } else { BY_MEANING };
+                    assert_eq!(last_request(&state).0, target, "{query}: the search still runs");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_meaning_search_answered_by_keyword_says_so() {
+        with_app("app::tickets_panel::tests::a_meaning_search_answered_by_keyword_says_so", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let _api = rest_profile(app, &state);
+            app.runtime.panel = PanelMode::Tickets;
+            app.runtime.diff_open = true;
+            search_for(app, "browser OAuth");
+            assert_eq!(app.runtime.tickets.panel.find.fell_back, None);
+            for why in ["unconfigured", "unavailable"] {
+                edit_state(&state, |state| state["semantic_state"] = why.into());
+                search_for(app, "browser OAuth");
+                let find = &app.runtime.tickets.panel.find;
+                assert_eq!(find.ran, Some(("browser OAuth".to_string(), false)), "{why}");
+                assert_eq!(find.fell_back.as_deref(), Some(why));
+                assert!(!app.runtime.tickets.panel.keyword, "the choice stays the person's");
+                let text = texts(&frame(app, ctx, vec![])).join("\n");
+                assert!(text.contains(&format!("1 ticket by keyword · meaning search: {why}")), "{text}");
+            }
+            // Still indexing is an answer by meaning.
+            edit_state(&state, |state| state["semantic_state"] = "pending".into());
+            search_for(app, "browser OAuth");
+            let find = &app.runtime.tickets.panel.find;
+            assert_eq!((find.ran.as_ref().unwrap().1, find.fell_back.as_deref()), (true, None));
+            assert_eq!(last_request(&state).0, BY_MEANING);
+        });
+    }
+
+    #[test]
+    fn the_rest_example_lists_its_views_and_reads_a_ticket() {
+        with_app("app::tickets_panel::tests::the_rest_example_lists_its_views_and_reads_a_ticket", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let _api = rest_profile(app, &state);
+            app.runtime.panel = PanelMode::Tickets;
+            app.runtime.diff_open = true;
+            search_for(app, "workspace");
+            edit_state(&state, |state| {
+                state["me"] = "Someone Else".into();
+                let tickets = state["tickets"].as_array_mut().unwrap();
+                tickets[4]["state"] = "Done".into();
+                tickets[1]["assignee"] = "Someone Else".into();
+            });
+            for (tab, view, value, count) in
+                [(0, "work-active", None, 4), (1, "work-all", None, 5), (2, "work-my", Some("assigned-to-me"), 1)]
+            {
+                app.runtime.tickets_tab(tab);
+                settle(app);
+                let find = &app.runtime.tickets.panel.find;
+                assert!(find.error.is_none(), "{view}: {:?}", find.error);
+                assert_eq!(find.results.len(), count, "{view}");
+                let (target, body) = last_request(&state);
+                assert_eq!(target, BY_KEYWORD, "{view}");
+                assert_eq!(body["baseViewKey"], view);
+                assert_eq!(body["baseViewValueKey"].as_str(), value);
+                assert!(body.get("query").is_none(), "{view}");
+            }
+            let text = texts(&frame(app, ctx, vec![])).join("\n");
+            assert!(text.contains("Active") && text.contains("All") && text.contains("Mine"), "{text}");
+
+            // A ticket known only by its key: the API's reads take its UUID, which `get` finds.
+            let link = TicketLink {
+                system: app.runtime.config.tickets.system.clone(),
+                id: "DEMO-1".into(),
+                ..Default::default()
+            };
+            app.runtime.open_ticket(link, Nav::Fresh);
+            settle(app);
+            let read = app.runtime.tickets.panel.read.as_ref().unwrap();
+            assert!(read.error.is_none(), "{:?}", read.error);
+            assert_eq!(read.card.link.key.as_deref(), Some("DEMO-1"));
+            assert_eq!(read.card.link.id, "00000000-0000-4000-8000-000000000001");
+            assert_eq!(
+                read.card.link.url.as_deref(),
+                Some("https://tickets.example/?selected=00000000-0000-4000-8000-000000000001")
+            );
+            assert!(read.card.body.as_deref().unwrap().contains("## Goal"));
+            assert_eq!(read.card.comments.len(), 1);
+            assert_eq!(read.card.comments[0].kind.as_deref(), Some("Agent"));
+            assert_eq!(read.card.comments[0].author_id.as_deref(), Some("u1"));
+            assert_eq!(read.children.items().len(), 4, "over http");
+            assert!(!read.related.items().is_empty(), "over the server");
+        });
+    }
+
     fn finds_and_reads(app: &mut Desktop<'_>, ctx: &egui::Context) {
         app.runtime.panel = PanelMode::Tickets;
         app.runtime.diff_open = true;
@@ -2803,7 +3050,7 @@ mod tests {
             assert_eq!(labels(app)[0], "DEMO-2");
             assert_ne!(app.runtime.tickets.panel.find.seq, late);
             let answer = vec![card(3, None)];
-            app.runtime.panel_result(Job::Find, late, Ok(TicketOutput::Page(answer, None)));
+            app.runtime.panel_result(Job::Find, late, Ok(TicketOutput::Page(answer, None, None)));
             assert_eq!(labels(app)[0], "DEMO-2");
             assert_eq!(app.runtime.tickets.panel.find.ran.as_ref().map(|r| r.0.as_str()), Some("DEMO-2"));
         });

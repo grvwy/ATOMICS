@@ -117,14 +117,23 @@ pub enum TicketOutput {
     Cards(Vec<TicketCard>),
     #[allow(dead_code)]
     Card(Box<TicketCard>),
-    /// One page of a list, with the cursor of the next when the operation maps paging.
-    Page(Vec<TicketCard>, Option<String>),
+    /// One page of a list or search: the cursor of the next when the operation maps paging, and
+    /// the status that says a meaning search was answered by keyword.
+    Page(Vec<TicketCard>, Option<String>, Option<String>),
     Ticket(TicketLink),
     Read(Value),
     Tickets(Vec<TicketLink>),
     /// A push went through; the ticket as read right after, when `get` is configured.
     Pushed(Option<Result<TicketLink, String>>),
     Remote(RemoteOutput),
+}
+
+/// One page of a list or search, as the worker reads it.
+#[derive(Default)]
+struct Page {
+    cards: Vec<TicketCard>,
+    next: Option<String>,
+    fell_back: Option<String>,
 }
 
 /// How a steering item handed to the app was dealt with.
@@ -338,8 +347,8 @@ impl Worker {
             TicketOutput::Cards(cards) => {
                 TicketOutput::Cards(cards.into_iter().map(|card| self.cleaner.card(card)).collect())
             }
-            TicketOutput::Page(cards, next) => {
-                TicketOutput::Page(cards.into_iter().map(|card| self.cleaner.card(card)).collect(), next)
+            TicketOutput::Page(cards, next, fell_back) => {
+                TicketOutput::Page(cards.into_iter().map(|card| self.cleaner.card(card)).collect(), next, fell_back)
             }
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
             TicketOutput::Remote(output) => TicketOutput::Remote(match output {
@@ -430,8 +439,8 @@ impl Worker {
             TicketOp::Search { query, semantic } => {
                 let name = if semantic { "semantic_search" } else { "search" };
                 let hit = self.key_hit(config, &query);
-                let found = self.cards(config, name, &Vars::new(system).query(&query));
-                hit_first(hit, found).map(TicketOutput::Cards)
+                let page = self.page(config, name, &Vars::new(system).query(&query), &Map::new());
+                hit_first(hit, page)
             }
             TicketOp::Page { name, query, extra } => {
                 // A page without a cursor is a list's first; only there can a key's ticket go first.
@@ -442,16 +451,14 @@ impl Worker {
                     Some(query) => vars.query(query),
                     None => vars,
                 };
-                let (found, next) = match self.page(config, name, &vars, &extra) {
-                    Ok((cards, next)) => (Ok(cards), next),
-                    Err(error) => (Err(error), None),
-                };
-                Ok(TicketOutput::Page(hit_first(hit, found)?, next))
+                let page = self.page(config, name, &vars, &extra);
+                hit_first(hit, page)
             }
             TicketOp::Children(link) | TicketOp::Related(link) | TicketOp::ReadCard(link) if !config.accepts(&link) => {
                 Err(config.mismatch(&link).expect("mismatch"))
             }
             TicketOp::Children(link) => {
+                let link = self.addressed(config, "children", link)?;
                 self.cards(config, "children", &Vars::new(system).ticket(&link)).map(TicketOutput::Cards)
             }
             TicketOp::Related(link) => {
@@ -459,6 +466,7 @@ impl Worker {
             }
             TicketOp::ReadCard(link) => {
                 let name = if config.operation("read").is_some() { "read" } else { "get" };
+                let link = self.addressed(config, name, link)?;
                 let output = self.call(config, name, &Vars::new(system).ticket(&link))?;
                 let operation = config.operation(name).expect("called");
                 let mut card = if name == "read" {
@@ -933,14 +941,25 @@ impl Worker {
         name: &str,
         vars: &Vars,
         extra: &Map<String, Value>,
-    ) -> Result<(Vec<TicketCard>, Option<String>), String> {
+    ) -> Result<Page, String> {
         let output = self.call_with(config, name, vars, extra)?;
         let operation = config.operation(name).expect("called");
         let cards = operation.cards(&output, &config.system)?;
-        Ok((
-            cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
-            operation.next_cursor(&output),
-        ))
+        Ok(Page {
+            cards: cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
+            next: operation.next_cursor(&output),
+            fell_back: operation.fell_back(&output),
+        })
+    }
+
+    /// The link an operation can address: one known only by its key, for an operation that needs
+    /// the ticket's UUID, is first read with a `get` that takes keys. Any other link is left for
+    /// the operation itself to use or refuse.
+    fn addressed(&mut self, config: &TicketConfig, name: &str, link: TicketLink) -> Result<TicketLink, String> {
+        let get = config.operation("get").filter(|get| !get.uses_placeholder("uuid"));
+        let (Some(get), Some(_)) = (get, config.unfit_id(name, &link)) else { return Ok(link) };
+        let output = self.call(config, "get", &Vars::new(&config.system).ticket(&link))?;
+        get.ticket(&output, &config.system)
     }
 
     /// The ticket a key-shaped query names, as a result row: read with `get`, or with `read` when
@@ -1179,14 +1198,19 @@ impl Worker {
 /// A key's ticket first, then what the search found, without the same ticket twice: the search's
 /// own row moves up when it has one, since that row carries the score and snippet. With the ticket
 /// in hand, a failed search still answers.
-fn hit_first(hit: Option<TicketCard>, found: Result<Vec<TicketCard>, String>) -> Result<Vec<TicketCard>, String> {
-    let Some(hit) = hit else { return found };
-    let mut cards = found.unwrap_or_default();
-    match cards.iter().position(|card| card.link.same_ticket(&hit.link)) {
-        Some(at) => cards[..=at].rotate_right(1),
-        None => cards.insert(0, hit),
+fn hit_first(hit: Option<TicketCard>, found: Result<Page, String>) -> Result<TicketOutput, String> {
+    let Page { mut cards, next, fell_back } = match (found, &hit) {
+        (Ok(page), _) => page,
+        (Err(error), None) => return Err(error),
+        (Err(_), Some(_)) => Page::default(),
+    };
+    if let Some(hit) = hit {
+        match cards.iter().position(|card| card.link.same_ticket(&hit.link)) {
+            Some(at) => cards[..=at].rotate_right(1),
+            None => cards.insert(0, hit),
+        }
     }
-    Ok(cards)
+    Ok(TicketOutput::Page(cards, next, fell_back))
 }
 
 #[cfg(test)]
@@ -2189,7 +2213,7 @@ pub(crate) mod tests {
                 ]
             };
             let cards = |output: TicketOutput| match output {
-                TicketOutput::Cards(cards) => serde_json::to_value(cards).unwrap(),
+                TicketOutput::Cards(cards) | TicketOutput::Page(cards, ..) => serde_json::to_value(cards).unwrap(),
                 TicketOutput::Card(card) => serde_json::to_value(card).unwrap(),
                 TicketOutput::Ticket(mut link) => {
                     link.synced_at = None;
@@ -2235,7 +2259,7 @@ pub(crate) mod tests {
         assert!(card.body.unwrap().contains("## Goal"));
         assert_eq!(http_requests(&path)[0]["target"], "/v1/tools/get_ticket/ticket/DEMO-2");
 
-        let TicketOutput::Cards(cards) =
+        let TicketOutput::Page(cards, ..) =
             job(&mut worker, &config, TicketOp::Search { query: "ticket workspace".into(), semantic: true }).unwrap()
         else {
             panic!("cards")
@@ -2261,7 +2285,7 @@ pub(crate) mod tests {
         assert!(config.operation("semantic_search").unwrap().http.is_none());
         let mut worker = Worker::default();
         for semantic in [false, true] {
-            let TicketOutput::Cards(cards) =
+            let TicketOutput::Page(cards, ..) =
                 job(&mut worker, &config, TicketOp::Search { query: "browser OAuth".into(), semantic }).unwrap()
             else {
                 panic!("cards")
@@ -2439,13 +2463,13 @@ pub(crate) mod tests {
             worker.prepare(&config);
             // Start the fixture and obtain the search's own rows before hanging the lookup.
             let search = || TicketOp::Search { query: query.into(), semantic: false };
-            let TicketOutput::Cards(expected) = worker.run(&config, search()).unwrap() else { panic!("cards") };
+            let TicketOutput::Page(expected, ..) = worker.run(&config, search()).unwrap() else { panic!("cards") };
             let mut state = server(&path);
             state["hang"] = json!(["get_ticket"]);
             state["calls"] = json!([]);
             std::fs::write(&path, state.to_string()).unwrap();
             worker.prepare(&config);
-            let TicketOutput::Cards(rows) = worker.run(&config, search()).unwrap() else { panic!("cards") };
+            let TicketOutput::Page(rows, ..) = worker.run(&config, search()).unwrap() else { panic!("cards") };
             assert_eq!(
                 rows.iter().map(|row| &row.link.id).collect::<Vec<_>>(),
                 expected.iter().map(|row| &row.link.id).collect::<Vec<_>>()
@@ -2484,7 +2508,7 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             for semantic in [false, true] {
-                let TicketOutput::Cards(cards) =
+                let TicketOutput::Page(cards, ..) =
                     run(&config, TicketOp::Search { query: "browser OAuth".into(), semantic })
                 else {
                     panic!("cards")
@@ -2547,7 +2571,7 @@ pub(crate) mod tests {
             state["tickets"][0]["comments"][0]["body"] = json!("test-secret-7c2d in a comment");
             std::fs::write(&path, state.to_string()).unwrap();
             for semantic in [false, true] {
-                let TicketOutput::Cards(cards) = run(&config, TicketOp::Search { query: literal.into(), semantic })
+                let TicketOutput::Page(cards, ..) = run(&config, TicketOp::Search { query: literal.into(), semantic })
                 else {
                     panic!("literal")
                 };
