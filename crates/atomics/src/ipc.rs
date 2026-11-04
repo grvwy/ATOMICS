@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::host::Window;
 use anyhow::{Result, bail};
 use atomics_core::control::{ControlRequest, ControlResponse, describe_diff};
-use atomics_core::hook::{HookEvent, HookReply, HookRequest, context_output};
+use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread, context_output};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -119,7 +119,7 @@ impl Hub {
     /// The stdout for one hook call: session context on start, plus any queued messages.
     pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
         let mut parts = Vec::new();
-        if event.name == "SessionStart" && !self.session_context.is_empty() {
+        if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
             parts.push(self.session_context.clone());
         }
         let mut delivered = 0;
@@ -605,6 +605,27 @@ mod tests {
             handler.join().unwrap();
         }
         assert!(started.elapsed() < Duration::from_secs(1), "scaled permission waits must stay fast");
+    }
+
+    #[test]
+    fn context_and_queued_messages_reach_only_the_main_thread() {
+        let mut hub = Hub {
+            session_context: "This session runs inside ATOMICS.".into(),
+            external_prefix: "From ATOMICS:".into(),
+            ..Hub::default()
+        };
+        hub.outbox.insert("s1".into(), vec!["stop and run the tests".into()]);
+        for thread in [HookThread::Background, HookThread::Spawned] {
+            for name in ["SessionStart", "PostToolUse"] {
+                let (reply, delivered) = hub.reply(&HookEvent { thread, ..event(name) });
+                assert!(reply.stdout.is_none(), "{thread:?} {name}");
+                assert_eq!(delivered, 0, "{thread:?} {name}");
+            }
+        }
+        let (reply, delivered) = hub.reply(&event("SessionStart"));
+        assert_eq!(delivered, 1);
+        let stdout = reply.stdout.unwrap();
+        assert!(stdout.contains("runs inside ATOMICS") && stdout.contains("stop and run the tests"));
     }
 
     #[test]

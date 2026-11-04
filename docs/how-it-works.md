@@ -9,8 +9,10 @@ A session is one agent in a terminal tile: Claude, Codex or a shell. It works in
 project, an existing folder, or a scratch folder of its own outside any project (the **Ungrouped** tab).
 The diff panel shows the session's worktree against the merge-base with `base_ref`, and review comments
 on that diff go to the agent as one message while it keeps working. Claude and Codex report their status
-through hooks, so the top bar counts what needs you. Sessions are saved in `sessions.json` in the state
-folder, and Claude sessions resume after a restart. See [What it does](../README.md#what-it-does).
+through hooks, so the top bar counts what needs you. A session follows its agent's main thread: threads the
+agent spawns or runs for itself, such as Codex's memory agent, report through the same pane but do not move
+its folder, title or status. Sessions are saved in `sessions.json` in the state folder, and Claude sessions
+resume after a restart. See [What it does](../README.md#what-it-does).
 
 ## The chief
 
@@ -90,7 +92,8 @@ Insights](isolation.md#azure-and-application-insights-through-host-az-login).
 
 When a bare Codex agent asks permission for a command, its hook brings the request to ATOMICS. ATOMICS shows
 it on the tile, allows the commands in `[approvals] allow` by itself, and leaves the rest to the chief
-(`atomics_approve`) or to you. Sandboxed agents run unattended: the VM, its mounts and sbx's network policy are the boundary. An
+(`atomics_approve`) or to you. Codex draws its own menu only once the hook returns, so a request from a thread
+the session does not follow goes back to Codex at once. Sandboxed agents run unattended: the VM, its mounts and sbx's network policy are the boundary. An
 Azure write through the relay waits for **Allow** or **Deny** in the agent's banner. Config changes the
 chief proposes wait for your **Apply**. See [Permission approvals](../README.md#permission-approvals).
 

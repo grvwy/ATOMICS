@@ -1,4 +1,5 @@
 use super::*;
+use atomics_core::hook::HookThread;
 
 impl State {
     // ── background events ─────────────────────────────────────────────────
@@ -603,9 +604,12 @@ impl State {
 
     pub(super) fn on_hook(&mut self, message: HookMessage) {
         let event = message.event;
-        if self.dismissed.contains(&event.session_id) {
+        // An agent's background threads inherit its pane, but what they do is not the session's.
+        if event.thread == HookThread::Background || self.dismissed.contains(&event.session_id) {
+            leave_to_agent(message.approval_reply);
             return;
         }
+        let main = event.thread == HookThread::Main;
         let found = message
             .pane
             .as_ref()
@@ -665,20 +669,18 @@ impl State {
             }
         };
 
-        // A command that drops shared stash entries says whose, for whoever decides. A sandboxed
-        // session's requests are not ATOMICS's to answer.
+        // A command that drops shared stash entries says whose, for whoever decides.
         let (stash_warning, stash) = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
             .then(|| self.stash_warning(index, &ApprovalRequest::from_event(&event)))
             .flatten()
             .unzip();
         let session = &mut self.sessions[index];
-        if session.sandbox.is_some() {
-            if let Some(reply) = message.approval_reply {
-                reply.answer(HookReply::default());
-            }
-            return;
-        }
-        if event.name != "SessionStart" && session.claude_id.as_ref().is_some_and(|id| id != &event.session_id) {
+        // A sandboxed session's requests are not ATOMICS's to answer, nor are those of a thread it
+        // no longer follows.
+        if session.sandbox.is_some()
+            || (event.name != "SessionStart" && session.claude_id.as_ref().is_some_and(|id| id != &event.session_id))
+        {
+            leave_to_agent(message.approval_reply);
             return;
         }
         session.claude_id = Some(event.session_id.clone());
@@ -722,10 +724,11 @@ impl State {
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
-        } else if matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
+        } else if main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
             session.approvals.clear();
         }
-        if let Some(cwd) = &event.cwd
+        if main
+            && let Some(cwd) = &event.cwd
             && *cwd != session.cwd
         {
             session.cwd = cwd.clone();
@@ -733,11 +736,14 @@ impl State {
             session.worktree = git::worktree_of(cwd);
             session.follow_folder();
         }
-        if let Some(status) = event.status() {
+        // A spawned thread moves the status only by asking, and once what it asked is answered.
+        if let Some(status) = event.status()
+            && (main || session.status == AgentStatus::NeedsInput || !session.approvals.is_empty())
+        {
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
         match event.name.as_str() {
-            "UserPromptSubmit" => {
+            "UserPromptSubmit" if main => {
                 self.pending_questions.remove(&session.id);
                 if let Some(pending) = &mut session.pending
                     && pending.codex
@@ -753,14 +759,14 @@ impl State {
                     session.first_prompt(prompt);
                 }
             }
-            "Stop" => session.last_message = event.last_assistant_message.clone(),
+            "Stop" if main => session.last_message = event.last_assistant_message.clone(),
             _ => {}
         }
         session.activity.observe(session.status);
         let root = session.root();
         let (id, title) = (session.id.clone(), session.title.clone());
         self.capture_chief_trace(index, &event);
-        if self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
+        if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());
         }
         if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "UserPromptSubmit" | "CwdChanged")
@@ -855,6 +861,14 @@ impl State {
         if let Some(watcher) = &mut self.watcher {
             watcher.set_roots(&wanted);
         }
+    }
+}
+
+/// Gives a request nobody here can answer no decision at once: the agent then asks in its own
+/// terminal, which it draws only once the hook has returned.
+fn leave_to_agent(reply: Option<Arc<ipc::ApprovalReply>>) {
+    if let Some(reply) = reply {
+        reply.answer(HookReply::default());
     }
 }
 
@@ -965,6 +979,281 @@ mod tests {
             let output = other.wait(Duration::ZERO).stdout.unwrap();
             assert!(output.contains("deny"));
         });
+    }
+
+    /// One thread's hook as Codex 0.166 sends it. Every thread of an agent inherits its pane; a
+    /// thread Codex keeps no rollout of, its memory agent among them, has a null `transcript_path`.
+    fn thread_hook(
+        name: &str,
+        thread: &str,
+        cwd: &Path,
+        transcript: Option<&str>,
+        reply: Option<Arc<ipc::ApprovalReply>>,
+    ) -> HookMessage {
+        HookMessage {
+            pane: Some("worker".into()),
+            ancestors: vec![],
+            delivered: 0,
+            approval_reply: reply,
+            event: atomics_core::hook::HookEvent::from_payload(&json!({
+                "hook_event_name":name, "session_id":thread, "cwd":cwd, "transcript_path":transcript,
+                "source":"startup", "reason":"other", "prompt":"a thread's own prompt",
+                "tool_name":"Bash", "tool_input":{"command":"touch approval-file"},
+                "last_assistant_message":"a thread's own answer",
+            }))
+            .unwrap(),
+        }
+    }
+
+    const MAIN: Option<&str> = Some("/sessions/rollout-main-thread.jsonl");
+
+    /// A worker in its own repository, following its main thread, and a folder elsewhere.
+    fn main_thread_worker(app: &mut Desktop<'_>, repo: &Path) {
+        let mut worker = session("worker", AgentKind::Generic, AgentStatus::Working, repo);
+        worker.claude_id = Some("main-thread".into());
+        worker.worktree = git::worktree_of(repo);
+        worker.follow_folder();
+        app.runtime.sessions = vec![worker];
+    }
+
+    /// A repository on a branch of its own, so a session moved there reads differently.
+    fn other_repository() -> (crate::test_support::TempDir, PathBuf) {
+        let (dir, repo) = repository();
+        git::git(&repo, &["checkout", "-qb", "elsewhere"]).unwrap();
+        (dir, repo)
+    }
+
+    /// Everything a session takes from the thread it follows.
+    fn followed(session: &Session) -> impl PartialEq + std::fmt::Debug + use<> {
+        (
+            session.claude_id.clone(),
+            session.cwd.clone(),
+            session.root(),
+            session.branch().map(str::to_string),
+            session.title.clone(),
+            session.status,
+            session.last_prompt.clone(),
+            session.last_message.clone(),
+        )
+    }
+
+    /// A background thread's whole life, from its own folder: Codex's memory agent sent its start,
+    /// prompt and end in a real run; the tool events and Stop are what a longer run could add.
+    fn background_thread_runs(app: &mut Desktop<'_>, elsewhere: &Path) {
+        let before = followed(&app.runtime.sessions[0]);
+        let approvals = app.runtime.sessions[0].approvals.len();
+        for name in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"] {
+            app.runtime.on_hook(thread_hook(name, "background-thread", elsewhere, None, None));
+            assert_eq!(followed(&app.runtime.sessions[0]), before, "after its {name}");
+            assert_eq!(app.runtime.sessions[0].approvals.len(), approvals, "after its {name}");
+            assert_eq!(app.runtime.sessions.len(), 1, "after its {name}");
+        }
+    }
+
+    #[test]
+    fn a_background_thread_leaves_its_session_on_the_main_thread() {
+        with_app("app::background::tests::a_background_thread_leaves_its_session_on_the_main_thread", |app, _| {
+            let ((_repo_dir, repo), (_other_dir, elsewhere)) = (repository(), other_repository());
+            main_thread_worker(app, &repo);
+            background_thread_runs(app, &elsewhere);
+            let worker = &app.runtime.sessions[0];
+            assert_eq!(worker.claude_id.as_deref(), Some("main-thread"));
+            assert_eq!(worker.cwd, repo);
+            assert_eq!(worker.root(), std::fs::canonicalize(&repo).unwrap());
+            assert_eq!(worker.status, AgentStatus::Working);
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn after_a_background_thread_the_main_thread_is_approved_and_ends_its_turn() {
+        with_app(
+            "app::background::tests::after_a_background_thread_the_main_thread_is_approved_and_ends_its_turn",
+            |app, _| {
+                let ((_repo_dir, repo), (_other_dir, elsewhere)) = (repository(), other_repository());
+                main_thread_worker(app, &repo);
+                background_thread_runs(app, &elsewhere);
+                let reply = Arc::new(ipc::ApprovalReply::default());
+                app.runtime.on_hook(thread_hook("PermissionRequest", "main-thread", &repo, MAIN, Some(reply.clone())));
+                assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                // A real run: the memory agent ended while the main thread's hook waited for its answer.
+                background_thread_runs(app, &elsewhere);
+                let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                assert!(answered.ok, "{answered:?}");
+                assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                assert!(app.runtime.sessions[0].approvals.is_empty());
+                app.runtime.on_hook(thread_hook("PostToolUse", "main-thread", &repo, MAIN, None));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                app.runtime.on_hook(thread_hook("Stop", "main-thread", &repo, MAIN, None));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                assert_eq!(app.runtime.sessions[0].last_message.as_deref(), Some("a thread's own answer"));
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    #[test]
+    fn a_background_thread_neither_binds_a_new_session_nor_starts_one() {
+        with_app("app::background::tests::a_background_thread_neither_binds_a_new_session_nor_starts_one", |app, _| {
+            let ((_repo_dir, repo), (_other_dir, elsewhere)) = (repository(), other_repository());
+            main_thread_worker(app, &repo);
+            // An interactive Codex starts its main thread with the first prompt, so this can come first.
+            app.runtime.sessions[0].claude_id = None;
+            app.runtime.on_hook(thread_hook("SessionStart", "background-thread", &elsewhere, None, None));
+            assert_eq!(app.runtime.sessions[0].claude_id, None);
+            assert!(!app.runtime.sessions[0].hooks_active);
+            assert_eq!(app.runtime.sessions[0].cwd, repo);
+            let outside = HookMessage {
+                pane: None,
+                ..thread_hook("SessionStart", "outside-background-thread", &elsewhere, None, None)
+            };
+            app.runtime.on_hook(outside);
+            assert_eq!(app.runtime.sessions.len(), 1, "no session of its own either");
+            app.runtime.on_hook(thread_hook("SessionStart", "main-thread", &repo, MAIN, None));
+            assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("main-thread"));
+            assert!(app.runtime.sessions[0].hooks_active);
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn a_spawned_thread_can_be_approved_but_the_session_stays_on_the_main_thread() {
+        with_app(
+            "app::background::tests::a_spawned_thread_can_be_approved_but_the_session_stays_on_the_main_thread",
+            |app, _| {
+                let ((_repo_dir, repo), (_other_dir, elsewhere)) = (repository(), other_repository());
+                main_thread_worker(app, &repo);
+                // Codex and Claude send a spawned thread's events under the main thread's session id.
+                let spawned = |name: &str, reply: Option<Arc<ipc::ApprovalReply>>| {
+                    let mut hook =
+                        thread_hook(name, "main-thread", &elsewhere, Some("/sessions/rollout-spawned.jsonl"), reply);
+                    hook.event = atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":name, "session_id":"main-thread", "cwd":&elsewhere,
+                        "transcript_path":"/sessions/rollout-spawned.jsonl",
+                        "agent_id":"spawned-thread", "agent_type":"default",
+                        "prompt":"a spawned thread's prompt", "last_assistant_message":"a spawned thread's answer",
+                        "tool_name":"Bash", "tool_input":{"command":"touch spawned-file"},
+                    }))
+                    .unwrap();
+                    hook
+                };
+                let main_reply = Arc::new(ipc::ApprovalReply::default());
+                app.runtime.on_hook(thread_hook(
+                    "PermissionRequest",
+                    "main-thread",
+                    &repo,
+                    MAIN,
+                    Some(main_reply.clone()),
+                ));
+                let waiting = followed(&app.runtime.sessions[0]);
+                app.runtime.on_hook(spawned("UserPromptSubmit", None));
+                assert_eq!(followed(&app.runtime.sessions[0]), waiting);
+                assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "its start must not retire the main request");
+                assert!(request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
+                assert!(main_reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                app.runtime.on_hook(thread_hook("PostToolUse", "main-thread", &repo, MAIN, None));
+                let before = followed(&app.runtime.sessions[0]);
+                app.runtime.on_hook(spawned("PostToolUse", None));
+                assert_eq!(followed(&app.runtime.sessions[0]), before);
+
+                let reply = Arc::new(ipc::ApprovalReply::default());
+                app.runtime.on_hook(spawned("PermissionRequest", Some(reply.clone())));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                assert_eq!(app.runtime.sessions[0].cwd, repo);
+                assert!(request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
+                assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+                app.runtime.on_hook(spawned("PostToolUse", None));
+                assert_eq!(followed(&app.runtime.sessions[0]), before, "back to where its request found the session");
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    #[test]
+    fn the_main_thread_still_changes_its_id_and_follows_its_folder() {
+        with_app("app::background::tests::the_main_thread_still_changes_its_id_and_follows_its_folder", |app, _| {
+            let ((_repo_dir, repo), (_other_dir, elsewhere)) = (repository(), other_repository());
+            main_thread_worker(app, &repo);
+            let hook = |payload: serde_json::Value| HookMessage {
+                pane: Some("worker".into()),
+                ancestors: vec![],
+                delivered: 0,
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+            };
+            // `/clear`, `/resume`, compaction and `/fork` start a thread with a transcript and a new id.
+            let mut previous = "main-thread".to_string();
+            for source in ["clear", "resume", "compact", "fork"] {
+                app.runtime.on_hook(hook(json!({
+                    "hook_event_name":"SessionStart", "session_id":source, "cwd":&repo, "source":source,
+                    "transcript_path":format!("/sessions/{source}.jsonl"),
+                })));
+                assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some(source));
+                // The thread it left has no say any more.
+                app.runtime.on_hook(hook(json!({
+                    "hook_event_name":"UserPromptSubmit", "session_id":previous, "cwd":&elsewhere, "prompt":"stale",
+                    "transcript_path":format!("/sessions/{previous}.jsonl"),
+                })));
+                assert_eq!(app.runtime.sessions[0].cwd, repo, "{source}");
+                assert_eq!(app.runtime.sessions[0].last_prompt, None, "{source}");
+                previous = source.to_string();
+            }
+            // Resuming a Codex thread keeps its id.
+            app.runtime.on_hook(hook(json!({
+                "hook_event_name":"SessionStart", "session_id":"fork", "cwd":&repo, "source":"resume",
+                "transcript_path":"/sessions/fork.jsonl",
+            })));
+            assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("fork"));
+            // A `cd` moves the session, reported either way the agents report it.
+            let elsewhere_title = title_for(Some("elsewhere"), &elsewhere);
+            let follows = [
+                json!({"hook_event_name":"CwdChanged", "session_id":"fork", "cwd":&repo, "new_cwd":&elsewhere,
+                       "transcript_path":"/sessions/fork.jsonl"}),
+                json!({"hook_event_name":"PostToolUse", "session_id":"fork", "cwd":&elsewhere,
+                       "transcript_path":"/sessions/fork.jsonl"}),
+            ];
+            for payload in follows {
+                app.runtime.on_hook(hook(json!({"hook_event_name":"PostToolUse", "session_id":"fork", "cwd":&repo})));
+                assert_eq!(app.runtime.sessions[0].cwd, repo);
+                app.runtime.on_hook(hook(payload));
+                let worker = &app.runtime.sessions[0];
+                assert_eq!(worker.cwd, elsewhere);
+                assert_eq!(worker.branch(), Some("elsewhere"));
+                assert_eq!(worker.title, elsewhere_title);
+            }
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn a_request_from_a_thread_the_session_does_not_follow_is_left_to_the_agent_at_once() {
+        with_app(
+            "app::background::tests::a_request_from_a_thread_the_session_does_not_follow_is_left_to_the_agent_at_once",
+            |app, _| {
+                let ((_repo_dir, repo), (_other_dir, elsewhere)) = (repository(), other_repository());
+                main_thread_worker(app, &repo);
+                let before = followed(&app.runtime.sessions[0]);
+                for (thread, transcript) in
+                    [("background-thread", None), ("earlier-thread", Some("/sessions/rollout-earlier.jsonl"))]
+                {
+                    let reply = Arc::new(ipc::ApprovalReply::default());
+                    app.runtime.on_hook(thread_hook(
+                        "PermissionRequest",
+                        thread,
+                        &elsewhere,
+                        transcript,
+                        Some(reply.clone()),
+                    ));
+                    // Nothing could ever answer it: the hook must not wait out its whole window.
+                    assert!(!reply.answer(HookReply { stdout: Some("too late".into()) }), "{thread}");
+                    assert!(reply.wait(Duration::ZERO).stdout.is_none(), "{thread}");
+                    assert!(app.runtime.sessions[0].approvals.is_empty(), "{thread}");
+                    assert_eq!(followed(&app.runtime.sessions[0]), before, "{thread}");
+                }
+                app.runtime.sessions.clear();
+            },
+        );
     }
 
     #[test]
