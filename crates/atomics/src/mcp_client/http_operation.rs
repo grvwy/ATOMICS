@@ -11,8 +11,8 @@ use atomics_core::tickets::{Cleaner, HttpCall, HttpMethod, HttpRequest, McpServe
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use super::McpError;
 use super::oauth::{OAuth, Session, agent, parse_secure};
+use super::{McpError, refusal_hint};
 
 /// The largest answer read. A page of tickets is far smaller; more than this is not a ticket API.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
@@ -245,12 +245,7 @@ impl HttpClient {
         }
         let text = response.body_mut().with_config().limit(MAX_REFUSAL_BYTES).read_to_string().unwrap_or_default();
         let shown: String = cleaner.error(&text).trim().chars().take(MAX_REFUSAL_CHARS).collect();
-        // A sign-in's 401 never gets here. With no token sent, there is none to check.
-        let hint = match (status, self.oauth.is_some(), self.token.is_some()) {
-            (403, true, _) => " (the sign-in lacks the right to this)",
-            (401 | 403, false, true) => " (check server.token_env)",
-            _ => "",
-        };
+        let hint = refusal_hint(status, self.oauth.is_some(), self.token.is_some());
         let separator = if shown.is_empty() { "" } else { ": " };
         let message = format!("{label} answered HTTP {status}{hint}{separator}{shown}");
         if status == 429 || (500..600).contains(&status) {
