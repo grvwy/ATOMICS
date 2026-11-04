@@ -87,6 +87,85 @@ fn a_shown_terminal_is_followed_and_text_typed_after_the_tap_waits_for_the_grant
     assert_eq!(inputs(&world), ["ls\r", "pwd"]);
 }
 
+/// What the host says of `session`'s lease as it stands, as it might in the moment before it reads a release.
+fn state_of_the_lease(world: &World, session: &str) -> atomics_core::lease::LeaseState {
+    use atomics_core::wire::Seq;
+
+    atomics_core::lease::LeaseState {
+        session: session.into(),
+        holder: world.driver.remote.lease(session).holder,
+        yours: true,
+        lease: world.host.terminals[session].lease.as_ref().map(|l| Seq(l.token)),
+        next: Some(Seq(1)),
+        ttl_ms: Some(30_000),
+        resized: false,
+        reason: Some(atomics_core::lease::LeaseReason::Granted),
+    }
+}
+
+/// The host's word on a lease, reaching this client now.
+fn tell(world: &World, state: &atomics_core::lease::LeaseState) {
+    let envelope = atomics_core::wire::Envelope::host(&world.host.epoch, Message::LeaseState(state.clone()));
+    world.driver.remote.receive(envelope);
+}
+
+#[test]
+fn asking_again_before_the_host_has_answered_a_release_settles_on_a_new_lease() {
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    assert_eq!(type_text(&mut world, "s1", "a"), Ok(()));
+    let earlier = state_of_the_lease(&world, "s1");
+    let (old, holder) = (earlier.lease, earlier.holder.clone());
+    assert!(old.is_some() && holder.is_some());
+
+    // Let go, and nothing has reached the host: nobody holds it here, so nothing offers to take it over.
+    world.driver.remote.release("s1");
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && !lease.acquiring, "{lease:?}");
+
+    // A click back asks at once, and what is typed waits for the answer.
+    world.driver.remote.acquire("s1", false);
+    assert_eq!(world.driver.remote.type_text("s1", "b"), Ok(()));
+    tell(&world, &earlier);
+    let lease = world.driver.remote.lease("s1");
+    assert!(lease.acquiring && !lease.yours && lease.lost.is_none(), "the request stands: {lease:?}");
+
+    // The host reads both, in order, and it settles on a new lease with the text under it.
+    world.driver.flush();
+    world.pump();
+    let kinds: Vec<&Message> = world
+        .sent()
+        .into_iter()
+        .filter(|m| matches!(m, Message::LeaseRelease { .. } | Message::LeaseAcquire { .. }))
+        .collect();
+    assert!(matches!(kinds[..], [_, Message::LeaseRelease { .. }, Message::LeaseAcquire { .. }]), "{kinds:?}");
+    assert_eq!(world.host.terminals["s1"].typed, "ab");
+    let lease = world.driver.remote.lease("s1");
+    assert!(lease.yours && !lease.acquiring && lease.holder == holder, "{lease:?}");
+    let new = world.host.terminals["s1"].lease.as_ref().map(|l| l.token);
+    assert_ne!(new, old.map(|l| l.0), "under a new token");
+}
+
+#[test]
+fn a_state_from_before_a_release_changes_nothing_and_the_hosts_answer_settles_it() {
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    let earlier = state_of_the_lease(&world, "s1");
+    world.driver.remote.release("s1");
+    tell(&world, &earlier);
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && !lease.acquiring && lease.lost.is_none(), "{lease:?}");
+    assert_eq!(world.driver.remote.type_text("s1", "x"), Err(Refused::NoLease), "nothing goes under the old lease");
+
+    world.driver.flush();
+    world.pump();
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && !lease.acquiring, "{lease:?}");
+    assert!(world.host.terminals["s1"].lease.is_none());
+}
+
 #[test]
 fn the_first_keys_survive_the_lease_state_a_subscription_starts_with() {
     let mut world = live();
@@ -209,7 +288,7 @@ fn a_slow_program_gets_at_most_a_mebibyte_again_per_change_and_more_than_may_wai
 
     let over = "x".repeat(MAX_TYPED_BYTES + 1);
     let before = typed_bytes(&world);
-    assert_eq!(type_text(&mut world, "s1", &over), Err(Refused::TooMuch), "a paste over the limit");
+    assert_eq!(type_text(&mut world, "s1", &over), Err(Refused::TooMuch(MAX_TYPED_BYTES)), "a paste over the limit");
     assert_eq!(typed_bytes(&world), before, "is not typed at all");
 
     // Two pastes of a mebibyte, sent before the program stopped reading the first: both come back.
@@ -221,7 +300,7 @@ fn a_slow_program_gets_at_most_a_mebibyte_again_per_change_and_more_than_may_wai
     world.driver.flush();
     world.pump();
     assert_eq!(world.host.terminals["s1"].typed, "a");
-    assert_eq!(type_text(&mut world, "s1", "z"), Err(Refused::TooMuch), "no more waits behind them");
+    assert_eq!(type_text(&mut world, "s1", "z"), Err(Refused::TooMuch(MAX_TYPED_BYTES)), "no more waits behind them");
 
     // A change while the program still does not read: one mebibyte is typed again, not all of it.
     let before = typed_bytes(&world);
@@ -371,6 +450,48 @@ fn fit_to_this_screen_resizes_until_the_desktop_takes_the_terminal_back() {
 }
 
 #[test]
+fn going_on_to_another_terminal_lets_go_of_its_lease_and_of_a_grant_on_its_way() {
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    assert!(world.driver.remote.lease("s1").yours);
+    world.driver.remote.release("s1");
+    world.driver.flush();
+    world.pump();
+    assert!(world.sent().iter().any(|m| matches!(m, Message::LeaseRelease { .. })), "the host hears it");
+    let terminal = &world.host.terminals["s1"];
+    assert!(terminal.lease.is_none() && terminal.followed, "it stays on screen, free");
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && lease.lost.is_none(), "{lease:?}");
+    assert_eq!(type_text(&mut world, "s1", "x"), Err(Refused::NoLease), "typing there is a new tap");
+    acquire(&mut world, "s1", false);
+    assert!(world.driver.remote.lease("s1").yours, "and that tap takes it again");
+
+    // Left before the grant came: what waits for it is dropped, and the grant is let go when it comes.
+    let mut world = live();
+    show(&mut world, "s1");
+    world.driver.remote.acquire("s1", false);
+    world.driver.remote.type_text("s1", "ls").unwrap();
+    world.driver.remote.release("s1");
+    world.driver.flush();
+    world.pump();
+    assert!(world.host.terminals["s1"].lease.is_none(), "the grant went straight back");
+    assert!(world.host.terminals["s1"].typed.is_empty(), "nothing typed into the terminal the user left");
+    assert!(!world.driver.remote.lease("s1").yours && !world.driver.remote.lease("s1").acquiring);
+
+    // Coming back before it came: the same request stands, and the grant is kept.
+    let mut world = live();
+    show(&mut world, "s1");
+    world.driver.remote.acquire("s1", false);
+    world.driver.remote.release("s1");
+    world.driver.remote.acquire("s1", false);
+    world.driver.flush();
+    world.pump();
+    assert!(world.driver.remote.lease("s1").yours && world.host.terminals["s1"].lease.is_some());
+    assert!(!world.sent().iter().any(|m| matches!(m, Message::LeaseRelease { .. })));
+}
+
+#[test]
 fn a_terminal_no_frame_shows_is_let_go() {
     let mut world = live();
     show(&mut world, "s1");
@@ -392,7 +513,7 @@ fn text_waiting_for_the_grant_is_bounded() {
     world.driver.remote.acquire("s1", false);
     let most = "w".repeat(MAX_WAITING_BYTES);
     assert_eq!(world.driver.remote.type_text("s1", &most), Ok(()));
-    assert_eq!(world.driver.remote.type_text("s1", "!"), Err(Refused::TooMuch));
+    assert_eq!(world.driver.remote.type_text("s1", "!"), Err(Refused::TooMuch(MAX_WAITING_BYTES)));
     world.driver.flush();
     world.pump();
     assert_eq!(world.host.terminals["s1"].typed, most);

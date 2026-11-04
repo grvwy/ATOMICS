@@ -10,7 +10,8 @@
 //! - Each channel the service opens has a thread of its own (`channel.rs`): a Noise handshake
 //!   with a paired device, or a pairing, then one `atomics.v1` client session inside the
 //!   encrypted channel, served like a loopback client (`protocol::Sessions`) with the role the
-//!   device's allowlist entry gives it. The service sees only ciphertext.
+//!   device's allowlist entry gives it. The service sees only ciphertext. Stopping waits for these
+//!   threads too, since a session writes its device's last-seen time as it ends.
 //! - `devices.rs` keeps the allowlist and the one pairing the desktop may offer.
 
 mod channel;
@@ -31,7 +32,7 @@ use atomics_core::tunnel::close;
 use ring::rand::SecureRandom;
 use serde::Serialize;
 
-use self::channel::Gate;
+use self::channel::{Crew, Gate};
 use self::devices::Devices;
 use self::issuer::{Ask, Desk, IssueError, IssueKind, Issuer, Reply};
 use self::keys::DeviceKeys;
@@ -263,6 +264,7 @@ pub struct Context {
     pub devices: Arc<Devices>,
     pub status: Arc<StatusCell>,
     pub signal: Arc<Signal>,
+    pub crew: Arc<Crew>,
 }
 
 /// Loads (or makes) the device keys, off the runtime thread.
@@ -274,9 +276,11 @@ pub struct Rendezvous {
     thread: Option<JoinHandle<()>>,
     /// Says the thread has finished, so `stop` knows whether a join would wait.
     done: std::sync::mpsc::Receiver<()>,
+    /// The channels' threads.
+    crew: Arc<Crew>,
 }
 
-/// How long `stop` waits for the thread: it answers a stop at once, except inside a dial, which
+/// How long `stop` waits for the threads: they answer a stop at once, except inside a dial, which
 /// may take up to the connect timeout.
 const STOP_WAIT: Duration = Duration::from_secs(2);
 
@@ -290,13 +294,15 @@ impl Rendezvous {
         status: Arc<StatusCell>,
     ) -> std::io::Result<Self> {
         let signal = Arc::new(Signal::default());
-        let context = Context { settings, sessions, devices, status: status.clone(), signal: signal.clone() };
+        let crew = Arc::new(Crew::default());
+        let context =
+            Context { settings, sessions, devices, status: status.clone(), signal: signal.clone(), crew: crew.clone() };
         let (finished, done) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new().name("atomics-rendezvous".into()).spawn(move || {
             run(context, issuer, keys);
             let _ = finished.send(());
         })?;
-        Ok(Self { signal, status, thread: Some(thread), done })
+        Ok(Self { signal, status, thread: Some(thread), done, crew })
     }
 
     #[allow(dead_code)] // Read by tests; the desktop holds its own handle.
@@ -304,16 +310,19 @@ impl Rendezvous {
         self.status.get()
     }
 
-    /// Close the tunnel (its channels end with it) and end the thread. A thread still inside a
-    /// dial after `STOP_WAIT` is left to see the stop when the dial returns, so quitting never
-    /// waits on a network. The issuer thread likewise finishes a call in flight on its own.
+    /// Close the tunnel and end the thread, then wait for the channels' threads, which end with
+    /// the tunnel: their sessions write their devices' last-seen times as they end. A thread still
+    /// inside a dial after `STOP_WAIT` is left to see the stop when the dial returns, so quitting
+    /// never waits on a network. The issuer thread likewise finishes a call in flight on its own.
     pub fn stop(&mut self) {
         self.signal.stop();
+        let deadline = Instant::now() + STOP_WAIT;
         if let Some(thread) = self.thread.take()
-            && self.done.recv_timeout(STOP_WAIT).is_ok()
+            && self.done.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
         {
             let _ = thread.join();
         }
+        self.crew.wait(deadline);
     }
 }
 
@@ -453,6 +462,7 @@ fn run(ctx: Context, issuer: Box<dyn Issuer>, keys: KeySource) {
                     pairing_timeout: ctx.settings.pairing_timeout,
                     send_timeout: ctx.settings.send_timeout,
                     rekey_every: ctx.settings.rekey_every,
+                    crew: ctx.crew.clone(),
                 });
                 match after(tunnel::run(socket, &ctx, &mut desk, gate, &mut backoff), &ctx.settings) {
                     Some(next) => next,

@@ -181,6 +181,9 @@ pub struct Boot {
     pub ticket_key: Option<String>,
     /// Set on a pairing boot: the pairing link's host key and psk.
     pub pairing: Option<Pairing>,
+    /// On a pairing boot, how long before the boot the hosting page got the link (`pair.age_ms`):
+    /// the link's lifetime runs from then. 0 when the page did not say.
+    pub pairing_age_ms: u64,
 }
 
 impl fmt::Debug for Boot {
@@ -193,6 +196,7 @@ impl fmt::Debug for Boot {
             .field("locale", &self.locale)
             .field("view", &self.view)
             .field("pairing", &self.pairing.is_some())
+            .field("pairing_age_ms", &self.pairing_age_ms)
             .finish_non_exhaustive()
     }
 }
@@ -308,9 +312,17 @@ fn boot(data: &Value) -> Result<Boot, Refused> {
         locale: text(data, "locale"),
         view: view.map(str::to_string),
         ticket_key: Some(text(data, "ticket_key")).filter(|key| !key.is_empty()),
+        pairing_age_ms: if pairing.is_some() { pairing_age_ms(data) } else { 0 },
         pairing,
         host_id,
     })
+}
+
+/// A pairing boot's `pair.age_ms`: milliseconds, a finite number of at least 0. Anything else, or
+/// none, counts as 0, so the link's time runs from the boot.
+fn pairing_age_ms(data: &Value) -> u64 {
+    let age = data.get("pair").and_then(|pair| pair.get("age_ms")).and_then(Value::as_f64);
+    age.filter(|ms| ms.is_finite() && *ms >= 0.0).map_or(0, |ms| ms as u64)
 }
 
 /// A pairing boot's `pair {v, host_noise_pubkey, psk}`, read as the link's fragment would be.

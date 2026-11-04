@@ -373,15 +373,17 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
 /// Drops the records of sandboxes sbx no longer has, as ATOMICS starts: a record outliving its
 /// sandbox would keep git out of a folder for good. A folder whose git files no longer match its
 /// record stays pinned, since the sandbox may have changed them and git would follow. Without an
-/// sbx that answers, which sandboxes exist is unknown, and every record stays.
+/// sbx that answers, which sandboxes exist is unknown, and every record stays. Without a record,
+/// sbx is not asked: asking starts its daemon, which outlives ATOMICS.
 pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
-    if !installed(program) {
+    let records = read_pins(dir);
+    if records.is_empty() || !installed(program) {
         return;
     }
     let Ok(sandboxes) = list(program) else { return };
     let Ok(owned) = ownership::owned(home) else { return };
     let names: std::collections::HashSet<String> = sandboxes.into_iter().map(|sandbox| sandbox.name).collect();
-    for (name, pins) in read_pins(dir) {
+    for (name, pins) in records {
         if names.contains(&name) || owned.get(&name).is_some_and(ownership::building) {
             continue;
         }
@@ -811,14 +813,12 @@ fn capture() -> Result<File> {
 /// The fake `sbx` in `tests/fixtures/sbx`, for tests here and in the app.
 #[cfg(test)]
 pub(crate) mod fake {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     /// Copies the fake into `dir`, where it keeps its state and call log, and returns its path.
     pub fn install(dir: &Path) -> PathBuf {
         let program = dir.join("sbx");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx"), &program).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx"), &program);
         program
     }
 
@@ -1055,7 +1055,10 @@ mod tests {
         let bin = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(bin.path());
         let keychain = bin.path().join("keychain");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &keychain,
+        );
         std::fs::write(bin.path().join("keychain-value"), "sk-ant-oat01-PRIVATE-token").unwrap();
         let mut job = job(&sbx, "atomics-c1", &repo, SandboxConfig::default());
         job.config.azure.enabled = false;

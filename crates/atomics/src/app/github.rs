@@ -1703,8 +1703,16 @@ impl Desktop<'_> {
         } else {
             rect
         };
-        let header =
-            Header { title: &title, branch: Some(&branch), can_send: false, split, editor_shortcut: &editor_shortcut };
+        let header = Header {
+            title: &title,
+            branch: Some(&branch),
+            can_send: false,
+            split,
+            editor_shortcut: &editor_shortcut,
+            touch: None,
+            review: true,
+            edit: true,
+        };
         let action = diff_view::show(ui, rect, state, header, &palette, &font);
         // Read-only: nothing receives review comments on a pull request diff.
         state.comments.clear();

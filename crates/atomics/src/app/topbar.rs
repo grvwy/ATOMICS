@@ -1,98 +1,19 @@
 use super::*;
 
-use atomics_ui::topbar::slot;
-pub(super) use atomics_ui::topbar::{measure, record_item};
+pub(super) use atomics_ui::topbar::record_item;
 
 impl Desktop<'_> {
-    pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.available_rect_before_wrap();
-        let gap = ui.spacing().item_spacing.x;
-        let controls = measure(ui, |ui| self.top_bar_controls(ui, false, false));
-        let controls_with_load = measure(ui, |ui| self.top_bar_controls(ui, true, false));
-        let full_chief = measure(ui, |ui| self.chief_pill(ui, false));
-        let compact_chief = measure(ui, |ui| self.chief_pill(ui, true));
-        let full_brand = measure(ui, |ui| self.top_bar_brand(ui, true));
-        let compact_brand = measure(ui, |ui| self.top_bar_brand(ui, false));
-        let tabs = measure(ui, |ui| self.view_tabs(ui));
-        let (urgent_label, urgent_color) = self.urgent_tabs_label();
-        let min_tabs = measure(ui, |ui| {
-            ui.menu_button(RichText::new(&urgent_label).color(urgent_color), |_| {});
-        });
-        let protected_navigation = self.urgent_navigation_width(ui).max(min_tabs);
-
-        // Once even the minimum navigation cannot fit, put the actions in a
-        // menu. All four slots then retain their measured natural minimums.
-        let actions_menu = compact_brand + protected_navigation + compact_chief + controls + gap * 3.0 > rect.width();
-        let show_load =
-            !actions_menu && full_brand + tabs + full_chief + controls_with_load + gap * 3.0 <= rect.width();
-        let controls_width = if actions_menu {
-            measure(ui, |ui| {
-                ui.menu_button("Actions", |_| {});
-            })
-        } else if show_load {
-            controls_with_load
-        } else {
-            controls
-        };
-        let show_agents =
-            full_brand + protected_navigation + compact_chief + controls_width + gap * 3.0 <= rect.width();
-        let brand_width = if show_agents { full_brand } else { compact_brand };
-        let compact = brand_width + protected_navigation + full_chief + controls_width + gap * 3.0 > rect.width();
-        let chief_width = if compact { compact_chief } else { full_chief };
-        let controls_left = rect.right() - controls_width;
-        let tabs_left = rect.left() + brand_width + gap;
-        // Keep the wide-screen center when navigation fits. Otherwise use the
-        // free space up to the actions before deciding which tabs overflow.
-        let chief_limit = controls_left - gap - chief_width;
-        let desired_navigation = tabs_left + tabs + gap;
-        let navigation_goal = desired_navigation.min(chief_limit);
-        let chief_left =
-            (rect.center().x - chief_width / 2.0).max(navigation_goal).max(tabs_left + min_tabs + gap).min(chief_limit);
-        let navigation = Rect::from_x_y_ranges(tabs_left..=chief_left - gap, rect.y_range());
-        slot(ui, "brand", rect.with_max_x(rect.left() + brand_width), |ui| self.top_bar_brand(ui, show_agents));
-        slot(ui, "chief", rect.with_min_x(chief_left).with_max_x(chief_left + chief_width), |ui| {
-            self.chief_pill(ui, compact);
-        });
-        slot(ui, "actions", rect.with_min_x(controls_left), |ui| {
-            if actions_menu {
-                let response = ui.menu_button("Actions", |ui| self.top_bar_controls(ui, false, true)).response;
-                record_item(ui, "Actions", &response);
-            } else {
-                self.top_bar_controls(ui, show_load, false);
-            }
-        });
-        slot(ui, "navigation", navigation, |ui| {
-            self.view_tabs(ui);
-            self.top_bar_notice(ui);
-        });
-        ui.allocate_rect(rect, Sense::hover());
-    }
-
-    fn top_bar_brand(&mut self, ui: &mut egui::Ui, show_agents: bool) {
-        self.draw(|backend, client| atomics_ui::topbar::brand(ui, show_agents, backend, client));
-    }
-
-    pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
-        self.draw(|backend, client| atomics_ui::tabs::view_tabs(ui, backend, client));
-    }
-
-    pub(super) fn urgent_tabs_label(&mut self) -> (String, Color32) {
-        self.draw(atomics_ui::tabs::urgent_tabs_label)
-    }
-
-    pub(super) fn urgent_navigation_width(&mut self, ui: &mut egui::Ui) -> f32 {
-        self.draw(|backend, client| atomics_ui::tabs::urgent_navigation_width(ui, backend, client))
-    }
-
     /// Phone and browser access through a rendezvous service, when `[remote.rendezvous]` is
     /// enabled: "Remote" in the success colour while online, with a dot in the warning colour while
-    /// it waits or has stopped, muted while it connects. The hover says why; a click opens Remote
-    /// devices (pairing and revoking).
+    /// it waits or has stopped, or while the operation journal cannot be written; muted while it
+    /// connects. The hover says why; a click opens Remote devices (pairing and revoking).
     fn rendezvous_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         use crate::protocol::rendezvous::Phase;
         let Some(status) = self.runtime.rendezvous_status() else { return };
         let palette = self.palette();
+        let journal = self.runtime.journal_problem();
         let (text, color) = match status.phase {
+            _ if journal.is_some() => ("Remote ●".to_string(), palette.warning),
             Phase::Online => ("Remote".to_string(), palette.success),
             Phase::Waiting | Phase::Stopped => ("Remote ●".to_string(), palette.warning),
             Phase::Starting | Phase::Registering | Phase::Connecting => ("Remote …".to_string(), palette.muted),
@@ -118,7 +39,7 @@ impl Desktop<'_> {
         if !status.registered && status.phase != Phase::Online {
             hover.push_str("\nThis host is not registered yet.");
         }
-        if let Some(note) = &status.note {
+        for note in status.note.iter().chain(&journal) {
             hover.push('\n');
             hover.push_str(note);
         }
@@ -135,10 +56,9 @@ impl Desktop<'_> {
         }
     }
 
-    fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool, in_menu: bool) {
-        self.draw(|backend, client| atomics_ui::topbar::diff_button(ui, in_menu, backend, client));
-        self.draw(|backend, client| atomics_ui::topbar::new_button(ui, in_menu, backend, client));
-        self.draw(|backend, client| atomics_ui::topbar::plan_button(ui, in_menu, backend, client));
+    /// This host's items after the top bar's Plan button: Tickets, the GitHub counter, Remote, and in the
+    /// Actions menu (`in_menu`) the ticket system's sign-in.
+    pub(super) fn host_top_bar_items(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         if self.runtime.ticket_config().is_some() {
             // A dot says the ticket system wants a sign-in.
             let signed_out = self.runtime.tickets.panel.signin;
@@ -184,11 +104,10 @@ impl Desktop<'_> {
                 ui.close();
             }
         }
-        let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
-        record_item(ui, "Project", &response);
-        if show_load {
-            self.load_gauge(ui);
-        }
+    }
+
+    /// The Settings menu, last in the top bar; ctl's `show_settings` opens or closes it.
+    pub(super) fn settings_button(&mut self, ui: &mut egui::Ui) {
         // Trying themes and toggling where they are saved keep the menu open.
         let config =
             egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
@@ -207,10 +126,6 @@ impl Desktop<'_> {
             }
             ui.ctx().request_repaint();
         }
-    }
-
-    fn top_bar_notice(&mut self, ui: &mut egui::Ui) {
-        self.draw(|backend, client| atomics_ui::topbar::notice(ui, backend, client));
     }
 }
 
@@ -642,5 +557,38 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn the_remote_indicator_warns_while_the_operation_journal_cannot_be_written() {
+        with_app(
+            "app::topbar::tests::the_remote_indicator_warns_while_the_operation_journal_cannot_be_written",
+            |app, ctx| {
+                use crate::protocol::journal::Journal;
+                use crate::protocol::rendezvous::{Phase, StatusCell};
+                let status = StatusCell::new(|| {});
+                status.update(|status| status.phase = Phase::Online);
+                app.runtime.set_remote_view(crate::host::RemoteView {
+                    enabled: true,
+                    rendezvous: Some(status),
+                    ..Default::default()
+                });
+                let label = |app: &mut Desktop<'_>| {
+                    let (_, output) = render(app, ctx, 2400.0, vec![]);
+                    let label = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(t) if t.galley.text().starts_with("Remote") => {
+                            Some(t.galley.text().to_string())
+                        }
+                        _ => None,
+                    });
+                    output.drop_without_applying_deltas();
+                    label.expect("the Remote indicator")
+                };
+                assert_eq!(label(app), "Remote", "online");
+                app.runtime.ops = Journal::unwritable("No space left on device".into());
+                assert_eq!(label(app), "Remote ●", "online, but clients cannot change anything");
+                assert!(app.runtime.journal_problem().unwrap().contains("No space left on device"));
+            },
+        );
     }
 }

@@ -170,6 +170,11 @@ Lease expiry/disconnect fences late input with a new lease token. Opening a tab 
 Approvals are shared host transactions: the first valid decision for an unexpired ID wins, and every
 client sees the resolution. A stale decision cannot approve the next request in that session.
 Keep the existing hook timeout/fallback behavior and held-message rules when no client answers.
+A session's approval list is the one source of truth for a waiting prompt. A hook request fills it; with no
+hook request, the host's screen check puts the agent's own command menu there (Codex's "Would you like to run
+the following command?", Claude's "Bash command … Do you want to proceed?"), under one ID while the menu stays.
+A decision on it presses that agent's keys only while the screen still shows the reviewed command. Raw input
+is refused only while a decision can answer the prompt; any other menu takes raw keys.
 
 ## Remote authentication and isolation
 
@@ -458,7 +463,9 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   resend an unanswered operation only while it is younger (`Pending::resend`): an older one needs the user's fresh
   intent. With `[remote]` off the journal is in memory and there is no file.
   An incomplete final line is truncated on open. If opening or writing the journal fails,
-  new client mutations are refused; a failed reopen after compaction disables further writes.
+  new client mutations are refused until the host restarts (no record may follow one that failed); a failed
+  reopen after compaction disables further writes. The desktop says why: in Remote devices, with a warning dot
+  on the Remote indicator and the reason in its hover, and as `journal_error` in `atomics ctl '{"cmd":"remote"}'`.
   Desktop actions use fresh operation IDs, bypass the client capacity limit, and still run
   without journaling when the journal is unwritable. Outcome records are appended under the
   State lock, then synced after releasing it, before client replies are sent. The beginning
@@ -628,10 +635,12 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   (`protocol::Sessions`), with the role of the paired device (below). At most four at once; one more is closed with
   `quota` (4429), and a channel the host closes gives its place back at once, before the service's `left`. A
   channel ends with 1000, `refused` (4000) for a protocol error or a message that fails to decrypt, `idle` (4001),
-  `not_paired` (4003), `no_pairing` (4004) or `slow` (4408); one the host cannot start gets `unavailable` (4002).
+  `not_paired` (4003), `no_pairing` (4004), `pairing_busy` (4005) or `slow` (4408); one the host cannot start gets
+  `unavailable` (4002).
   Each channel may queue 1 MiB
   toward the service (a session waits up to 5 s for room, then ends as slow), and a channel whose session stops
-  reading 1 MiB of what arrives is closed as slow.
+  reading 1 MiB of what arrives is closed as slow. Stopping the rendezvous closes the tunnel and waits up to 2 s
+  for the channels' threads, so their sessions' last-seen times are written before the host goes.
 - **Renewal.** After each `expiry` the host renews at half the remaining admission, between 15 s and 150 s, so a
   skewed clock still renews in time. The renewal's MCP calls never stall the frames; a failed one is retried after
   15 s (a minute when throttled), and a revoked answer stops the host.
@@ -642,12 +651,13 @@ The ticket profile maps `rendezvous_register`, `rendezvous_challenge` and `rende
   every 30 s; an `unknown` host id a minute after registering registers again.
 - **Status.** A "Remote" indicator in the top bar while `[remote.rendezvous]` is enabled (online in the success
   colour, waiting or stopped with a dot, connecting muted; the hover says why), and `atomics ctl '{"cmd":"remote"}'`:
-  the protocol server's URL and the rendezvous's `phase`, `service`, `host`, `registered`, `host_id`, `online`,
-  `channels` and `note`. The headless host logs whether it started.
+  the protocol server's URL (and `journal_error` while the operation journal cannot be written, above) and the
+  rendezvous's `phase`, `service`, `host`, `registered`, `host_id`, `online`, `channels` and `note`. The headless
+  host logs whether it started.
 - **Tests.** `protocol::rendezvous::tests` runs the host against an in-process service that admits only unused
   passes from a fake issuer, with browsers speaking `atomics_core::noise` on its channels: registration, the
   upgrade's headers, pairing (controller and view-only, a wrong psk and the link given back, a device racing the
-  link, no pairing open), sessions of paired devices, an unknown device refused inside the channel, plaintext and
+  link and told it is busy, a used link and no pairing open), sessions of paired devices, an unknown device refused inside the channel, plaintext and
   forged channels, replays (a replayed handshake marks nothing connected and writes nothing), revoking, renewal at
   half-life, every close code, a dropped socket and a silent service, refused upgrades, the channel limit, issuer
   refusals, and a stop. The profile issuer is tested against an in-process MCP server (whoami, signatures, refusal
@@ -668,7 +678,10 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   characters of unpadded base64url. `pair_url` must be `https://` (or `http://` to this machine) and end in
   `#{pairing}`, so the psk travels only in the fragment, which browsers never send. The link works once, for five
   minutes, and only one is open. A device answers it with `Noise_IKpsk2_25519_ChaChaPoly_SHA256`; one at a time
-  (another gets `no_pairing`, and a browser asks again while its link may be valid). The handshake proves nothing
+  (another gets `pairing_busy`, 4005, and a browser asks again while its link may be valid). A link that was
+  never offered, was used, expired or was withdrawn gets `no_pairing` (4004): asking again cannot help. An older
+  host says `no_pairing` for both; an older browser reads `pairing_busy` as a dropped channel and dials again,
+  until the link is used or expires and the host says `no_pairing`. The handshake proves nothing
   about the psk, so the link goes back as soon as the device's first message fails to decrypt or the device leaves,
   and at the latest after 30 s. Its first message (`PairRequest`, its name) proves the psk; then the desktop asks
   "Pair “name”?" beside the six-digit code from the handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
@@ -739,7 +752,7 @@ sustained 2 MiB/s per host with an 8 MiB burst, ping every 25 s with a 60 s idle
 and channels. The broker cannot read frames, so it cannot supersede screen deltas: the host applies the queue
 policy from Terminal streaming before encrypting, and a closed slow channel reconnects to a fresh snapshot.
 Close codes are typed: `unauthorised`, `revoked`, `slow`, `replaced`, `quota`; the host's own, on a channel, are
-`refused`, `idle`, `unavailable`, `not_paired` and `no_pairing`.
+`refused`, `idle`, `unavailable`, `not_paired`, `no_pairing` and `pairing_busy`.
 
 **Reconnect.** Jittered backoff. A dropped broker socket detaches channels without touching sessions. The host
 redials with a fresh pass; each browser reconnects, handshakes again and sends `hello` with its prior epoch and
@@ -810,10 +823,10 @@ clipboard could not be read, and pasting with the keyboard still works.
 | `theme` | no | The page's theme. A built-in ATOMICS theme of that name is used, else the first built-in of `scheme` |
 | `scheme` | no | `dark` (the default) or `light` |
 | `locale` | no | The page's locale |
-| `view` | no | Where to open: `board` (the default), `plans`, `approvals`, `diffs`, `terminal` (an agent's) or `chief`; an unknown name opens the board |
+| `view` | no | Where to open: `board` (the default), `agents`, `approvals`, `diffs`, `terminal` (an agent's) or `chief`; on a wide screen `diffs` opens the right panel on the diff and `chief` shows the chief; `plans`, or an unknown name, opens the board |
 | `ticket_key` | no | A ticket's key (`docs/tickets.md`; its id where it has no key): opens the plan that follows it, else one with a task for it (open plans first, keys compared without regard to ASCII case), or the board when none does. Wins over `view`. A text like the others; empty is ignored. (`ticket` is the connect ticket.) |
 | `mode` | no | Absent, or `pair` on a pairing page |
-| `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk}`: the pairing link's fields, each key 43 characters of unpadded base64url |
+| `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk, age_ms}`: the pairing link's fields, each key 43 characters of unpadded base64url, and optionally `age_ms`, how many milliseconds before this boot the page got the link (opened, scanned or pasted). The link's five minutes run from then; without it, or with anything but a number of at least 0, from the boot |
 
 A boot with a malformed required field, an unknown `mode` or a malformed `pair` is ignored. Texts are trimmed,
 stripped of control characters and cut at 200 characters.
@@ -842,69 +855,162 @@ the board holds, so the host replays what was missed or sends a snapshot. A gap 
 `resync`. Operations still unanswered are sent again with the same IDs while younger than `op_ttl_secs`; older
 ones say to check the board. At most 64 wait (`max_pending_ops`); past that the browser refuses new ones until
 some are answered. A transport message that fails to decrypt ends the channel, and the frame dials again. While
-pairing, `no_pairing` is tried again with the same waits until five minutes after the boot (the link's lifetime).
-It stops for good on the host's sealed refusal (and forgets the key), a bare `not_paired` close (it keeps the key),
-`no_pairing` after that, `revoked`, a refused or failed pairing, a drop while the codes are being compared, or a
-handshake answer that does not authenticate (the host's key is not the one this browser paired with).
+pairing, `pairing_busy` (another device is pairing) is tried again with the same waits, saying so, until the link's
+five minutes are up, counted from when the page got it (`pair.age_ms`). It stops for good on `no_pairing` at once
+("This pairing link was used or has expired. Show a new code on the computer."), on `pairing_busy` once the link's
+time is up, on the host's sealed refusal (and forgets the key), a bare `not_paired` close (it keeps the key),
+`revoked`, a refused or failed pairing, a drop while the codes are being compared, or a handshake answer that does
+not authenticate (the host's key is not the one this browser paired with).
 
-**What it offers.** The board, the plans, the approvals, the diffs and the terminals, with `board`, `plans`,
-`approvals`, `diffs`, `terminals`, `input` and `mutations` asked for in `hello`. It answers approvals
-(`approval_decide`), approves plans (`plan_command` `approve`, with the plan's digest) and types into terminals
-when `welcome`'s `may` grants it; any other command says it is not available in the browser yet. A diff on screen
-is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the browser draws it without
-syntax colours.
+**What it offers.** What the desktop offers wherever `atomics.v1` can carry it, asked for in `hello` with `board`,
+`plans`, `approvals`, `diffs`, `terminals`, `input` and `mutations`. A command is offered when
+`Command::remote` has mutations for it and `welcome`'s `may` grants them all, so a viewer, or a browser that is not
+connected, sees no action it cannot take. The shared views ask `Backend::available` and draw no button, menu entry
+or tab for the others:
 
-**Layouts (C4).** On a desktop, a top bar with the connection's state and a tab per view: Board, Plans,
-Approvals, Diffs, Terminal (an agent's, picked from a list) and Chief. On a phone (narrower than 600 points, or 900
-with a coarse pointer; the ⋯ menu overrides it, remembered in the client origin's `localStorage`), one pane at a
-time (Board, Plans, Diffs, Terminal, Chief) from a bottom bar, the approvals behind the top bar's ◆ badge, all
-inside `visualViewport` and the safe-area insets. Everything is drawn in the boot's ATOMICS theme (`Palette`);
-the page's own controls take its colours as CSS custom properties.
+- **Offered:** answering approvals; approving a plan, Dispatch, a card's start, accept, send back, unblock and reopen,
+  integrate and Integrate; a tile's close and the sidebar's Close, asking where the desktop asks; review comments and
+  Send review; the steer bar, to the active session or the selected, and "Include in selected" (wide only: a phone's
+  terminal is right there); typing into terminals.
+- **Close plan…** offers Archive alone: `atomics.v1` has no way to complete a plan. An open plan's tab closes the same
+  way; a finished plan's tab has no close, and its board's Archive does that. A closed plan's board stays read-only.
+  A plan that closes while it shows gives way to the first open plan, as on the desktop.
+- **`+ New`** (wide only) opens a small picker of what the host's board names: the agents its sessions and open plans
+  use, and a scratch folder or a folder its sessions and open plans use. The host's configured agents and its
+  worktrees are not sent, so a host with no session and no open plan offers none, and starting in a new worktree
+  stays on the computer.
+- **The changed-files column** scrolls to a file's hunks, which the page has already.
+- **Hidden, for lack of an action or of what it reads:** reopening a plan, cleaning one up, completing one, editing a
+  brief, syncing tickets, renaming and resuming a session, the editor, the whole file of a file with no changes, the
+  explorer; and the voice, since a browser has no microphone here. The mirror does not say whether a session is
+  sandboxed, outside ATOMICS or in a scratch folder, so closing an exited session outside a worktree and a plan asks, in
+  case it deletes its folder. It has no agent kinds either, and a shell can run under any name, so there is no "All
+  agents" target: typed into a shell, a steer would run as a command. A shell not named `shell` still counts as an
+  agent in the top bar, and a worktree with only that shell still offers Send review; the host sends a review only to
+  an agent, so it refuses, and the comments stay. An integration the host is still checking, or could not verify,
+  shows as integrated: the mirror does not carry that state.
+
+A command that fails says why: refused, unconfirmed or too large, on the phone's notice line and in a note under the
+wide layout's top bar, which like a window takes the pointer and its part of the input, and goes after 12 s or a click.
+A note about the connection goes when the connection is back. A steer that reached none of its targets goes back into
+the bar; one that reached some does not, since Enter would reach those again, and the note names those it missed. An
+approval goes back to its banner, a refused comment back into its box with its text, and a task's `integrating…` ends
+with the outcome. A comment box open when the connection drops keeps its draft and the keyboard: Enter does nothing
+until the connection is back, then sends. If the host sends the whole board again, as after a restart, the box goes
+for a moment, so the draft stays and the keyboard takes a click. A diff on screen is fetched file by file with
+`diff_get`, four files at a time, up to 16 pages each; the browser draws it without syntax colours.
+
+**Layouts (C4).** A wide window draws the desktop's own window, `atomics_ui::shell::frame`, in the boot's theme
+as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
+plan tabs and the chief's pill, the sidebar where the window has room for it, the tiled terminals with their
+headers and approval banners, the steer bar, the board or a worktree's diff in the right panel, and the chief docked
+(at first) or floating. The items only a host has (Settings, sandboxes, credentials, the ticket sign-in, GitHub, the
+load gauge, USAGE, Project) are hooks the browser leaves empty; the connection's state takes the place of the
+desktop's Remote item, and the ⋯ layout menu that of Settings. What the desktop keeps in its
+host's model about its window (the tab, the active session, the right panel, the chief's window) the browser keeps
+per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view commands; the tabs are the plans'
+and Ungrouped, and a page opens as the desktop does, on the first open plan's with its board beside the agents, and
+keeps its plan by id. Finished plans are reached through History; with no open plan, every agent shows and no board.
+A click into a terminal, or picking an agent, sends what is typed there, as on the desktop: the page's one input
+moves over it, focused, and lets go of the lease of the terminal it left. A chief's permission request is answered over
+the chief's terminal, and connection trouble (why the page stopped, or that the board may be out of date) stays in
+a line under the frame.
+
+On a phone (narrower than 600 CSS pixels, or 900 with a coarse pointer; the ⋯ menu overrides it, remembered in the
+client origin's `localStorage`), one pane at a time from a bottom bar, each a view of the desktop's: Agents (the
+sidebar's AGENTS list; a tap opens the agent's tile), Board (the current plan's board under one row to pick plans
+from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History, the one picked
+there joining the strip, which scrolls to it and keeps a tap's width of the plan before it), Diffs (the
+worktrees with changes, then the diff panel), Terminal (the active agent's fleet tile at the pane's size: its header,
+its approval banner, its terminal) and Chief (the chief's window, with the request it waits on). The approvals are
+behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
+insets (the sides too, for a phone held sideways). The page's own
+controls take the theme's colours as CSS custom properties.
+
+The phone draws the theme's colours zoomed by 1.25 (through the theme's UI size, so code and terminals keep their
+CSS size), with proportional UI text and monospace only for code, terminals and IDs; every control is at least
+44 CSS pixels square and the content keeps a 16 px gutter from the sides. The shared views fit it through
+`Client::touch` (`atomics_ui::touch`), which the desktop never sets: the board stacks the statuses that have tasks
+with full-width cards under its header and buttons; a tile fills the pane to its sides with a finger-sized header;
+the diff header stacks the title, then the branch and counts, then its buttons in a row that wraps with Close last,
+and the diff shows one side, numbers each line once and wraps long lines under their indent, measured by the
+glyphs they are drawn with, so wide characters never run past the screen (**wrap** turns that off); approval
+banners span the screen.
 
 **Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and
 the history kept for it freed. Its cells are the desktop's grid, drawn by the shared painter: the font fits the
-width until the user pinches, a wider grid pans, and a grid taller than the pane keeps the cursor in view. Looking
-never resizes the PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
-desktop, and lasts as long as the lease (**Computer's size** gives it back early).
+width until the user pinches, on a phone never below 13 px, a wider grid pans, a grid taller than the pane keeps
+the cursor in view, and the screen's own background fills the pane below a shorter one. Looking never resizes the
+PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
+desktop, and lasts as long as the lease (**Computer's size** gives it back early), so the keyboard moving to a text
+box ends it too.
 
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
   from `keydown` (Ctrl+V and Cmd stay the browser's), a soft keyboard's Return and Backspace from `beforeinput`
   where its `keydown` names no key, and pastes. The field has autocorrect, autocapitalisation, autocomplete and
   spellcheck off. A touch on it is handled by the client: a tap focuses it from the touch's own handler (which
-  opens the keyboard), and the browser's loupe, callout and page zoom never start.
+  opens the keyboard), and the browser's loupe, callout and page zoom never start. It takes the pointer only where
+  egui would give the terminal the pointer: a floating window over the terminal is cut out of it with a `clip-path`,
+  so the browser sends that part's pointer to the canvas, and all of it goes while a menu or popup is open, so a click
+  away closes the popup as it does anywhere else. A click on a text box the page draws, the steer bar or a comment
+  box, takes the browser's focus with it: what is typed goes there, and nothing reaches the terminal.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
-  while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, and takes the bottom
-  bar's place. Its keys never take the focus; Paste reads the clipboard on the touch's end.
+  while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
+  safe area's sides, and takes the bottom bar's place. Its keys are at least 44 CSS pixels each way (a screen
+  narrower than 375 scrolls a row) and never take the focus; Paste reads the clipboard on the touch's end.
 - **Touch and mouse.** A tap clicks the cell (press and release) where the program asked for mouse reports and this
   client types; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
-  output does not move a view scrolled back) and pans; a long press (450 ms) selects, and a **Copy** chip copies
-  on its touch's end, leaving the focus where it was (see the iframe above); a pinch sets the font size (5-28
-  points). A touch whose lift never reached the client is cancelled when the next touch starts. A mouse clicks
-  and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a
-  scroll sends arrows or wheel reports instead, as the desktop does, only while this client types.
-- **Typing needs the lease.** Only the tap that focuses the field asks for a free lease; text typed meanwhile waits
-  for the grant (16 KiB at most, this connection only), and a lease state sent before the host read the request
-  leaves it standing. Typing never asks for the lease: text, keys and pastes count only while the field has the
-  focus and this client holds the lease or is asking for it, and anything else is dropped, never kept. Another
-  client typing makes the field read-only, with **Take over**. The lease is renewed every 10 s while the field has
-  the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
-  the focus away, and what was in flight then is dropped: keys of that frame, a word the keyboard commits as the
-  field loses the focus, a Paste whose clipboard read finishes late. Typing again is a new tap. A paste over
-  1 MiB, or more than may wait, is not typed, with a note that says so. Input refused as `slow_client` is typed
-  again from the screen's next change on, at most 1 MiB per change. Lease requests, input and resizes carry
-  request IDs, so a refusal names what it refuses; the client keeps at most 1024, forgetting input once a lease
-  state shows it applied. A view-only device's field is always read-only.
+  output does not move a view scrolled back) and pans; a long press (450 ms) selects the word under the finger
+  (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
+  each end to drag; a **Copy** chip, above the selection or below it where there is no room in the terminal, copies
+  just that range on its touch's end, leaving the focus where it was (see the iframe above). The page's own text
+  selection is off. A pinch sets the font size (5-28 points). A touch whose lift never reached the client is cancelled
+  when the next touch starts. A mouse clicks and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the
+  alternate screen, or with SGR mouse reports, a scroll sends arrows or wheel reports instead, as the desktop does,
+  only while this client types.
+- **Typing needs the lease.** Only the field gaining the focus asks for a free lease, by a tap, a click, or a pick
+  or the chief's notice that moves it there; text typed meanwhile waits for the grant (16 KiB at most, this
+  connection only), and a lease state sent before the host read the request leaves it standing. The input moving to
+  another terminal or to none, or the keyboard moving to a text box the page draws, releases the lease (a grant still
+  on its way goes back when it comes), and a click back asks again at once, even before the host has answered. A field
+  that only loses the focus, to another window or to a button, keeps the lease until it runs out, since nothing renews
+  it. Typing never asks for the lease: text, keys and pastes count only while the field has the focus and this client
+  holds the lease or is asking for it, and anything else is dropped, never kept. Another client typing makes the field
+  read-only, with **Take over**. The lease is renewed every 10 s while the field has the focus. Losing it (the desktop
+  types or takes it back, another client takes over), or being refused it, takes the focus away, and what was in
+  flight then is dropped: keys of that frame, a word the keyboard commits as the field is blurred, a Paste whose
+  clipboard read finishes late. The caret goes with the focus, so text a keyboard commits later cannot focus the field
+  again. Typing again is a new tap. A word being composed when the user clicks away commits first, so it is typed,
+  with no Return. A paste over 1 MiB, or more than may wait, is not typed, with a note naming the limit that refused
+  it (16 KiB while waiting for the grant, else 1 MiB). Input refused as `slow_client` is typed again from the screen's
+  next change on, at most 1 MiB per change. Lease requests, input and resizes carry request IDs, so a refusal names
+  what it refuses; the client keeps at most 1024, forgetting input once a lease state shows it applied. A view-only
+  device's field is always read-only.
 - **Offline.** The screen stays on view, marked "Disconnected"; the field is read-only and nothing typed is kept:
   the lease and anything waiting end with the channel, and the screen is subscribed again after `welcome`.
 
-**Tests.** `cargo test -p atomics-web`: the boot's origin, window and field rules; the channel, pairing, the
-board, commands and grants, reconnecting and every stop against an in-process host built from `atomics_core`
-(`src/fake_host.rs`, whose terminals echo under leases); the terminals' leases, typing, history, no replay and
-`slow_client`; that nothing typed after a take back types or asks for the lease; the gestures; the overlay's
-events; the phone layout at 360, 390 and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
-the views drawn headless; the manifest; and that the crate names no hosting product. `tests/browser.rs` (ignored; needs the bundle and Chrome) also types into a terminal of the real
-bundle through DevTools, sees the echo, and loses and regains the lease.
+**Tests.** `cargo test -p atomics-web` runs against an in-process host built from `atomics_core`
+(`src/fake_host.rs`, whose terminals echo under leases): pairing, the channel and reconnecting; each command as a
+controller, a viewer and offline, with what it sends and what comes of it; leases, typing and gestures; and the views
+drawn headless in both layouts.
+
+`tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker, in a desktop
+window and as an iPhone used by touch alone. Its header says what each test drives. The tests click and tap where the
+fake board puts things, and save screens for a person to review under `target/` (`phone-shots/`, `many-plans-shots/`,
+`wide-shots/`, `actions-shots/`). They need the bundle and Chrome, so they are ignored by default:
+
+```sh
+scripts/build-web.sh
+cargo test -p atomics-web --test browser -- --ignored
+# the phone alone, printing where its screenshots are:
+cargo test -p atomics-web --test browser -- --ignored --nocapture the_bundle_works_on_a_phone_by_touch
+# the desktop's QA screenshot first, then the wide window beside it:
+atomics queue --class qa -- scripts/wide-desktop-shot.sh
+cargo test -p atomics-web --test browser -- --ignored --nocapture the_bundle_draws_the_desktops_frame_in_a_wide_window
+```
+
+`ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser.
 `crates/atomics-ui/tests/dependencies.rs` keeps desktop-only crates out of `atomics-ui` and `atomics-web` on both
 targets, and CI checks both for `wasm32-unknown-unknown`.
 

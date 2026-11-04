@@ -40,6 +40,7 @@ impl Session {
             held: Vec::new(),
             approval_hold: false,
             menu_absent_since: None,
+            answered_menu: None,
             chief,
             pending: None,
             sandbox: None,
@@ -799,6 +800,7 @@ impl State {
         let mut finished = Vec::new();
         let mut credential_errors = Vec::new();
         let mut ref_checks = Vec::new();
+        let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let Some(terminal) = &session.terminal else { continue };
             if !session.approvals.is_empty() {
@@ -814,6 +816,21 @@ impl State {
                 session.last_message = Some(reason);
                 session.activity.observe(session.status);
                 continue;
+            }
+            // A command menu drawn with no hook asking is the session's pending approval.
+            if session.is_agent()
+                && session.sandbox.is_none()
+                && !terminal.exited()
+                && matches!(
+                    session.status,
+                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+                )
+            {
+                let screen = terminal.screen_text(60);
+                if atomics_core::approvals::native_menu(&screen).is_some() {
+                    menus.push((index, screen));
+                    continue;
+                }
             }
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
@@ -871,6 +888,9 @@ impl State {
                 self.pending_questions.remove(&session.id);
             }
             session.activity.observe(session.status);
+        }
+        for (index, screen) in menus {
+            self.sync_native(index, &screen, Instant::now());
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();
@@ -1038,36 +1058,39 @@ impl State {
         Delivery::Queued
     }
 
-    pub(super) fn send_review(&mut self, root: &Path) -> Delivery {
+    /// Send `root`'s comments to its agent as one message. When they cannot go they stay, and the error says why.
+    pub(super) fn send_review(&mut self, root: &Path) -> Result<Delivery, &'static str> {
         let comments = self.diffs.get(root).map(|s| s.comments.clone()).unwrap_or_default();
         if comments.is_empty() {
-            return Delivery::Unavailable;
+            return Err("no pending comments");
         }
         let header = self.config.fill(&self.config.steer.review_header);
         let message = steer::compose_review(&header, &comments);
         let target = self
             .active_index()
-            .filter(|&i| self.sessions[i].root() == root)
+            .filter(|&i| self.sessions[i].root() == root && self.sessions[i].is_agent())
             .or_else(|| self.sessions.iter().position(|s| s.root() == root && s.is_agent() && s.can_receive()));
         let Some(index) = target else {
-            self.toast("No agent is working in this worktree");
-            return Delivery::Unavailable;
+            let reason = "No agent is working in this worktree";
+            self.toast(reason);
+            return Err(reason);
         };
         let count = comments.len();
         let delivery = self.deliver(index, &message);
-        if delivery != Delivery::Unavailable {
-            if let Some(state) = self.diffs.get_mut(root) {
-                state.comments.clear();
-            }
-            let title = self.sessions[index].title.clone();
-            let action = match delivery {
-                Delivery::Held => "Held",
-                Delivery::Pending => "Sending",
-                _ => "Sent",
-            };
-            self.toast(format!("{action} {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
+        if delivery == Delivery::Unavailable {
+            return Err("could not deliver the review");
         }
-        delivery
+        if let Some(state) = self.diffs.get_mut(root) {
+            state.comments.clear();
+        }
+        let title = self.sessions[index].title.clone();
+        let action = match delivery {
+            Delivery::Held => "Held",
+            Delivery::Pending => "Sending",
+            _ => "Sent",
+        };
+        self.toast(format!("{action} {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
+        Ok(delivery)
     }
 }
 
@@ -1253,36 +1276,11 @@ fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
     vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
 }
 
+#[cfg(test)]
 impl Desktop<'_> {
-    fn steer_targets(&self) -> Vec<usize> {
-        let indices = 0..self.runtime.sessions.len();
-        match self.client.steer_target {
-            SteerTarget::Active => self.runtime.active_index().into_iter().collect::<Vec<usize>>(),
-            SteerTarget::Agents => indices
-                .filter(|&i| self.runtime.sessions[i].is_agent() && !self.runtime.sessions[i].chief)
-                .collect::<Vec<usize>>(),
-            SteerTarget::Selected => {
-                indices.filter(|&i| self.client.selected.contains(&self.runtime.sessions[i].id)).collect::<Vec<usize>>()
-            }
-        }
-        .into_iter()
-        .filter(|&i| self.runtime.sessions[i].can_receive())
-        .collect()
-    }
-
+    /// Sends the steer bar's message as the bar's Send does (`atomics_ui::chief::send_steer`), for tests.
     pub(super) fn send_steer(&mut self) {
-        let text = self.client.steer_text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let targets = self.steer_targets();
-        if targets.is_empty() {
-            self.runtime.toast("No session to send to");
-            return;
-        }
-        let sessions: Vec<String> = targets.into_iter().map(|i| self.runtime.sessions[i].id.clone()).collect();
-        self.client.steer_text.clear();
-        self.send(Command::Steer { sessions, text });
+        self.draw(atomics_ui::chief::send_steer);
     }
 }
 
@@ -1616,7 +1614,6 @@ mod tests {
     #[test]
     fn codex_version_is_cached_per_program_without_blocking_launch() {
         with_app("app::sessions::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, _ctx| {
-            use std::os::unix::fs::PermissionsExt;
             let dir = crate::test_support::tempdir().unwrap();
             let script = r#"#!/bin/sh
 dir=${0%/*}
@@ -1637,12 +1634,10 @@ fi
                 let folder = dir.path().join(name);
                 std::fs::create_dir(&folder).unwrap();
                 let program = folder.join("codex");
-                std::fs::write(
+                crate::test_support::write_program(
                     &program,
                     if name == "two" { script.replace("0.165.0", "0.164.0") } else { script.to_string() },
-                )
-                .unwrap();
-                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+                );
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: name.into(),
                     command: vec![program.to_string_lossy().into_owned()],
@@ -1730,7 +1725,6 @@ fi
         with_app(
             "app::sessions::tests::failed_codex_probes_are_retried_and_recovered_launches_get_hooks",
             |app, _ctx| {
-                use std::os::unix::fs::PermissionsExt;
                 let dir = crate::test_support::tempdir().unwrap();
                 let program = dir.path().join("codex");
                 let name = program.to_string_lossy().into_owned();
@@ -1742,13 +1736,12 @@ fi
                     isolation: None,
                 });
                 for script in ["#!/bin/sh\nexec sleep 30\n", "#!/bin/sh\nexit 1\n"] {
-                    std::fs::write(&program, script).unwrap();
-                    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    crate::test_support::write_program(&program, script);
                     let failed = Arc::new(OnceLock::new());
                     failed.set(crate::setup::codex_supports_hooks(&name, Duration::from_millis(100))).unwrap();
                     assert_eq!(failed.get(), Some(&None));
                     app.runtime.codex_versions.insert(name.clone(), failed.clone());
-                    std::fs::write(
+                    crate::test_support::write_program(
                         &program,
                         r#"#!/bin/sh
 if [ "$1" = --version ]; then
@@ -1757,8 +1750,7 @@ else
   printf '%s\n' "$@" > launch-args
 fi
 "#,
-                    )
-                    .unwrap();
+                    );
                     let id = app.runtime.start("flaky", dir.path().into(), None, vec![], None).unwrap();
                     let retried = app.runtime.codex_versions[&name].clone();
                     assert!(!Arc::ptr_eq(&failed, &retried), "failed probes must not be reused as old versions");
@@ -2049,10 +2041,9 @@ fi
             assert_eq!(worktree.root, dir);
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_support::tempdir().unwrap();
         let git = dir.path().join("git");
-        std::fs::write(
+        crate::test_support::write_program(
             &git,
             r#"#!/bin/sh
 attempts=0
@@ -2069,9 +2060,7 @@ case "$5" in
   symbolic-ref) printf 'feature\n' ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])

@@ -130,7 +130,7 @@ impl Admitted {
                 }
                 Ok(tungstenite::Message::Close(_)) => return None,
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(tungstenite::Error::Io(e)) if crate::test_support::nothing_yet(&e) => {}
                 Err(_) => return None,
             }
         }
@@ -334,6 +334,15 @@ struct Fixture {
     devices: Arc<Devices>,
     _server: Server,
     _dir: crate::test_support::TempDir,
+}
+
+impl Drop for Fixture {
+    /// `stop` gives the channels' threads 2 s, as a quit should, and a loaded machine can take
+    /// longer. Each writes `devices.json` as its session ends, and `_dir` goes next.
+    fn drop(&mut self) {
+        self.rendezvous.stop();
+        self.rendezvous.crew.wait(Instant::now() + wait(Duration::from_secs(60)));
+    }
 }
 
 const PAIR_URL: &str = "https://service.example/atomics/pair#{pairing}";
@@ -677,6 +686,30 @@ fn a_wrong_psk_fails_and_the_link_stays_for_the_right_device() {
 }
 
 #[test]
+fn stopping_waits_for_the_channels_so_their_last_writes_land_first() {
+    let ledger = Shared::default();
+    let service = FakeService::start(ledger.clone());
+    let mut host = fixture(&service, &ledger, |_| {});
+    let mut socket = service.accept();
+    socket.expiry_in(300_000);
+    let device = Secret::generate().unwrap();
+    let mut secure = host.paired(&mut socket, 1, &device, Access::Control);
+    socket.hello(1, &mut secure);
+    let welcome = socket.envelope(1, &mut secure);
+    assert!(matches!(welcome.message, Message::Welcome { .. }), "{welcome:?}");
+    // Later than the attach's last-seen time, so only the detach can write one this late.
+    std::thread::sleep(Duration::from_millis(5));
+    let stopping = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    host.rendezvous.stop();
+    // The session's thread has ended: its device is no longer connected, and the last-seen time
+    // it wrote as it ended is on disk, before anything that owns the home goes.
+    let list = host.devices.list();
+    assert_eq!((list.len(), list[0].1), (1, false), "the session ended within stop");
+    let stored: Value = serde_json::from_str(&host.allowlist()).unwrap();
+    assert!(stored["devices"][0]["seen_ms"].as_u64().unwrap() >= stopping, "{stored}");
+}
+
+#[test]
 fn a_device_racing_the_link_shows_another_code_and_is_refused() {
     let ledger = Shared::default();
     let service = FakeService::start(ledger.clone());
@@ -689,10 +722,10 @@ fn a_device_racing_the_link_shows_another_code_and_is_refused() {
     let (mut raced, racer_code) = socket.pair(1, &link, &racer, "Phone").unwrap();
     let (name, shown) = host.prompt();
     assert_eq!((name.as_str(), shown.as_str()), ("Phone", racer_code.as_str()));
-    // The phone itself is refused while that pairing waits: one at a time.
+    // The phone itself is refused while that pairing waits: one at a time, and it may ask again.
     let phone = Secret::generate().unwrap();
-    assert_eq!(socket.pair(2, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
-    socket.send(service::left(2, close::NO_PAIRING));
+    assert_eq!(socket.pair(2, &link, &phone, "Phone").err(), Some(close::PAIRING_BUSY));
+    socket.send(service::left(2, close::PAIRING_BUSY));
     // The phone shows no code the user could match, so the user refuses.
     host.devices.decide(None);
     assert_eq!(socket.pair_answer(1, &mut raced), PairAnswer { paired: false, may: None });
@@ -700,7 +733,7 @@ fn a_device_racing_the_link_shows_another_code_and_is_refused() {
     assert!(host.devices.list().is_empty(), "never added");
     let mut later = socket.connect(3, &host.host_key(), &racer).expect("an answer");
     assert_eq!(socket.refused(3, &mut later), close::NOT_PAIRED);
-    // And the link is used up.
+    // And the link is used up: no longer busy, and asking again cannot help.
     assert_eq!(socket.pair(4, &link, &phone, "Phone").err(), Some(close::NO_PAIRING));
 }
 
@@ -1038,7 +1071,7 @@ fn stopping_closes_the_tunnel_normally_and_ends_every_channel() {
         match socket.ws.read() {
             Ok(tungstenite::Message::Close(frame)) => break frame.map(|f| u16::from(f.code)),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(tungstenite::Error::Io(e)) if crate::test_support::nothing_yet(&e) => {}
             Err(e) => panic!("no close frame: {e}"),
         }
     };

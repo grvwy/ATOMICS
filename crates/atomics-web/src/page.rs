@@ -1,6 +1,7 @@
 //! What the page's overlay script (`web/terminal.js`) reports, read into the frame's own types. The script
-//! sends plain objects, `{kind, …}`, in CSS pixels; `zoom` (egui's zoom factor) turns them into points.
-//! Anything malformed is dropped.
+//! sends plain objects, `{kind, …}`, in CSS pixels; `zoom` (egui's zoom factor) turns a pointer's into
+//! points. The viewport stays in CSS pixels, since the layout it picks may change the zoom
+//! ([`Viewport::points`]). Anything malformed is dropped.
 
 use egui::{Modifiers, Rect, pos2, vec2};
 use serde_json::Value;
@@ -57,18 +58,19 @@ pub fn read(event: &Value, zoom: f32) -> Option<PageEvent> {
             term(TermInput::Wheel { delta, at: at()?, zoom })
         }
         "viewport" => {
-            let visible = Rect::from_min_size(
-                pos2(point(number("x")?), point(number("y")?)),
-                vec2(point(number("w")?), point(number("h")?)),
-            );
+            let css = |field: &str| number(field).map(|n| n as f32);
+            let visible = Rect::from_min_size(pos2(css("x")?, css("y")?), vec2(css("w")?, css("h")?));
             // A page the user pinch-zoomed shows part of the canvas magnified; the layout then uses it all.
             let scaled = number("scale").is_some_and(|s| (s - 1.0).abs() > 0.01);
+            let inset = |field: &str| css(field).unwrap_or(0.0).max(0.0);
             Some(PageEvent::Viewport(Viewport {
                 visible: (!scaled && visible.width() > 0.0 && visible.height() > 0.0).then_some(visible),
                 coarse: event.get("coarse").and_then(Value::as_bool).unwrap_or(false),
-                keybar: point(number("keybar").unwrap_or(0.0)),
-                inset_top: point(number("insetTop").unwrap_or(0.0)),
-                inset_bottom: point(number("insetBottom").unwrap_or(0.0)),
+                keybar: inset("keybar"),
+                inset_top: inset("insetTop"),
+                inset_bottom: inset("insetBottom"),
+                inset_left: inset("insetLeft"),
+                inset_right: inset("insetRight"),
             }))
         }
         "note" => Some(PageEvent::Note(text("text")?.chars().filter(|c| !c.is_control()).take(200).collect())),
@@ -124,11 +126,12 @@ mod tests {
     #[test]
     fn the_viewport_is_the_visible_part_unless_the_page_is_zoomed() {
         let event = json!({ "kind": "viewport", "x": 0, "y": 40, "w": 390, "h": 460, "scale": 1, "coarse": true,
-                            "keybar": 88, "insetTop": 47, "insetBottom": 0 });
-        let Some(PageEvent::Viewport(port)) = read(&event, 1.0) else { panic!("a viewport") };
+                            "keybar": 88, "insetTop": 47, "insetBottom": 0, "insetLeft": 0, "insetRight": 12 });
+        // In CSS pixels, whatever egui's zoom: the layout turns them into points.
+        let Some(PageEvent::Viewport(port)) = read(&event, 1.25) else { panic!("a viewport") };
         assert_eq!(port.visible, Some(Rect::from_min_size(pos2(0.0, 40.0), vec2(390.0, 460.0))));
         assert!(port.coarse);
-        assert_eq!((port.keybar, port.inset_top), (88.0, 47.0));
+        assert_eq!((port.keybar, port.inset_top, port.inset_right), (88.0, 47.0, 12.0));
         let mut zoomed = event.clone();
         zoomed["scale"] = json!(1.6);
         let Some(PageEvent::Viewport(port)) = read(&zoomed, 1.0) else { panic!("a viewport") };

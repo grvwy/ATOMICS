@@ -454,8 +454,9 @@ impl Store {
 
     /// The device item `slot` (the rendezvous device keys of one ATOMICS home, as text), made by
     /// `make` and stored first when there is none. Two processes that both find none agree on one:
-    /// the second waits for the first's write and returns it.
-    pub fn device_item(&self, slot: &str, make: impl FnOnce() -> Result<String>) -> Result<String> {
+    /// the second waits for the first's write and returns it. Every copy of the keys here is
+    /// wiped when dropped.
+    pub fn device_item(&self, slot: &str, make: impl FnOnce() -> Result<String>) -> Result<Zeroizing<String>> {
         check_slot(slot)?;
         if let Some(text) = self.read_device(slot)? {
             return Ok(text);
@@ -464,7 +465,7 @@ impl Store {
         if let Some(text) = self.read_device(slot)? {
             return Ok(text);
         }
-        let text = make()?;
+        let text = Zeroizing::new(make()?);
         let encoded = Zeroizing::new(text.bytes().fold(String::with_capacity(text.len() * 2), |mut hex, b| {
             use std::fmt::Write;
             let _ = write!(hex, "{b:02x}");
@@ -482,7 +483,7 @@ impl Store {
         self.keychain.remove_item(DEVICE, slot)
     }
 
-    fn read_device(&self, slot: &str) -> Result<Option<String>> {
+    fn read_device(&self, slot: &str) -> Result<Option<Zeroizing<String>>> {
         let invalid =
             || anyhow::anyhow!("OS credential item is malformed (contents hidden); remove it to make new keys");
         let Some(encoded) = self.keychain.read_item(DEVICE, slot)? else { return Ok(None) };
@@ -490,18 +491,15 @@ impl Store {
         if encoded.len() > OAUTH_CHUNK || !encoded.len().is_multiple_of(2) {
             return Err(invalid());
         }
-        let bytes: Vec<u8> = encoded
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-                Some(digit(pair[0])? * 16 + digit(pair[1])?)
-            })
-            .collect::<Option<_>>()
-            .ok_or_else(invalid)?;
-        String::from_utf8(bytes).map(Some).map_err(|_| invalid())
+        // Sized up front, so that no reallocation leaves a copy of the keys behind.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(encoded.len() / 2));
+        for pair in encoded.as_bytes().as_chunks::<2>().0 {
+            let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+            let (high, low) = digit(pair[0]).zip(digit(pair[1])).ok_or_else(invalid)?;
+            bytes.push(high * 16 + low);
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        Ok(Some(Zeroizing::new(text.to_owned())))
     }
 
     /// Holds off every other ATOMICS process's sign-in, refresh and sign-out of the server `key`
@@ -721,7 +719,10 @@ pub(crate) mod tests {
     pub fn machine(mac: bool) -> (crate::test_support::TempDir, Keychain, Store) {
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("keychain");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &program).unwrap();
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &program,
+        );
         let keychain = Keychain::at(&program, mac);
         let store = Store::new(keychain.clone());
         (dir, keychain, store)

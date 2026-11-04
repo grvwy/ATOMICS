@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Hosting page</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1f1e1d; }
+    iframe { display: block; border: 0; width: 100vw; height: 100vh; height: 100dvh; }
+  </style>
+</head>
+<body>
+  <script>
+    // A hosting page, on a phone or a wide screen: the client's frame fills it. The frame is mounted once the test has
+    // set the device up (`/phase` says `go`); the page boots it when it says it is ready, answers a request for
+    // a fresh ticket, and reports what the frame said to the test's server.
+    const client = 'CLIENT_ORIGIN';
+    const boot = PHONE_BOOT;
+    let frame;
+    let tickets = 0;
+    const report = text => fetch('/report', { method: 'POST', body: text });
+    addEventListener('message', event => {
+      if (event.origin !== client || event.source !== frame?.contentWindow) return;
+      const type = event.data?.type;
+      report(String(type));
+      if (type === 'atomics.ready') frame.contentWindow.postMessage(boot, client);
+      if (type === 'atomics.ticket') {
+        const ticket = `ticket-${++tickets}`;
+        frame.contentWindow.postMessage({ type: 'atomics.embed.ticket', v: 1, host_id: boot.host_id, ticket }, client);
+      }
+    });
+    const waiting = setInterval(async () => {
+      if (frame || (await (await fetch('/phase')).text()) !== 'go') return;
+      clearInterval(waiting);
+      frame = document.createElement('iframe');
+      frame.src = `${client}/index.html`;
+      frame.allow = 'clipboard-write; clipboard-read';
+      document.body.append(frame);
+    }, 100);
+
+    // The test's eyes: the client draws on a canvas, so its controls are found by colour in a screenshot.
+    // `look` decodes one (base64 PNG); `boxes` returns the bounding boxes, in CSS pixels, of the connected
+    // areas of one colour (±`tol` a channel) inside a region, sampled once a CSS pixel, the largest first.
+    let shot = null;
+    window.look = async png => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${png}`;
+      await image.decode();
+      const canvas = document.createElement('canvas');
+      [canvas.width, canvas.height] = [image.width, image.height];
+      const g = canvas.getContext('2d', { willReadFrequently: true });
+      g.drawImage(image, 0, 0);
+      shot = { scale: image.width / innerWidth, data: g.getImageData(0, 0, image.width, image.height) };
+      return [image.width, image.height];
+    };
+    window.boxes = ([r, g, b], tol, [x0, y0, x1, y1], minArea) => {
+      const { scale, data } = shot;
+      const [w, h] = [Math.floor(x1 - x0), Math.floor(y1 - y0)];
+      const hit = new Uint8Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const px = Math.floor((x0 + x + 0.5) * scale), py = Math.floor((y0 + y + 0.5) * scale);
+          const i = (py * data.width + px) * 4;
+          const d = data.data;
+          if (Math.abs(d[i] - r) <= tol && Math.abs(d[i + 1] - g) <= tol && Math.abs(d[i + 2] - b) <= tol) hit[y * w + x] = 1;
+        }
+      }
+      const found = [];
+      for (let start = 0; start < hit.length; start++) {
+        if (hit[start] !== 1) continue;
+        let [left, top, right, bottom, area] = [w, h, 0, 0, 0];
+        const stack = [start];
+        hit[start] = 2;
+        while (stack.length) {
+          const at = stack.pop();
+          const [x, y] = [at % w, Math.floor(at / w)];
+          [left, top, right, bottom, area] = [Math.min(left, x), Math.min(top, y), Math.max(right, x), Math.max(bottom, y), area + 1];
+          for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+            if (nx >= 0 && ny >= 0 && nx < w && ny < h && hit[ny * w + nx] === 1) {
+              hit[ny * w + nx] = 2;
+              stack.push(ny * w + nx);
+            }
+          }
+        }
+        if (area >= minArea) found.push([x0 + left, y0 + top, right - left + 1, bottom - top + 1, area]);
+      }
+      return found.sort((a, b) => b[4] - a[4]);
+    };
+    // Two screenshots (base64 PNGs) side by side, the first on the left, as a base64 PNG.
+    window.sideBySide = async (left, right) => {
+      const images = await Promise.all([left, right].map(async png => {
+        const image = new Image();
+        image.src = `data:image/png;base64,${png}`;
+        await image.decode();
+        return image;
+      }));
+      const canvas = document.createElement('canvas');
+      canvas.width = images[0].width + images[1].width;
+      canvas.height = Math.max(images[0].height, images[1].height);
+      const g = canvas.getContext('2d');
+      g.drawImage(images[0], 0, 0);
+      g.drawImage(images[1], images[0].width, 0);
+      return canvas.toDataURL('image/png').split(',')[1];
+    };
+  </script>
+</body>
+</html>

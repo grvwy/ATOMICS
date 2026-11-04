@@ -5,8 +5,10 @@
 //! execution is safe.
 use atomics_core::ops::{self, ApprovalDecide, Outcome};
 use atomics_ui::Command;
+use atomics_ui::terminal_surface::TerminalSurface;
 
 use super::backend::Local;
+use super::fleet::Terminals;
 use super::*;
 
 pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
@@ -149,7 +151,7 @@ impl Local<'_> {
                 state.diffs.entry(root).or_default().edit_comments(before, after);
             }),
             Command::SendReview(root) => state.post(move |state| {
-                state.send_review(&root);
+                let _ = state.send_review(&root);
             }),
             Command::RefreshDiff(root) => state.post(move |state| state_refresh(state.diffs.entry(root).or_default())),
             Command::OpenFile { root, path } => state.post(move |state| state.open_file(&root, &path)),
@@ -162,8 +164,12 @@ impl Local<'_> {
             Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
             Command::Steer { sessions, text } => state.post(move |state| state.steer_sessions(sessions, text)),
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
+            Command::Start { agent, folder } => {
+                state.post(move |state| state.client_commands.push(start_request(agent, folder)))
+            }
             Command::CloseSession(id) => state.post(move |state| state.close(&id)),
             Command::Resume(record) => state.post(move |state| state.resume.push(record)),
+            Command::ResumeSession(id) => state.post(move |state| state.resume_exited(&id)),
             Command::RenameSession { session, title } => state.post(move |state| {
                 if let Some(found) = state.sessions.iter_mut().find(|s| s.id == session) {
                     found.rename(&title);
@@ -249,12 +255,35 @@ impl Local<'_> {
     }
 }
 
+/// `atomics ctl start` for an agent in `folder`, or with none in a scratch folder of its own.
+fn start_request(agent: String, folder: Option<PathBuf>) -> ControlRequest {
+    ControlRequest::Start {
+        agent,
+        folder: folder.map(|folder| folder.to_string_lossy().into_owned()),
+        repo: None,
+        branch: None,
+        prompt: None,
+        args: Vec::new(),
+        isolation: None,
+    }
+}
+
 impl Desktop<'_> {
     /// Draws with atomics-ui code: the client's palette is the host's theme, reads go through the
     /// in-process backend, and the commands the draw recorded run when it returns.
     pub(super) fn draw<R>(&mut self, draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client) -> R) -> R {
+        self.draw_terminals(|backend, client, _| draw(backend, client))
+    }
+
+    /// [`Desktop::draw`] for views that hold terminals: they draw each through the desktop's own terminal
+    /// views ([`Terminals`]).
+    pub(super) fn draw_terminals<R>(
+        &mut self,
+        draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client, &mut dyn TerminalSurface) -> R,
+    ) -> R {
         self.client.ui.palette = self.palette();
-        let result = draw(&self.runtime.backend(), &mut self.client.ui);
+        let mut terminals = Terminals { sessions: &self.runtime.sessions, views: &mut self.client.terminal_views };
+        let result = draw(&self.runtime.backend(), &mut self.client.ui, &mut terminals);
         for command in std::mem::take(&mut self.client.ui.commands) {
             self.send(command);
         }
@@ -264,7 +293,8 @@ impl Desktop<'_> {
     /// Carries out a command now: a view command ([`Command::is_view`]) on this window, any other through
     /// the in-process backend. Selection is immediate client state, projected into the native model
     /// (`active`, `diff_root`, `diff_open`, `panel`, the tab) for ctl and the host's subscription and
-    /// scheduling decisions; dialogs open on this window's client.
+    /// scheduling decisions; dialogs open on this window's client. The welcome's [`Command::Start`] joins
+    /// the window's control requests, which go to the host when the frame is drawn.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
@@ -302,6 +332,12 @@ impl Desktop<'_> {
             }
             Command::Rename(session) => self.begin_rename(&session),
             Command::PickProject => self.pick_project(),
+            Command::HideChief => self.runtime.chief_open = false,
+            Command::ResizeChief(width) => self.runtime.store.chief_width = width,
+            Command::Toast(text) => self.runtime.toast(text),
+            // The window's own control requests, which it sends to the host after the draw, as the new-session
+            // dialog's.
+            Command::Start { agent, folder } => self.runtime.client_commands.push(start_request(agent, folder)),
             command => {
                 debug_assert!(!command.is_view(), "the desktop does not show {command:?}");
                 self.runtime.backend().send(command);

@@ -1,6 +1,7 @@
 //! One channel of the tunnel, on a thread of its own: the Noise handshake on its first frames
 //! (`atomics_core::noise`), then one `atomics.v1` session inside the encrypted channel, with the
-//! role the device's allowlist entry gives it (`devices.rs`).
+//! role the device's allowlist entry gives it (`devices.rs`). Stopping the rendezvous waits for the
+//! thread ([`Crew`]).
 //!
 //! - **Sessions** (`Noise_IK`): the host answers the handshake and waits for the device's first
 //!   transport message. Only once that decrypts (so the peer holds the device's key, and a replayed
@@ -11,8 +12,9 @@
 //!   controller, so H4's grants (`welcome.may`) follow from what the user chose when pairing. Its
 //!   paired name, not the `client_id` its `hello` chose, is the lease holder others see and the
 //!   sender the operation journal records (`protocol::Peer`).
-//! - **Pairing** (`Noise_IKpsk2`): only while the desktop offers a link, and one device at a time
-//!   (otherwise `no_pairing`, 4004). The device's first message proves the psk and names it; the
+//! - **Pairing** (`Noise_IKpsk2`): only while the desktop offers a link (otherwise `no_pairing`, 4004),
+//!   and one device at a time (another gets `pairing_busy`, 4005, and may ask again while its link
+//!   may be valid: `devices::Unavailable`). The device's first message proves the psk and names it; the
 //!   desktop shows its name and the code and asks; the answer goes back encrypted
 //!   ([`PairAnswer`]). A paired device's channel goes on as its session.
 //! - Before the handshake the host reads one bounded frame and parses nothing else. A message
@@ -24,7 +26,7 @@
 //!   every 1 GiB (`noise::Channel`).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use atomics_core::noise::{self, Established, Kind, NoiseError, PairAnswer, PairRequest, Responder};
@@ -50,6 +52,54 @@ pub struct Gate {
     pub pairing_timeout: Duration,
     pub send_timeout: Duration,
     pub rekey_every: Duration,
+    /// Counts the channels' threads.
+    pub crew: Arc<Crew>,
+}
+
+/// The channels' threads, counted so that `Rendezvous::stop` can wait for them: a session that
+/// ends writes its device's last-seen time (`Devices::detach`), and nothing may write into the
+/// ATOMICS home after its owner stopped.
+#[derive(Default)]
+pub struct Crew {
+    running: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl Crew {
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One more thread, until the returned member is dropped.
+    fn enter(self: &Arc<Self>) -> Member {
+        *self.lock() += 1;
+        Member(self.clone())
+    }
+
+    /// Wait until no channel's thread runs, at most until `deadline`.
+    pub fn wait(&self, deadline: Instant) {
+        let mut running = self.lock();
+        while *running > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            running = self.idle.wait_timeout(running, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
+/// A running channel thread of a [`Crew`].
+struct Member(Arc<Crew>);
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        let mut running = self.0.lock();
+        *running -= 1;
+        if *running == 0 {
+            self.0.idle.notify_all();
+        }
+    }
 }
 
 /// The frames that arrived for one channel and not yet read. The tunnel's thread fills it; the
@@ -169,7 +219,12 @@ pub fn open(channel: u32, outbound: Arc<Outbound>, gate: Arc<Gate>) -> std::io::
     let wait = Wait::new()?;
     let inbox = Arc::new(Inbox { state: Mutex::default(), waker: wait.waker() });
     let raw = Raw { channel, inbox: inbox.clone(), wait, outbound, send_timeout: gate.send_timeout, closed: false };
-    std::thread::Builder::new().name("atomics-protocol-channel".into()).spawn(move || serve(raw, &gate))?;
+    let member = gate.crew.enter();
+    std::thread::Builder::new().name("atomics-protocol-channel".into()).spawn(move || {
+        // Counted until its session's last write is done.
+        let _member = member;
+        serve(raw, &gate);
+    })?;
     Ok(inbox)
 }
 
@@ -227,7 +282,10 @@ fn session(mut raw: Raw, gate: &Gate, first: &[u8]) {
 
 /// A device answering the pairing link.
 fn pair(mut raw: Raw, gate: &Gate, first: &[u8]) {
-    let Some((attempt, psk)) = gate.devices.begin() else { return raw.close(close::NO_PAIRING) };
+    let (attempt, psk) = match gate.devices.begin() {
+        Ok(begun) => begun,
+        Err(why) => return raw.close(why.close_code()),
+    };
     // Until the device has proved the psk, a failure gives the link back for another try.
     let failed = |mut raw: Raw, code: u16| {
         gate.devices.abandon(attempt);
@@ -259,8 +317,8 @@ fn pair(mut raw: Raw, gate: &Gate, first: &[u8]) {
         gate.devices.abandon(attempt);
         return link.raw.close(close::REFUSED);
     };
-    if !gate.devices.claim(attempt, noise::device_name(&request.name), code, key, link.raw.waker()) {
-        return link.raw.close(close::NO_PAIRING);
+    if let Err(why) = gate.devices.claim(attempt, noise::device_name(&request.name), code, key, link.raw.waker()) {
+        return link.raw.close(why.close_code());
     }
     let Some(answer) = await_answer(&mut link.raw, &gate.devices, attempt) else {
         return gate.devices.abandon(attempt);

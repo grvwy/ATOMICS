@@ -64,7 +64,7 @@ impl DeviceKeys {
     /// The keys of the ATOMICS home `home`, made and stored the first time. The credential store's
     /// tool may wait for the keychain to unlock: never call this on the runtime thread.
     pub fn load_or_create(store: &Store, home: &Path) -> Result<Self> {
-        let text = Zeroizing::new(store.device_item(&slot(home), fresh)?);
+        let text = store.device_item(&slot(home), fresh)?;
         Self::parse(&text)
     }
 

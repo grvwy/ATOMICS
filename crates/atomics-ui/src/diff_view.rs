@@ -15,6 +15,7 @@ use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2
 
 use crate::keys::shortcut_label;
 use crate::theme::{Palette, lerp};
+use crate::touch::{self, Touch};
 
 pub use atomics_core::diff_data::{FileView, Prepared};
 
@@ -37,6 +38,8 @@ pub struct DiffState {
     pub file_error: Option<String>,
     /// The file last opened or reached by scrolling the diff.
     pub focused: Option<String>,
+    /// Long lines run on to the right, to scroll to, where a phone would wrap them.
+    pub unwrapped: bool,
 }
 
 /// The explorer of one project: the main checkout's files, with the changes of the
@@ -117,6 +120,28 @@ pub enum DiffAction {
 }
 
 impl DiffState {
+    /// Opens the comment box on `comment`'s line again, with its text, for a comment that did not go through; it
+    /// takes the keyboard with `focus`. False, and nothing changes, when another comment is being written or the
+    /// diff no longer has that line.
+    pub fn reopen_comment(&mut self, comment: &ReviewComment, focus: bool) -> bool {
+        if self.editor.as_ref().is_some_and(|editor| !editor.text.trim().is_empty()) {
+            return false;
+        }
+        let Some(prepared) = &self.prepared else { return false };
+        let on_it = |line: &DiffLine| {
+            let number = if comment.removed { line.old_no } else { line.new_no };
+            number.is_some() && number == comment.line && (line.kind == LineKind::Removed) == comment.removed
+        };
+        let files = prepared.diff.files.iter().enumerate().filter(|(_, file)| file.path() == comment.path);
+        let mut anchors = files.flat_map(|(fi, file)| {
+            let hunks = file.hunks.iter().enumerate();
+            hunks.filter_map(move |(hi, hunk)| hunk.lines.iter().position(on_it).map(|li| Anchor::Diff(fi, hi, li)))
+        });
+        let Some(anchor) = anchors.next() else { return false };
+        self.editor = Some(Editor { anchor, text: comment.body.clone(), focus });
+        true
+    }
+
     /// Opens `path`: its hunks when the diff touches it, the whole file otherwise.
     /// Returns true when the file content has to be loaded.
     pub fn open(&mut self, path: &str) -> bool {
@@ -213,6 +238,8 @@ enum Row {
     Binary,
     Hunk(usize, usize),
     Line(usize, usize, usize),
+    /// On a phone, a long line's continuation (the first is 1), wrapped under the line ([`wrapping`]).
+    Wrap(usize, usize, usize, usize),
     /// Side by side: the old and the new line of one hunk row.
     Pair(usize, usize, SplitRow),
     Comment(usize),
@@ -224,7 +251,7 @@ impl Row {
     /// The line a diff row shows: the new side of a pair, unless that is blank.
     fn line(&self) -> Option<(usize, usize, usize)> {
         match *self {
-            Row::Line(fi, hi, li) => Some((fi, hi, li)),
+            Row::Line(fi, hi, li) | Row::Wrap(fi, hi, li, _) => Some((fi, hi, li)),
             Row::Pair(fi, hi, pair) => pair.new.or(pair.old).map(|li| (fi, hi, li)),
             _ => None,
         }
@@ -245,6 +272,13 @@ pub struct Header<'a> {
     pub can_send: bool,
     pub split: DiffSplit,
     pub editor_shortcut: &'a str,
+    /// A phone: the header stacks, a side shows at a time and long lines wrap ([`crate::touch`]).
+    pub touch: Option<Touch>,
+    /// A click on a line starts a review comment, a click on one deletes it, and Send review shows. Without it a
+    /// comment box already open keeps its draft: Enter waits until it can go.
+    pub review: bool,
+    /// A double click on a line, and the editor button, open the file in the editor.
+    pub edit: bool,
 }
 
 pub use crate::panel_nav::focus_id;
@@ -264,61 +298,48 @@ pub fn show(
 ) -> DiffAction {
     crate::panel_nav::focusable(ui, rect);
     let mut action = DiffAction::None;
-    let mut split = header.split.split(rect.width());
+    let touch = header.touch;
+    let mut split = header.split.split(rect.width()) && touch.is_none();
     ui.painter().rect_filled(rect, 0.0, palette.background);
-    let mut panel = ui.new_child(egui::UiBuilder::new().id_salt("diff-panel").max_rect(rect.shrink2(vec2(10.0, 6.0))));
+    let margin = touch.map_or(vec2(10.0, 6.0), |touch| vec2(touch.gutter, 6.0));
+    let mut panel = ui.new_child(egui::UiBuilder::new().id_salt("diff-panel").max_rect(rect.shrink2(margin)));
     let ui = &mut panel;
 
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(header.title).strong().size(14.0).color(palette.foreground));
-        if let Some(branch) = header.branch {
-            ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("×").on_hover_text("Close diff").clicked() {
-                action = DiffAction::Close;
+    if touch.is_none() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(header.title).strong().size(14.0).color(palette.foreground));
+            if let Some(branch) = header.branch {
+                ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
             }
-            if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                action = DiffAction::Refresh;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                header_buttons(ui, state, &header, palette, &mut action);
+            });
+        });
+    } else {
+        // A phone stacks the header: the title, the branch and counts, then every button in a row that wraps,
+        // with Close last.
+        let title = egui::RichText::new(header.title).strong().size(15.0).color(palette.foreground);
+        ui.add(egui::Label::new(title).wrap());
+        let prepared = state.prepared.clone().filter(|_| state.viewing.is_none());
+        ui.horizontal_wrapped(|ui| {
+            if let Some(branch) = header.branch {
+                ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
             }
-            if state.viewing.is_some() && ui.small_button("← diff").on_hover_text("Back to the diff").clicked() {
-                state.viewing = None;
-            }
-            if ui
-                .small_button("editor")
-                .on_hover_text(format!(
-                    "Edit in the editor ({}) · double-click a line to edit there",
-                    shortcut_label(ui.ctx(), header.editor_shortcut)
-                ))
-                .clicked()
-            {
-                let first = state.prepared.as_ref().and_then(|p| p.diff.files.first().map(|f| f.path().to_string()));
-                action = DiffAction::Edit { path: state.viewing.clone().or(first), line: None };
-            }
-            let n = state.comments.len();
-            let (text, fill) =
-                if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
-            let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(text)).fill(fill);
-            if ui
-                .add_enabled(n > 0 && header.can_send, send)
-                .on_hover_text("Send every comment to the agent as one message")
-                .on_disabled_hover_text(if header.can_send {
-                    "Click a line to comment"
-                } else {
-                    "No agent in this worktree"
-                })
-                .clicked()
-            {
-                action = DiffAction::SendReview;
-            }
-            if !state.comments.is_empty() && ui.small_button("discard").clicked() {
-                state.comments.clear();
+            if let Some(prepared) = &prepared {
+                counts(ui, prepared, state.error.as_deref(), palette);
             }
         });
-    });
+        ui.horizontal_wrapped(|ui| {
+            header_buttons(ui, state, &header, palette, &mut action);
+            if let Some(prepared) = &prepared {
+                diff_buttons(ui, state, &prepared.diff, &mut split, touch, &mut action);
+            }
+            close_button(ui, touch, &mut action);
+        });
+    }
 
     if let Some(path) = state.viewing.clone() {
-        if let Some(line) = show_file(ui, state, &path, palette, font) {
+        if let Some(line) = show_file(ui, state, &path, palette, font, header.review, header.edit) {
             action = DiffAction::Edit { path: Some(path), line: Some(line) };
         }
         return action;
@@ -336,45 +357,12 @@ pub fn show(
     };
     let diff = &prepared.diff;
 
-    ui.horizontal(|ui| {
-        let short = &diff.base[..diff.base.len().min(8)];
-        ui.label(egui::RichText::new(format!("{} files", diff.files.len())).color(palette.foreground));
-        ui.label(egui::RichText::new(format!("+{}", prepared.additions)).color(palette.success));
-        ui.label(egui::RichText::new(format!("−{}", prepared.deletions)).color(palette.error));
-        ui.label(egui::RichText::new(format!("vs {} @ {short}", diff.base_ref)).color(palette.muted).monospace());
-        if let Some(err) = &state.error {
-            ui.label(egui::RichText::new("refresh failed").color(palette.error)).on_hover_text(err);
-        }
-        ui.menu_button("files ▾", |ui| {
-            egui::ScrollArea::vertical().id_salt("diff-files").max_height(420.0).show(ui, |ui| {
-                for (i, file) in diff.files.iter().enumerate() {
-                    let label = format!("{}  +{} −{}", file.path(), file.additions(), file.deletions());
-                    if ui.button(label).clicked() {
-                        state.collapsed.remove(file.path());
-                        state.scroll_to = Some(ScrollTarget::File(i));
-                        ui.close();
-                    }
-                }
-            });
+    if touch.is_none() {
+        ui.horizontal(|ui| {
+            counts(ui, &prepared, state.error.as_deref(), palette);
+            diff_buttons(ui, state, diff, &mut split, None, &mut action);
         });
-        if !diff.files.is_empty() {
-            let all = state.collapsed.len() == diff.files.len();
-            if ui.small_button(if all { "expand all" } else { "collapse all" }).clicked() {
-                if all {
-                    state.collapsed.clear();
-                } else {
-                    state.collapsed = diff.files.iter().map(|f| f.path().to_string()).collect();
-                }
-            }
-        }
-        if ui
-            .toggle_value(&mut split, "split")
-            .on_hover_text("Old and new side by side until ATOMICS quits (diff_split in the config sets the default)")
-            .changed()
-        {
-            action = DiffAction::Split(split);
-        }
-    });
+    }
     ui.add_space(4.0);
 
     if diff.files.is_empty() {
@@ -382,6 +370,23 @@ pub fn show(
         ui.label(egui::RichText::new("No changes against the merge-base yet.").color(palette.muted));
         return action;
     }
+
+    let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
+    let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
+    let view = ui.available_rect_before_wrap();
+    // A phone numbers each line once, as wide as the diff's highest number, and wraps long lines to the screen
+    // unless the user turned that off.
+    let digits = touch.map(|_| {
+        let lines = diff.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines);
+        let highest = lines.filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
+        highest.to_string().len().max(2)
+    });
+    let gutter = digits.map_or(char_w * 13.0, |digits| char_w * (digits as f32 + 3.0));
+    // The width a wrapped row has for code, in points; a row holds at least eight digits.
+    let wrap = (touch.is_some() && !state.unwrapped && !split).then(|| (view.width() - gutter).max(char_w * 8.0));
+    // How a line wraps there, measured with the glyphs it is drawn with.
+    let ctx = ui.ctx().clone();
+    let wrapped = |text: &str, width: f32| ctx.fonts_mut(|f| wrapping(text, width, |c| f.glyph_width(font, c)));
 
     // Comment anchors: (path, line, removed) → comment indices.
     let mut anchored: HashMap<(&str, u32, bool), Vec<usize>> = HashMap::new();
@@ -428,22 +433,24 @@ pub fn show(
             } else {
                 for li in 0..hunk.lines.len() {
                     rows.push(Row::Line(fi, hi, li));
+                    if let Some(width) = wrap {
+                        let more = wrapped(&hunk.lines[li].text, width).starts.len();
+                        rows.extend((1..=more).map(|piece| Row::Wrap(fi, hi, li, piece)));
+                    }
                     annotate(&mut rows, li);
                 }
             }
         }
     }
 
-    let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
-    let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
-    let gutter = char_w * 13.0;
     let code_w = char_w * (prepared.longest_line as f32 + 2.0);
     // Side by side, the line numbers stay put and the code of both halves scrolls together.
-    let view = ui.available_rect_before_wrap();
     let mid = view.left() + (view.width() / 2.0).floor();
     let side_gutter = char_w * 8.0;
     let content_w = if split {
         view.width() + (side_gutter + code_w - (mid - view.left())).max(0.0)
+    } else if wrap.is_some() {
+        view.width()
     } else {
         (gutter + code_w).max(view.width())
     };
@@ -472,6 +479,7 @@ pub fn show(
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
     let mut edit_line: Option<(String, Option<u32>)> = None;
+    let (can_review, can_edit) = (header.review, header.edit);
     let mut toggle: Option<String> = None;
     let mut delete: Option<usize> = None;
     let mut commit_editor = false;
@@ -546,29 +554,39 @@ pub fn show(
                         lerp(palette.muted, palette.accent, 0.5),
                     );
                 }
-                Row::Line(fi, hi, li) => {
+                Row::Line(fi, hi, li) | Row::Wrap(fi, hi, li, _) => {
                     let line = &diff.files[fi].hunks[hi].lines[li];
                     let code_x = rect.left() + gutter;
                     let hovered = response.hovered();
-                    paint_line(painter, rect, code_x, 0.0, char_w, line, spans(fi, hi, li), hovered, font, palette);
-                    painter.text(
-                        text_pos(0.0),
-                        egui::Align2::LEFT_TOP,
-                        number(line.old_no),
-                        font.clone(),
-                        palette.quiet,
-                    );
-                    painter.text(
-                        text_pos(char_w * 5.5),
-                        egui::Align2::LEFT_TOP,
-                        number(line.new_no),
-                        font.clone(),
-                        palette.quiet,
-                    );
+                    let piece = if let Row::Wrap(.., piece) = *row { piece } else { 0 };
+                    let segment = wrap.map(|width| Piece::of(&wrapped(&line.text, width), piece, width));
+                    let spans = spans(fi, hi, li);
+                    let hovered = hovered && can_review;
+                    paint_line(painter, rect, code_x, 0.0, char_w, line, spans, hovered, font, palette, segment);
+                    if let Some(digits) = digits.filter(|_| piece == 0) {
+                        let n = if line.kind == LineKind::Removed { line.old_no } else { line.new_no };
+                        let n = n.map(|n| format!("{n:>digits$}")).unwrap_or_default();
+                        painter.text(text_pos(0.0), egui::Align2::LEFT_TOP, n, font.clone(), palette.quiet);
+                    } else if digits.is_none() {
+                        painter.text(
+                            text_pos(0.0),
+                            egui::Align2::LEFT_TOP,
+                            number(line.old_no),
+                            font.clone(),
+                            palette.quiet,
+                        );
+                        painter.text(
+                            text_pos(char_w * 5.5),
+                            egui::Align2::LEFT_TOP,
+                            number(line.new_no),
+                            font.clone(),
+                            palette.quiet,
+                        );
+                    }
                     if line.kind != LineKind::Note {
-                        if response.double_clicked() {
+                        if can_edit && response.double_clicked() {
                             edit_line = Some((diff.files[fi].path().to_string(), edit_target(line)));
-                        } else if response.clicked() {
+                        } else if can_review && response.clicked() {
                             clicked_line = Some((fi, hi, li));
                         }
                     }
@@ -585,8 +603,9 @@ pub fn show(
                         };
                         let line = &lines[li];
                         let code_x = cell.left() + side_gutter;
-                        let over = hovered == Some(right);
-                        paint_line(painter, cell, code_x, shift, char_w, line, spans(fi, hi, li), over, font, palette);
+                        let over = hovered == Some(right) && can_review;
+                        let spans = spans(fi, hi, li);
+                        paint_line(painter, cell, code_x, shift, char_w, line, spans, over, font, palette, None);
                         let n = if right { line.new_no } else { line.old_no };
                         let at = pos2(cell.left() + char_w * 0.5, rect.top() + 1.5);
                         painter.text(at, egui::Align2::LEFT_TOP, number(n), font.clone(), palette.quiet);
@@ -596,9 +615,9 @@ pub fn show(
                         .and_then(|right| if right { pair.new } else { pair.old })
                         .filter(|&li| lines[li].kind != LineKind::Note);
                     if let Some(li) = target {
-                        if response.double_clicked() {
+                        if can_edit && response.double_clicked() {
                             edit_line = Some((diff.files[fi].path().to_string(), edit_target(&lines[li])));
-                        } else if response.clicked() {
+                        } else if can_review && response.clicked() {
                             clicked_line = Some((fi, hi, li));
                         }
                     }
@@ -607,9 +626,9 @@ pub fn show(
                     let comment = &state.comments[i];
                     let (cell, gutter) = if split { (side(!comment.removed), side_gutter) } else { (rect, gutter) };
                     let over = |pos: Option<Pos2>| pos.is_some_and(|p| cell.x_range().contains(p.x));
-                    let hovered = over(response.hover_pos());
+                    let hovered = can_review && over(response.hover_pos());
                     comment_row(&painter.with_clip_rect(cell), cell, hovered, gutter, char_w, comment, font, palette);
-                    if response.clicked() && over(response.interact_pointer_pos()) {
+                    if can_review && response.clicked() && over(response.interact_pointer_pos()) {
                         delete = Some(i);
                     }
                 }
@@ -622,7 +641,7 @@ pub fn show(
                             }
                             _ => (rect, gutter),
                         };
-                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font);
+                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font, can_review);
                         commit_editor |= commit;
                         cancel_editor |= cancel;
                     }
@@ -686,9 +705,133 @@ pub fn show(
     action
 }
 
-/// A whole file, read-only, where clicking a line starts a comment just like in the
-/// diff. Returns a line that was double-clicked, to edit there.
-fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Palette, font: &FontId) -> Option<u32> {
+/// The header's buttons, in the order a right-to-left row shows them from its end: Close, Refresh, Back to
+/// the diff, Edit, Send review and Discard.
+fn header_buttons(
+    ui: &mut egui::Ui,
+    state: &mut DiffState,
+    header: &Header<'_>,
+    palette: &Palette,
+    action: &mut DiffAction,
+) {
+    let touch = header.touch;
+    // Right to left on a desktop, so Close is the header's last button; a phone draws it after the rest.
+    if touch.is_none() {
+        close_button(ui, touch, action);
+    }
+    if touch::small_button(ui, touch, "⟳").on_hover_text("Refresh").clicked() {
+        *action = DiffAction::Refresh;
+    }
+    if state.viewing.is_some() && touch::small_button(ui, touch, "← diff").on_hover_text("Back to the diff").clicked()
+    {
+        state.viewing = None;
+    }
+    if header.edit
+        && touch::small_button(ui, touch, "editor")
+            .on_hover_text(format!(
+                "Edit in the editor ({}) · double-click a line to edit there",
+                shortcut_label(ui.ctx(), header.editor_shortcut)
+            ))
+            .clicked()
+    {
+        let first = state.prepared.as_ref().and_then(|p| p.diff.files.first().map(|f| f.path().to_string()));
+        *action = DiffAction::Edit { path: state.viewing.clone().or(first), line: None };
+    }
+    if !header.review {
+        return;
+    }
+    let n = state.comments.len();
+    let (text, fill) = if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
+    let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(text)).fill(fill);
+    if ui
+        .add_enabled(n > 0 && header.can_send, touch::sized(send, touch))
+        .on_hover_text("Send every comment to the agent as one message")
+        .on_disabled_hover_text(if header.can_send { "Click a line to comment" } else { "No agent in this worktree" })
+        .clicked()
+    {
+        *action = DiffAction::SendReview;
+    }
+    if !state.comments.is_empty() && touch::small_button(ui, touch, "discard").clicked() {
+        state.comments.clear();
+    }
+}
+
+fn close_button(ui: &mut egui::Ui, touch: Option<Touch>, action: &mut DiffAction) {
+    if touch::small_button(ui, touch, "×").on_hover_text("Close diff").clicked() {
+        *action = DiffAction::Close;
+    }
+}
+
+/// What the diff holds: its files, the lines it adds and removes, and what it is against.
+fn counts(ui: &mut egui::Ui, prepared: &Prepared, error: Option<&str>, palette: &Palette) {
+    let diff = &prepared.diff;
+    let short = &diff.base[..diff.base.len().min(8)];
+    ui.label(egui::RichText::new(format!("{} files", diff.files.len())).color(palette.foreground));
+    ui.label(egui::RichText::new(format!("+{}", prepared.additions)).color(palette.success));
+    ui.label(egui::RichText::new(format!("−{}", prepared.deletions)).color(palette.error));
+    ui.label(egui::RichText::new(format!("vs {} @ {short}", diff.base_ref)).color(palette.muted).monospace());
+    if let Some(err) = error {
+        ui.label(egui::RichText::new("refresh failed").color(palette.error)).on_hover_text(err);
+    }
+}
+
+/// The diff's own buttons: its files, to jump to one, folding them all, and side by side; on a phone,
+/// wrapping long lines instead.
+fn diff_buttons(
+    ui: &mut egui::Ui,
+    state: &mut DiffState,
+    diff: &atomics_core::diff::WorktreeDiff,
+    split: &mut bool,
+    touch: Option<Touch>,
+    action: &mut DiffAction,
+) {
+    ui.menu_button("files ▾", |ui| {
+        egui::ScrollArea::vertical().id_salt("diff-files").max_height(420.0).show(ui, |ui| {
+            for (i, file) in diff.files.iter().enumerate() {
+                let label = format!("{}  +{} −{}", file.path(), file.additions(), file.deletions());
+                if ui.button(label).clicked() {
+                    state.collapsed.remove(file.path());
+                    state.scroll_to = Some(ScrollTarget::File(i));
+                    ui.close();
+                }
+            }
+        });
+    });
+    if !diff.files.is_empty() {
+        let all = state.collapsed.len() == diff.files.len();
+        if touch::small_button(ui, touch, if all { "expand all" } else { "collapse all" }).clicked() {
+            if all {
+                state.collapsed.clear();
+            } else {
+                state.collapsed = diff.files.iter().map(|f| f.path().to_string()).collect();
+            }
+        }
+    }
+    if touch.is_some() {
+        let wrap = egui::Button::selectable(!state.unwrapped, "wrap");
+        if ui.add(touch::sized(wrap, touch)).on_hover_text("Wrap long lines to the screen").clicked() {
+            state.unwrapped = !state.unwrapped;
+        }
+    } else if ui
+        .toggle_value(split, "split")
+        .on_hover_text("Old and new side by side until ATOMICS quits (diff_split in the config sets the default)")
+        .changed()
+    {
+        *action = DiffAction::Split(*split);
+    }
+}
+
+/// A whole file, read-only, where clicking a line starts a comment just like in the diff, with `review`.
+/// Returns a line that was double-clicked, to edit there, with `edit`.
+fn show_file(
+    ui: &mut egui::Ui,
+    state: &mut DiffState,
+    path: &str,
+    palette: &Palette,
+    font: &FontId,
+    review: bool,
+    edit: bool,
+) -> Option<u32> {
     ui.horizontal(|ui| {
         ui.label(RichText::new(path).monospace().color(palette.foreground));
         ui.label(RichText::new("unchanged · click a line to comment").color(palette.muted).size(12.0));
@@ -749,7 +892,7 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
             let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
             match *row {
                 Row::FileLine(i) => {
-                    if response.hovered() {
+                    if response.hovered() && review {
                         painter.rect_filled(rect, 0.0, palette.hover());
                         painter.text(
                             text_pos(char_w * 7.0),
@@ -765,22 +908,22 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
                     let job = line_job(&file.lines[i], spans, &[], palette.background, font, palette);
                     let galley = ui.fonts_mut(|f| f.layout_job(job));
                     ui.painter().galley(text_pos(gutter), galley, palette.foreground);
-                    if response.double_clicked() {
+                    if edit && response.double_clicked() {
                         double_clicked = Some(i);
-                    } else if response.clicked() {
+                    } else if review && response.clicked() {
                         clicked = Some(i);
                     }
                 }
                 Row::Comment(i) => {
                     let comment = &state.comments[i];
-                    comment_row(painter, rect, response.hovered(), gutter, char_w, comment, font, palette);
-                    if response.clicked() {
+                    comment_row(painter, rect, review && response.hovered(), gutter, char_w, comment, font, palette);
+                    if review && response.clicked() {
                         delete = Some(i);
                     }
                 }
                 Row::Editor => {
                     if let Some(editor) = state.editor.as_mut() {
-                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font);
+                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font, review);
                         commit |= c;
                         cancel |= x;
                     }
@@ -846,7 +989,8 @@ fn comment_row(
     }
 }
 
-/// The inline comment input. Returns (commit, cancel).
+/// The inline comment input. Returns (commit, cancel). Without `review` Enter does nothing: the box keeps its draft
+/// and the keyboard. Its id is its own, so that it keeps the keyboard when what is drawn before it changes.
 fn editor_row(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -854,13 +998,16 @@ fn editor_row(
     char_w: f32,
     editor: &mut Editor,
     font: &FontId,
+    review: bool,
 ) -> (bool, bool) {
     let field = rect.with_min_x(rect.left() + gutter - char_w);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("comment-editor").max_rect(field));
     let edit = egui::TextEdit::singleline(&mut editor.text)
+        .id(child.scope_id().with("comment-box"))
         .hint_text("Comment for the agent · Enter adds · Esc cancels")
         .font(font.clone())
         .desired_width(field.width().min(900.0));
+    let edit = if review { edit } else { edit.return_key(None::<egui::KeyboardShortcut>) };
     let response = child.add(edit);
     if editor.focus {
         response.request_focus();
@@ -870,7 +1017,7 @@ fn editor_row(
         return (false, false);
     }
     if child.input(|i| i.key_pressed(Key::Enter)) {
-        (true, false)
+        (review, false)
     } else {
         (false, child.input(|i| i.key_pressed(Key::Escape)) || editor.text.trim().is_empty())
     }
@@ -1040,9 +1187,63 @@ fn status_badge(status: FileStatus, palette: &Palette) -> (&'static str, Color32
     }
 }
 
+/// How a line wraps in rows of a width, in points: what its continuations hang in by, and where each starts.
+#[derive(Debug, Clone, PartialEq)]
+struct Wrapped {
+    /// The line's own indent, up to half a row.
+    indent: f32,
+    /// Where each continuation starts, from the line's start: always at a character, never inside one.
+    starts: Vec<f32>,
+}
+
+/// How a line of `text` wraps in rows `width` points wide, `glyph` giving each character's advance (a tab
+/// is four spaces, as the line is drawn). Wide characters (CJK, emoji) take what their glyphs take, so a row
+/// never runs past the screen or cuts a character in two.
+fn wrapping(text: &str, width: f32, mut glyph: impl FnMut(char) -> f32) -> Wrapped {
+    let mut advance = |c: char| if c == '\t' { 4.0 * glyph(' ') } else { glyph(c) };
+    let mut indent = 0.0;
+    let mut starts = Vec::new();
+    let (mut x, mut row_start, mut row_width, mut leading) = (0.0, 0.0, width, true);
+    for c in text.chars() {
+        let w = advance(c);
+        leading &= c.is_whitespace();
+        if leading {
+            indent = (indent + w).min(width / 2.0);
+        }
+        if x > row_start && x + w - row_start > row_width + 0.01 {
+            starts.push(x);
+            row_start = x;
+            row_width = width - indent;
+        }
+        x += w;
+    }
+    Wrapped { indent, starts }
+}
+
+/// The part of a wrapped line one row shows, in points: the code from `start` on, drawn `indent` right of
+/// the code column and `width` wide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Piece {
+    start: f32,
+    indent: f32,
+    width: f32,
+}
+
+impl Piece {
+    /// The `piece`th part of a line wrapped in rows `width` points wide: the first from the line's start,
+    /// each continuation under the line's indent, each up to where the next starts.
+    fn of(wrapped: &Wrapped, piece: usize, width: f32) -> Piece {
+        let start = if piece == 0 { 0.0 } else { wrapped.starts.get(piece - 1).copied().unwrap_or(f32::INFINITY) };
+        let indent = if piece == 0 { 0.0 } else { wrapped.indent };
+        let end = wrapped.starts.get(piece).copied().unwrap_or(start + width - indent);
+        Piece { start, indent, width: end - start }
+    }
+}
+
 /// Paints a diff line over `cell`: the background of its kind, the sign (💬 when hovered)
 /// left of `code_x`, and the highlighted code from `code_x`, scrolled left by `shift`
-/// and clipped to the code column.
+/// and clipped to the code column. A wrapped line's `piece` shows that part alone, the sign
+/// with the first.
 #[allow(clippy::too_many_arguments)]
 fn paint_line(
     painter: &egui::Painter,
@@ -1055,6 +1256,7 @@ fn paint_line(
     hovered: bool,
     font: &FontId,
     palette: &Palette,
+    piece: Option<Piece>,
 ) {
     let (bg, emphasis, sign) = match line.kind {
         LineKind::Added => (palette.added, palette.added_emphasis, "+"),
@@ -1065,14 +1267,21 @@ fn paint_line(
         painter.rect_filled(cell, 0.0, bg);
     }
     let y = cell.top() + 1.5;
+    let piece = piece.unwrap_or(Piece { start: 0.0, indent: 0.0, width: f32::INFINITY });
+    let first = piece.start == 0.0;
     if hovered {
         painter.rect_filled(cell, 0.0, palette.hover());
+    }
+    if hovered && first {
         painter.text(pos2(code_x - char_w * 2.0, y), egui::Align2::LEFT_TOP, "💬", font.clone(), palette.accent);
-    } else {
+    } else if first {
         painter.text(pos2(code_x - char_w * 1.5, y), egui::Align2::LEFT_TOP, sign, font.clone(), palette.muted);
     }
     let galley = painter.layout_job(line_job(&line.text, spans, &line.emphasis, emphasis, font, palette));
-    painter.with_clip_rect(cell.with_min_x(code_x - 1.0)).galley(pos2(code_x - shift, y), galley, palette.foreground);
+    // A continuation is cut exactly where it starts, so nothing of the part before shows.
+    let x = code_x + piece.indent;
+    let clip = cell.with_min_x(if first { code_x - 1.0 } else { x }).with_max_x(cell.right().min(x + piece.width));
+    painter.with_clip_rect(clip).galley(pos2(x - shift - piece.start, y), galley, palette.foreground);
 }
 
 /// Where double-clicking a line opens the editor: the line in the new version, or
@@ -1234,6 +1443,105 @@ mod tests {
             all_files: Arc::default(),
         };
         DiffState { prepared: Some(Arc::new(prepared)), ..DiffState::default() }
+    }
+
+    #[test]
+    fn a_comment_box_keeps_the_keyboard_and_its_draft_until_the_comment_can_go() {
+        let ctx = egui::Context::default();
+        let mut state = state_with(&["a.rs"]);
+        state.editor = Some(Editor { anchor: Anchor::Diff(0, 0, 0), text: "draft".into(), focus: true });
+        let palette = crate::Client::default().palette;
+        let font = palette.mono(13.0);
+        let enter = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut time = 0.0;
+        let mut frame = |state: &mut DiffState, ahead: usize, review: bool, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                for _ in 0..ahead {
+                    ui.label("drawn ahead of the diff");
+                }
+                let header = Header {
+                    title: "title",
+                    branch: None,
+                    can_send: true,
+                    split: DiffSplit::Never,
+                    editor_shortcut: "",
+                    touch: None,
+                    review,
+                    edit: false,
+                };
+                let rect = ui.available_rect_before_wrap();
+                show(ui, rect, state, header, &palette, &font);
+            });
+            output.textures_delta.clear();
+            ctx.memory(|m| m.focused().is_some())
+        };
+        frame(&mut state, 0, true, Vec::new());
+        assert!(frame(&mut state, 0, true, Vec::new()), "the box has the keyboard");
+
+        // What comes before it changes, as a line under the frame does when it goes.
+        frame(&mut state, 1, true, Vec::new());
+        assert!(frame(&mut state, 1, true, Vec::new()), "and it keeps it");
+
+        // Nowhere to send it: Enter does nothing, not even for a frame.
+        assert!(frame(&mut state, 0, false, vec![enter.clone()]));
+        assert!(frame(&mut state, 0, false, Vec::new()));
+        assert_eq!(state.editor.as_ref().map(|editor| editor.text.as_str()), Some("draft"));
+        assert!(state.comments.is_empty());
+
+        // Back, one Enter adds it.
+        frame(&mut state, 0, true, vec![enter]);
+        assert_eq!(state.comments.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(), ["draft"]);
+        assert!(state.editor.is_none());
+    }
+
+    #[test]
+    fn a_phone_wraps_a_long_line_under_its_indent() {
+        // Ten two-point glyphs a row.
+        let mono = |text: &str| wrapping(text, 20.0, |_| 2.0);
+        let rows = |text: &str| mono(text).starts.len();
+        assert_eq!(rows("short"), 0);
+        assert_eq!(rows("0123456789"), 0, "a line that just fits");
+        assert_eq!(rows("0123456789abcdefghij"), 1);
+        // Four spaces in: the continuations hang under the code, six glyphs a row.
+        let line = "    step(1); // xxxxxxxx";
+        let wrapped = mono(line);
+        assert_eq!(wrapped, Wrapped { indent: 8.0, starts: vec![20.0, 32.0, 44.0] });
+        let piece = |n| Piece::of(&wrapped, n, 20.0);
+        assert_eq!(piece(0), Piece { start: 0.0, indent: 0.0, width: 20.0 });
+        assert_eq!(piece(1), Piece { start: 20.0, indent: 8.0, width: 12.0 });
+        assert_eq!(piece(3), Piece { start: 44.0, indent: 8.0, width: 12.0 });
+        // A tab is four spaces; an indent past half a row hangs at half.
+        assert_eq!(mono("\tx").indent, 8.0);
+        let deep = mono(&format!("{}x{}", " ".repeat(9), "y".repeat(10)));
+        assert_eq!((deep.indent, deep.starts.len()), (10.0, 2));
+    }
+
+    #[test]
+    fn a_phone_wraps_wide_glyphs_by_their_width() {
+        // CJK glyphs twice as wide as Latin ones: five fit a row, and none is cut in two.
+        let glyph = |c: char| if c.is_ascii() { 2.0 } else { 4.0 };
+        let wrapped = wrapping("日本語のテキストです", 20.0, glyph);
+        assert_eq!(wrapped.starts, [20.0]);
+        assert_eq!(Piece::of(&wrapped, 1, 20.0), Piece { start: 20.0, indent: 0.0, width: 20.0 });
+        // A glyph that would cross the row's edge starts the next row instead.
+        let wrapped = wrapping("abcdefghi日x", 20.0, glyph);
+        assert_eq!(wrapped.starts, [18.0]);
+        assert_eq!(Piece::of(&wrapped, 0, 20.0).width, 18.0, "the first row ends before the glyph");
+        let emoji = wrapping(&"🦀".repeat(7), 20.0, |c| if c == '🦀' { 6.0 } else { 2.0 });
+        assert_eq!(emoji.starts, [18.0, 36.0], "three to a row");
     }
 
     #[test]

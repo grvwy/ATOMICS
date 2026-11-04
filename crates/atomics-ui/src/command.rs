@@ -130,10 +130,19 @@ pub enum Command {
         agent: String,
         folder: PathBuf,
     },
+    /// Start a configured agent as `atomics ctl start` does: in `folder`, or with none in a scratch folder
+    /// of its own outside any project. The welcome's buttons start agents this way.
+    Start {
+        agent: String,
+        folder: Option<PathBuf>,
+    },
     /// End a session, by id, and close its tab.
     CloseSession(String),
     /// Start a session again from its record.
     Resume(SessionRecord),
+    /// Start an exited session, by id, again in its place: its tile closes and its agent picks its
+    /// conversation up again.
+    ResumeSession(String),
     /// Give a session, by id, a new title.
     RenameSession {
         session: String,
@@ -263,6 +272,12 @@ pub enum Command {
     Rename(String),
     /// Ask the platform for a folder to open as a project.
     PickProject,
+    /// Hide the chief's window; the chief keeps running.
+    HideChief,
+    /// Give the docked chief this width, or its default with `None`.
+    ResizeChief(Option<f32>),
+    /// Say something short on the notice line.
+    Toast(String),
 }
 
 impl Command {
@@ -291,6 +306,9 @@ impl Command {
                 | Command::NewWorktree(_)
                 | Command::Rename(_)
                 | Command::PickProject
+                | Command::HideChief
+                | Command::ResizeChief(_)
+                | Command::Toast(_)
         )
     }
 
@@ -385,6 +403,12 @@ impl Command {
                 .collect(),
             Command::StartAgent { agent, folder } => {
                 let folder = Some(folder.to_string_lossy().into_owned());
+                let action =
+                    SessionAction::Start { agent: agent.clone(), folder, repo: None, branch: None, prompt: None };
+                vec![session(action, op)]
+            }
+            Command::Start { agent, folder } => {
+                let folder = folder.as_ref().map(|folder| folder.to_string_lossy().into_owned());
                 let action =
                     SessionAction::Start { agent: agent.clone(), folder, repo: None, branch: None, prompt: None };
                 vec![session(action, op)]

@@ -2,12 +2,14 @@
 //! encoded for the screen's modes, under the lease; the grid is never resized by looking at it.
 
 use atomics_core::wire::Message;
+use atomics_ui::Client;
 use egui::{Modifiers, Rect, pos2, vec2};
 
 use super::*;
 use crate::driver::Status;
 use crate::fake_host;
 use crate::gesture::{Kind, Phase, Pointer};
+use crate::screens::MAX_TYPED_BYTES;
 use crate::views::{self, Tab, View};
 use crate::world::World;
 
@@ -129,6 +131,7 @@ fn the_phone_shows_the_desktops_grid_and_resizes_only_when_asked() {
     let frame_rect = view.term.overlay.rect.unwrap();
     let fit = fit_size(&Frame {
         rect: frame_rect,
+        pad: vec2(PAD, PAD),
         origin: frame_rect.min,
         size: font,
         cell: vec2(1.0, 1.0),
@@ -225,8 +228,23 @@ fn a_paste_over_the_limit_is_not_typed_and_says_so() {
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste)]);
     assert_eq!(typed(&world), "a");
     let notice = world.driver.remote.notice().expect("a note");
-    assert!(notice.starts_with("Too much to type at once"), "{notice}");
+    assert!(notice.starts_with("Too much to type at once") && notice.contains("up to 1 MiB"), "{notice}");
     assert!(view.term.typing(), "still typing: only the paste was refused");
+}
+
+#[test]
+fn a_paste_before_the_grant_names_the_smaller_limit() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    // The tap asks for the lease; the paste in the same frame would wait for the grant.
+    let paste = "p".repeat(MAX_WAITING_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Paste(paste)]);
+    assert_eq!(typed(&world), "");
+    let notice = world.driver.remote.notice().expect("a note");
+    assert!(notice.contains("Up to 16 KiB waits") && !notice.contains("MiB"), "{notice}");
+    // Once granted, the same paste is typed.
+    let paste = "q".repeat(MAX_WAITING_BYTES + 1);
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Paste(paste.clone())]);
+    assert_eq!(typed(&world), paste);
 }
 
 #[test]
@@ -349,11 +367,72 @@ fn a_long_press_selects_and_offers_copy() {
             touch(1, Phase::Up, start + vec2(300.0, 0.0), now + 10.0),
         ],
     );
-    let (text, _) = view.term.overlay.copy.clone().expect("Copy offered");
+    let (text, ..) = view.term.overlay.copy.clone().expect("Copy offered");
     assert_eq!(text, "$ hello world");
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Copied]);
     assert_eq!(view.term.overlay.copy, None);
     assert!(world.host.terminals["s1"].typed.is_empty(), "selecting types nothing");
+}
+
+#[test]
+fn a_long_press_selects_the_word_and_its_handles_move_its_ends() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    let output = world.host.output("s1", "echo hello world\r");
+    world.deliver(output);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    // "$ echo hello world": the finger rests on "hello", columns 7 to 11.
+    let (on_hello, cell) = view.term.cell_centre(0, 9);
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Down, on_hello, now)]);
+    view.now_ms += 600.0;
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Up, on_hello, now)]);
+    let copy = |view: &View| view.term.overlay.copy.clone().map(|(text, ..)| text);
+    assert_eq!(copy(&view).as_deref(), Some("hello"), "the word under the finger, nothing more");
+    // Copy goes above the selection, or below its handles' knobs where that would leave the terminal.
+    let (_, above, below) = view.term.overlay.copy.clone().unwrap();
+    let (line, _) = view.term.cell_centre(0, 9);
+    assert!(above.y < line.y && below > line.y + cell.y / 2.0 + 2.0 * KNOB - 0.5, "{above:?} {below} {line:?}");
+
+    // The end handle's knob hangs under the word's last cell; dragging it over "world" takes that word in.
+    let knob = |col: u16| view.term.cell_centre(0, col).0 + vec2(cell.x / 2.0, cell.y / 2.0 + KNOB);
+    let (end, to) = (knob(11), knob(17));
+    let now = view.now_ms;
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            touch(2, Phase::Down, end, now),
+            touch(2, Phase::Move, end + (to - end) / 2.0, now + 30.0),
+            touch(2, Phase::Move, to, now + 60.0),
+            touch(2, Phase::Up, to, now + 90.0),
+        ],
+    );
+    assert_eq!(copy(&view).as_deref(), Some("hello world"));
+    // The start handle, dragged left past "echo".
+    let start = view.term.cell_centre(0, 7).0 + vec2(-cell.x / 2.0, cell.y / 2.0 + KNOB);
+    let now = view.now_ms;
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            touch(3, Phase::Down, start, now),
+            touch(3, Phase::Move, start - vec2(5.0 * cell.x, 0.0), now + 30.0),
+            touch(3, Phase::Up, start - vec2(5.0 * cell.x, 0.0), now + 60.0),
+        ],
+    );
+    assert_eq!(copy(&view).as_deref(), Some("echo hello world"));
+    assert_eq!(view.term.font, None, "dragging a handle neither pinches nor pans");
+    assert_eq!(view.term.top, None, "nor scrolls");
+    // Copy takes the selection away; a tap elsewhere would too. Nothing was typed.
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Copied]);
+    assert_eq!(copy(&view), None);
+    assert!(world.host.terminals["s1"].typed.is_empty());
 }
 
 #[test]
@@ -365,15 +444,17 @@ fn the_phone_layout_at_phone_widths() {
         let rect = view.term.overlay.rect.expect("a terminal");
         assert_eq!(rect.width(), size.0, "{size:?}: the terminal fills the width");
         assert!(rect.bottom() <= size.1 - crate::layout::BOTTOM_BAR, "{size:?}: above the pane switcher");
-        // Typing: the key bar's space replaces the switcher, and the terminal grows into it.
+        // Typing: the key bar's space replaces the switcher, and the terminal grows into it. The page says
+        // how tall the key bar is in CSS pixels.
         view.viewport.keybar = 88.0;
         view.term.inputs.push(TermInput::Focus(true));
         frame(&ctx, &mut world, &mut client, &mut view, size);
         frame(&ctx, &mut world, &mut client, &mut view, size);
         let typing = view.term.overlay.rect.unwrap();
-        assert_eq!(typing.bottom(), size.1 - 88.0, "{size:?}");
+        // egui rounds the layout to 1/32 of a point.
+        assert!((typing.bottom() - (size.1 - 88.0 / crate::layout::ZOOM)).abs() < 0.05, "{size:?}: {typing:?}");
         // Every pane draws at this width.
-        for tab in [Tab::Board, Tab::Plans, Tab::Diffs, Tab::Approvals, Tab::Chief] {
+        for tab in [Tab::Agents, Tab::Board, Tab::Diffs, Tab::Approvals, Tab::Chief] {
             view.tab = tab;
             frame(&ctx, &mut world, &mut client, &mut view, size);
             frame(&ctx, &mut world, &mut client, &mut view, size);
@@ -381,4 +462,53 @@ fn the_phone_layout_at_phone_widths() {
         }
         assert!(world.host.terminals["chief"].followed && !world.host.terminals["s1"].followed);
     }
+}
+
+#[test]
+fn dragging_a_handle_past_the_other_end_keeps_that_end() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    let output = world.host.output("s1", "echo hello world\r");
+    world.deliver(output);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    // "$ echo hello world": the finger rests on "world", columns 13 to 17.
+    let (on_world, cell) = view.term.cell_centre(0, 15);
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Down, on_world, now)]);
+    view.now_ms += 600.0;
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Up, on_world, now)]);
+    let copy = |view: &View| view.term.overlay.copy.clone().map(|(text, ..)| text);
+    assert_eq!(copy(&view).as_deref(), Some("world"));
+    // The end handle, over two moves, to the left of the start handle: "world"'s first cell stays selected.
+    let knob = |col: u16| view.term.cell_centre(0, col).0 + vec2(cell.x / 2.0, cell.y / 2.0 + KNOB);
+    let (end, a, b) = (knob(17), knob(10), knob(8));
+    let now = view.now_ms;
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            touch(2, Phase::Down, end, now),
+            touch(2, Phase::Move, a, now + 30.0),
+            touch(2, Phase::Move, b, now + 60.0),
+            touch(2, Phase::Up, b, now + 90.0),
+        ],
+    );
+    assert_eq!(copy(&view).as_deref(), Some("ello w"));
+}
+
+#[test]
+fn the_clip_leaves_out_what_covers_the_overlay() {
+    let rect = Rect::from_min_size(pos2(100.0, 200.0), vec2(300.0, 100.0));
+    assert_eq!(clip_path(rect, &[], 1.0), "", "nothing over it: no clip");
+    assert_eq!(clip_path(rect, &[rect], 1.0), "inset(50%)", "all of it covered");
+    // A window over its top right corner: what is left, in pixels from the overlay's corner, at the zoom.
+    let window = Rect::from_min_max(pos2(300.0, 100.0), pos2(500.0, 250.0));
+    assert_eq!(clip_path(rect, &[window], 2.0), "path(\"M0 100H600V200H0ZM0 0H400V100H0Z\")");
+    // Two that overlap leave out their union, which an even-odd hole in the overlay would not.
+    let left = Rect::from_min_size(pos2(100.0, 200.0), vec2(200.0, 100.0));
+    let right = Rect::from_min_size(pos2(200.0, 200.0), vec2(200.0, 100.0));
+    assert_eq!(clip_path(rect, &[left, right], 1.0), "inset(50%)");
 }

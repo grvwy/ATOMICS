@@ -8,6 +8,8 @@
 //!   a takeover the user asks for. Text is typed while this client holds the lease; typed while the grant
 //!   is on its way, it waits for it, on this connection only, and is dropped if the lease goes elsewhere.
 //!   Otherwise it is refused, never kept: text that arrives after the lease was lost cannot take it back.
+//!   The user going on to another terminal lets go of this one's lease ([`Screens::release`]), and of a
+//!   grant still on its way once it comes.
 //!   Input refused as `slow_client` is typed again, before anything newer, from the screen's next change
 //!   on, [`MAX_TYPED_BYTES`] per change: the program read something.
 //! - **No replay.** A disconnect forgets the lease, the waiting text and whatever was not known to be
@@ -75,9 +77,9 @@ pub enum Lost {
 pub enum Refused {
     /// This client neither holds the lease nor is asking for it (or is offline, or view only).
     NoLease,
-    /// Over [`MAX_TYPED_BYTES`] at once, or more than may wait: [`MAX_WAITING_BYTES`] for the grant, or
-    /// [`MAX_TYPED_BYTES`] behind input the program has not read yet.
-    TooMuch,
+    /// Over the limit that applied, in bytes: [`MAX_TYPED_BYTES`] at once or behind input the program
+    /// has not read yet, [`MAX_WAITING_BYTES`] waiting for the grant.
+    TooMuch(usize),
 }
 
 enum Request {
@@ -102,6 +104,8 @@ struct Term {
     /// A frame showed it since the last [`Screens::end_frame`].
     shown: bool,
     acquiring: bool,
+    /// The user went on to another terminal while asking: the grant, when it comes, is let go.
+    unwanted: bool,
     /// Text that waits: for the grant, or (with `retype`) to be typed again after `slow_client`.
     waiting: String,
     retype: bool,
@@ -195,6 +199,7 @@ impl Screens {
                     frames.push(release);
                 }
                 term.acquiring = false;
+                term.unwanted = false;
                 term.waiting = String::new();
                 term.retype = false;
                 term.history = BTreeMap::new();
@@ -231,6 +236,7 @@ impl Screens {
     /// the user's explicit act.
     pub fn acquire(&mut self, session: &str, takeover: bool, out: &mut Vec<Envelope>) {
         let term = self.term(session);
+        term.unwanted = false;
         if term.typist.may_type() || term.acquiring || term.subscribed.is_none() {
             return;
         }
@@ -239,6 +245,19 @@ impl Screens {
         let message = term.typist.acquire(takeover);
         let id = self.request(Request::Acquire(session.to_string()));
         out.push(Envelope::new(message).reply_to(Some(id)));
+    }
+
+    /// The user went on to another terminal: let go of `session`'s lease and of what waits for it, and of a
+    /// grant still on its way when it comes. The terminal stays followed, and asking again is a new tap.
+    pub fn release(&mut self, session: &str, out: &mut Vec<Envelope>) {
+        let Some(term) = self.terms.get_mut(session) else { return };
+        term.unwanted |= std::mem::take(&mut term.acquiring);
+        term.waiting.clear();
+        term.retype = false;
+        if let Some(release) = term.typist.release() {
+            let id = self.request(Request::Lease);
+            out.push(Envelope::new(release).reply_to(Some(id)));
+        }
     }
 
     /// Type `data` (already encoded for the terminal's modes) while this client holds the lease or is
@@ -255,7 +274,7 @@ impl Screens {
             return Ok(());
         }
         if data.len() > MAX_TYPED_BYTES {
-            return Err(Refused::TooMuch);
+            return Err(Refused::TooMuch(MAX_TYPED_BYTES));
         }
         if term.typist.may_type() && term.waiting.is_empty() {
             self.send(session, data, out);
@@ -263,7 +282,7 @@ impl Screens {
         }
         let limit = if term.retype { MAX_TYPED_BYTES } else { MAX_WAITING_BYTES };
         if term.waiting.len() + data.len() > limit {
-            return Err(Refused::TooMuch);
+            return Err(Refused::TooMuch(limit));
         }
         term.waiting.push_str(data);
         Ok(())
@@ -381,6 +400,7 @@ impl Screens {
             term.typist.disconnected();
             term.subscribed = None;
             term.acquiring = false;
+            term.unwanted = false;
             term.waiting.clear();
             term.retype = false;
             term.resyncing = false;
@@ -489,6 +509,10 @@ impl Screens {
     /// What the host says of a lease; `acquired` when it answers this client's request for it.
     fn lease_state(&mut self, state: &LeaseState, acquired: bool, out: &mut Vec<Envelope>) {
         let Some(term) = self.terms.get_mut(&state.session) else { return };
+        // From before the host read this client's release: its answer, and any new request's, are still to come.
+        if term.typist.out_of_date(state) {
+            return;
+        }
         let held = term.typist.may_type();
         term.typist.apply(state);
         // Input the host applied, or sent under a lease that ended, can no longer be refused as
@@ -498,6 +522,9 @@ impl Screens {
             .retain(|_, r| !matches!(r, Request::Input { session, seq } if *session == state.session && *seq < next));
         let Some(term) = self.terms.get_mut(&state.session) else { return };
         if term.typist.may_type() {
+            if std::mem::take(&mut term.unwanted) {
+                return self.release(&state.session, out);
+            }
             term.acquiring = false;
             term.lost = None;
             if !term.waiting.is_empty() && !term.retype {
@@ -540,6 +567,7 @@ impl Screens {
             Request::Acquire(session) => {
                 let Some(term) = self.terms.get_mut(&session) else { return };
                 term.acquiring = false;
+                term.unwanted = false;
                 term.waiting.clear();
                 term.lost = Some(if code == ErrorCode::LeaseHeld { Lost::Held } else { Lost::Gone });
             }

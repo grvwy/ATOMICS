@@ -619,6 +619,7 @@ impl State {
                     held: Vec::new(),
                     approval_hold: false,
                     menu_absent_since: None,
+                    answered_menu: None,
                     chief: false,
                     pending: None,
                     sandbox: None,
@@ -663,10 +664,13 @@ impl State {
             }
             session.approval_hold = true;
             session.menu_absent_since = None;
+            // The hook is the request itself: a menu read off the screen only stood in for it.
+            session.approvals.retain(|pending| pending.native.is_none());
             session.approvals.push(PendingApproval {
                 id: uuid::Uuid::new_v4().to_string(),
                 request,
                 reply: message.approval_reply,
+                native: None,
             });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {
