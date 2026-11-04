@@ -860,7 +860,11 @@ mod tests {
                 view.handle_keys(&terminal, ui)
             });
             assert!(
-                !output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+                !output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
             );
             output.drop_without_applying_deltas();
             let bytes = captured_input(&terminal, &dir);
