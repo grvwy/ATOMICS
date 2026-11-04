@@ -5,7 +5,7 @@
 use atomics_core::layout::Layout;
 use egui::{Color32, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
-use crate::status::{status_dot, status_glyph};
+use crate::status::{status_color, status_dot, status_glyph};
 use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::text::truncate;
@@ -185,14 +185,13 @@ pub fn tiles(
         );
         let title_response = ui.interact(title_rect, ui.scope_id().with(("tile-title", &row.id)), Sense::click());
         let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
-        let mut subtitle = match (row.scratch, row.branch.as_deref()) {
-            (true, _) => format!("{} · scratch · {}", row.agent, row.status.label()),
-            (false, Some(branch)) => format!("{} · {} · {}", row.agent, branch, row.status.label()),
-            (false, None) => format!("{} · {}", row.agent, row.status.label()),
+        let place = match (row.scratch, row.branch.as_deref()) {
+            (true, _) => format!("{} · scratch · ", row.agent),
+            (false, Some(branch)) => format!("{} · {} · ", row.agent, branch),
+            (false, None) => format!("{} · ", row.agent),
         };
-        if let Some(note) = &view.queue_note {
-            subtitle.push_str(&format!(" · {note}"));
-        }
+        let note = view.queue_note.as_ref().map(|note| format!(" · {note}")).unwrap_or_default();
+        let subtitle = format!("{place}{}{note}", row.status.label());
         let galley = ui.fonts_mut(|f| f.layout_no_wrap(row.title.clone(), p.ui(13.0), title_color));
         let title_width = galley.size().x;
         ui.painter().with_clip_rect(title_rect).galley(
@@ -200,19 +199,25 @@ pub fn tiles(
             galley,
             title_color,
         );
-        ui.painter().with_clip_rect(title_rect).text(
-            pos2(title_rect.left() + title_width + 10.0, header.center().y),
-            egui::Align2::LEFT_CENTER,
-            subtitle,
-            p.ui(11.5),
+        // The status in its own color between the place and the queue's note.
+        let mut job = egui::text::LayoutJob::default();
+        let format = |color| egui::TextFormat { font_id: p.ui(11.5), color, ..Default::default() };
+        job.append(&place, 0.0, format(p.muted));
+        job.append(row.status.label(), 0.0, format(status_color(row.status, &p)));
+        job.append(&note, 0.0, format(p.muted));
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        ui.painter().with_clip_rect(title_rect).galley(
+            pos2(title_rect.left() + title_width + 10.0, header.center().y - galley.size().y / 2.0),
+            galley,
             p.muted,
         );
-        let hover = if row.chief {
-            "Show this worktree's diff against main"
+        // The header may cut a long title: the hover has all of it.
+        let action = if row.chief {
+            "Click to show this worktree's diff against its base."
         } else {
-            "Show this worktree's diff against main · double-click to rename"
+            "Click to show this worktree's diff against its base; double-click to rename."
         };
-        let title_response = title_response.on_hover_text(hover);
+        let title_response = title_response.on_hover_text(format!("{}\n{subtitle}\n{action}", row.title));
         if title_response.double_clicked() && can_rename {
             rename = Some(row.id.clone());
         } else if title_response.clicked() {
@@ -224,6 +229,13 @@ pub fn tiles(
                 Vec2::splat(close_size),
             );
             let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
+            if close_response.hovered() || close_response.has_focus() {
+                ui.painter().rect_filled(close_rect, 3.0, lerp(p.raised, p.error, 0.15));
+            }
+            if close_response.has_focus() {
+                let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
+                ui.painter().rect_stroke(close_rect, 3.0, ring, egui::StrokeKind::Inside);
+            }
             ui.painter().text(
                 close_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -231,6 +243,11 @@ pub fn tiles(
                 p.ui(15.0),
                 if close_response.hovered() { p.error } else { p.muted },
             );
+            let close_response = close_response.on_hover_text(if ask {
+                "Close this session; it asks first"
+            } else {
+                "Close this session"
+            });
             if close_response.clicked() {
                 close = Some((row.id.clone(), ask));
             }

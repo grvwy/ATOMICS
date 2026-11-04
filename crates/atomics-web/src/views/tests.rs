@@ -219,6 +219,19 @@ fn a_task_cards_click_shows_its_session_and_diff_and_marks_the_card() {
 }
 
 #[test]
+fn the_diff_with_nothing_to_show_says_how_to_pick_something() {
+    let (ctx, mut world, mut client, mut view) = live();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    (view.desk.active, view.desk.diff_root) = (None, None);
+    (view.desk.panel, view.desk.diff_open) = (PanelMode::Diff, true);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "No diff to show") && has(&shown, "Pick an agent in the sidebar"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Show the board")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(view.desk.panel, PanelMode::Plan, "its button shows the board");
+}
+
+#[test]
 fn opening_a_diff_fetches_it_and_shows_it_in_the_panel() {
     let (ctx, mut world, mut client, mut view) = live();
     world.host.received.clear();

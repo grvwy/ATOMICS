@@ -111,14 +111,19 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let history_board = hints.plan_view
             && hints.panel == PanelMode::Plan
             && backend.plan_row(hints.selected_plan).is_some_and(|plan| plan.status != PlanStatus::Open);
+        let visible = if history_board { Vec::new() } else { backend.visible_sessions() };
+        let completed = if history_board { 0 } else { backend.completed_tasks().len() };
+        // The diff with nothing to show still shows beside agents, saying how to pick one; an empty window keeps
+        // its welcome.
         let diff_open = !history_board
             && hints.diff_open
-            && (hints.diff_target.is_some() || matches!(hints.panel, PanelMode::Plan | PanelMode::Tickets));
+            && (hints.diff_target.is_some()
+                || matches!(hints.panel, PanelMode::Plan | PanelMode::Tickets)
+                || !visible.is_empty()
+                || completed > 0);
         let config = backend.ui_config().layout;
         let sidebar_width = config.sidebar_width;
         let layout_config = LayoutConfig { diff_width: client.split, ..config };
-        let visible = if history_board { Vec::new() } else { backend.visible_sessions() };
-        let completed = if history_board { 0 } else { backend.completed_tasks().len() };
         let dock_width = chief::dock_width(&backend.chief(), area.width(), &layout_config);
         let compute = |height| {
             layout::compute(area.width(), height, visible.len(), completed, diff_open, dock_width, &layout_config)
@@ -249,7 +254,9 @@ pub fn right_panel(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) 
         PanelMode::Diff if platform.panel_pull_request(ui, rect) => return,
         _ => {}
     }
-    let Some(root) = hints.diff_target else { return };
+    let Some(root) = hints.diff_target else {
+        return platform.draw(|backend, client, _| empty_panel(ui, rect, backend, client));
+    };
     let editor = hints.panel == PanelMode::Editor;
     // What changed sits right next to the diff/editor, in both modes, where a click can open it.
     let open = |path: String, line: Option<u32>| match editor {
@@ -278,6 +285,36 @@ pub fn right_panel(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) 
         return platform.panel_editor(ui, rect, &root);
     }
     platform.draw(|backend, client, _| diff_panel::draw(ui, rect, &root, backend, client));
+}
+
+/// The panel's diff while no session is active and no worktree is picked: what would show there, and how
+/// to get it.
+fn empty_panel(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("empty-panel")
+            .max_rect(Rect::from_center_size(rect.center(), vec2((rect.width() - 32.0).clamp(0.0, 380.0), 160.0))),
+    );
+    child.set_clip_rect(rect);
+    child.vertical_centered(|ui| {
+        ui.label(RichText::new("No diff to show").color(p.foreground).size(14.0));
+        ui.add_space(6.0);
+        let mut ways = vec!["Pick an agent in the sidebar or a tile", "click a task's card on the board"];
+        if backend.available(&Command::ShowRoot(PathBuf::new())) && !backend.repos().is_empty() {
+            ways.push("or a worktree in the EXPLORER");
+        }
+        let text = format!("{}: its changes against the base show here.", ways.join(", "));
+        ui.label(RichText::new(text).color(p.muted).size(12.0));
+        if backend.available(&Command::ToggleView(PanelMode::Plan))
+            && backend.plan_row(backend.view_hints().selected_plan).is_some()
+        {
+            ui.add_space(8.0);
+            if ui.button("Show the board").clicked() {
+                client.send(Command::ToggleView(PanelMode::Plan));
+            }
+        }
+    });
 }
 
 /// The sidebar: the host's USAGE, its TICKETS and the AGENTS over the EXPLORER, which takes the rest while a

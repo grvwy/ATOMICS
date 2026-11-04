@@ -12,6 +12,9 @@ use crate::theme::{Palette, lerp};
 use crate::touch::{self, Touch};
 use crate::{Backend, Client, Command};
 
+/// The least width of a status's column on a board laid out in columns.
+const MIN_COLUMN: f32 = 240.0;
+
 /// A ticket's key and state. A click opens it in the browser; hovering shows the rest.
 /// A failed ticket operation shows beneath it, and a state that means another ATOMICS
 /// status than the task's is pointed out.
@@ -186,6 +189,8 @@ pub(crate) fn task_result_for(
             } else {
                 truncate(&report.summary.lines().take(3).collect::<Vec<_>>().join("\n"), 360)
             };
+            // A shortened report keeps all of it a hover away, and an open card shows it whole.
+            let shortened = summary != report.summary;
             let (summary, color) = if task.finished_at.is_some() {
                 (summary, p.foreground)
             } else {
@@ -196,7 +201,10 @@ pub(crate) fn task_result_for(
                 };
                 (format!("{}: {summary}", report.status), color)
             };
-            ui.label(RichText::new(summary).color(color).size(12.0));
+            let response = ui.label(RichText::new(summary).color(color).size(12.0));
+            if shortened {
+                response.on_hover_text(format!("{}\n\nClick the card's title to keep it open.", report.summary));
+            }
         }
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
@@ -570,8 +578,22 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                                         actions.push((task.id.clone(), "acknowledge_refs"));
                                     }
                                 });
+                        } else if open {
+                            // An open card shows every note, oldest first.
+                            for note in &task.notes {
+                                ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
+                            }
                         } else if let Some(note) = task.notes.last() {
-                            ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
+                            let response = ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
+                            let earlier = task.notes.len() - 1;
+                            if earlier > 0 {
+                                let plural = if earlier == 1 { "" } else { "s" };
+                                let more = format!("{earlier} earlier note{plural} · click the title");
+                                let hint = ui.label(RichText::new(more).color(p.quiet).size(10.5));
+                                let all = task.notes.join("\n\n");
+                                response.on_hover_text(&all);
+                                hint.on_hover_text(all);
+                            }
                         }
                         if open {
                             ui.add_space(4.0);
@@ -684,11 +706,17 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 .size(11.0),
         );
     };
-    if !tasks.is_empty() && touch.is_none() {
+    // The columns want this much room; a narrower panel stacks the statuses as a phone does, so that no card
+    // is cut at the panel's edge.
+    let columns_fit = {
+        let columns = TaskStatus::ALL.len() as f32;
+        ui.available_width() >= MIN_COLUMN * columns + ui.spacing().item_spacing.x * (columns - 1.0)
+    };
+    if !tasks.is_empty() && touch.is_none() && columns_fit {
         egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             let columns = TaskStatus::ALL.len();
             let spacing = ui.spacing().item_spacing.x * (columns - 1) as f32;
-            ui.set_width(ui.available_width().max(280.0 * columns as f32 + spacing));
+            ui.set_width(ui.available_width().max(MIN_COLUMN * columns as f32 + spacing));
             ui.columns(TaskStatus::ALL.len(), |columns| {
                 for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
                     let count = tasks.iter().filter(|t| t.status == status).count();
@@ -707,7 +735,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             });
         });
     } else if !tasks.is_empty() {
-        // A phone stacks the statuses that have tasks, one under the other, each card the screen's width.
+        // A phone, or a panel too narrow for the columns, stacks the statuses that have tasks, one under the
+        // other, each card the panel's width.
         egui::ScrollArea::vertical().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             for status in TaskStatus::ALL {
                 let count = tasks.iter().filter(|t| t.status == status).count();

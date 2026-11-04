@@ -176,17 +176,18 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if let Some(text) = &state.toast {
         notices.push(text.clone());
     }
+    // Each problem says what to do about it: the hover shows the whole line.
     if let Some(err) = &state.config_error {
-        notices.push(format!("config error: {err}"));
+        notices.push(format!("config error: {err} (the last good config stays in effect; fix the file to reload)"));
     }
     if let Some(problems) = &state.config_problems {
-        notices.push(format!("config: {problems}"));
+        notices.push(format!("config: {problems} (atomics doctor says more)"));
     }
     if let Some(err) = &state.theme_error {
-        notices.push(format!("theme: {err}"));
+        notices.push(format!("theme: {err} (the rest of the theme applies)"));
     }
     if let Some(err) = &state.hook_error {
-        notices.push(format!("hooks offline: {err}"));
+        notices.push(format!("hooks offline: {err} (agents cannot report; run atomics doctor)"));
     }
     if notices.is_empty() {
         return;

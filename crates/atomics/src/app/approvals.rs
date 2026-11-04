@@ -526,7 +526,7 @@ mod tests {
                     for expected in ["Permission requested", "touch banner-fixture", "Verify permission controls"] {
                         assert!(text.iter().any(|(text, _)| text == expected), "{expected}");
                     }
-                    assert!(text.iter().any(|(text, _)| text.starts_with("cwd: ")));
+                    assert!(text.iter().any(|(text, _)| text.starts_with("in ")), "the folder it runs in");
                     let pos = text.iter().find(|(text, _)| text == label).unwrap().1;
                     for pressed in [true, false] {
                         frame(
