@@ -104,11 +104,19 @@ open -a ATOMICS --args --workspace backend
 ```
 
 The Dock, Spotlight and a Linux desktop launcher start ATOMICS with a bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`).
-At startup ATOMICS asks your login shell (`$SHELL -l -i -c`) for its `PATH`, once and for at most five seconds, and
-adds the folders it lacks. Everything ATOMICS runs itself then finds what a terminal would: git with its LFS filters
-and hooks, the Codex version check, MCP and ticket servers and queued commands. A `PATH` that already has those
-folders, as one from a terminal does, is left alone; a shell that gives none in time leaves the `PATH` ATOMICS was
-started with. `atomics doctor` says which happened.
+ATOMICS asks your login shell (`$SHELL -l -i -c`) for its `PATH`, once per start and for at most five seconds, and
+adds the folders it lacks. Only absolute folders count: an entry such as `.` or `node_modules/.bin` would find
+programs in whatever folder a command runs in, so ATOMICS leaves it out. Everything ATOMICS runs itself then finds
+what a terminal would: git with its LFS filters and hooks, the Codex version check, MCP and ticket servers and queued
+commands. A `PATH` that already has those folders, as one from a terminal does, is left alone; a shell that gives
+none in time leaves the `PATH` ATOMICS was started with. `atomics doctor` says which happened.
+
+The window never waits for the shell, which can take seconds. Before it starts anything, it adds the folders the
+shell gave at an earlier start (`login-path.json` in the state directory, written whenever ATOMICS reads the shell,
+`atomics setup` included), then reads the shell's current `PATH` in the background: agents, MCP and ticket servers
+and the Codex version check wait for that one, and it is recorded for the next start. With nothing recorded yet, git
+and the rest of what the window runs itself keep the `PATH` it was started with until then. `atomics host` and the
+other commands wait for the shell.
 
 On Linux, install the build dependencies first (Debian/Ubuntu example), then install or update from this checkout.
 For a new desktop, [Fresh start on Linux](docs/fresh-start-linux.md) lists every prerequisite and check:
@@ -403,10 +411,15 @@ first line says where `PATH` came from: the login shell's folders added, already
 
 For Codex hook trust, doctor computes the hook definitions ATOMICS passes (its executable and socket) the way Codex
 does, and reads `[hooks.state]` in the Codex home those agents get (`<ATOMICS_HOME>/codex` for an explicit
-`ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). It names each event as trusted, untrusted, changed since
-trusted (a new install path, socket or definition) or disabled, and the fix: trust them in Codex's review prompt
-or `/hooks`, or set the exact `trusted_hash` entries it prints. While every Codex agent runs sandboxed, ATOMICS passes
-no hooks and doctor says trust is not needed.
+`ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). The executable is the one the desktop or `atomics host` that
+serves this ATOMICS home runs from, which it records in `executable.json` there at every start, so a terminal's
+doctor from another install (a cargo-installed CLI beside the app) checks the hooks the app passes; with none
+recorded yet, it checks its own, and its line names the binary either way. It names each event as trusted,
+untrusted, changed since trusted (a new install path, socket or definition) or disabled, and the fix: trust them in
+Codex's review prompt or `/hooks`, or set the exact `trusted_hash` entries it prints. Codex keeps trust per event, not
+per install, so it trusts one install's hooks at a time: doctor lists each other install it finds (itself, the app in
+`~/Applications` or `/Applications`, `~/.local/bin` and `~/.cargo/bin`) and whether Codex trusts its hooks instead.
+While every Codex agent runs sandboxed, ATOMICS passes no hooks and doctor says trust is not needed.
 
 Cleanup failures the startup sweep finds are replaced at every start, so a failure that is fixed, such as a deleted
 project folder or the record of a sandbox that is gone, drops out of doctor after the next start. Failures that no

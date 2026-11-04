@@ -969,6 +969,10 @@ impl State {
             None => {
                 // Only the instance that owns the socket records its runs, so second instances stay out of the log.
                 notices.extend(crate::crash::started(&paths::atomics_home()));
+                // The hooks bare Codex agents get run this executable: the doctor checks Codex's trust for it.
+                if let Err(error) = crate::setup::record_executable(&paths::atomics_home()) {
+                    eprintln!("atomics: recording this executable for the doctor failed: {error}");
+                }
                 let tokens = config.resources.jobs(governor.cores);
                 match (tokens > 0).then(|| Jobserver::create(&Jobserver::path_for(&paths::atomics_home()), tokens)) {
                     None => None,

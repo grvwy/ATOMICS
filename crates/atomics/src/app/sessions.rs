@@ -405,7 +405,11 @@ impl State {
                 let result = ready.clone();
                 let wake = self.wake.clone();
                 std::thread::spawn(move || {
-                    let supported = crate::setup::codex_supports_hooks(&program, CODEX_VERSION_TIMEOUT);
+                    // `codex` can be a Node script: `env node` needs the login shell's PATH, which
+                    // a window started from the Dock may not have taken on yet.
+                    let path = crate::setup::child_path();
+                    let supported =
+                        crate::setup::codex_supports_hooks(&program, path.as_deref(), CODEX_VERSION_TIMEOUT);
                     let _ = result.set(supported);
                     wake.notify();
                 });
@@ -1731,7 +1735,7 @@ fi
                 for script in ["#!/bin/sh\nexec sleep 30\n", "#!/bin/sh\nexit 1\n"] {
                     crate::test_support::write_program(&program, script);
                     let failed = Arc::new(OnceLock::new());
-                    failed.set(crate::setup::codex_supports_hooks(&name, Duration::from_millis(100))).unwrap();
+                    failed.set(crate::setup::codex_supports_hooks(&name, None, Duration::from_millis(100))).unwrap();
                     assert_eq!(failed.get(), Some(&None));
                     app.runtime.codex_versions.insert(name.clone(), failed.clone());
                     crate::test_support::write_program(

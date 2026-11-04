@@ -1,11 +1,11 @@
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use atomics_core::{
     config::Config,
     doctor::{
-        approvals_check, cache_clone_check, check_line, codex_trust_check, codex_version_check, plans_check,
+        approvals_check, cache_clone_check, check_line, codex_trust_lines, codex_version_check, plans_check,
         stash_lines, worktree_checks,
     },
     paths,
@@ -154,11 +154,11 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             && let Some(path) = found
         {
             // Like agent launch, tolerate a cold CLI starting while other agents compile.
-            let supported = codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(10));
+            let supported = codex_supports_hooks(&path.to_string_lossy(), None, std::time::Duration::from_secs(10));
             lines.push(codex_version_check(supported));
             // An older Codex gets no hooks to trust.
             if supported != Some(false) {
-                lines.push(codex_trust_line(config.as_ref().ok().map(|(config, _)| config), workspace));
+                lines.extend(codex_trust_lines_for(config.as_ref().ok().map(|(config, _)| config), workspace));
             }
         }
     }
@@ -336,24 +336,65 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
 }
 
 /// Whether Codex runs the hooks ATOMICS passes its bare agents, from the trust in the Codex home
-/// they get. Sandboxed Codex agents get no ATOMICS hooks, so the check is moot while every Codex
-/// agent runs sandboxed.
-fn codex_trust_line(config: Option<&Config>, workspace: Option<&str>) -> String {
+/// they get, for the install that passes them, and how other installs found stand. Sandboxed Codex
+/// agents get no ATOMICS hooks, so the check is moot while every Codex agent runs sandboxed.
+fn codex_trust_lines_for(config: Option<&Config>, workspace: Option<&str>) -> Vec<String> {
     if let Some(config) = config
         && !bare_codex_agents(config, workspace)
     {
-        return check_line(
+        return vec![check_line(
             true,
             "Codex hook trust not needed: Codex agents run sandboxed, where ATOMICS passes no hooks; a bare \
              Codex agent or task needs it",
             "",
-        );
+        )];
     }
-    // The same command and socket agent launch passes.
-    let exe = crate::setup::executable_path().unwrap_or_else(|_| "atomics".into());
-    let hooks = atomics_core::hook::codex_hook_trust(&exe, &paths::socket_path());
+    // The command and socket agent launch passes, for each install.
+    let socket = paths::socket_path();
+    let installs: Vec<_> = atomics_installs(
+        crate::setup::recorded_executable(&paths::atomics_home()),
+        crate::setup::executable_path().unwrap_or_else(|_| "atomics".into()),
+        &paths::home(),
+    )
+    .into_iter()
+    .map(|(executable, why)| atomics_core::doctor::InstallHooks {
+        binary: format!("{} ({why})", executable.display()),
+        hooks: atomics_core::hook::codex_hook_trust(&executable, &socket),
+    })
+    .collect();
     let file = crate::setup::agent_codex_home().join("config.toml");
-    codex_trust_check(&hooks, &file, std::fs::read_to_string(&file))
+    codex_trust_lines(&installs, &file, std::fs::read_to_string(&file))
+}
+
+/// The ATOMICS installs whose hooks Codex can be asked to trust, and why each is listed. First the
+/// one whose hooks bare Codex agents get: the executable `recorded` by the desktop or host that last
+/// served this home's socket, or with none recorded (or gone), this doctor's `own`. Then the others
+/// found: this doctor, the app in `home`'s or the system's Applications folder, and what the Linux
+/// installer and cargo install. A binary reached by several of these paths is listed once.
+fn atomics_installs(recorded: Option<PathBuf>, own: PathBuf, home: &Path) -> Vec<(PathBuf, &'static str)> {
+    let mut installs = match recorded.filter(|executable| executable.is_file()) {
+        Some(served) => vec![(served, "the desktop or host that last ran here"), (own, "this doctor")],
+        None => vec![(own, "this doctor; no desktop or host has run here since recording its own")],
+    };
+    let app = "ATOMICS.app/Contents/MacOS/atomics";
+    for found in [
+        home.join("Applications").join(app),
+        Path::new("/Applications").join(app),
+        home.join(".local/bin/atomics"),
+        home.join(".cargo/bin/atomics"),
+    ] {
+        if found.is_file() {
+            installs.push((found, "installed"));
+        }
+    }
+    let mut seen = Vec::new();
+    installs.retain(|(executable, _)| {
+        let real = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.clone());
+        let first = !seen.contains(&real);
+        seen.push(real);
+        first
+    });
+    installs
 }
 
 /// Whether a configured Codex agent runs bare by default, with the workspace's `[isolation]`.
@@ -896,10 +937,66 @@ mod tests {
             .iter()
             .map(|hook| format!("[hooks.state.\"{}\"]\ntrusted_hash = \"{}\"\n", hook.key, hook.hash))
             .collect();
+        std::fs::write(codex_home.join("config.toml"), &trusted).unwrap();
+        let stdout = doctor();
+        let own = crate::setup::executable_path().unwrap().display().to_string();
+        assert!(
+            stdout.contains(&format!(
+                "✓ Codex trusts ATOMICS's hooks for all 8 events, as {own} (this doctor; no desktop or host has run \
+                 here since recording its own) passes them ({file})"
+            )),
+            "{stdout}"
+        );
+        // This doctor is the install checked, not another (an app in /Applications may be).
+        assert!(!stdout.contains(&format!("Other ATOMICS install {own}")), "{stdout}");
+        assert!(!dir.path().join("inherited-codex").exists());
+
+        // Two installs: the app, which serves this home and so passes the hooks Codex agents get, and
+        // the doctor run from another (as a cargo-installed CLI in a terminal would be).
+        let app = dir.path().join("Applications/ATOMICS.app/Contents/MacOS/atomics");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        crate::test_support::write_program(&app, "#!/bin/sh\nexit 0\n");
+        std::fs::write(state.join("executable.json"), serde_json::to_vec(&app.to_string_lossy()).unwrap()).unwrap();
+        assert_eq!(crate::setup::recorded_executable(&state), Some(app.clone()));
+        let app_hooks = atomics_core::hook::codex_hook_trust(&app, &dir.path().join("absent.sock"));
+        let entry = |hook: &atomics_core::hook::CodexHookTrust| format!("trusted_hash = \"{}\"", hook.hash);
+        let checked = format!("{} (the desktop or host that last ran here)", app.display());
+        // Codex trusts this doctor's hooks, not the app's: the check is the app's, and says so.
+        let stdout = doctor();
+        let line = stdout.lines().find(|line| line.contains("Codex does not run every ATOMICS hook")).unwrap();
+        assert!(line.starts_with(&format!("✗ Codex does not run every ATOMICS hook as {checked} passes them")));
+        assert!(line.contains("changed since trusted: "), "{line}");
+        assert!(app_hooks.iter().all(|hook| line.contains(&entry(hook))), "{line}");
+        assert!(hooks.iter().all(|hook| !line.contains(&entry(hook))), "{line}");
+        assert!(
+            stdout.contains(&format!(
+                "Other ATOMICS install {own} (this doctor): Codex trusts its hooks, rather than those of the install \
+                 checked above"
+            )),
+            "{stdout}"
+        );
+        // Trusted for the app, as its review writes it: a doctor from the other install agrees, and
+        // suggests nothing that would trust its own hooks instead.
+        let trusted: String = app_hooks
+            .iter()
+            .map(|hook| format!("[hooks.state.\"{}\"]\ntrusted_hash = \"{}\"\n", hook.key, hook.hash))
+            .collect();
         std::fs::write(codex_home.join("config.toml"), trusted).unwrap();
         let stdout = doctor();
-        assert!(stdout.contains(&format!("✓ Codex trusts ATOMICS's hooks for all 8 events ({file})")), "{stdout}");
-        assert!(!dir.path().join("inherited-codex").exists());
+        assert!(
+            stdout.contains(&format!(
+                "✓ Codex trusts ATOMICS's hooks for all 8 events, as {checked} passes them ({file})"
+            )),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("changed since trusted"), "{stdout}");
+        assert!(hooks.iter().all(|hook| !stdout.contains(&entry(hook))), "{stdout}");
+        assert!(
+            stdout.contains(&format!("Other ATOMICS install {own} (this doctor): its hooks are not trusted.")),
+            "{stdout}"
+        );
+        // The app found where it is installed is the recorded one, listed once.
+        assert_eq!(stdout.matches(&*app.display().to_string()).count(), 1, "{stdout}");
     }
 
     #[test]
