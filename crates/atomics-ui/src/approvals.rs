@@ -8,8 +8,12 @@ use crate::{Backend, Client, Command};
 
 /// Draws the first permission request the session at `index` of [`Backend::session_list`] waits on at the
 /// top of its tile's `body`, and returns the part of `body` below it; with no request waiting, `body` as it
-/// is. Allow, Allow always (never for Azure REST) and Deny record a [`Command::Decide`] once per request;
-/// the buttons stay disabled until the host has decided, and are not drawn where the backend cannot decide.
+/// is. Allow, Allow always (only where [`ApprovalRequest::may_allow_always`]) and Deny record a
+/// [`Command::Decide`] once per request; the buttons stay disabled until the host has decided, and are not
+/// drawn where the backend cannot decide. The host's warning, such as whose stash entries the command drops,
+/// comes first.
+///
+/// [`ApprovalRequest::may_allow_always`]: atomics_core::approvals::ApprovalRequest::may_allow_always
 pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend, client: &mut Client) -> Rect {
     let Some(pending) = backend.session_approval(index) else { return body };
     let p = client.palette.clone();
@@ -34,7 +38,7 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
         for (label, decision) in
             [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
         {
-            if request.tool == "Azure REST" && decision == Decision::AllowAlways {
+            if decision == Decision::AllowAlways && !request.may_allow_always() {
                 continue;
             }
             let response = ui.add_enabled(!deciding, touch::sized(egui::Button::new(label), touch));
@@ -51,6 +55,9 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
         child.label("Decision pending…");
     }
     egui::ScrollArea::vertical().max_height(child.available_height()).show(&mut child, |ui| {
+        if let Some(warning) = &request.warning {
+            ui.label(RichText::new(warning).color(p.warning));
+        }
         ui.label(RichText::new(request.command.as_deref().unwrap_or(&request.tool)).monospace());
         if !request.cwd.as_os_str().is_empty() {
             ui.label(format!("cwd: {}", request.cwd.display()));

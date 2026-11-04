@@ -86,6 +86,18 @@ fn the_board_reads_as_the_desktop_draws_it() {
 }
 
 #[test]
+fn an_approvals_warning_reaches_its_banner() {
+    let remote = connected(Role::Controller);
+    let mut approval = fake_host::board().approvals[0].clone();
+    approval.command = Some("git stash drop stash@{1}".into());
+    approval.warning = Some("stash@{1} (On atomics/t2: t2), which belongs to task t2 (session s2)".into());
+    remote.receive(Envelope::host(EPOCH, Message::ApprovalPending { cursor: Seq(4), approval: approval.clone() }));
+    let row = remote.session_approval(1).expect("s1's approval");
+    assert_eq!(row.request.warning, approval.warning);
+    assert!(!row.request.may_allow_always(), "a stash drop is never allowed always");
+}
+
+#[test]
 fn commands_become_the_mutations_welcome_allows() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();

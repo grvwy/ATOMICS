@@ -711,6 +711,14 @@ impl Task {
              ATOMICS socket, request to run them outside the sandbox.\n",
         );
         }
+        // Sandboxed or not, an agent's git shares the repository's one stash with every other checkout.
+        text.push_str(&format!(
+            "\nAll worktrees of this repository share one git stash, so an index such as `stash@{{0}}` can name \
+             another agent's entry. If you stash, use `git stash push -m {}` and refer to your entry by that \
+             message: `git stash list --format='%H %gs'` shows each entry's commit, and `git stash apply <commit>` \
+             restores it. Never drop, pop or clear stash entries without the chief's or the user's approval.\n",
+            crate::hook::shell_quote(&self.id)
+        ));
         text.push_str(
             "\nWork only in this worktree and do not commit unless the task says so. When you are done, \
              blocked, or have a question, call the atomics_report tool with status (done, blocked or question) \
@@ -1377,6 +1385,11 @@ mod tests {
         );
         assert!(text.contains("atomics_report"));
         assert!(text.contains("atomics queue --class test -- dotnet test"));
+        assert!(text.contains("share one git stash"), "{text}");
+        assert!(text.contains("use `git stash push -m a` and refer to your entry by that message"), "{text}");
+        assert!(text.contains("Never drop, pop or clear stash entries without the chief's or the user's approval."));
+        t.id = "it's 1".into();
+        assert!(t.compose_brief("Better CLI").contains(r"`git stash push -m 'it'\''s 1'`"));
     }
 
     #[test]

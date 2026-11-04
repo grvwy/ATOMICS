@@ -94,7 +94,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `diff_get`, `file_get`, `review_command` | Bounded content request, or add/remove/send comments against a diff revision. |
 | Host → client | `plan_upsert`, `plan_removed`, `task_report` | Explicit plan/task IDs, revisions, approval state, integration branch, report, and the key of the ticket a plan or task follows (`ticket`, optional). |
 | Client → host | `plan_command` | Set, approve, dispatch, update, integrate or archive a specified plan/task. |
-| Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. |
+| Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. An optional `warning` is what the host tells whoever decides, such as whose shared stash entries the command drops. |
 | Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |

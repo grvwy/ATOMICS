@@ -6,7 +6,7 @@ use atomics_core::{
     config::Config,
     doctor::{
         approvals_check, cache_clone_check, check_line, codex_trust_check, codex_version_check, plans_check,
-        worktree_checks,
+        stash_lines, worktree_checks,
     },
     paths,
     selfconfig::{self, Layer, Source},
@@ -300,6 +300,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             let config = workflow.apply(config);
             lines.push(cache_clone_check(&repo, &config.worktree_path));
             lines.extend(worktree_checks(&repo, &config.base_ref));
+            lines.extend(stash_lines(&repo));
         }
     }
 
@@ -680,6 +681,13 @@ mod tests {
             &["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base"],
         )
         .unwrap();
+        std::fs::write(repo.join("wip.txt"), "work in progress").unwrap();
+        atomics_core::git::git(&repo, &["add", "wip.txt"]).unwrap();
+        atomics_core::git::git(
+            &repo,
+            &["-c", "user.name=test", "-c", "user.email=test@example.com", "stash", "push", "-q", "-m", "ENG-123"],
+        )
+        .unwrap();
         let merged = repo.with_file_name("merged");
         let shell = bin.join("shell");
         crate::test_support::write_program(
@@ -748,6 +756,11 @@ mod tests {
                 format!("✓ no merged worktrees to clean up ({})", repo.display())
             };
             assert_eq!(worktree_lines, [expected], "{stdout}");
+            let stash = format!(
+                "Stash of {}, shared by its worktrees: 1 entry\n  stash@{{0}}: On main: ENG-123\n",
+                repo.display()
+            );
+            assert!(stdout.contains(&stash), "{stdout}");
         }
 
         // Bare Codex agents get the hooks, and their trust lives in this instance's own Codex home.

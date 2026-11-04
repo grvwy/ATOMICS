@@ -268,6 +268,52 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let reply: Value = serde_json::from_slice(&reply.stdout).unwrap();
     assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "allow", "{reply}");
 
+    // Dropping an entry of the stash every worktree shares waits, and its approval says which entry
+    // that is, to ctl and to protocol clients alike.
+    let repo = instance.dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = test_support::output(
+            Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(&repo),
+        );
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+    std::fs::write(repo.join("a.txt"), "work in progress\n").unwrap();
+    git(&["stash", "push", "-q", "-m", "ENG-123"]);
+    let mut hook = TestChild::spawn(
+        instance.command(["hook", "--socket"]).arg(instance.socket()).args(["--pane", &session]).stdin(Stdio::piped()),
+        CHILD_TIMEOUT,
+    )
+    .unwrap();
+    let request = json!({
+        "hook_event_name":"PermissionRequest", "session_id":"headless-gate", "cwd":repo,
+        "tool_name":"Bash", "tool_input":{"command":"git stash drop stash@{0}"}
+    });
+    let mut stdin = hook.child.stdin.take().unwrap();
+    stdin.write_all(request.to_string().as_bytes()).unwrap();
+    drop(stdin);
+    let entry = "git stash drop drops stash@{0} (On main: ENG-123)";
+    eventually("the stash warning", || {
+        let list = instance.ctl(json!({"cmd":"list"}));
+        list["sessions"].as_array().unwrap().iter().any(|s| {
+            s["id"] == session && s["approval"]["warning"].as_str().is_some_and(|warning| warning.contains(entry))
+        })
+    });
+    let mirror = board(&instance.home(), |mirror| {
+        mirror.approvals.values().any(|approval| approval.warning.as_deref().is_some_and(|w| w.contains(entry)))
+    });
+    assert!(mirror.approvals.values().all(|approval| approval.session == session), "{:?}", mirror.approvals);
+    instance.ctl(json!({"cmd":"approve","session":session,"decision":"deny"}));
+    let reply: Value = serde_json::from_slice(&hook.wait_output().unwrap().stdout).unwrap();
+    assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "deny", "{reply}");
+
     // A plan persists on disk.
     let plan = instance.ctl(json!({
         "cmd":"plan_set", "goal":"Headless gate",

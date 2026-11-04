@@ -57,6 +57,7 @@ fn approval(id: &str) -> ApprovalInfo {
         command: Some("git status".into()),
         cwd: "/w/a".into(),
         reason: None,
+        warning: None,
     }
 }
 

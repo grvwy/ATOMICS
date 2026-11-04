@@ -971,6 +971,7 @@ pub fn board() -> Board {
             command: Some("cargo test".into()),
             cwd: WORKTREE.into(),
             reason: Some("Run the tests".into()),
+            warning: None,
         }],
         diffs: vec![DiffSummary {
             worktree: WORKTREE.into(),
