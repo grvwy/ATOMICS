@@ -331,15 +331,19 @@ fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
     let mut host = instance.host();
     instance.ready(&mut host);
     assert!(!advert.exists(), "a stale protocol.json outlived the start of a host without remote");
-    let plan = instance.ctl(json!({"cmd":"plan_set","goal":"Local only","tasks":[]}));
+    let brief = format!("Brief start {}", "context ".repeat(5000));
+    let plan =
+        instance.ctl(json!({"cmd":"plan_set","goal":"Local only","tasks":[{"id":"a","title":"First","brief":brief}]}));
     let id = plan["plan"].as_str().unwrap().to_string();
 
-    // `atomics mcp` reaches the host through the local socket, with no client attached.
+    // `atomics mcp` reaches the host through the local socket, with no client attached: a plan
+    // reads compactly, and one task in full.
     let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
     let mut stdin = mcp.child.stdin.take().unwrap();
     for message in [
         json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}),
         json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"atomics_plan_get", "arguments":{"plan":id}}}),
+        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"atomics_plan_get", "arguments":{"plan":id, "task":"a"}}}),
     ] {
         writeln!(stdin, "{message}").unwrap();
     }
@@ -354,7 +358,13 @@ fn without_remote_there_is_no_protocol_server_and_mcp_still_reaches_the_host() {
         .collect();
     let got = replies.iter().find(|reply| reply["id"] == 2).expect("an answer to the tool call");
     assert_eq!(got["result"]["isError"], false, "{got}");
-    assert!(got["result"]["content"][0]["text"].as_str().unwrap().contains("Local only"), "{got}");
+    let compact = got["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(compact.contains("Local only") && compact.contains("\"First\""), "{got}");
+    assert!(!compact.contains("Brief start"), "a plan reads without its briefs: {got}");
+    let task = replies.iter().find(|reply| reply["id"] == 3).expect("an answer to the task call");
+    assert_eq!(task["result"]["isError"], false, "{task}");
+    let full: Value = serde_json::from_str(task["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(full["task"]["brief"], brief, "one task in full");
 
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     let output = host.wait_output().unwrap();

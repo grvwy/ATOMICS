@@ -1,4 +1,12 @@
+use atomics_core::control::{MAX_READ_LINES, clip, clip_json, clip_start};
+
 use super::*;
+
+/// The characters of screen text `read` and `result` show.
+const MAX_SCREEN_CHARS: usize = 40_000;
+/// An agent's final message as `result` shows it, and a prompt.
+const MAX_MESSAGE_CHARS: usize = 24_000;
+const MAX_PROMPT_CHARS: usize = 2000;
 
 impl State {
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
@@ -21,8 +29,12 @@ impl State {
             "claude_session_id": s.claude_id,
             "sandbox": s.sandbox,
             "scratch": s.scratch,
-            "last_prompt": s.last_prompt,
-            "approval": s.approvals.first().map(|p| &p.request),
+            "last_prompt": s.last_prompt.as_deref().map(|prompt| clip(prompt, MAX_PROMPT_CHARS)),
+            "approval": s.approvals.first().map(|p| {
+                let mut request = json!(p.request);
+                clip_json(&mut request, MAX_PROMPT_CHARS, 50);
+                request
+            }),
             "queue": s.terminal.as_ref().and_then(|t| {
                 let (running, waiting) = self.governor.snapshot();
                 queue_note(t.process_id(), &running, &waiting)
@@ -125,7 +137,16 @@ impl State {
                 return;
             }
             ControlRequest::List => {
-                let sessions: Vec<_> = (0..self.sessions.len()).map(|i| self.describe(i)).collect();
+                // Every session, so each one's prompt and pending request are kept short.
+                let sessions: Vec<_> = (0..self.sessions.len())
+                    .map(|i| {
+                        let mut session = self.describe(i);
+                        session["last_prompt"] = json!(self.sessions[i].last_prompt.as_deref().map(|p| clip(p, 300)));
+                        session["approval"] = json!(self.sessions[i].approvals.first().map(|p| &p.request));
+                        clip_json(&mut session["approval"], 300, 20);
+                        session
+                    })
+                    .collect();
                 // The headless host has no window: both are null there.
                 let viewport = self.window.viewport();
                 let layout = self.last_layout.map(|l| {
@@ -177,7 +198,8 @@ impl State {
                 } else {
                     statuses
                 };
-                let timeout = Duration::from_secs(timeout_secs.unwrap_or(120)).min(MAX_WAIT);
+                let timeout =
+                    Duration::from_secs(timeout_secs.unwrap_or(atomics_core::control::DEFAULT_WAIT_SECS)).min(MAX_WAIT);
                 self.waiters.push(Waiter {
                     sessions: ids,
                     statuses,
@@ -192,9 +214,9 @@ impl State {
                 None => missing(&session),
                 Some(index) => {
                     let s = &self.sessions[index];
-                    let screen = s.terminal.as_ref().map(|t| t.screen_text(40));
+                    let screen = s.terminal.as_ref().map(|t| clip_start(&t.screen_text(40), MAX_SCREEN_CHARS));
                     let mut result = self.describe(index);
-                    result["last_message"] = json!(s.last_message);
+                    result["last_message"] = json!(s.last_message.as_deref().map(|m| clip(m, MAX_MESSAGE_CHARS)));
                     result["screen"] = json!(screen);
                     done(ControlResponse::ok(result))
                 }
@@ -293,11 +315,20 @@ impl State {
                 self.approve_plan(target);
                 done(ControlResponse::ok(self.plan_json(target)))
             }
-            ControlRequest::PlanGet { plan: None } => done(ControlResponse::ok(json!({
+            ControlRequest::PlanGet { plan: None, task: None } => done(ControlResponse::ok(json!({
                 "plans": self.plans.iter().filter(|p| p.is_open()).map(Plan::summary).collect::<Vec<_>>()
             }))),
-            ControlRequest::PlanGet { plan: Some(id) } => match self.plans.iter().position(|p| p.id == id) {
-                Some(index) => done(ControlResponse::ok(self.plan_json(index))),
+            ControlRequest::PlanGet { plan: None, task: Some(_) } => {
+                done(ControlResponse::error("Pass plan with task: a task id is unique only within its plan."))
+            }
+            ControlRequest::PlanGet { plan: Some(id), task } => match self.plans.iter().position(|p| p.id == id) {
+                Some(index) => done(match task {
+                    None => ControlResponse::ok(self.plan_view(index)),
+                    Some(task) => match self.task_view(index, &task) {
+                        Ok(view) => ControlResponse::ok(view),
+                        Err(error) => ControlResponse::error(error),
+                    },
+                }),
                 None => done(ControlResponse::error(format!("no plan {id}"))),
             },
             ControlRequest::PlanUpdate { plan: _, id, status, note, session } => match self.plans[target].task_mut(&id)
@@ -579,22 +610,22 @@ impl State {
                 Some(index) => match &self.sessions[index].terminal {
                     Some(terminal) => done(ControlResponse::ok(json!({
                         "status": self.sessions[index].status.label(),
-                        "screen": terminal.screen_text(lines.unwrap_or(60)),
+                        "screen": clip_start(&terminal.screen_text(lines.unwrap_or(60).min(MAX_READ_LINES)), MAX_SCREEN_CHARS),
                     }))),
                     None => done(ControlResponse::ok(json!({
                         "status": self.sessions[index].status.label(),
-                        "last_prompt": self.sessions[index].last_prompt,
-                        "last_message": self.sessions[index].last_message,
+                        "last_prompt": self.sessions[index].last_prompt.as_deref().map(|p| clip(p, MAX_PROMPT_CHARS)),
+                        "last_message": self.sessions[index].last_message.as_deref().map(|m| clip(m, MAX_MESSAGE_CHARS)),
                     }))),
                 },
             },
-            ControlRequest::Diff { session, patch } => match self.find(&session) {
+            ControlRequest::Diff { session, patch, path } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
                     let base_ref = self.project_config(&root).base_ref;
-                    ControlOutcome::Diff { root, base_ref, patch, session: json!(self.sessions[index].id) }
+                    ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
                 }
             },
             ControlRequest::Exec { session, command, timeout_secs, class } => match self.find(&session) {
@@ -753,7 +784,7 @@ impl State {
         let now = Instant::now();
         let mut pending = Vec::new();
         for waiter in std::mem::take(&mut self.waiters) {
-            let mut matching: Vec<serde_json::Value> = self
+            let mut matching: Vec<(u64, serde_json::Value)> = self
                 .events
                 .iter()
                 .filter(|e| e.seq > waiter.after)
@@ -766,27 +797,60 @@ impl State {
                         || waiter.sessions.contains(&e.session)
                 })
                 .filter(|e| waiter.statuses.iter().any(|s| s == e.kind()))
-                .map(StatusEvent::to_json)
+                .map(|e| (e.seq, e.to_json()))
                 .collect();
             // Deliver the handoff even with a cursor from the previous process.
             if let Some(event) = self.restart_event.take() {
-                matching.insert(0, event);
+                matching.insert(0, (waiter.after, event));
             }
             let timed_out = now >= waiter.deadline;
             if matching.is_empty() && !timed_out {
                 pending.push(waiter);
                 continue;
             }
+            // An answer carries the events that fit the client's limit, each with its texts cut. Its
+            // cursor then stops at the last one, and the next wait reads on from there.
+            let (mut events, mut size, mut read_to, mut more) = (Vec::new(), 0, waiter.after, false);
+            for (seq, event) in matching {
+                let event = clipped_event(event);
+                let len = atomics_core::control::shown_len(&event);
+                if !events.is_empty() && size + len > atomics_core::control::MAX_WAIT_CHARS {
+                    more = true;
+                    break;
+                }
+                size += len;
+                read_to = read_to.max(seq);
+                events.push(event);
+            }
             let sessions: Vec<_> = self
                 .sessions
                 .iter()
-                .map(|s| json!({ "id": s.id, "title": s.title, "status": s.status.label() }))
+                .map(|s| json!({ "id": s.id, "title": clip(&s.title, 120), "status": s.status.label() }))
                 .collect();
-            let response = json!({ "events": matching, "cursor": self.event_seq, "timed_out": matching.is_empty(), "sessions": sessions });
+            let mut response = json!({
+                "events": events,
+                "cursor": if more { read_to } else { self.event_seq },
+                "timed_out": events.is_empty(),
+                "sessions": sessions,
+            });
+            if more {
+                response["more"] = json!("More events wait: call atomics_wait again with this cursor.");
+            }
             let _ = waiter.reply.send(ControlOutcome::Done(ControlResponse::ok(response)));
         }
         self.waiters = pending;
     }
+}
+
+/// A `wait` event with its texts cut: a report summary to 8,000 characters, and an approval
+/// request, ticket or config change to 2,000 characters per string and 50 items per list.
+fn clipped_event(mut event: serde_json::Value) -> serde_json::Value {
+    let summary = event.pointer_mut("/report/summary").map(serde_json::Value::take);
+    atomics_core::control::clip_json(&mut event, 2000, 50);
+    if let Some(summary) = summary {
+        event["report"]["summary"] = json!(clip(summary.as_str().unwrap_or_default(), 8000));
+    }
+    event
 }
 
 /// `\r`, `\n`, `\t`, `\e` and `\xNN` escapes in raw key input.
