@@ -127,6 +127,12 @@ jobs:
             CARGO_BUILD_TARGET="$TARGET" scripts/macos-app.sh "$out"
             tar -czf "$out/$archive" -C "$out" ATOMICS.app
           fi
+          # Only a debug build can name another release feed or key: a release must not hold that path at all.
+          program="target/$TARGET/release/atomics"
+          if grep -q ATOMICS_TEST_RELEASE_FEED "$program"; then
+            echo '::error::This release build holds the test release feed.'
+            exit 1
+          fi
           (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
           echo "archive=$out/$archive" >> "$GITHUB_OUTPUT"
       - name: Sign and verify the archive

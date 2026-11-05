@@ -24,6 +24,12 @@ libraries corresponding to the dependencies in the workflow. The app bundle keep
 ad-hoc macOS code signature; the release signature below authenticates the download and does
 not provide Apple Developer ID signing or notarization.
 
+`scripts/install.sh` is what the README's one line runs. It reads the release keys from `assets/` on `main`, not from the
+release, and then the program installs itself with `atomics install`, as a build downloaded by hand can. A build only
+updates itself when it finds a key built in; a debug build can also be pointed at another feed and key for a test
+(`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`). No release holds that path: the desktop job fails if the
+release binary contains the name, and a test keeps `debug-assertions` out of the release profile.
+
 ## Provision the release key once
 
 Use OpenSSL 3 or later. On macOS, install `openssl@3` with Homebrew and put
@@ -82,6 +88,7 @@ Before tagging, check YAML with PyYAML installed:
 python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' .github/workflows/web.yml
 sh -n scripts/sign-release.sh
 sh -n scripts/macos-app.sh
+sh -n scripts/install.sh
 python3 tests/test_release_signing.py
 ```
 

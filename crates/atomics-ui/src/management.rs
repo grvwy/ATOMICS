@@ -20,8 +20,6 @@ pub struct State {
     setup_opened: bool,
     /// It has asked the host to look for the programs since it opened.
     setup_loaded: bool,
-    /// The connections it says will wait, by id.
-    later: Vec<String>,
     /// The Settings section that opens as Settings next draws.
     open_section: Option<String>,
     /// What was pasted for a setup step and not sent yet. It goes as Settings closes.

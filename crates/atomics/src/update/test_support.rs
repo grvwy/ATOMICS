@@ -151,6 +151,7 @@ impl Install {
 
     pub(super) fn untouched(&self) {
         assert_eq!(std::fs::read_to_string(&self.target).unwrap(), OLD, "the old install stays as it was");
+        assert!(!self.target.with_file_name("atomics.previous").exists(), "and nothing has moved yet");
         self.no_leftovers();
     }
 
@@ -159,7 +160,9 @@ impl Install {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, ["atomics"], "nothing is left beside the install");
+        let leftovers: Vec<_> =
+            names.iter().filter(|name| !["atomics", "atomics.previous"].contains(&name.as_str())).collect();
+        assert!(leftovers.is_empty(), "nothing is left beside the install but what it keeps: {leftovers:?}");
     }
 }
 

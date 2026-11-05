@@ -11,8 +11,26 @@ orchestrating agent plan the work, hand out tasks and review the results while y
 
 An open-source project.
 
+## Install
+
+On Linux (x86_64) or a Mac (Apple Silicon), with no Rust and no checkout:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh
+```
+
+It checks the download's SHA-256 and signature, installs ATOMICS for your user with its menu entry, and asks nothing.
+Open it, and its first run opens a [setup screen](docs/how-it-works.md#first-run). A build you downloaded by hand offers
+to install itself the same way, on that screen or with `atomics install`. After that, ATOMICS updates itself:
+[Updates](docs/how-it-works.md#updates) says what it keeps and how to go back.
+
+To build it instead, see [Run](#run). `rust-version` in `Cargo.toml` is the oldest Rust it builds on, and
+`rust-toolchain.toml` is the one it is built and tested with; rustup picks that up by itself.
+
+## Where things live
+
 The command is `atomics`. `scripts/macos-app.sh` builds ATOMICS.app for the Dock; `scripts/linux-install.sh` installs
-the Linux desktop app. State stays in `~/.atomics` on macOS and existing installs; new Linux installs use
+the Linux desktop app from a checkout. State stays in `~/.atomics` on macOS and existing installs; new Linux installs use
 `${XDG_STATE_HOME:-~/.local/state}/atomics`. Config lives in `${XDG_CONFIG_HOME:-~/.config}/atomics`.
 
 [How ATOMICS works](docs/how-it-works.md) is a one-page overview of sessions, the chief, plans, isolation,
@@ -358,7 +376,7 @@ scripts/linux-qa.sh shell
 captures the window through `atomics ctl`, verifies the PNG size and exits. Each `--ctl` request is sent to that
 instance first, in order, to set the scene; one that fails stops the run. The default size is 1600x1000; supported
 sizes range from 480x320 to 8192x8192. Its instance names its config, so the setup screen stays away;
-`ATOMICS_QA_FIRST_RUN=1` shows a person's first run instead. The image uses Debian, Rust 1.98, Xvfb and Mesa's lavapipe Vulkan driver
+`ATOMICS_QA_FIRST_RUN=1` shows a person's first run instead. The image uses Debian, its own Rust 1.98 (whatever `rust-toolchain.toml` says), Xvfb and Mesa's lavapipe Vulkan driver
 (software rendering for wgpu). No display server, GPU, agent credentials or ATOMICS state from the host are shared.
 
 The repository and linked-worktree git metadata are mounted read-only. Each checkout gets a separate Docker target

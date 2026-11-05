@@ -68,6 +68,12 @@ impl Updates {
     }
 }
 
+/// The same file, by whichever name.
+fn same_program(first: &Path, second: &Path) -> bool {
+    let resolved = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    resolved(first) == resolved(second)
+}
+
 impl State {
     fn update_mode(&self) -> Mode {
         #[cfg(test)]
@@ -239,9 +245,18 @@ impl State {
     }
 
     /// `atomics update` installed a version from a terminal.
-    pub(super) fn update_installed(&mut self, version: String) -> ControlResponse {
+    pub(super) fn update_installed(&mut self, version: String, program: Option<String>) -> ControlResponse {
         if self.update.installing() {
             return ControlResponse::error("this ATOMICS is installing an update itself");
+        }
+        // Restarting would only rerun the program it already is.
+        if let (Some(program), Ok(running)) = (program, crate::setup::executable_path())
+            && !same_program(Path::new(&program), &running)
+        {
+            return ControlResponse::error(format!(
+                "ATOMICS is running from {}, which this did not update; start {program} to use the new version",
+                running.display()
+            ));
         }
         self.update.version = Some(version);
         self.update.restart_at = None;
@@ -294,6 +309,23 @@ mod tests {
     use super::super::key_tests::{two_agents, untouched};
     use super::super::tests::{session, with_app};
     use super::*;
+
+    #[test]
+    fn a_host_running_another_program_than_the_one_updated_says_so_and_stays_put() {
+        with_app(
+            "app::update::tests::a_host_running_another_program_than_the_one_updated_says_so_and_stays_put",
+            |app, _| {
+                let elsewhere = app.runtime.update_installed("9.0.0".into(), Some("/elsewhere/atomics".into()));
+                let error = elsewhere.error.unwrap();
+                assert!(error.contains("which this did not update") && error.contains("/elsewhere/atomics"), "{error}");
+                assert!(matches!(app.runtime.update.phase, UpdatePhase::Idle), "nothing is armed");
+                let running = crate::setup::executable_path().unwrap().display().to_string();
+                assert!(app.runtime.update_installed("9.0.0".into(), Some(running)).ok);
+                assert!(matches!(app.runtime.update.phase, UpdatePhase::WaitingForAgents { .. }));
+                app.runtime.update.phase = UpdatePhase::Idle;
+            },
+        );
+    }
     use crate::update::test_support::{Release, found, signed_feed_failing, signed_feed_with};
 
     /// One frame of the whole window, `width` wide, and what the top bar's items recorded.
@@ -717,7 +749,7 @@ mod tests {
         with_app(
             "app::update::tests::a_restart_that_fails_keeps_the_new_version_installed_and_offers_it_again",
             |app, _| {
-                assert!(app.runtime.update_installed("9.0.0".into()).ok, "as atomics update asks");
+                assert!(app.runtime.update_installed("9.0.0".into(), None).ok, "as atomics update asks");
                 countdown_over(app);
                 app.runtime.restart_when_clear(|| {
                     Ok(crate::restart::Target { executable: "/missing/atomics".into(), command: vec![] })
@@ -1083,7 +1115,7 @@ mod tests {
     #[test]
     fn a_working_chief_holds_the_update_restart_back() {
         with_app("app::update::tests::a_working_chief_holds_the_update_restart_back", |app, _| {
-            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
             let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &app.runtime.launch_dir);
             chief.chief = true;
             app.runtime.sessions = vec![chief];
@@ -1096,7 +1128,7 @@ mod tests {
         with_app(
             "app::update::tests::an_agent_whose_screen_is_still_in_a_turn_holds_the_update_restart_back",
             |app, _| {
-                assert!(app.runtime.update_installed("9.0.0".into()).ok);
+                assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
                 let dir = crate::test_support::tempdir().unwrap();
                 // Where a sandboxed agent's report arrives before its turn ends.
                 let mut worker = session("worker", AgentKind::Claude, AgentStatus::Done, dir.path());
@@ -1111,7 +1143,7 @@ mod tests {
     #[test]
     fn an_idle_agent_with_background_work_holds_the_update_restart_back() {
         with_app("app::update::tests::an_idle_agent_with_background_work_holds_the_update_restart_back", |app, _| {
-            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
             let dir = crate::test_support::tempdir().unwrap();
             let mut worker = session("worker", AgentKind::Claude, AgentStatus::Idle, dir.path());
             worker.terminal = Some(footer(app, dir.path(), "  ⏵⏵ auto mode on · 1 shell · ← 1 agent"));
@@ -1123,7 +1155,7 @@ mod tests {
     #[test]
     fn a_shell_running_a_command_holds_the_update_restart_back() {
         with_app("app::update::tests::a_shell_running_a_command_holds_the_update_restart_back", |app, _| {
-            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
             let dir = crate::test_support::tempdir().unwrap();
             let terminal = terminal_running(app, dir.path(), "/bin/sh", &["-i"], "ready>");
             assert!(!terminal.foreground_process(), "at its prompt");
@@ -1154,7 +1186,7 @@ mod tests {
     #[test]
     fn a_running_editor_holds_the_update_restart_back() {
         with_app("app::update::tests::a_running_editor_holds_the_update_restart_back", |app, _| {
-            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
             let dir = crate::test_support::tempdir().unwrap();
             let editor = footer(app, dir.path(), "unsaved");
             app.runtime.editors.insert(dir.path().to_path_buf(), editor);
@@ -1182,7 +1214,7 @@ mod tests {
                 let whole = UpdatePhase::RestartsIn { seconds: COUNTDOWN.as_secs() };
                 let target =
                     || -> anyhow::Result<crate::restart::Target> { panic!("the window closed during the countdown") };
-                assert!(app.runtime.update_installed("9.0.0".into()).ok);
+                assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
                 app.runtime.restart_when_clear(target);
                 assert_eq!(app.runtime.update.phase, whole);
                 assert!(!app.runtime.restarting);
@@ -1215,7 +1247,7 @@ mod tests {
             "app::update::tests::cancel_stops_the_countdown_and_pressing_again_counts_from_the_start",
             |app, _| {
                 let target = || -> anyhow::Result<crate::restart::Target> { panic!("nothing restarts here") };
-                assert!(app.runtime.update_installed("9.0.0".into()).ok);
+                assert!(app.runtime.update_installed("9.0.0".into(), None).ok);
                 app.runtime.restart_when_clear(target);
                 countdown_over(app);
                 app.runtime.cancel_update_wait();

@@ -155,6 +155,84 @@ fn a_verified_release_replaces_the_program_with_a_new_file() {
     assert_ne!(std::fs::metadata(&install.target).unwrap().ino(), inode, "a new file, not the running one rewritten");
     assert_eq!(*steps.borrow(), ["Downloading 9.0.0", "Verifying 9.0.0", "Installing 9.0.0"]);
     install.no_leftovers();
+    // What it replaced is kept, the very file a running program holds.
+    let previous = install.target.with_file_name("atomics.previous");
+    assert_eq!(std::fs::read_to_string(&previous).unwrap(), OLD);
+    assert_eq!(std::fs::metadata(&previous).unwrap().ino(), inode);
+    use std::os::unix::fs::PermissionsExt;
+    assert!(std::fs::metadata(&previous).unwrap().permissions().mode() & 0o111 != 0, "and it still runs");
+}
+
+#[test]
+fn only_a_debug_build_can_name_another_feed_and_the_release_profile_is_not_one() {
+    let manifest = include_str!("../../../../Cargo.toml");
+    let release = manifest.split("[profile.release]").nth(1).unwrap();
+    let release = release.split("\n[").next().unwrap();
+    assert!(!release.contains("debug-assertions"), "the test feed would reach a release: {release}");
+}
+
+#[test]
+fn going_back_trades_places_from_either_copy_and_refuses_what_cannot_run() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (target, previous) = (bin.join("atomics"), bin.join("atomics.previous"));
+    let (old, new) = ("#!/bin/sh\necho 'atomics 1.0.0 (v1)'\n", "#!/bin/sh\necho 'atomics 2.0.0 (v2)'\n");
+    crate::test_support::write_program(&target, new);
+
+    let error = rollback(&target, false).unwrap_err();
+    assert!(format!("{error:#}").contains("No previous version"), "{error:#}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), new);
+
+    crate::test_support::write_program(&previous, old);
+    assert_eq!(rollback(&target, false).unwrap(), "1.0.0");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
+    assert_eq!(std::fs::read_to_string(&previous).unwrap(), new);
+    // Forward again, and from the kept copy, as a new version that will not start would need.
+    assert_eq!(rollback(&previous, false).unwrap(), "2.0.0");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), new);
+    assert_eq!(std::fs::read_to_string(&previous).unwrap(), old);
+
+    // A kept copy that does not run here stays out.
+    crate::test_support::write_program(&previous, "#!/bin/sh\nexit 1\n");
+    assert!(rollback(&target, false).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), new);
+
+    // With the new version gone altogether, the kept copy still puts itself back.
+    crate::test_support::write_program(&previous, old);
+    std::fs::remove_file(&target).unwrap();
+    assert_eq!(rollback(&previous, false).unwrap(), "1.0.0");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
+    assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1, "nothing else is left");
+}
+
+#[test]
+fn trading_places_without_the_systems_help_puts_things_back_if_it_fails() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let (previous, target, aside) = (dir.path().join("previous"), dir.path().join("target"), dir.path().join("aside"));
+    std::fs::write(&target, "kept").unwrap();
+    assert!(trade_places(&previous, &target, &aside).is_err(), "there is no previous to trade with");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
+    assert!(!aside.exists());
+}
+
+#[test]
+fn a_kept_bundle_goes_back_whole_under_a_name_macos_does_not_offer() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let folder = dir.path().join("Applications");
+    let bundle = |name: &str, text: &str| {
+        let program = folder.join(name).join("Contents/MacOS/atomics");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        crate::test_support::write_program(&program, text);
+        program
+    };
+    let program = bundle("ATOMICS.app", "#!/bin/sh\necho 'atomics 2.0.0 (v2)'\n");
+    let kept = bundle(".atomics-previous", "#!/bin/sh\necho 'atomics 1.0.0 (v1)'\n");
+    assert_eq!(rollback(&program, true).unwrap(), "1.0.0");
+    assert!(std::fs::read_to_string(&program).unwrap().contains("1.0.0"));
+    assert!(std::fs::read_to_string(&kept).unwrap().contains("2.0.0"));
+    assert_eq!(rollback(&kept, true).unwrap(), "2.0.0", "and from the kept copy");
+    assert!(std::fs::read_to_string(&program).unwrap().contains("2.0.0"));
 }
 
 #[test]
@@ -329,7 +407,12 @@ fn a_bundle_is_swapped_whole_and_kept_when_the_new_one_is_broken() {
     feed.install(&found, &|_| {}).unwrap();
     assert_eq!(std::fs::read_to_string(&program).unwrap(), NEW);
     assert!(!bundle.join("Contents/old-only").exists(), "the bundle is replaced whole");
-    assert_eq!(std::fs::read_dir(bundle.parent().unwrap()).unwrap().count(), 1, "nothing is left beside it");
+    let names: Vec<_> =
+        std::fs::read_dir(bundle.parent().unwrap()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert_eq!(names.len(), 2, "nothing is left beside it but what it keeps: {names:?}");
+    let kept = bundle.with_file_name(".atomics-previous");
+    assert_eq!(std::fs::read_to_string(kept.join("Contents/MacOS/atomics")).unwrap(), OLD);
+    assert!(kept.join("Contents/old-only").is_file(), "whole");
 }
 
 #[test]

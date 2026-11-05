@@ -150,13 +150,19 @@ fn a_fresh_home_reaches_a_first_agent_with_clicks_and_every_connection_can_wait(
             assert!(has(&shown, "not found"), "Codex is not there: {shown:?}");
             assert!(has(&shown, "Start Claude Code") && !has(&shown, "Start Codex"), "{shown:?}");
 
-            // Every connection waits with a click, and nothing asks about it again.
+            // Every connection waits with a click, nothing asks about it again, and that lasts: it is on the disk at once.
             for row in ["GitHub", "Azure DevOps", "Tickets", "Remote devices"] {
                 let shown = click_beside(app, ctx, row, "Connect later");
                 assert!(has(&shown, row), "{shown:?}");
             }
             let shown = settle(app, ctx);
             assert!(!has(&shown, "Connect later"), "{shown:?}");
+            assert_eq!(Store::load(&paths::store_file()).setup_later, ["github", "azure", "tickets", "remote"]);
+            // And it can be taken back.
+            let shown = click_beside(app, ctx, "Tickets", "Connect now");
+            assert!(has(&shown, "Connect later"), "{shown:?}");
+            assert_eq!(Store::load(&paths::store_file()).setup_later, ["github", "azure", "remote"]);
+            click_beside(app, ctx, "Tickets", "Connect later");
 
             // The first Start works, with nothing else done.
             click(app, ctx, "Start Claude Code");
@@ -458,6 +464,48 @@ fn skipping_lasts_and_settings_brings_the_screen_back_as_a_window_over_agents() 
             app.runtime.sessions.clear();
         },
     );
+}
+
+/// What a saved first run comes back to after any restart or update: no screen once it was skipped, and what was left for
+/// later still left for later when Settings brings it back. Only a home with no config is a first run.
+#[test]
+fn what_was_skipped_and_left_for_later_stays_that_way_after_a_restart() {
+    with_app("app::setup_tests::what_was_skipped_and_left_for_later_stays_that_way_after_a_restart", |app, ctx| {
+        app.runtime.store.setup_later = vec!["github".into()];
+        app.runtime.store.save(&paths::store_file()).unwrap();
+        let saved = Store::load(&paths::store_file());
+        assert_eq!(saved.setup_later, ["github"]);
+        assert!(!saved.setup_pending);
+        let shown = settle(app, ctx);
+        assert!(!app.client.ui.management.setup && !has(&shown, "Your agents"), "{shown:?}");
+        app.client.ui.management.setup = true;
+        let shown = settle(app, ctx);
+        assert!(has(&shown, "Later") && has(&shown, "Connect now"), "{shown:?}");
+    });
+}
+
+#[test]
+fn a_program_outside_where_it_belongs_offers_to_install_itself() {
+    with_app("app::setup_tests::a_program_outside_where_it_belongs_offers_to_install_itself", |app, ctx| {
+        assert!(app.runtime.install_offer.is_none(), "a test build stays where it is");
+        app.client.ui.management.setup = true;
+        assert!(!has(&settle(app, ctx), "Install ATOMICS"));
+
+        let (from, to) = (PathBuf::from("/tmp/Downloads/atomics"), paths::home().join(".local/bin/atomics"));
+        app.runtime.install_offer = Some((from, to));
+        let shown = settle(app, ctx);
+        assert!(has(&shown, "Install ATOMICS"), "{shown:?}");
+        assert!(shown.iter().any(|(text, _)| text.contains("/tmp/Downloads/atomics")), "{shown:?}");
+        let setup = app.runtime.setup_info().install.unwrap();
+        assert_eq!(setup.from, "/tmp/Downloads/atomics");
+        // With nothing running it reopens from there; over agents, the next start does.
+        app.runtime.sessions = vec![session("agent", AgentKind::Generic, AgentStatus::Working, &paths::home())];
+        app.runtime.installed_self_for_test();
+        assert!(app.runtime.install_offer.is_none());
+        assert!(!app.runtime.restarting, "it does not close over a running agent");
+        app.runtime.sessions.clear();
+        app.client.ui.management.setup = false;
+    });
 }
 
 #[test]

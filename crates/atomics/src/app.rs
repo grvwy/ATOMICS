@@ -542,6 +542,8 @@ pub(crate) struct State {
     setup_failure: Option<atomics_core::projection::SetupFailure>,
     /// A step finished while a look was under way, whose answer may be from before it.
     setup_look_again: bool,
+    /// This program runs from outside where it belongs: from there, and where it would go.
+    install_offer: Option<(PathBuf, PathBuf)>,
     /// The folder ATOMICS started in is in a repository, so that its welcome starts agents there.
     launch_project: bool,
     /// A person's start that could not get a sandbox, until they say what to do.
@@ -1086,6 +1088,7 @@ impl State {
             setup_job: None,
             setup_failure: None,
             setup_look_again: false,
+            install_offer: crate::install::offer(),
             launch_project: workspace::project_root(&launch_dir).is_ok(),
             start_choice: None,
             interactive_start: false,

@@ -311,12 +311,28 @@ pub struct SetupInfo {
     pub job: Option<SetupJob>,
     /// Why the last one did not finish. Its words hold no credential.
     pub failure: Option<SetupFailure>,
+    /// The connections someone said will wait, by id.
+    pub later: Vec<String>,
+    /// This program runs from outside where it belongs, and can install itself there.
+    pub install: Option<SetupInstall>,
+}
+
+/// A program that can install itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupInstall {
+    /// Where it runs from, as the host shows a path.
+    pub from: String,
+    /// Where it would go.
+    pub to: String,
 }
 
 /// What a click on a setup step does on the host. `atomics setup` runs the same work from a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupAction {
+    /// This program itself, from where it was downloaded to where it belongs.
+    InstallSelf,
     InstallClaude,
     InstallCodex,
     InstallGit,

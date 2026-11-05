@@ -55,6 +55,9 @@ pub enum ControlRequest {
     /// button does. It never forces.
     UpdateInstalled {
         version: String,
+        /// The program that was updated: a host running another one has nothing to restart into.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<String>,
     },
     /// An `atomics://open` link, parsed by the launching process: focus the window and show a
     /// plan, or the plan for a ticket. `rejected` carries why a link was refused, for a toast.

@@ -1,0 +1,6 @@
+# What ATOMICS is built and tested with. `rust-version` in Cargo.toml is the oldest it builds on, set by its dependencies.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
