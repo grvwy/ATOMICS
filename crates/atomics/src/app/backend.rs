@@ -723,7 +723,10 @@ mod tests {
             assert_eq!(board.ready, ["b"]);
             assert_eq!(board.sessions["asking"], ("Asking".to_string(), AgentStatus::NeedsInput));
             assert_eq!(board.sessions.len(), 2);
-            let note = format!("checking whether it is in {}", app.runtime.plans[1].integration_branch());
+            let note = format!(
+                "Agent kept open: waiting for its turn and pending messages to finish; checking whether it is in {}",
+                app.runtime.plans[1].integration_branch()
+            );
             assert_eq!(board.integration_notes.len(), 1);
             assert_eq!(board.integration_notes["a"], (note, true));
             assert!(board.checking);
