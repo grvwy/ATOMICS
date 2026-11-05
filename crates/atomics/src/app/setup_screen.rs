@@ -2,9 +2,13 @@
 //! the question a person's start asks when no sandbox can be had for it: ATOMICS never runs a sandboxed agent bare on
 //! its own, so it asks instead of failing (docs/isolation.md).
 use super::*;
+use crate::sandbox::steps;
 use atomics_core::config::AgentKind;
 use atomics_core::isolation::IsolationMode;
-use atomics_core::projection::{SetupConnection, SetupInfo, SetupProgram, StartChoice};
+use atomics_core::projection::{
+    SetupAction, SetupClick, SetupConnection, SetupFailure, SetupInfo, SetupJob, SetupProgram, StartChoice,
+};
+use std::sync::atomic::AtomicBool;
 
 /// A person's start waiting for their answer.
 pub(super) struct PendingStart {
@@ -14,6 +18,39 @@ pub(super) struct PendingStart {
     pub(super) prompt: Option<String>,
     pub(super) why: String,
     pub(super) sandbox_required: bool,
+}
+
+/// What looking for the programs found.
+pub(super) struct ProgramsChecked {
+    programs: Vec<SetupProgram>,
+    azure: crate::relay::azure::Status,
+    /// What gets the Azure CLI on this machine.
+    azure_install: String,
+}
+
+/// The setup step under way.
+pub(super) struct RunningSetup {
+    action: SetupAction,
+    stop: Arc<AtomicBool>,
+}
+
+impl RunningSetup {
+    pub(super) fn progress(&self) -> &'static str {
+        steps::progress(self.action)
+    }
+}
+
+/// The click that gets `program`, where it takes no terminal and no sudo: Claude Code's installer, npm or Homebrew where
+/// they are here, and Apple's own dialog for git.
+fn install_click(program: &str, mac: bool, has: &dyn Fn(&str) -> bool) -> Option<SetupClick> {
+    let action = match (program, mac) {
+        ("claude", _) if has("curl") && has("bash") => SetupAction::InstallClaude,
+        ("codex", false) if has("npm") => SetupAction::InstallCodex,
+        ("codex", true) if has("brew") => SetupAction::InstallCodex,
+        ("git", true) => SetupAction::InstallGit,
+        _ => return None,
+    };
+    Some(SetupClick::new(action, "Install"))
 }
 
 /// The programs a fresh machine needs: git, then the agents the config runs. A program whose name a person would not
@@ -41,6 +78,9 @@ impl State {
             programs: self.setup_programs.clone(),
             project: self.open_projects.first().map(|project| paths::display(project)),
             connections: self.setup_connections(),
+            sandbox_steps: self.sandbox_steps.clone(),
+            job: self.setup_job.as_ref().map(|job| SetupJob { action: job.action, progress: job.progress().into() }),
+            failure: self.setup_failure.clone(),
             start_choice: self.start_choice.as_ref().map(|pending| StartChoice {
                 agent: pending.agent.clone(),
                 why: pending.why.clone(),
@@ -58,9 +98,13 @@ impl State {
                 connected,
                 note: note.into(),
                 command: command.map(str::to_string),
+                click: None,
             };
         let github = self.github.signed_in_hosts().into_iter().find(|(host, _)| host != AZURE_HOST);
-        let azure = self.github.viewer(AZURE_HOST).map(str::to_string);
+        let azure = self.github.viewer(AZURE_HOST).map(str::to_string).or_else(|| {
+            let signed_in = self.setup_azure.found && self.setup_azure.logged_in;
+            signed_in.then(|| "Signed in".to_string())
+        });
         let tickets = self.ticket_config();
         let tickets_connected =
             tickets.as_ref().filter(|_| !self.tickets.panel.signin).map(|config| config.system.clone());
@@ -71,13 +115,26 @@ impl State {
         let devices = self.remote_devices().map_or(0, |devices| devices.list().len());
         vec![
             row("github", "GitHub", github.map(|(_, login)| login), "See, review and merge pull requests here.", None),
-            row(
-                "azure",
-                "Azure DevOps",
-                azure,
-                "Uses the Azure CLI's sign-in. Nothing is stored, and no agent gets it.",
-                Some("az login"),
-            ),
+            if self.setup_azure.found {
+                SetupConnection {
+                    click: Some(SetupClick::new(SetupAction::AzureLogin, "Sign in")),
+                    ..row(
+                        "azure",
+                        "Azure DevOps",
+                        azure,
+                        "Uses the Azure CLI's sign-in, in your browser. Nothing is stored, and no agent gets it.",
+                        None,
+                    )
+                }
+            } else {
+                row(
+                    "azure",
+                    "Azure DevOps",
+                    azure,
+                    "Takes the Azure CLI, which ATOMICS signs in with once it is here.",
+                    self.setup_azure_install.as_deref(),
+                )
+            },
             row("tickets", "Tickets", tickets_connected, tickets_note, None),
             row(
                 "remote",
@@ -110,11 +167,16 @@ impl State {
                     } else {
                         crate::setup::find_on_path(&program, &path)
                     };
-                    let install = crate::sandbox::checks::install_command(&program, mac);
-                    SetupProgram { name, agent, found: found.as_deref().map(paths::display), install }
+                    let has = |name: &str| crate::setup::find_on_path(name, &path).is_some();
+                    let install = crate::sandbox::checks::install_command(&program, mac, &has);
+                    let click = install_click(&program, mac, &has);
+                    SetupProgram { name, agent, found: found.as_deref().map(paths::display), install, click }
                 })
                 .collect();
-            let _ = tx.send(programs);
+            let has = |name: &str| crate::setup::find_on_path(name, &path).is_some();
+            let azure_install = crate::sandbox::checks::install_command("az", mac, &has);
+            let azure = crate::relay::azure::status(crate::setup::find_on_path("az", &path));
+            let _ = tx.send(ProgramsChecked { programs, azure, azure_install });
             wake.notify();
         });
         // Azure DevOps counts as signed in once a poll has seen its login.
@@ -124,11 +186,81 @@ impl State {
     pub(super) fn poll_programs_check(&mut self) -> bool {
         let Some(rx) = &self.programs_check else { return false };
         match rx.try_recv() {
-            Ok(programs) => self.setup_programs = programs,
+            Ok(checked) => {
+                self.setup_programs = checked.programs;
+                self.setup_azure = checked.azure;
+                self.setup_azure_install = Some(checked.azure_install);
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
         self.programs_check = None;
+        true
+    }
+
+    /// What sandboxes would need of this machine, with `config` for them. Whether they are on yet makes no difference,
+    /// so that someone can get ready before switching.
+    pub(super) fn sandbox_machine(&self, config: atomics_core::isolation::SandboxConfig) -> steps::Machine {
+        let would_run = |agent: &&atomics_core::config::AgentConfig| agent.isolation != Some(IsolationMode::Bare);
+        steps::Machine {
+            sbx: resolve_program(&self.sbx),
+            config,
+            claude: self.config.agents.iter().filter(would_run).any(|agent| agent.kind == AgentKind::Claude),
+            codex: self.config.agents.iter().filter(would_run).any(|agent| agent.is_codex()),
+            keychain: self.relay.keychain().clone(),
+        }
+    }
+
+    /// Runs one step off the window's thread. What it finds goes back through [`Self::setup_finished`].
+    pub(super) fn run_setup(&mut self, action: SetupAction, value: Option<String>) -> Result<(), String> {
+        if self.setup_job.is_some() {
+            return Err("Another setup step is under way.".into());
+        }
+        self.setup_failure = None;
+        if action == SetupAction::SshAgentOff {
+            let saved = self.write_machine_setting("[isolation.sandbox]\nssh_agent = false");
+            self.setup_failure = saved.err().map(|why| SetupFailure { action, why });
+            self.setup_look_again = true;
+            return Ok(());
+        }
+        let config = crate::sandbox::checks::configured(&self.config, self.workspace.as_deref())
+            .map_err(|_| "Cannot read sandbox/ticket configuration; fix it and try again".to_string())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let job = steps::Job { action, value, machine: self.sandbox_machine(config), stop: stop.clone() };
+        self.setup_job = Some(RunningSetup { action, stop });
+        let actions = self.action_tx.clone();
+        std::thread::spawn(move || {
+            let result = job.run();
+            let _ = actions.send(Box::new(move |state| state.setup_finished(action, result)));
+        });
+        Ok(())
+    }
+
+    pub(super) fn cancel_setup(&mut self) {
+        if let Some(job) = &self.setup_job {
+            job.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn setup_finished(&mut self, action: SetupAction, result: anyhow::Result<()>) {
+        self.setup_job = None;
+        self.setup_failure = match result {
+            Ok(()) => None,
+            // Whoever stopped it knows.
+            Err(error) if error.is::<crate::sandbox::setup::Stopped>() => None,
+            Err(error) => Some(SetupFailure { action, why: format!("{error:#}") }),
+        };
+        self.setup_look_again = true;
+    }
+
+    /// Looks again once nothing that may be older than the last step is under way.
+    pub(super) fn poll_setup_look_again(&mut self) -> bool {
+        if !self.setup_look_again || self.sandbox_check.is_some() || self.programs_check.is_some() {
+            return false;
+        }
+        self.setup_look_again = false;
+        self.check_sandbox();
+        self.check_programs();
         true
     }
 
@@ -141,19 +273,19 @@ impl State {
 
     /// In this machine's own file: whether sandboxes can run here says nothing of another machine sharing the main one.
     pub(super) fn set_isolation(&mut self, mode: IsolationMode) -> Result<(), String> {
+        self.write_machine_setting(&format!("[isolation]\nmode = \"{}\"", mode.name()))
+    }
+
+    /// Merges `fragment` into this machine's own config file, keeping what else it says.
+    fn write_machine_setting(&mut self, fragment: &str) -> Result<(), String> {
         let [_, file] = Config::source_paths(&self.config_path);
-        let unsaved = |why: String| format!("Could not save where agents run: {why}");
+        let unsaved = |why: String| format!("Could not save that: {why}");
         let before = match std::fs::read_to_string(&file) {
             Ok(text) => Some(text),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(unsaved(err.to_string())),
         };
-        let after = atomics_core::selfconfig::edit(
-            before.as_deref().unwrap_or(""),
-            &format!("[isolation]\nmode = \"{}\"", mode.name()),
-            &[],
-        )
-        .map_err(unsaved)?;
+        let after = atomics_core::selfconfig::edit(before.as_deref().unwrap_or(""), fragment, &[]).map_err(unsaved)?;
         if let Some(folder) = file.parent() {
             std::fs::create_dir_all(folder).map_err(|err| unsaved(err.to_string()))?;
         }

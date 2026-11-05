@@ -1091,7 +1091,7 @@ impl AgentConfig {
 }
 
 /// The config file a new install starts from: [`DEFAULT_CONFIG`], with agents on this machine under the user's own
-/// login. Sandboxes are a later click, since they need Docker's tools and account. A file that does not name a mode
+/// login. Sandboxes are a later click in Settings, since they need Docker's tools and account. A file that does not name a mode
 /// still means sandboxes, as it did when it was written, so no existing install changes.
 pub fn new_install_config() -> String {
     DEFAULT_CONFIG.replacen("\nmode = \"sandbox\"\n", "\nmode = \"bare\"\n", 1)

@@ -135,6 +135,7 @@ impl Azure {
             OutputError::Read => "could not read Azure CLI output",
             OutputError::Timeout => "host Azure CLI timed out",
             OutputError::TooLarge => "Azure CLI output was too large",
+            OutputError::Stopped => "host Azure CLI was stopped",
         })?;
         if !output.status.success() {
             return Err("host Azure CLI failed; run az login on the host");

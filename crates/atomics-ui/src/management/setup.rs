@@ -10,7 +10,7 @@ use crate::theme::Palette;
 use crate::touch;
 use atomics_core::isolation::IsolationMode;
 use atomics_core::ops::SettingsTool;
-use atomics_core::projection::{SetupConnection, SetupInfo};
+use atomics_core::projection::{SetupAction, SetupClick, SetupConnection, SetupInfo};
 use egui::{Align, Color32, Layout, vec2};
 
 const WIDTH: f32 = 640.0;
@@ -115,9 +115,12 @@ fn step(ui: &mut egui::Ui, p: &Palette, done: bool, title: &str, body: impl FnOn
     ui.indent(title, body);
 }
 
-/// A row's button that puts a command on the clipboard, with its text in plain sight.
+/// A row's button that puts a command on the clipboard, with its text in plain sight. Where the host knows no command,
+/// as on a Linux with a package manager it does not know, its words say what to get, and there is nothing to copy.
 fn copy_button(ui: &mut egui::Ui, client: &Client, command: &str) {
-    if button(ui, client, format!("Copy: {command}")).clicked() {
+    if command.starts_with("install ") {
+        note(ui, &client.palette, command);
+    } else if button(ui, client, format!("Copy: {command}")).clicked() {
         ui.ctx().copy_text(command.into());
     }
 }
@@ -141,7 +144,7 @@ fn steps(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &M
     let connected = setup.connections.iter().any(|row| row.connected.is_some());
     step(ui, &p, connected, "Connections", |ui| {
         for row in &setup.connections {
-            connection(ui, backend, client, enabled, row);
+            connection(ui, backend, client, enabled, setup, row);
         }
     });
 }
@@ -183,7 +186,8 @@ fn actions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: 
     }
 }
 
-fn programs(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &SetupInfo) {
+/// git and the agents, with what gets the ones that are missing.
+pub(super) fn programs(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &SetupInfo) {
     let p = client.palette.clone();
     if setup.programs.is_empty() {
         note(ui, &p, if enabled { "Looking for git and your agents…" } else { "The host has not looked yet." });
@@ -193,14 +197,26 @@ fn programs(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &Setup
             let found = program.found.is_some();
             mark(ui, if found { Mark::Check } else { Mark::Cross }, found_color(client, found));
             ui.label(RichText::new(&program.name).strong());
-            match &program.found {
-                Some(path) => note(ui, &p, path.clone()),
-                None => {
+            match (&program.found, &program.click) {
+                (Some(path), _) => note(ui, &p, path.clone()),
+                (None, Some(click)) => {
+                    note(ui, &p, "not found");
+                    run_button(ui, client, enabled, setup, click);
+                }
+                (None, None) => {
                     note(ui, &p, "not found");
                     copy_button(ui, client, &program.install);
                 }
             }
         });
+        // What it runs stays in reach once a click has not been enough.
+        if let Some(click) = &program.click
+            && program.found.is_none()
+            && setup.failure.as_ref().is_some_and(|failure| failure.action == click.action)
+        {
+            failure(ui, client, setup, click.action);
+            copy_button(ui, client, &program.install);
+        }
     }
     ui.horizontal(|ui| {
         ui.add_enabled_ui(enabled && !setup.checking, |ui| {
@@ -212,6 +228,78 @@ fn programs(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &Setup
             ui.spinner();
         }
     });
+}
+
+/// Why `action` did not finish, if it was the last to try.
+fn failure(ui: &mut egui::Ui, client: &Client, setup: &SetupInfo, action: SetupAction) {
+    if let Some(failure) = setup.failure.as_ref().filter(|failure| failure.action == action) {
+        ui.add(egui::Label::new(RichText::new(&failure.why).size(11.5).color(client.palette.warning)).wrap());
+    }
+}
+
+/// A step's click: its button, what it is doing while it runs with a way to stop it, the field a pasted value goes in,
+/// and the question it asks first if it cannot be undone. One runs at a time.
+fn run_button(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &SetupInfo, click: &SetupClick) {
+    let run = |client: &mut Client, value| tool(client, SettingsTool::RunSetup { action: click.action, value });
+    if let Some(job) = setup.job.as_ref().filter(|job| job.action == click.action) {
+        ui.spinner();
+        note(ui, &client.palette.clone(), job.progress.clone());
+        if button(ui, client, "Cancel").clicked() {
+            tool(client, SettingsTool::CancelSetup);
+        }
+        return;
+    }
+    if let Some(question) = click.confirm.as_ref().filter(|_| client.management.setup_confirm == Some(click.action)) {
+        match settings::ask(ui, client, question, &click.label) {
+            Some(true) => {
+                client.management.setup_confirm = None;
+                run(client, None);
+            }
+            Some(false) => client.management.setup_confirm = None,
+            None => {}
+        }
+        return;
+    }
+    ui.add_enabled_ui(enabled && setup.job.is_none(), |ui| {
+        if let Some(name) = &click.paste {
+            let field = client.management.setup_values.entry(click.action).or_default();
+            ui.add(egui::TextEdit::singleline(field).password(true).hint_text(name.as_str()).desired_width(220.0));
+            let ready = !field.is_empty();
+            if ui.add_enabled(ready, touch::sized(egui::Button::new(&click.label), client.touch)).clicked() {
+                let value = client.management.setup_values.remove(&click.action);
+                run(client, value);
+            }
+        } else if button(ui, client, &click.label).clicked() {
+            if click.confirm.is_some() {
+                client.management.setup_confirm = Some(click.action);
+            } else {
+                run(client, None);
+            }
+        }
+    });
+}
+
+/// What sandboxes need on this machine.
+pub(super) fn sandbox_steps(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &SetupInfo) {
+    let p = client.palette.clone();
+    for step in &setup.sandbox_steps {
+        ui.horizontal_wrapped(|ui| {
+            mark(ui, if step.done { Mark::Check } else { Mark::Ring }, if step.done { p.accent } else { p.muted });
+            ui.label(RichText::new(&step.name).strong());
+            for click in &step.clicks {
+                run_button(ui, client, enabled, setup, click);
+            }
+            if let Some(command) = &step.command {
+                copy_button(ui, client, command);
+            }
+        });
+        if !step.note.is_empty() {
+            ui.indent(("step-note", &step.name), |ui| note(ui, &p, step.note.clone()));
+        }
+        for click in &step.clicks {
+            failure(ui, client, setup, click.action);
+        }
+    }
 }
 
 fn where_agents_run(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
@@ -249,7 +337,14 @@ fn project(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, setup:
     }
 }
 
-fn connection(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, row: &SetupConnection) {
+fn connection(
+    ui: &mut egui::Ui,
+    backend: &dyn Backend,
+    client: &mut Client,
+    enabled: bool,
+    setup: &SetupInfo,
+    row: &SetupConnection,
+) {
     let p = client.palette.clone();
     ui.horizontal_wrapped(|ui| {
         let connected = row.connected.is_some();
@@ -260,7 +355,7 @@ fn connection(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, ena
         } else if client.management.later.contains(&row.id) {
             note(ui, &p, "Later");
         } else {
-            connect_button(ui, backend, client, enabled, row);
+            connect_button(ui, backend, client, enabled, setup, row);
             if button(ui, client, "Connect later").clicked() {
                 client.management.later.push(row.id.clone());
             }
@@ -268,10 +363,20 @@ fn connection(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, ena
     });
     if row.connected.is_none() && !client.management.later.contains(&row.id) {
         note(ui, &p, row.note.clone());
+        if let Some(click) = &row.click {
+            failure(ui, client, setup, click.action);
+        }
     }
 }
 
-fn connect_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, row: &SetupConnection) {
+fn connect_button(
+    ui: &mut egui::Ui,
+    backend: &dyn Backend,
+    client: &mut Client,
+    enabled: bool,
+    setup: &SetupInfo,
+    row: &SetupConnection,
+) {
     let p = client.palette.clone();
     match row.id.as_str() {
         "github" if backend.available(&Command::ConnectGithub) => {
@@ -296,6 +401,10 @@ fn connect_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
             }
         }
         _ => {
+            if let Some(click) = &row.click {
+                run_button(ui, client, enabled, setup, click);
+                return;
+            }
             if let Some(command) = &row.command {
                 copy_button(ui, client, command);
             }

@@ -155,7 +155,7 @@ pub(super) fn button(ui: &mut egui::Ui, client: &Client, text: impl Into<String>
 }
 
 /// Asks about what cannot be undone: `Some` once answered.
-fn ask(ui: &mut egui::Ui, client: &Client, question: &str, yes: &str) -> Option<bool> {
+pub(super) fn ask(ui: &mut egui::Ui, client: &Client, question: &str, yes: &str) -> Option<bool> {
     ui.add(egui::Label::new(RichText::new(question).color(client.palette.warning)).wrap());
     let mut answer = None;
     ui.horizontal_wrapped(|ui| {
@@ -401,6 +401,7 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
     let tools = &info.tools;
     let busy = tools["sandbox_busy"] == true;
     load(client, enabled, busy, SettingsTool::CheckSandbox);
+    load(client, enabled, info.setup.checking, SettingsTool::CheckPrograms);
     subheading(ui, &p, "Where agents run");
     ui.add_enabled_ui(enabled, |ui| {
         for (mode, text) in [
@@ -428,19 +429,33 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
         }
     }
     note(ui, &p, "Agents are the [[agents]] entries in the config: see Advanced.");
+    subheading(ui, &p, "What they need");
+    super::setup::programs(ui, client, enabled, &info.setup);
     subheading(ui, &p, "Docker Sandboxes");
+    if isolation(info) == atomics_core::isolation::IsolationMode::Bare.name() {
+        note(ui, &p, "Agents run on this machine, so none of this is needed yet. Get it ready, then switch above.");
+    }
     let lines = tools["sandbox"].as_array().map_or(&[][..], Vec::as_slice);
-    if busy || lines.is_empty() {
+    if busy || (lines.is_empty() && info.setup.sandbox_steps.is_empty()) {
         note(ui, &p, if enabled { "Checking Docker Sandboxes…" } else { "The host has not checked them yet." });
     }
-    for line in lines.iter().filter_map(|line| line.as_str()) {
-        check_line(ui, &p, line);
-    }
+    super::setup::sandbox_steps(ui, client, enabled, &info.setup);
     ui.add_enabled_ui(enabled && !busy, |ui| {
         if button(ui, client, "Check again").clicked() {
             tool(client, SettingsTool::CheckSandbox);
         }
     });
+    // A host that does not list steps has only these; on one that does, they are the detail behind them.
+    let details = |ui: &mut egui::Ui| {
+        for line in lines.iter().filter_map(|line| line.as_str()) {
+            check_line(ui, &p, line);
+        }
+    };
+    if info.setup.sandbox_steps.is_empty() {
+        details(ui);
+    } else if !lines.is_empty() {
+        egui::CollapsingHeader::new("Every check").id_salt("sandbox-checks").show(ui, details);
+    }
     subheading(ui, &p, "Claude sessions outside ATOMICS");
     if tools["hooks"] == true {
         ui.label("Hooks for all Claude sessions are installed");

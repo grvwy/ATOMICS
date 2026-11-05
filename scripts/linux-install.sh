@@ -1,15 +1,13 @@
 #!/bin/sh
-# Build/install the desktop app, or remove just the installed files with --uninstall.
-# --no-setup leaves out `atomics setup`, which asks questions: for an update, with nobody at a terminal.
+# Build/install the desktop app, or remove just the installed files with --uninstall. It asks nothing: the program opens
+# a setup screen on its first run. --no-setup changes nothing, for builds that still ask for it when they update.
 set -eu
 
-setup=yes
 case "${1:-}" in
-  '') action=install ;;
+  ''|--no-setup) action=install ;;
   --uninstall) action=uninstall ;;
-  --no-setup) action=install; setup=no ;;
-  --help|-h) echo 'Usage: scripts/linux-install.sh [--uninstall | --no-setup]'; exit 0 ;;
-  *) echo 'Usage: scripts/linux-install.sh [--uninstall | --no-setup]' >&2; exit 2 ;;
+  --help|-h) echo 'Usage: scripts/linux-install.sh [--uninstall]'; exit 0 ;;
+  *) echo 'Usage: scripts/linux-install.sh [--uninstall]' >&2; exit 2 ;;
 esac
 [ "$#" -le 1 ] || { echo 'Too many arguments' >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo 'This installer requires Linux; use scripts/macos-app.sh on macOS.' >&2; exit 1; }
@@ -84,13 +82,9 @@ if [ "$action" = uninstall ]; then
   echo 'Uninstalled ATOMICS. Configuration and session state were kept.'
 else
   echo "Installed $bin/atomics and $desktop"
+  echo 'Open ATOMICS from your applications menu. Its first run opens a setup screen.'
   case ":$PATH:" in
     *":$bin:"*) ;;
-    *) echo "Add $bin to PATH to run atomics from a terminal." ;;
+    *) echo "To run atomics from a terminal too, add this to your shell's startup file: export PATH=\"$bin:\$PATH\"" ;;
   esac
-  # Use the installed path even before ~/.local/bin has been added to PATH.
-  # Keep stdin attached: setup guides first-time installation and resumes on updates.
-  if [ "$setup" = yes ]; then
-    "$bin/atomics" setup
-  fi
 fi

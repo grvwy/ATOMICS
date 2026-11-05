@@ -575,7 +575,7 @@ pub trait Backend {
         None
     }
 
-    /// The folder the host was started in, where the welcome starts agents outside the Ungrouped tab;
+    /// The project the host was started in, where the welcome starts agents outside the Ungrouped tab;
     /// `None` when the host does not say.
     fn launch_dir(&self) -> Option<PathBuf>;
 

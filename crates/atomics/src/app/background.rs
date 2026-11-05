@@ -28,6 +28,7 @@ impl State {
         changed |= self.machine.tick(machine_paths, machine_roots, self.wake.clone());
         changed |= self.poll_sandbox_check();
         changed |= self.poll_programs_check();
+        changed |= self.poll_setup_look_again();
         changed |= self.poll_connections();
         changed |= self.github_tick();
         for record in std::mem::take(&mut self.resume) {

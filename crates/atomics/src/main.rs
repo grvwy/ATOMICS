@@ -345,9 +345,17 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        Some(Command::Setup { credential: None, .. } | Command::Sandbox { command: SandboxCommand::Setup }) => {
-            if let Err(err) = sandbox::setup::run(cli.workspace.as_deref()) {
-                eprintln!("Sandbox setup failed: {err}");
+        Some(
+            command @ (Command::Setup { credential: None, .. } | Command::Sandbox { command: SandboxCommand::Setup }),
+        ) => {
+            let sandboxes = matches!(command, Command::Sandbox { .. });
+            if let Err(err) = sandbox::setup::run(cli.workspace.as_deref(), sandboxes) {
+                // Stopping it is no failure: ATOMICS is installed, and this carries on whenever someone wants it.
+                if err.is::<sandbox::setup::Stopped>() {
+                    println!("{}", sandbox::setup::STOPPED);
+                    return Ok(());
+                }
+                eprintln!("Setup did not finish: {err}");
                 std::process::exit(1);
             }
             return Ok(());

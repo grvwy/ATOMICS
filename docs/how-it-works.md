@@ -5,8 +5,8 @@ A short map of the moving parts. Each section links to the page with the details
 
 ## First run
 
-With no config yet, ATOMICS opens the setup screen instead of its usual window: which agents it found, with **Check
-again**, where agents run, a first project folder, and connections (GitHub, Azure DevOps, tickets, remote devices), each
+With no config yet, ATOMICS opens the setup screen instead of its usual window: which agents it found, with **Install**
+where a click can do it, the exact command where it cannot, and **Check again**; where agents run, a first project folder, and connections (GitHub, Azure DevOps, tickets, remote devices), each
 with **Connect later**. Nothing on it holds up anything else. The Start buttons work as soon as an agent is found, and
 **Skip for now** or Escape leave for later: **Settings → Getting started** brings it back, as a window over whatever is
 running. An install that already has a config never sees it.

@@ -186,7 +186,7 @@ people change, and each reads what it shows as it opens:
 | Updates | Only with something to say: this version and the new one, its notes, the Update button, what an update is doing, and why the last check failed. A client always has it, to say which version the host runs. See [Updates](#updates). |
 | Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
-| Agents | The configured agents, whether they run sandboxed, the [sandbox checks](isolation.md#check-sandbox-setup), the Claude hooks and `atomics setup`. |
+| Agents | The configured agents, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
 | Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
 | Remote devices | Pairing and paired devices, as in the Remote window. |
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |

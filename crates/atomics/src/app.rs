@@ -530,10 +530,20 @@ pub(crate) struct State {
     lifecycle_jobs: Vec<crate::lifecycle::Job>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
-    sandbox_check: Option<Receiver<Vec<String>>>,
+    sandbox_check: Option<Receiver<(Vec<String>, Vec<atomics_core::projection::SetupStep>)>>,
     sandbox_lines: Vec<String>,
-    programs_check: Option<Receiver<Vec<atomics_core::projection::SetupProgram>>>,
+    sandbox_steps: Vec<atomics_core::projection::SetupStep>,
+    programs_check: Option<Receiver<setup_screen::ProgramsChecked>>,
     setup_programs: Vec<atomics_core::projection::SetupProgram>,
+    /// Azure's CLI, once it has been looked for.
+    setup_azure: crate::relay::azure::Status,
+    setup_azure_install: Option<String>,
+    setup_job: Option<setup_screen::RunningSetup>,
+    setup_failure: Option<atomics_core::projection::SetupFailure>,
+    /// A step finished while a look was under way, whose answer may be from before it.
+    setup_look_again: bool,
+    /// The folder ATOMICS started in is in a repository, so that its welcome starts agents there.
+    launch_project: bool,
     /// A person's start that could not get a sandbox, until they say what to do.
     start_choice: Option<setup_screen::PendingStart>,
     /// The next launch comes from a person pressing Start, and so may ask them about it.
@@ -1068,8 +1078,15 @@ impl State {
             sbx: sbx.into(),
             sandbox_check: None,
             sandbox_lines: Vec::new(),
+            sandbox_steps: Vec::new(),
             programs_check: None,
             setup_programs: Vec::new(),
+            setup_azure: Default::default(),
+            setup_azure_install: None,
+            setup_job: None,
+            setup_failure: None,
+            setup_look_again: false,
+            launch_project: workspace::project_root(&launch_dir).is_ok(),
             start_choice: None,
             interactive_start: false,
             pending_sandbox: Vec::new(),

@@ -255,7 +255,12 @@ impl State {
             SettingsTool::CheckPrograms => self.check_programs(),
             SettingsTool::SetIsolation { mode } => {
                 self.set_isolation(mode).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+                self.check_sandbox();
             }
+            SettingsTool::RunSetup { action, value } => {
+                self.run_setup(action, value).map_err(|e| WireError::new(ErrorCode::Conflict, e))?;
+            }
+            SettingsTool::CancelSetup => self.cancel_setup(),
             SettingsTool::FinishSetup => {
                 self.finish_setup().map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
             }

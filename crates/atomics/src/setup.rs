@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use atomics_core::paths;
 
-/// The PATH of an interactive login shell. Desktop launchers can supply a bare
-/// PATH, hiding tools installed by the user's shell startup files.
-pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_path().path.clone().ok());
+/// The PATH of an interactive login shell, with the user's own programs folder ([`with_user_programs`]). Desktop
+/// launchers can supply a bare PATH, hiding tools installed by the user's shell startup files.
+pub static SHELL_PATH: LazyLock<Option<String>> =
+    LazyLock::new(|| login_path().path.clone().ok().map(|path| with_user_programs(&path, &paths::home())));
 
 /// The login shell's PATH when someone last asked ATOMICS to look again ([`refresh_login_path`]).
 static REFRESHED_PATH: Mutex<Option<String>> = Mutex::new(None);
@@ -254,6 +255,16 @@ fn login_shell_path(shell: &str, timeout: Duration) -> Result<String, String> {
         .and_then(|path| if path.trim().is_empty() { Err("it printed an empty PATH".into()) } else { Ok(path) })
 }
 
+/// `path`, with the folder Claude Code's installer and ATOMICS's own install to. A login may add it only at the next
+/// login or not at all, and what was installed there has to run now.
+fn with_user_programs(path: &str, home: &Path) -> String {
+    let folder = home.join(".local/bin");
+    if !folder.is_dir() || std::env::split_paths(path).any(|known| known == folder) {
+        return path.to_string();
+    }
+    format!("{path}:{}", folder.display())
+}
+
 /// The folders of `login`, in its order and followed by those only `current` has. Entries that are
 /// not absolute are dropped (see [`absolute_folders`]).
 fn with_login_path(current: &str, login: &str) -> String {
@@ -431,11 +442,14 @@ pub fn login_path_now() -> Option<String> {
 /// Reads the login shell's PATH again, so that what was installed while ATOMICS ran can be found and started without
 /// a restart. Waits for the shell, up to five seconds: call it off the window's thread. Returns the PATH to look on.
 pub fn refresh_login_path() -> String {
-    let login = login_shell_var("PATH");
+    let login = login_shell_path(&shell_program(), LOGIN_SHELL_TIMEOUT)
+        .ok()
+        .map(|path| with_user_programs(&path, &paths::home()));
     if let Some(login) = &login {
         *REFRESHED_PATH.lock().unwrap() = Some(login.clone());
     }
-    login.or_else(login_path_now).or_else(|| std::env::var("PATH").ok()).unwrap_or_default()
+    let login = login.or_else(login_path_now).unwrap_or_default();
+    with_login_path(&std::env::var("PATH").unwrap_or_default(), &login)
 }
 
 pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {
@@ -568,6 +582,22 @@ pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_users_own_programs_folder_counts_where_it_exists_and_only_once() {
+        let home = crate::test_support::tempdir().unwrap();
+        assert_eq!(with_user_programs("/usr/bin", home.path()), "/usr/bin", "no such folder yet");
+        let local = home.path().join(".local/bin");
+        std::fs::create_dir_all(&local).unwrap();
+        let shown = local.display().to_string();
+        assert_eq!(
+            with_user_programs("/usr/bin", home.path()),
+            format!("/usr/bin:{shown}"),
+            "after what the login lists"
+        );
+        let listed = format!("{shown}:/usr/bin");
+        assert_eq!(with_user_programs(&listed, home.path()), listed, "already there");
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -859,6 +889,7 @@ mod tests {
                         "--nocapture",
                     ])
                     .env(CHILD, dir.path())
+                    .env("HOME", dir.path())
                     .env("SHELL", &shell)
                     .env("PATH", started_with)
                     .env("ATOMICS_HOME", dir.path().join("state")),

@@ -32,20 +32,41 @@ pressed Start, ATOMICS asks what to do: **Run on this machine** starts it there 
 the last two. A start nobody pressed, by the chief or another agent, has nobody to ask: its tile and a toast say what
 to do, and a plan task dispatched to it is blocked with the reason. `atomics doctor` shows whether sandboxes are ready.
 
-## Fresh machine: one guided command
+## Fresh machine: clicks, or one guided command
 
-After installing ATOMICS, run this in a trusted host terminal:
+**Settings → Agents** lists what sandboxes need on this machine, whether agents run in them yet or not, so you can get
+ready before switching. Each step is a button with progress and a Cancel, or a field to paste a credential into, and
+**Check again** reads the machine back. What still needs a terminal says its exact command, with a copy button:
+
+| Step | In Settings |
+| --- | --- |
+| Claude Code; Codex where npm is here (Homebrew on a Mac); git on a Mac | **Install** |
+| Docker sign-in, network policy, turning SSH forwarding off | A click |
+| Claude and OpenAI credentials | Paste into a masked field. It reaches no argument, log or reply |
+| ChatGPT sign-in for Codex, Linear's server | A click, finished in your browser |
+| Removing sbx's `github` secret | A click that asks first, because it cannot be undone |
+| Docker Sandboxes itself on Linux, git, Node.js and the keychain tool | The command for your package manager. They take sudo. Docker Sandboxes installs with a click on a Mac with Homebrew |
+| Joining the `kvm` group | `sudo usermod -aG kvm "$USER"`, then log out and back in |
+| Hardware virtualization | Words only: it is a firmware setting, and in a VM it takes nested virtualization |
+| A token that `claude setup-token` prints | The command, in a terminal. Or paste an Anthropic API key, which needs no terminal |
+| Secrets filed under the wrong name in sbx | `sbx secret rm`, whose own list keeps what may be a pasted credential off the command line |
+
+`atomics setup` does the same work from a terminal, and asks only for what your configuration uses:
 
 ```sh
 atomics setup
 # With one workspace's isolation/ticket settings:
 atomics setup --workspace daily
+# Sandboxes, even while agents run on this machine:
+atomics sandbox setup
 ```
 
-Setup creates a missing ATOMICS config and checks git, Claude Code, Codex and sbx (at least
-v0.50.1). It displays installation commands and waits while you run them in another terminal.
-Linux also requires Ubuntu 24.04+, accessible KVM and membership of the `kvm` group.
-After changing groups, log out and back in, then rerun setup.
+It creates a missing config and checks git and your agents; one agent is enough, and another one missing only says how
+to get it. With agents on this machine that is all it does. When agents run in sandboxes it also checks sbx (at least
+v0.50.1) and, on Linux, the keychain tool, accessible KVM and the `kvm` group, displaying each install command and
+waiting while you run it. Ubuntu 24.04+ is what Docker supports, and anything else is only a warning.
+Pressing `q` or declining a step stops it with ATOMICS still fine to open, and exits 0; running it again carries on.
+After changing groups, log out and back in, then check again.
 
 The current [Docker installation instructions](https://docs.docker.com/ai/sandboxes/install/)
 are:
@@ -74,8 +95,8 @@ child output; if a browser does not open, run the indicated authentication comma
 terminal and retry setup. It also offers to remove a stored GitHub credential and disable
 SSH forwarding, so the corresponding readiness checks can pass.
 
-Each change asks for confirmation. EOF, declining another step, or Ctrl-C stops setup; running it
-again checks actual state and skips completed steps. An existing Claude subscription token, Anthropic
+Each change asks for confirmation. Declining a step or Ctrl-C stops setup, as does EOF, which with nobody to answer
+exits non-zero; running it again checks actual state and skips completed steps. An existing Claude subscription token, Anthropic
 key and OpenAI secret are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
 stdin. Tokens are never command arguments, printed output, logs, or ATOMICS configuration.
@@ -96,8 +117,8 @@ have resolved those warnings. Start a new sandbox after changing credentials.
 ## Check sandbox setup
 
 `atomics doctor` (when sandbox mode is configured) and **Settings → Agents** share the same
-read-only checks. Settings runs them in the background as the section opens; use **Check again** after
-changing sbx. They check the installed minimum version and Docker sign-in, global network policy,
+read-only checks. Settings runs them in the background as the section opens, keeps them under **Every check** below its
+steps, and looks again after each step; use **Check again** after changing sbx yourself. They check the installed minimum version and Docker sign-in, global network policy,
 model credential names, registered MCP servers and their authorization, and SSH forwarding.
 An unrelated failed `sbx diagnose` check, such as SSH client configuration, does not hide a
 successful Authentication check. Missing setup produces warnings; doctor still only requires git
