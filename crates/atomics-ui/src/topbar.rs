@@ -68,6 +68,10 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
             sessions.iter().filter(|s| !s.chief && s.kind != AgentKind::Shell).map(|s| s.status).collect();
         let response = ui.label(RichText::new(agent_count(&statuses)).color(client.palette.muted));
         record_item(ui, "agents", &response);
+        let breakdown = agent_breakdown(&statuses);
+        if !breakdown.is_empty() {
+            response.on_hover_text(breakdown);
+        }
         let names: HashSet<_> = sessions.iter().filter_map(|s| s.sandbox.as_ref()).collect();
         if !names.is_empty() {
             let load = backend.sandbox_load();
@@ -88,13 +92,23 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
     ui.separator();
 }
 
-/// How the agents stand, in the fewest words that are true: "idle" only when every one of them is.
+/// How the agents stand: "idle" only when every one of them is. It stays this narrow however they stand, because the
+/// tabs beside it need the room just as agents finish, and the notice line after them says who needs you.
 fn agent_count(statuses: &[AgentStatus]) -> String {
-    let count = |status| statuses.iter().filter(|s| **s == status).count();
     let open = statuses.len();
-    if count(AgentStatus::Working) > 0 {
-        return format!("{} working · {open} open", count(AgentStatus::Working));
+    let working = statuses.iter().filter(|status| **status == AgentStatus::Working).count();
+    if working > 0 {
+        format!("{working} working · {open} open")
+    } else if statuses.iter().all(|status| *status == AgentStatus::Idle) {
+        format!("{open} idle")
+    } else {
+        format!("{open} open")
     }
+}
+
+/// What the count leaves out, on hover: the agents that are neither working nor idle.
+fn agent_breakdown(statuses: &[AgentStatus]) -> String {
+    let count = |status| statuses.iter().filter(|s| **s == status).count();
     let need = count(AgentStatus::NeedsInput);
     let parts = [
         (need, if need == 1 { "needs you" } else { "need you" }),
@@ -103,7 +117,7 @@ fn agent_count(statuses: &[AgentStatus]) -> String {
         (count(AgentStatus::Starting), "starting"),
     ];
     let parts: Vec<_> = parts.iter().filter(|(n, _)| *n > 0).map(|(n, what)| format!("{n} {what}")).collect();
-    if parts.is_empty() { format!("{open} idle") } else { format!("{} · {open} open", parts.join(" · ")) }
+    parts.join(" · ")
 }
 
 /// `response` with a tooltip naming the chord `key` reads from the `[keys]`, on a platform that takes them.
@@ -292,4 +306,28 @@ pub fn workspace_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Cli
         "The workspace open on the host: its projects and its [tickets], workflow and chief settings. A start \
          that names none, and a restart, open it again.",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use AgentStatus::{Done, Exited, Idle, NeedsInput, Starting, Working};
+
+    #[test]
+    fn the_count_stays_narrow_and_the_breakdown_says_the_rest() {
+        assert_eq!(agent_count(&[]), "0 idle");
+        assert_eq!(agent_breakdown(&[]), "");
+        assert_eq!(agent_count(&[Idle, Idle]), "2 idle");
+        assert_eq!(agent_breakdown(&[Idle, Idle]), "");
+
+        // However many states are on the fleet, the count takes the room of one number and one word.
+        let mixed = [NeedsInput, NeedsInput, Done, Exited, Starting, Idle];
+        assert_eq!(agent_count(&mixed), "6 open");
+        assert_eq!(agent_breakdown(&mixed), "2 need you · 1 finished · 1 exited · 1 starting");
+        assert_eq!(agent_breakdown(&[NeedsInput]), "1 needs you");
+
+        // Work still counts first, and the hover still says who waits.
+        assert_eq!(agent_count(&[Working, NeedsInput]), "1 working · 2 open");
+        assert_eq!(agent_breakdown(&[Working, NeedsInput]), "1 needs you");
+    }
 }
