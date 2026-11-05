@@ -36,6 +36,11 @@ pub enum ControlRequest {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// `atomics update` installed a new version from a terminal: restart when agents finish, as the Update
+    /// button does. It never forces.
+    UpdateInstalled {
+        version: String,
+    },
     /// An `atomics://open` link, parsed by the launching process: focus the window and show a
     /// plan, or the plan for a ticket. `rejected` carries why a link was refused, for a toast.
     OpenLink {

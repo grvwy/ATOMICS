@@ -127,6 +127,33 @@ the next start's sweep cannot find; that sweep also removes stale briefs, unused
 scratch folders. Dirty worktrees and the main checkout are always kept, and resources of another ATOMICS
 home are never touched. See [Lifecycle](isolation.md#lifecycle).
 
+## Updates
+
+On start and every 6 hours ATOMICS reads the latest release from GitHub's public API. With a newer one, a quiet
+**Update** button joins the top bar, folding into **Actions** like the items around it, which then wears a small dot,
+and Settings gets an Updates section with both versions and a link to the notes. Otherwise nothing shows. The button
+opens nothing and leaves the keyboard where it was. A browser or `--connect` shows the host's version and a hint: atomics.v1 has no operation that
+starts an update, so only a window on the host, or `atomics update` in a terminal there, can.
+
+An update downloads `atomics-<version>-<target>.tar.gz` for this platform and checks its SHA-256 and its Ed25519
+signature against the public key built into the binary, before anything is unpacked. It then unpacks beside the
+install and runs the new program, which must report the version being installed, so an older signed build offered under
+a newer tag is refused. Then it swaps: a rename of the file on Linux, of the whole `.app` on a Mac. Any failure leaves
+the install as it was and says why. A build made without `assets/release-signing-key.pub` has no key: it can
+still say a new version exists, and refuses to install one. A development build under a `target` folder is not replaced.
+
+Then ATOMICS restarts the way `atomics_restart` does. While agents work, or anything else [holds a restart
+back](../README.md#restart-onto-a-new-build), the top bar says **Restarts when agents finish**, with a **Cancel** that keeps the
+new version installed for the next start and offers **Restart to update**. Nothing forces it. A headless host does not
+restart itself; `atomics update` says to use its service manager.
+
+With [`[update] source`](configuration.md#updates) a checkout is the source, for working on ATOMICS itself. The check
+fetches and compares the checkout, and this build, with `origin/main`. The button refuses a checkout with uncommitted
+changes or with commits no branch holds. Otherwise it fast-forwards `main`, or detaches on `origin/main` from any other
+branch, and runs the checkout's install script through `atomics queue` at `nice 19`, in the agents' compiler job pool,
+with the toolchain from the checkout's `rust-toolchain.toml` or `rust-toolchain` if it has one. The script's output is
+in `update.log` in the state folder.
+
 ## Tickets
 
 Plans can follow Relay, Linear or any ticket system with an MCP server. ATOMICS talks to that server on

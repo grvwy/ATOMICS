@@ -415,6 +415,10 @@ impl Backend for Local<'_> {
         Some(self.0.management_info())
     }
 
+    fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
+        Some(self.0.update_info())
+    }
+
     fn project_menu(&self) -> ProjectMenu {
         let state = self.0;
         ProjectMenu {

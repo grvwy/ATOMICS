@@ -182,6 +182,7 @@ people change, and each reads what it shows as it opens:
 
 | Section | What is in it |
 | --- | --- |
+| Updates | Only with something to say: this version and the new one, its notes, the Update button, what an update is doing, and why the last check failed. A client always has it, to say which version the host runs. See [Updates](#updates). |
 | Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
 | Agents | The configured agents, whether they run sandboxed, the [sandbox checks](isolation.md#check-sandbox-setup), the Claude hooks and `atomics setup`. |
@@ -196,6 +197,22 @@ opens the file in an editor on the host, so only a window on the host has it; a 
 Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
 chief's, wait for you as proposals.
 
+## Updates
+
+```toml
+[update]
+check = true   # look for a new version on start and every 6 hours
+source = ""    # a checkout to build new versions from; empty = signed releases
+```
+
+ATOMICS looks once on start and again every 6 hours, with a 20-second limit and no retries. A look that fails stays
+quiet and shows only in Settings. `check = false` stops looking. `atomics update --check` asks in any case, and
+`atomics update` installs from a terminal. See [Updates](how-it-works.md#updates) for what happens then.
+
+`source` points at a checkout. The check compares it with its `origin/main`, and the button moves it there and runs its
+install script. That script runs what the checkout holds, with no signature behind it, so a proposal that changes
+`source` is labelled "runs commands".
+
 ## Reviewing a proposal
 
 The oldest proposal opens in the ATOMICS window, above Settings if that is open. It shows the file and scope, who proposed it and why, and a
@@ -204,7 +221,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
+| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 

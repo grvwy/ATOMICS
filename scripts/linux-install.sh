@@ -1,12 +1,15 @@
 #!/bin/sh
 # Build/install the desktop app, or remove just the installed files with --uninstall.
+# --no-setup leaves out `atomics setup`, which asks questions: for an update, with nobody at a terminal.
 set -eu
 
+setup=yes
 case "${1:-}" in
   '') action=install ;;
   --uninstall) action=uninstall ;;
-  --help|-h) echo 'Usage: scripts/linux-install.sh [--uninstall]'; exit 0 ;;
-  *) echo 'Usage: scripts/linux-install.sh [--uninstall]' >&2; exit 2 ;;
+  --no-setup) action=install; setup=no ;;
+  --help|-h) echo 'Usage: scripts/linux-install.sh [--uninstall | --no-setup]'; exit 0 ;;
+  *) echo 'Usage: scripts/linux-install.sh [--uninstall | --no-setup]' >&2; exit 2 ;;
 esac
 [ "$#" -le 1 ] || { echo 'Too many arguments' >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo 'This installer requires Linux; use scripts/macos-app.sh on macOS.' >&2; exit 1; }
@@ -87,5 +90,7 @@ else
   esac
   # Use the installed path even before ~/.local/bin has been added to PATH.
   # Keep stdin attached: setup guides first-time installation and resumes on updates.
-  "$bin/atomics" setup
+  if [ "$setup" = yes ]; then
+    "$bin/atomics" setup
+  fi
 fi

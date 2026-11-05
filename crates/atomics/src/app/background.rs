@@ -37,6 +37,7 @@ impl State {
         changed |= self.poll_plan_cleanup();
         changed |= self.usage.drain();
         changed |= self.poll_resources();
+        changed |= self.poll_update();
         for session in &mut self.sessions {
             if let Some(ready) = &session.worktree_ready
                 && let Ok(worktree) = ready.try_recv()

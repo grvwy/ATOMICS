@@ -1680,6 +1680,10 @@ impl Backend for RemoteBackend {
         Some(SignInView { info, opens_browser: false, seconds_left: None })
     }
 
+    fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
+        self.state.borrow().mirror.host.update.clone()
+    }
+
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         self.state.borrow().mirror.host.resources.clone()
     }

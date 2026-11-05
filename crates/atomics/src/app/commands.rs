@@ -258,6 +258,8 @@ impl Local<'_> {
             }
             Command::EditConfig => state.post(State::edit_config),
             Command::CheckSandbox => state.post(|state| state.check_sandbox()),
+            Command::Update => state.post(State::start_update),
+            Command::CancelUpdate => state.post(State::cancel_update_wait),
             Command::RefreshConnections => state.post(|state| state.refresh_connections()),
             Command::ImportConnections => state.post(|state| state.import_connections()),
             Command::Connect { name, store_env, url } => {

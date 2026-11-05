@@ -5,7 +5,7 @@ use crate::keys::shortcut_label;
 use crate::theme::{Palette, lerp, parse_hex};
 use crate::touch;
 use atomics_core::ops::SettingsTool;
-use atomics_core::projection::ThemeChoice;
+use atomics_core::projection::{ThemeChoice, UpdateInfo, UpdatePhase};
 use egui::text::LayoutJob;
 use egui::{Align, Color32, FontSelection, Rect, Sense, Stroke, Vec2};
 
@@ -110,6 +110,11 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     if let Some(problem) = info.config["load_error"].as_str() {
         ui.colored_label(p.warning, problem);
     }
+    // A window on the host says nothing while nothing is new; a client always shows which version the host runs.
+    if let Some(update) = backend.update().filter(|update| update.has_news() || !backend.available(&Command::Update)) {
+        let summary = update_summary(&update);
+        section(ui, &p, "Updates", &summary, update.has_news(), |ui| updates(ui, backend, client, &update));
+    }
     let selected = info.themes.choices.iter().find(|choice| choice.selected).map_or("", |choice| &choice.name);
     section(ui, &p, "Theme", selected, true, |ui| theme(ui, backend, client, info));
     section(ui, &p, "Shortcuts", "", false, |ui| shortcuts(ui, backend, client, info));
@@ -182,6 +187,71 @@ fn load(client: &mut Client, enabled: bool, busy: bool, asked: SettingsTool) {
     client.management.loaded.push(asked.clone());
     if !busy {
         tool(client, asked);
+    }
+}
+
+// ── Updates ──────────────────────────────────────────────────────────────────────────────────────────
+
+fn update_summary(update: &UpdateInfo) -> String {
+    match (&update.phase, &update.latest) {
+        (UpdatePhase::Working { step }, _) => step.clone(),
+        (UpdatePhase::WaitingForAgents { .. }, _) => "restarts when agents finish".into(),
+        (UpdatePhase::Failed { .. }, _) => "update failed".into(),
+        (UpdatePhase::Installed { version }, _) => format!("{version} installed"),
+        (_, Some(latest)) => format!("{latest} available"),
+        (_, None) if update.check_error.is_some() => "the last check failed".into(),
+        (_, None) => format!("host runs {}", update.current),
+    }
+}
+
+fn updates(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, update: &UpdateInfo) {
+    let p = client.palette.clone();
+    let on_host = backend.available(&Command::Update);
+    let name = if on_host { "This version" } else { "The host runs" };
+    ui.label(format!("{name}: {}", update.current));
+    if let Some(latest) = &update.latest {
+        ui.label(format!("New version: {latest}"));
+    }
+    if let Some(detail) = &update.detail {
+        note(ui, &p, detail.clone());
+    }
+    if let Some(url) = &update.notes {
+        ui.hyperlink_to("Release notes", url);
+    }
+    match &update.phase {
+        UpdatePhase::Working { step } => note(ui, &p, step.clone()),
+        UpdatePhase::WaitingForAgents { blockers } => {
+            ui.label("Restarts when agents finish.");
+            for blocker in blockers {
+                note(ui, &p, blocker.clone());
+            }
+            if backend.available(&Command::CancelUpdate) && button(ui, client, "Cancel").clicked() {
+                client.send(Command::CancelUpdate);
+            }
+        }
+        UpdatePhase::Installed { version } => {
+            note(ui, &p, format!("{version} is installed. The next start runs it."));
+            if on_host && button(ui, client, "Restart to update").clicked() {
+                client.send(Command::Update);
+            }
+        }
+        UpdatePhase::Failed { .. } | UpdatePhase::Idle | UpdatePhase::Unknown => {
+            if let UpdatePhase::Failed { error } = &update.phase {
+                ui.add(egui::Label::new(RichText::new(error).color(p.warning)).wrap());
+            }
+            if update.latest.is_some() {
+                if crate::update::can_update(backend, update) {
+                    if button(ui, client, "Update").clicked() {
+                        client.send(Command::Update);
+                    }
+                } else {
+                    note(ui, &p, crate::update::why_not(backend, update));
+                }
+            }
+        }
+    }
+    if let Some(error) = &update.check_error {
+        note(ui, &p, format!("The last check failed: {error}"));
     }
 }
 

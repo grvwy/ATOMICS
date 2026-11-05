@@ -83,6 +83,7 @@ mod tickets_signin;
 mod topbar;
 mod trace;
 mod trace_lane;
+mod update;
 mod voice;
 mod workflow;
 mod worktrees;
@@ -544,6 +545,8 @@ pub(crate) struct State {
     /// Account usage and governor state published to every client.
     resources: atomics_core::projection::ResourceInfo,
     resources_checked: Instant,
+    /// What the update check found, and an update under way.
+    update: update::Updates,
     busy_checked: Instant,
     output_delay: Option<Duration>,
     approvals_checked: Instant,
@@ -996,6 +999,7 @@ impl State {
             plans.push(Plan::default());
             plans.len() - 1
         });
+        let update = update::Updates::new(&config);
         let mut app = State {
             window,
             remote: crate::host::RemoteView::default(),
@@ -1062,6 +1066,7 @@ impl State {
             jobserver,
             resources: Default::default(),
             resources_checked: Instant::now() - Duration::from_secs(10),
+            update,
             busy_checked: Instant::now(),
             output_delay: None,
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,

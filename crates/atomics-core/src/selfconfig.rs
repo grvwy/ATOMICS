@@ -396,6 +396,7 @@ impl Risk {
                 "tickets.server.command",
                 "tickets.server.env",
                 "tickets.server.url",
+                "update.source",
             ],
             Risk::SendsCredentials => &[
                 "github.hosts",
@@ -1266,6 +1267,8 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         let risk = |key: &str| proposal.changes.iter().find(|c| c.key == key).unwrap().risk;
         assert_eq!(risk("agents"), Some(Risk::RunsCommands));
         assert_eq!(risk("voice.base_url"), Some(Risk::SendsCredentials));
+        assert_eq!(Risk::of("update.source"), Some(Risk::RunsCommands), "it builds and runs what a checkout holds");
+        assert_eq!(Risk::of("update.check"), None);
         for key in [
             "tickets.http",
             "tickets.http.url",

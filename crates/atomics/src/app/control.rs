@@ -124,6 +124,7 @@ impl State {
                 }
             }
             ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
+            ControlRequest::UpdateInstalled { version } => done(self.update_installed(version)),
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::PairClient { name } => done(self.pair_client(&name)),
             ControlRequest::UnpairClient { name } => done(self.unpair_client(&name)),
@@ -920,7 +921,7 @@ fn headless_refusal(request: &ControlRequest) -> Option<&'static str> {
         ControlRequest::Screenshot { .. } | ControlRequest::Resize { .. } | ControlRequest::ShowSettings { .. } => {
             Some(super::NO_WINDOW)
         }
-        ControlRequest::Restart { .. } => {
+        ControlRequest::Restart { .. } | ControlRequest::UpdateInstalled { .. } => {
             Some("the headless host does not restart itself; restart it with its service manager (systemctl restart)")
         }
         _ => None,

@@ -133,13 +133,28 @@ fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result
 }
 
 fn check_version(executable: &Path, timeout: Duration) -> Result<()> {
+    run_version(executable, timeout, Stdio::null())
+}
+
+/// What `executable --version` prints.
+pub fn version_output(executable: &Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut output = tempfile::tempfile().context("making a file for the version's output")?;
+    run_version(executable, Duration::from_secs(5), output.try_clone()?.into())?;
+    output.seek(SeekFrom::Start(0))?;
+    let mut text = String::new();
+    output.take(4096).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+fn run_version(executable: &Path, timeout: Duration, stdout: Stdio) -> Result<()> {
     if !executable.is_file() {
         bail!("restart target is missing: {}", executable.display());
     }
     let mut child = Command::new(executable)
         .arg("--version")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()

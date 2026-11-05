@@ -478,6 +478,9 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         if plan.actions_menu {
             let response = ui.menu_button("Actions", |ui| top_bar_controls(ui, platform, false, true)).response;
             record_item(ui, "Actions", &response);
+            if read(platform, |backend, _| crate::update::offered(backend)) {
+                crate::update::paint_dot(ui, &response, &palette);
+            }
         } else {
             top_bar_controls(ui, platform, plan.show_load, false);
         }
@@ -508,6 +511,7 @@ fn top_bar_controls(ui: &mut egui::Ui, platform: &mut impl Platform, show_load: 
     platform.draw(|backend, client, _| topbar::new_button(ui, in_menu, backend, client));
     platform.draw(|backend, client, _| topbar::explorer_menu(ui, backend, client));
     platform.top_bar_items(ui, in_menu);
+    platform.draw(|backend, client, _| crate::update::top_bar_item(ui, backend, client));
     platform.draw(|backend, client, _| crate::pull_request::menu(ui, backend, client));
     if read(platform, |backend, _| backend.management().is_some() || backend.available(&Command::PickProject)) {
         let response = ui

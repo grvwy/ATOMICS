@@ -154,6 +154,55 @@ pub struct HostInfo {
     /// Account limits and machine load, sampled by the host, absent on older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceInfo>,
+    /// The host's version and what its update check found, absent on older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateInfo>,
+}
+
+/// The host's version and any newer one. Every client reads it; only a window on the host can start an update,
+/// and atomics.v1 has no operation for one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateInfo {
+    /// The version running on the host.
+    pub current: String,
+    /// A newer version the last check found.
+    pub latest: Option<String>,
+    /// What is new, where the version alone does not say: the commits a checkout is behind.
+    pub detail: Option<String>,
+    /// The new version's release notes.
+    pub notes: Option<String>,
+    /// Why the last check failed; only Settings shows it.
+    pub check_error: Option<String>,
+    /// Why this install cannot take `latest`.
+    pub unavailable: Option<String>,
+    pub phase: UpdatePhase,
+}
+
+impl UpdateInfo {
+    /// Whether the host has anything to say about updates beyond its version.
+    pub fn has_news(&self) -> bool {
+        self.latest.is_some() || self.check_error.is_some() || self.phase != UpdatePhase::Idle
+    }
+}
+
+/// What an update is doing on the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UpdatePhase {
+    #[default]
+    Idle,
+    /// Downloading, verifying or building: the step, in the user's words.
+    Working { step: String },
+    /// Installed; the host restarts once nothing below is in the way. It never forces that.
+    WaitingForAgents { blockers: Vec<String> },
+    /// Installed, the wait was cancelled, and this host still runs the old version.
+    Installed { version: String },
+    /// Nothing was installed, and why.
+    Failed { error: String },
+    /// A phase from a newer host.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Plain host data for the shared USAGE section and load gauge. The host's clock determines expiry
