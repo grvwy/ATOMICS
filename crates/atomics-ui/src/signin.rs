@@ -144,7 +144,7 @@ pub fn banner(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> 
     };
     ui.label(RichText::new(headline).strong().color(p.warning));
     if let Some(reason) = &info.reason {
-        ui.label(RichText::new(reason).color(p.muted).size(11.5));
+        ui.label(RichText::new(reason).color(p.muted).size(11.0));
     }
     let row = |ui: &mut egui::Ui| {
         if !can {
@@ -176,7 +176,7 @@ pub fn banner(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> 
         } else {
             "Gives you a link to open, then asks where the browser ended up."
         };
-        ui.label(RichText::new(how).color(p.muted).size(11.5));
+        ui.label(RichText::new(how).color(p.muted).size(11.0));
     };
     match touch {
         Some(_) => ui.vertical(row),

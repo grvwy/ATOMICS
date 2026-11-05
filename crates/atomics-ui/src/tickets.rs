@@ -523,7 +523,7 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
     } else {
         String::new()
     };
-    ui.label(RichText::new(status).size(11.5).color(client.palette.muted));
+    ui.label(RichText::new(status).size(11.0).color(client.palette.muted));
     if let Some(query) = &panel.chief_query {
         ui.label(format!("from the chief: “{query}”"));
     }
@@ -625,13 +625,13 @@ fn facts(ui: &mut egui::Ui, card: &TicketCard, info: &TicketsInfo, p: &Palette) 
     .flatten()
     .collect::<Vec<_>>()
     .join(" · ");
-    ui.label(RichText::new(facts).size(11.5).color(p.muted));
+    ui.label(RichText::new(facts).size(11.0).color(p.muted));
 }
 
 /// A section title in the reader, under the ticket's own text.
 fn section_title(ui: &mut egui::Ui, text: &str, p: &Palette) {
     ui.add_space(8.0);
-    ui.label(RichText::new(text).strong().size(12.5).color(p.muted));
+    ui.label(RichText::new(text).strong().size(12.0).color(p.muted));
     ui.separator();
 }
 
@@ -707,13 +707,13 @@ fn read(
         0 => trail,
         stops => format!("{trail} · section {}/{stops}", panel.section.map_or("–".into(), |at| (at + 1).to_string())),
     };
-    ui.label(RichText::new(place).size(11.5).color(p.muted));
+    ui.label(RichText::new(place).size(11.0).color(p.muted));
     let title = card.link.title.as_deref().unwrap_or(card.link.label());
     ui.add(egui::Label::new(RichText::new(title).size(16.0).strong().color(p.foreground)).wrap());
     ui.horizontal_wrapped(|ui| {
         facts(ui, &card, info, &p);
         if !panel.children.is_empty() {
-            ui.label(RichText::new(format!("· {} children", panel.children.len())).size(11.5).color(p.muted));
+            ui.label(RichText::new(format!("· {} children", panel.children.len())).size(11.0).color(p.muted));
         }
     });
     ui.horizontal_wrapped(|ui| {
@@ -733,7 +733,7 @@ fn read(
         }
     });
     if panel.busy(Part::Read) {
-        ui.label(RichText::new("loading…").size(11.5).color(p.muted));
+        ui.label(RichText::new("loading…").size(11.0).color(p.muted));
     }
     ui.separator();
     for key in panel_nav::take_keys(ui, &[Key::PageUp, Key::PageDown, Key::Enter]) {
@@ -813,7 +813,7 @@ fn read(
         if card.body.is_none() && !card.fields.is_empty() {
             egui::Grid::new("ticket-fields").num_columns(2).show(ui, |ui| {
                 for (name, value) in &card.fields {
-                    ui.label(RichText::new(name).color(p.muted).size(11.5));
+                    ui.label(RichText::new(name).color(p.muted).size(11.0));
                     ui.add(egui::Label::new(value).wrap());
                     ui.end_row();
                 }
@@ -1071,11 +1071,11 @@ pub fn find_row(
         painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, p.raised);
     }
     let (left, right) = (rect.left() + 10.0, rect.right() - 8.0);
-    let key = fit(ui, card.link.label(), p.mono(12.5), p.accent, right - left);
+    let key = fit(ui, card.link.label(), p.mono(12.0), p.accent, right - left);
     let key_w = key.size().x;
     painter.galley(pos2(left, rect.top() + 5.0), key, p.accent);
     let title = card.link.title.as_deref().unwrap_or("");
-    let galley = fit(ui, title, p.ui(12.5), p.foreground, right - left - key_w - 8.0);
+    let galley = fit(ui, title, p.ui(12.0), p.foreground, right - left - key_w - 8.0);
     painter.galley(pos2(left + key_w + 8.0, rect.top() + 5.0), galley, p.foreground);
 
     let y = rect.top() + 24.0;
@@ -1102,13 +1102,13 @@ pub fn find_row(
         if x >= right {
             break;
         }
-        let galley = fit(ui, text, p.ui(11.5), p.muted, right - x);
+        let galley = fit(ui, text, p.ui(11.0), p.muted, right - x);
         let width = galley.size().x;
         painter.galley(pos2(x, y + 1.0), galley, p.muted);
         x += width + 10.0;
     }
     if let Some(snippet) = card.snippet.as_deref().filter(|s| !s.is_empty()) {
-        let galley = fit(ui, &snippet.replace("**", ""), p.ui(11.5), p.muted, right - left);
+        let galley = fit(ui, &snippet.replace("**", ""), p.ui(11.0), p.muted, right - left);
         painter.galley(pos2(left, rect.top() + 40.0), galley, p.muted);
     }
     response

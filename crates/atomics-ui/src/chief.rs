@@ -447,12 +447,17 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
             .desired_rows(1)
             .desired_width(width)
             .hint_text(hint)
-            .font(p.ui(13.5));
+            .font(p.ui(13.0));
         let response = ui.add(edit);
         if std::mem::take(&mut client.focus_steer) {
             response.request_focus();
         }
-        let button = egui::Button::new(RichText::new("Send").color(p.on_accent)).fill(p.accent);
+        // Filled only with something to send, as Send review is: with nothing typed it does nothing.
+        let button = if client.steer_text.trim().is_empty() {
+            egui::Button::new("Send")
+        } else {
+            egui::Button::new(RichText::new("Send").color(p.on_accent)).fill(p.accent)
+        };
         if ui.add(touch::sized(button, client.touch)).clicked() {
             send = true;
         }

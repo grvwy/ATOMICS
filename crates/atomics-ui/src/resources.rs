@@ -23,7 +23,7 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
             ui.label(RichText::new(name).font(p.ui(12.0)).color(p.foreground));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if usage.observed_at > 0 {
-                    ui.label(RichText::new(age_label(usage.observed_at, now)).font(p.ui(10.0)).color(p.muted));
+                    ui.label(RichText::new(age_label(usage.observed_at, now)).font(p.ui(10.5)).color(p.muted));
                 }
             });
         });

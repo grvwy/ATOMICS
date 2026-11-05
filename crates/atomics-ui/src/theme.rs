@@ -54,7 +54,9 @@ const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-/// The UI text size the built-in themes are drawn at; `ui_size` scales the UI from it.
+/// The UI text size the built-in themes are drawn at; `ui_size` scales the UI from it. The rest of the type scale:
+/// 10.5 for headings in capitals and the smallest notes, 11 for secondary text, 12 for small body text; names and
+/// titles above that.
 pub const UI_SIZE: f32 = 13.0;
 
 impl Palette {
@@ -182,8 +184,9 @@ impl Palette {
         widgets.active.bg_fill = lerp(p.raised, p.accent, 0.35);
         widgets.active.weak_bg_fill = lerp(p.raised, p.accent, 0.35);
         widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-        widgets.open.bg_fill = lerp(p.raised, p.accent, 0.25);
-        widgets.open.weak_bg_fill = lerp(p.raised, p.accent, 0.25);
+        // Neutral: egui paints every dialog's title bar with this too, where the accent would say nothing.
+        widgets.open.bg_fill = lerp(p.raised, p.foreground, 0.08);
+        widgets.open.weak_bg_fill = lerp(p.raised, p.foreground, 0.08);
         widgets.open.bg_stroke = Stroke::new(1.0, p.border);
         style.visuals = visuals;
         if p.mono_ui {
@@ -410,6 +413,8 @@ mod tests {
             assert_eq!(visuals.panel_fill, palette.panel);
             assert_eq!(visuals.window_fill, palette.overlay);
             assert_eq!(visuals.widgets.inactive.bg_fill, palette.raised);
+            // What egui fills a dialog's title bar with: no tint of the accent.
+            assert_eq!(visuals.widgets.open.weak_bg_fill, lerp(palette.raised, palette.foreground, 0.08));
             assert_eq!(visuals.widgets.inactive.fg_stroke.color, palette.foreground);
             assert_eq!(visuals.selection.bg_fill, palette.selection);
             assert_eq!(visuals.text_cursor.stroke.color, palette.cursor);

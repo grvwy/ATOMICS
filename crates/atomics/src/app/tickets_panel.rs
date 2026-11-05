@@ -867,7 +867,7 @@ impl Desktop<'_> {
             let response = ui.interact(strip, egui::Id::NULL.with("tickets-echo"), Sense::click());
             ui.painter().line_segment([strip.left_top(), strip.right_top()], Stroke::new(1.0, p.border));
             let galley =
-                fit(ui, &echo, p.ui(11.5), if response.hovered() { p.accent } else { p.muted }, strip.width() - 20.0);
+                fit(ui, &echo, p.ui(11.0), if response.hovered() { p.accent } else { p.muted }, strip.width() - 20.0);
             ui.painter().galley(strip.left_center() + vec2(10.0, -galley.size().y / 2.0), galley, p.muted);
             if response.on_hover_text("Open the chief").clicked() {
                 self.runtime.show_chief();
@@ -907,8 +907,8 @@ impl Desktop<'_> {
                         )
                     };
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(text).size(11.5).color(p.muted));
-                        ui.label(RichText::new("●").size(10.0).color(dot));
+                        ui.label(RichText::new(text).size(11.0).color(p.muted));
+                        ui.label(RichText::new("●").size(10.5).color(dot));
                     });
                 }
             }
@@ -995,7 +995,7 @@ impl Desktop<'_> {
                     ),
                     Some(_) => "Ticket mode: one plan; progress is reported on this ticket.".to_string(),
                 };
-                ui.label(RichText::new(text).color(p.muted).size(11.5));
+                ui.label(RichText::new(text).color(p.muted).size(11.0));
                 if config.mode != TicketMode::Ticket && count > 0 {
                     ui.checkbox(&mut dialog.ticket_only, "one plan for this ticket only (ticket mode)");
                 }
@@ -1012,7 +1012,7 @@ impl Desktop<'_> {
                 ui.label(
                     RichText::new("The chief reads the ticket, proposes a plan and waits for your approval.")
                         .color(p.muted)
-                        .size(11.5),
+                        .size(11.0),
                 );
                 if let Some(error) = &dialog.error {
                     ui.label(RichText::new(error).color(p.error));
@@ -1164,14 +1164,14 @@ impl Desktop<'_> {
         let color = if find.error.is_some() { p.error } else { p.muted };
         ui.horizontal(|ui| {
             if find.more {
-                ui.label(RichText::new("loading more…").size(11.5).color(p.muted));
+                ui.label(RichText::new("loading more…").size(11.0).color(p.muted));
             } else if find.next.is_some()
                 && !find.busy
                 && ui.small_button("More").on_hover_text("↓ on the last").clicked()
             {
                 acts.push(Act::More);
             }
-            ui.add(egui::Label::new(RichText::new(status).size(11.5).color(color)).truncate());
+            ui.add(egui::Label::new(RichText::new(status).size(11.0).color(color)).truncate());
         });
         ui.separator();
         // Selection and Enter, then paging.
@@ -1267,10 +1267,10 @@ impl Desktop<'_> {
                 acts.push(Act::Plan);
             }
             let trail = crumbs.iter().map(String::as_str).chain([read.link.label()]).collect::<Vec<_>>().join(" › ");
-            ui.label(RichText::new(trail).size(11.5).color(p.muted));
+            ui.label(RichText::new(trail).size(11.0).color(p.muted));
             if !stops.is_empty() {
                 let at = read.selected.map_or("–".to_string(), |i| (i + 1).to_string());
-                ui.label(RichText::new(format!("section {at}/{}", stops.len())).size(11.5).color(p.muted));
+                ui.label(RichText::new(format!("section {at}/{}", stops.len())).size(11.0).color(p.muted));
             }
         });
         let card = &read.card;
@@ -1292,7 +1292,7 @@ impl Desktop<'_> {
                 .chain((!read.children.items().is_empty()).then(|| format!("{} children", read.children.items().len())))
                 .collect::<Vec<_>>()
                 .join(" · ");
-            ui.label(RichText::new(facts).size(11.5).color(p.muted));
+            ui.label(RichText::new(facts).size(11.0).color(p.muted));
             for link in &card.links {
                 let text = [link.label.as_deref(), link.status.as_deref(), link.ci.as_deref()]
                     .into_iter()
@@ -1308,7 +1308,7 @@ impl Desktop<'_> {
             }
         });
         if read.loading {
-            ui.label(RichText::new("loading…").size(11.5).color(p.muted));
+            ui.label(RichText::new("loading…").size(11.0).color(p.muted));
         }
         if let Some(error) = &read.error {
             ui.label(RichText::new(error).color(p.error));
@@ -1375,7 +1375,7 @@ impl Desktop<'_> {
             if read.card.body.is_none() && !read.card.fields.is_empty() {
                 egui::Grid::new("ticket-fields").num_columns(2).show(ui, |ui| {
                     for (name, value) in &read.card.fields {
-                        ui.label(RichText::new(name).color(p.muted).size(11.5));
+                        ui.label(RichText::new(name).color(p.muted).size(11.0));
                         ui.add(egui::Label::new(value).wrap());
                         ui.end_row();
                     }
@@ -1404,7 +1404,7 @@ impl Desktop<'_> {
 
 fn heading(ui: &mut egui::Ui, text: &str, p: &Palette) {
     ui.add_space(8.0);
-    ui.label(RichText::new(text).strong().size(12.5).color(p.muted));
+    ui.label(RichText::new(text).strong().size(12.0).color(p.muted));
     ui.separator();
 }
 
@@ -1454,14 +1454,14 @@ fn related_list(
     match part {
         Part::Unmapped => {
             ui.add_space(8.0);
-            ui.label(RichText::new(format!("This server offers no {op} operation.")).size(11.5).color(p.muted));
+            ui.label(RichText::new(format!("This server offers no {op} operation.")).size(11.0).color(p.muted));
         }
         Part::Loading => {
             heading(ui, &format!("{title}…"), p);
         }
         Part::Failed(error) => {
             heading(ui, title, p);
-            ui.label(RichText::new(error).color(p.error).size(11.5));
+            ui.label(RichText::new(error).color(p.error).size(11.0));
         }
         Part::Loaded(items) => {
             if items.is_empty() {
@@ -1489,7 +1489,7 @@ fn related_list(
                         ui.label(RichText::new(card.link.label()).monospace().color(p.accent));
                         if let Some(state) = &card.link.state {
                             ui.label(
-                                RichText::new(format!("[{state}]")).size(11.5).color(state_color(config, state, p)),
+                                RichText::new(format!("[{state}]")).size(11.0).color(state_color(config, state, p)),
                             );
                         }
                         ui.label(card.link.title.as_deref().unwrap_or(""));

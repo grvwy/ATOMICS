@@ -231,7 +231,7 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         for RecentSession { record, folder } in recent {
             let hover = record.last_prompt.clone().unwrap_or(folder);
             let response =
-                ui.selectable_label(false, RichText::new(&record.title).color(p.muted).size(12.5)).on_hover_text(hover);
+                ui.selectable_label(false, RichText::new(&record.title).color(p.muted).size(12.0)).on_hover_text(hover);
             if response.clicked() {
                 client.send(Command::Resume(record));
             }
@@ -273,7 +273,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             let label = if agents > 0 { format!("{name} ·{agents}") } else { name };
             let selected = focus.as_ref() == Some(&root);
             let color = if selected { p.accent } else { p.foreground };
-            let response = ui.selectable_label(selected, RichText::new(label).color(color).size(12.5));
+            let response = ui.selectable_label(selected, RichText::new(label).color(color).size(12.0));
             if response.clicked() && !selected {
                 switch_to = Some(root.clone());
             }
@@ -374,7 +374,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 let response = ui
                     .horizontal(|ui| {
                         if let Some(agent) = agent {
-                            ui.label(RichText::new("●").color(status_color(agent.status, p)).size(10.0));
+                            ui.label(RichText::new("●").color(status_color(agent.status, p)).size(10.5));
                         }
                         let response = ui.selectable_label(selected, RichText::new(&name).size(12.0));
                         if let Some(branch) = &wt.branch {
@@ -421,7 +421,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let review = target.filter(|t| backend.project_of(t).as_ref() == Some(&project)).unwrap_or_else(|| project.clone());
     if review != project {
         let name = review.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        ui.label(RichText::new(format!("changes from {name}")).color(p.accent).size(11.0));
+        ui.label(RichText::new(format!("changes from {name}")).color(p.muted).size(11.0));
     }
     if backend.paged_folders() {
         folder_panel(ui, backend, client, &project, &review, can_open);

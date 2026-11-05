@@ -29,7 +29,7 @@ pub fn draw(
             .max_rect(header.shrink2(vec2(10.0, 3.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    child.label(RichText::new("EDITOR").color(p.accent).strong().size(12.0));
+    crate::sidebar::section(&mut child, &p, "EDITOR");
     child.label(RichText::new(&name).color(p.muted).size(12.0));
     let editor_running = editor.as_ref().is_some_and(|e| e.running);
     let mut action = None;

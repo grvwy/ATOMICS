@@ -262,14 +262,11 @@ pub(crate) fn task_result_for(
         }
         action
     };
-    match touch {
-        Some(_) => when_drawn(ui, egui::Layout::top_down(egui::Align::Min), None, result),
-        None => ui.with_layout(egui::Layout::top_down(egui::Align::Min), result).inner,
-    }
+    when_drawn(ui, egui::Layout::top_down(egui::Align::Min), None, result)
 }
 
 /// `add` in a child of `layout`, its rows `row` high if given, that takes room only once something is drawn
-/// in it, so that a phone's card keeps no gap for a part it has nothing of.
+/// in it, so that a card keeps no gap for a part it has nothing of.
 fn when_drawn<R>(ui: &mut egui::Ui, layout: egui::Layout, row: Option<f32>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let mut rect = ui.available_rect_before_wrap();
     if let Some(row) = row {
@@ -369,7 +366,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
         }
     };
     ui.horizontal(|ui| {
-        ui.label(RichText::new("PLAN").color(p.accent).strong().size(13.0));
+        crate::sidebar::section(ui, &p, "PLAN");
         if total > 0 {
             let done = plan.count(TaskStatus::Done);
             ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
@@ -394,7 +391,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     }
     let integration = plan.integration_branch();
     if !plan.tasks.is_empty() {
-        ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
+        ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.0))
             .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
     }
     if touch.is_some() {
@@ -430,7 +427,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             let system = ticket_config.as_ref().map_or(link.system.as_str(), |c| c.system.as_str());
             let what = ticket_config.as_ref().map_or("ticket".to_string(), |c| mode_label(plan, c));
             // A client that knows only the ticket's key has no system to name.
-            ui.label(RichText::new(format!("{system} {what}").trim_start()).color(p.muted).size(11.5));
+            ui.label(RichText::new(format!("{system} {what}").trim_start()).color(p.muted).size(11.0));
             let means = ticket_config
                 .as_ref()
                 .filter(|c| {
@@ -444,16 +441,16 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 read_ticket = Some(link.clone());
             }
             if let Some(title) = &link.title {
-                ui.label(RichText::new(title).color(p.foreground).size(11.5));
+                ui.label(RichText::new(title).color(p.foreground).size(11.0));
             }
             if let Some(tracked) = ticket_config.as_ref().and_then(|c| tracked_label(plan, c)) {
-                ui.label(RichText::new(tracked).color(p.muted).size(11.5));
+                ui.label(RichText::new(tracked).color(p.muted).size(11.0));
             }
             if let Some((tickets, loose)) = board.board_counts {
                 ui.label(
                     RichText::new(format!("{tickets} tickets · {loose} without a task"))
                         .color(if loose > 0 { p.warning } else { p.muted })
-                        .size(11.5),
+                        .size(11.0),
                 );
             }
             if ticket_config.is_some() && can_sync {
@@ -471,7 +468,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
         }
     }
     for (task, dep) in plan.unknown_dependencies() {
-        ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.5));
+        ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.0));
     }
     ui.add_space(6.0);
     if plan.tasks.is_empty() {
@@ -656,7 +653,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                                 ui.label(RichText::new(&task.brief).color(p.foreground).size(12.0));
                             }
                             for check in &task.acceptance {
-                                ui.label(RichText::new(format!("✓ {check}")).color(p.muted).size(11.5));
+                                ui.label(RichText::new(format!("✓ {check}")).color(p.muted).size(11.0));
                             }
                         }
                         let buttons = |ui: &mut egui::Ui| {
@@ -716,16 +713,10 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                                 }
                             }
                         };
-                        match touch {
-                            // A phone's row is as tall as its buttons, and takes no room without any.
-                            Some(touch) => {
-                                let row = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
-                                when_drawn(ui, row, Some(touch.target), buttons);
-                            }
-                            None => {
-                                ui.horizontal_wrapped(buttons);
-                            }
-                        }
+                        // The row is as tall as its buttons, and takes no room without any.
+                        let row = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+                        let height = touch.map_or(ui.spacing().interact_size.y, |touch| touch.target);
+                        when_drawn(ui, row, Some(height), buttons);
                     });
                 });
         });
@@ -749,7 +740,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             RichText::new(format!("{} · {count}", status.label().to_uppercase()))
                 .color(task_color(status, &p))
                 .strong()
-                .size(11.0),
+                .size(10.5),
         );
     };
     // A panel narrower than all the columns scrolls them sideways; only a panel too narrow for one whole

@@ -364,10 +364,10 @@ impl Desktop<'_> {
                         .map(|label| format!("{system} · {label}"))
                         .unwrap_or_else(|| format!("{system} · signed in")),
                 )
-                .size(11.5)
+                .size(11.0)
                 .color(p.muted),
             );
-            ui.label(RichText::new("●").size(10.0).color(p.success));
+            ui.label(RichText::new("●").size(10.5).color(p.success));
         });
     }
 }

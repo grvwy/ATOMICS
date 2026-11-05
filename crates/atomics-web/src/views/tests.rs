@@ -3633,6 +3633,26 @@ fn ctrl_n_from_a_terminal_shows_the_nth_agents_diff_and_no_byte_reaches_a_termin
 }
 
 #[test]
+fn the_approval_banner_takes_what_it_holds_and_the_terminal_the_rest() {
+    let top_of = |shown: &[(String, Rect)], label: &str| shown.iter().find(|(text, _)| text == label).map(|(_, r)| *r);
+    let (ctx, mut world, mut client, mut view) = live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let reason = top_of(&shown, "Run the tests").expect("the request's reason");
+    let prompt = top_of(&shown, "$").expect("the terminal");
+    assert!((reason.bottom()..reason.bottom() + 40.0).contains(&prompt.top()), "no dead space: {reason:?} {prompt:?}");
+
+    // A long request keeps to the banner's limit, its buttons in reach, and scrolls.
+    let mut host = fake_host::host();
+    host.board.approvals[0].reason = Some(vec!["A very long reason"; 60].join("\n"));
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let asked = top_of(&shown, "Permission requested").expect("the banner");
+    let prompt = top_of(&shown, "$").expect("the terminal");
+    assert!(prompt.top() - asked.top() <= 230.0, "the terminal keeps its room: {asked:?} {prompt:?}");
+    assert!(top_of(&shown, "Allow").is_some_and(|allow| allow.bottom() < prompt.top()), "{shown:?}");
+}
+
+#[test]
 fn ctrl_n_works_with_the_boards_dropdown_open_and_after_using_it() {
     let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), WIDE);
     let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);

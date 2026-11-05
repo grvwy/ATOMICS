@@ -320,7 +320,7 @@ impl Desktop<'_> {
                                 h.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                             ui.label(RichText::new(folder).color(p.foreground));
                             let branch = h.branch.clone().unwrap_or_else(|| "detached".into());
-                            ui.label(RichText::new(branch).color(p.muted).size(11.5));
+                            ui.label(RichText::new(branch).color(p.muted).size(11.0));
                             ui.horizontal(|ui| {
                                 let chip = |ui: &mut egui::Ui, text: String, color: Color32| {
                                     ui.label(RichText::new(text).color(color).size(11.0));
