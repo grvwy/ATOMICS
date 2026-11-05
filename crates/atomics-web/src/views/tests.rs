@@ -2829,6 +2829,7 @@ fn only_what_cannot_be_undone_asks_first() {
 
         section(&ctx, &mut world, &mut client, &mut view, size, "Credentials");
         let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Remote devices");
+        assert!(has(&shown, "Paired 2026-11-05 00:00 UTC · Last seen 2026-11-05 12:00 UTC"), "device dates: {shown:?}");
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Revoke…")));
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(has(&shown, "Revoke A phone?"), "{size:?}: {shown:?}");
@@ -4028,4 +4029,27 @@ fn machine_opens_from_the_load_gauge_and_browser_preview_stays_disabled() {
     assert!(!world.driver.remote.can_preview());
     click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Preview");
     assert!(world.driver.remote.take_preview_actions().is_empty());
+}
+
+#[test]
+fn an_unreadable_pairing_offers_try_again_instead_of_pairing() {
+    use crate::driver::{DeviceReadError, Stop};
+    for size in [WIDE, PHONE] {
+        let mut world = World::paired(fake_host::host());
+        let pairing = world.host.open_pairing();
+        let data = world.boot_data(Some(&pairing));
+        world.driver.message(PARENT, true, &data).unwrap();
+        world.driver.take_outputs(); // Simulate the asynchronous storage read before the world answers it.
+        world.driver.device_loaded(Err(DeviceReadError));
+        let ctx = egui::Context::default();
+        let (mut client, mut view) = (Client::default(), View::default());
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, Stop::DeviceReadFailed.message()), "{shown:?}");
+        assert!(has(&shown, "Reason: could not read the stored key."), "{shown:?}");
+        assert!(has(&shown, "Try again"), "{shown:?}");
+        assert!(!has(&shown, "Pair again") && !has(&shown, "Pairing this browser"), "{shown:?}");
+        assert!(world.dials.is_empty());
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Try again")));
+        assert_eq!(world.driver.status(), &Status::Live, "the retry reads the existing pairing");
+    }
 }

@@ -70,6 +70,8 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             if device.controls { "may type and approve" } else { "view only" },
             if device.connected { "connected" } else { "offline" }
         ));
+        let (paired, seen) = device.dates();
+        ui.label(RichText::new(format!("Paired {paired} · Last seen {seen}")).small().color(client.palette.muted));
         ui.add_enabled_ui(enabled, |ui| {
             if client.management.revoke.as_deref() == Some(&device.id) {
                 ui.colored_label(

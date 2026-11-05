@@ -70,6 +70,7 @@ impl State {
                     name: d.name,
                     controls: d.access == atomics_core::noise::Access::Control,
                     connected,
+                    paired_ms: d.paired_ms,
                     seen_ms: d.seen_ms,
                 })
                 .collect();

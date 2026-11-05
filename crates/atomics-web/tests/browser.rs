@@ -809,6 +809,51 @@ fn launch(flags: &[String], url: &str, log: &Arc<Log>, overall: Duration) -> Bro
     Browser { child, log: chrome_log, profile, cancel, watchdog: Some(watchdog) }
 }
 
+/// Exercises the source module directly, so storage regressions need no WASM bundle build.
+#[test]
+#[ignore = "needs Chrome; no built bundle required"]
+fn device_store_recovers_connections_and_preserves_unreadable_keys() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    serve(
+        listener,
+        Arc::new(|_, path, _| match path {
+            "/" => Some(Reply::new("text/html", "<!doctype html><title>Storage checks</title>")),
+            "/device-store.js" => Some(Reply::new("text/javascript", include_str!("../web/device-store.js"))),
+            "/checks.js" => Some(Reply::new("text/javascript", include_str!("browser/device-store.js"))),
+            _ => None,
+        }),
+    );
+    let log = Arc::new(Log::default());
+    let browser = launch(&[], &url, &log, Duration::from_secs(45));
+    let mut page = DevTools::open(&browser.devtools(), "storage checks", |t| t["type"] == "page" && t["url"] == url);
+    page.wait(
+        "the storage test document to finish loading",
+        &format!("location.href === {} && document.readyState === 'complete'", json!(url)),
+    );
+    let checked = page.eval(&format!(
+        "import({}).then(m => m.check()).catch(e => ({{ error: e.message }}))",
+        json!(format!("{url}checks.js")),
+    ));
+    assert_eq!(
+        checked,
+        json!([
+            "sealed storage",
+            "closed connection",
+            "background close",
+            "version change",
+            "interrupted read",
+            "aborted save",
+            "bounded retry",
+            "read failure preserves key",
+            "failed open can retry",
+            "unreadable record preserves key",
+            "persistence is best effort",
+            "explicit forget",
+        ])
+    );
+}
+
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {

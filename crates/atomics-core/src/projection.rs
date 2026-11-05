@@ -434,7 +434,33 @@ pub struct DeviceInfo {
     pub name: String,
     pub controls: bool,
     pub connected: bool,
+    /// Unix milliseconds; older hosts omit it.
+    #[serde(default)]
+    pub paired_ms: u64,
     pub seen_ms: u64,
+}
+
+impl DeviceInfo {
+    /// Paired and last seen dates in UTC, also usable by clients with no local clock or time zone.
+    pub fn dates(&self) -> (String, String) {
+        let date = |ms: u64| {
+            if ms == 0 {
+                return "unknown".to_string();
+            }
+            let Ok(at) = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000) else {
+                return "unknown".to_string();
+            };
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+                at.year(),
+                u8::from(at.month()),
+                at.day(),
+                at.hour(),
+                at.minute()
+            )
+        };
+        (date(self.paired_ms), date(self.seen_ms))
+    }
 }
 
 /// Where the ticket system's sign-in stands, as the Sign in and Reconnect buttons show it.

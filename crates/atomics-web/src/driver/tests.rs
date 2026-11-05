@@ -630,8 +630,11 @@ fn pairing_again_under_another_host_key_asks_first() {
     // The same host key: only that host can answer the link, so nothing is asked.
     let mut world = World::paired(fake_host::host());
     let pairing = world.host.open_pairing();
+    let key = world.store[HOST_ID].secret.public();
     world.boot(Some(&pairing));
     assert_eq!(world.driver.status(), &Status::Live);
+    assert_eq!(world.store[HOST_ID].secret.public(), key, "pairing again reuses the stored device key");
+    assert!(world.host.allowed.iter().all(|(allowed, _)| *allowed == key), "no extra key was registered");
 }
 
 /// A native client reaches its host directly: it dials at once with no boot or ticket, says hello as soon
@@ -680,4 +683,133 @@ fn a_direct_client_dials_at_once_and_stops_only_when_waiting_cannot_help() {
     driver.take_outputs();
     driver.socket_message(fourth, br#"{"v":{"major":2,"minor":0},"kind":"ping"}"#);
     assert_eq!(driver.status(), &Status::Stopped(Stop::Version));
+}
+
+#[test]
+fn a_failed_device_read_never_pairs_or_replaces_a_key_and_can_be_retried() {
+    for pair in [false, true] {
+        let mut world = World::paired(fake_host::host());
+        let key = world.store[HOST_ID].secret.public();
+        let pairing = world.host.open_pairing();
+        let data = world.boot_data(pair.then_some(&pairing));
+        world.driver.message(PARENT, true, &data).unwrap();
+        let outputs = world.driver.take_outputs();
+        assert!(outputs.iter().any(|o| matches!(o, Output::LoadDevice(_))));
+        world.driver.device_loaded(Err(DeviceReadError));
+        assert_eq!(world.driver.status(), &Status::Stopped(Stop::DeviceReadFailed));
+        assert_eq!(world.driver.pairing_reason(), Some("Reason: could not read the stored key."));
+        assert!(world.driver.device.is_none(), "no device key is created before a successful read");
+        world.driver.repair(true);
+        world.driver.resumed(LIVE_SOCKET_STALE_AFTER_MS);
+        assert!(world.driver.take_outputs().is_empty(), "no dial, save, forget or pairing on read failure");
+        assert_eq!(world.store[HOST_ID].secret.public(), key);
+
+        world.driver.retry_now();
+        assert!(world.driver.loading);
+        world.pump();
+        assert_eq!(world.driver.status(), &Status::Live);
+        assert_eq!(world.store[HOST_ID].secret.public(), key);
+    }
+}
+
+#[test]
+fn a_short_tab_switch_keeps_the_live_socket_screen_and_typing_lease() {
+    for hidden_ms in [0, LIVE_SOCKET_STALE_AFTER_MS - 1] {
+        let mut world = World::paired(fake_host::host());
+        world.boot(None);
+        world.driver.remote.show_screen("s1", true);
+        world.driver.flush();
+        world.pump();
+        world.driver.remote.acquire("s1", false);
+        world.driver.flush();
+        world.pump();
+        let lease = world.driver.remote.lease("s1");
+        assert!(lease.yours, "the browser holds the typing lease before switching tabs");
+        let socket = world.socket;
+        let posted = world.posted.clone();
+        assert_eq!(world.driver.remote.with_screen("s1", |s| s.map(|(_, stale)| stale)), Some(false));
+
+        world.driver.resumed(hidden_ms);
+        assert!(world.driver.take_outputs().is_empty(), "no close, ticket request or redial after {hidden_ms} ms");
+        assert_eq!(world.driver.status(), &Status::Live);
+        assert_eq!(world.socket, socket);
+        assert_eq!(world.posted, posted);
+        assert_eq!(world.driver.remote.lease("s1"), lease, "the typing lease is kept");
+        assert_eq!(world.driver.remote.with_screen("s1", |s| s.map(|(_, stale)| stale)), Some(false));
+    }
+}
+
+#[test]
+fn waking_after_thirty_seconds_reconnects_with_the_same_device() {
+    let mut world = World::paired(fake_host::host());
+    let key = world.store[HOST_ID].secret.public();
+    world.boot(None);
+    let first = world.socket;
+    world.driver.resumed(LIVE_SOCKET_STALE_AFTER_MS);
+    world.pump();
+    assert_eq!(world.socket, None, "even a socket that looked live was closed");
+    assert_eq!(world.closed, [close::NORMAL]);
+    assert_eq!(world.posted.last(), Some(&boot::WANTS_TICKET));
+    world.ticket("wake-ticket");
+    assert_eq!(world.driver.status(), &Status::Live);
+    assert_ne!(world.socket, first);
+    assert_eq!(world.store[HOST_ID].secret.public(), key);
+
+    world.drop_socket(close::ABNORMAL);
+    world.driver.resumed(0);
+    world.pump();
+    assert_eq!(world.driver.retry.due_ms, None, "wake skips the reconnect wait");
+    world.ticket("wake-again");
+    assert_eq!(world.driver.status(), &Status::Live);
+}
+
+#[test]
+fn expired_sign_in_keeps_the_pairing_and_asks_to_sign_in() {
+    let mut world = World::paired(fake_host::host());
+    let key = world.store[HOST_ID].secret.public();
+    world.boot(None);
+    world.drop_socket(close::UNAUTHORISED);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::SignIn));
+    assert!(Stop::SignIn.message().contains("Sign in again"));
+    assert_eq!(world.store[HOST_ID].secret.public(), key);
+    world.driver.retry_now();
+    world.pump();
+    assert_eq!(world.posted.last(), Some(&boot::WANTS_TICKET));
+    world.ticket("signed-in-again");
+    assert_eq!(world.driver.status(), &Status::Live);
+}
+
+#[test]
+fn waking_does_not_restart_a_pairing_or_a_security_refusal() {
+    let mut host = fake_host::host();
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let mut world = World::new(host);
+    world.boot(Some(&pairing));
+    let status = world.driver.status().clone();
+    assert_eq!(world.driver.pairing_reason(), Some("Reason: no key stored for this host."));
+    world.driver.resumed(LIVE_SOCKET_STALE_AFTER_MS);
+    assert_eq!(world.driver.status(), &status);
+    assert!(world.driver.take_outputs().is_empty());
+
+    let mut world = World::paired(fake_host::host());
+    world.boot(None);
+    world.drop_socket(close::NOT_PAIRED);
+    world.driver.resumed(LIVE_SOCKET_STALE_AFTER_MS);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotPairedUnconfirmed));
+    assert!(world.driver.take_outputs().is_empty());
+    assert!(world.store.contains_key(HOST_ID));
+}
+
+#[test]
+fn device_dates_include_pairing_and_work_with_older_hosts() {
+    use atomics_core::projection::DeviceInfo;
+    let mut info: DeviceInfo = serde_json::from_value(serde_json::json!({
+        "id": "opaque-id", "name": "A browser", "controls": false, "connected": false,
+        "seen_ms": 1_793_836_800_000u64,
+    }))
+    .unwrap();
+    assert_eq!(info.dates(), ("unknown".into(), "2026-11-05 00:00 UTC".into()));
+    info.paired_ms = 1_793_750_400_000;
+    assert_eq!(info.dates().0, "2026-11-04 00:00 UTC");
 }
