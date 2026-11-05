@@ -72,6 +72,12 @@ fn on(shown: &[(String, Rect)], label: &str) -> egui::Pos2 {
     found.unwrap_or_else(|| panic!("{label} is not drawn: {shown:?}")).1.center()
 }
 
+/// The middle of the top bar's `label`, such as the Boards dropdown's word or the name of the board on screen.
+fn on_bar(shown: &[(String, Rect)], label: &str) -> egui::Pos2 {
+    let found = shown.iter().find(|(text, rect)| text == label && rect.bottom() <= 34.0);
+    found.unwrap_or_else(|| panic!("{label} is not in the top bar: {shown:?}")).1.center()
+}
+
 /// A few frames at `size`, for the first frame's measuring to settle; the text of the last.
 fn settled(
     ctx: &egui::Context,
@@ -231,7 +237,10 @@ fn the_location_line_says_where_the_window_is_and_back_and_forward_walk_the_plac
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     // Plan › task › session, under the top bar.
     let parts: Vec<_> = ["Parse faster", "Task t1", "Fix the parser · needs you"]
-        .map(|part| shown.iter().find(|(text, _)| text == part).unwrap_or_else(|| panic!("{part}: {shown:?}")).1)
+        .map(|part| {
+            let found = shown.iter().find(|(text, rect)| text == part && rect.top() > 34.0);
+            found.unwrap_or_else(|| panic!("{part}: {shown:?}")).1
+        })
         .into();
     assert!(parts.windows(2).all(|w| w[0].right() < w[1].left()), "in order: {parts:?}");
     assert!(parts.iter().all(|r| r.top() > 34.0 && r.bottom() < 34.0 + nav::HEIGHT + 2.0), "{parts:?}");
@@ -449,7 +458,7 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
     // The top bar, the chief docked with its terminal, the agent's tile with its approval, the plan's board.
     for shown in [
         "ATOMICS",
-        "◆ Parse faster",
+        "Parse faster",
         "CHIEF",
         "Diff",
         "Board 0/2",
@@ -561,7 +570,11 @@ fn a_wide_window_over_a_host_without_plans_shows_every_agent_and_no_plan_button(
         text = sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     }
     assert!(text.iter().any(|t| t == "Fix the parser"), "{text:?}");
-    assert!(!text.iter().any(|t| t.starts_with("Board")), "no board's segment without a plan: {text:?}");
+    assert!(!text.iter().any(|t| t.starts_with("Board ")), "no board's segment without a plan: {text:?}");
+    assert!(
+        text.iter().any(|t| t == "Boards"),
+        "the dropdown stays, in its place, and says how a board comes: {text:?}"
+    );
     assert_eq!(view.term.session(), Some("s1"));
 }
 
@@ -600,14 +613,16 @@ fn a_page_of_many_plans_opens_on_the_open_plan_with_its_board() {
     let hints = view.desk.hints(&world.driver.remote);
     assert_eq!(view.desk.plan.as_deref(), Some("p1"));
     assert!(hints.plan_view && hints.panel == PanelMode::Plan && hints.selected_plan == 23, "{hints:?}");
-    for wanted in ["◆ Parse faster", "Approve plan", "Fix the parser", "Board 0/2", "History"] {
+    for wanted in ["Parse faster", "Approve plan", "Fix the parser", "Board 0/2"] {
         assert!(has(&shown, wanted), "{wanted} is missing: {shown:?}");
     }
     assert!(!has(&shown, "Archived"), "no archived plan shows unless it is picked: {shown:?}");
     assert_eq!(view.term.session(), Some("s1"), "the open plan's agent takes the input");
 
-    // Only History reaches an archived plan, and its tab then shows while it does.
-    let opened = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "History")));
+    // Only History, in the Boards dropdown, reaches an archived plan, and the button names it while it shows.
+    let menu = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on_bar(&shown, "Parse faster")));
+    let menu = if has(&menu, "History") { menu } else { settled(&ctx, &mut world, &mut client, &mut view, WIDE) };
+    let opened = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&menu, "History")));
     let opened = if has(&opened, "View") { opened } else { settled(&ctx, &mut world, &mut client, &mut view, WIDE) };
     assert_eq!(view.term.overlay.covered, [view.term.overlay.rect.unwrap()], "an open menu takes the pointer");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&opened, "View")));
@@ -637,7 +652,7 @@ fn a_host_with_no_open_plan_shows_its_agents_and_no_finished_plans_board() {
     let (ctx, mut world, mut client, mut view) = live_with(host);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert_eq!(view.desk.plan, None);
-    assert!(has(&shown, "Fix the parser") && has(&shown, "History"), "{shown:?}");
+    assert!(has(&shown, "Fix the parser") && has(&shown, "Boards"), "{shown:?}");
     for absent in ["PLAN", "Plan", "Archived"] {
         assert!(!has(&shown, absent), "{absent} shows: {shown:?}");
     }
@@ -3511,6 +3526,132 @@ fn ctrl_n_from_a_terminal_shows_the_nth_agents_diff_and_no_byte_reaches_a_termin
     sized(ctx, world, client, view, WIDE, press(egui::Key::Num9, CHORD));
     assert_eq!(view.desk.active.as_deref(), Some("s0"));
     no_bytes(world);
+}
+
+#[test]
+fn ctrl_n_works_with_the_boards_dropdown_open_and_after_using_it() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    let shown = settled(ctx, world, client, view, WIDE);
+
+    // Open, from a terminal: the chord picks the agent, the menu goes, and the diff has the keyboard.
+    drawn(ctx, world, client, view, WIDE, click(on_bar(&shown, "Boards")));
+    let menu = settled(ctx, world, client, view, WIDE);
+    assert!(egui::Popup::is_any_open(ctx) && has(&menu, "NEEDS YOU · 1"), "{menu:?}");
+    forwarded(ctx, world, client, view, "3", CHORD);
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert!(panel_has_the_keys(ctx), "the diff holds the keyboard");
+    assert!(!egui::Popup::is_any_open(ctx), "and no menu covers it");
+    no_bytes(world);
+
+    // Open again, through the canvas: past the last agent nothing moves, not even the menu.
+    let shown = settled(ctx, world, client, view, WIDE);
+    drawn(ctx, world, client, view, WIDE, click(on_bar(&shown, "Boards")));
+    settled(ctx, world, client, view, WIDE);
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Num9, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s2"));
+    assert!(egui::Popup::is_any_open(ctx));
+
+    // After using it: a board picked from the menu is a plan's tab, whose first agent is Ctrl+1.
+    let menu = settled(ctx, world, client, view, WIDE);
+    let row = menu.iter().rfind(|(text, _)| text == "Parse faster").expect("the board's row").1.center();
+    drawn(ctx, world, client, view, WIDE, click(row));
+    let shown = settled(ctx, world, client, view, WIDE);
+    assert!(view.desk.plan_view && !egui::Popup::is_any_open(ctx));
+    assert_eq!(view.desk.panel, PanelMode::Plan, "a row shows its board, though the panel was on the diff");
+    assert!(view.desk.diff_open && has(&shown, "PLAN") && has(&shown, "Dispatch ready"), "{shown:?}");
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Num1, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s1"), "the plan's only agent");
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert!(panel_has_the_keys(ctx));
+    no_bytes(world);
+}
+
+#[test]
+fn the_boards_dropdown_counts_what_waits_lists_it_first_and_keeps_every_boards_commands() {
+    use atomics_core::plan::PlanStatus;
+
+    let mut host = fake_host::working();
+    for (id, goal, status) in [
+        ("p2", "Another open plan", PlanStatus::Open),
+        ("p3", "Not approved yet", PlanStatus::Open),
+        ("p4", "A finished plan", PlanStatus::Completed),
+    ] {
+        let mut plan = fake_host::closed_plan(id, status, goal);
+        plan.approved = id != "p3";
+        plan.tasks = host.board.plans[0].tasks[..1].to_vec();
+        plan.tasks[0].session = None;
+        plan.digest = format!("digest-{id}");
+        host.board.plans.push(plan);
+    }
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    let shown = settled(ctx, world, client, view, WIDE);
+
+    // The button names the board on screen and counts the two that wait; finished boards are out of the bar.
+    assert_eq!(view.desk.plan.as_deref(), Some("p1"));
+    let button = on_bar(&shown, "Parse faster");
+    let beside =
+        |text: &str, rect: &Rect| text == "2" && rect.bottom() <= 34.0 && (button.x - rect.right()).abs() < 60.0;
+    assert!(shown.iter().any(|(text, rect)| beside(text, rect)), "the count comes before the name: {shown:?}");
+    assert!(!shown.iter().any(|(text, rect)| text.contains("A finished plan") && rect.bottom() <= 34.0), "{shown:?}");
+
+    // The ones that wait first, under a heading of their own, then the others, then History.
+    drawn(ctx, world, client, view, WIDE, click(button));
+    let menu = settled(ctx, world, client, view, WIDE);
+    let y = |label: &str| {
+        menu.iter().rfind(|(text, _)| text == label).unwrap_or_else(|| panic!("{label}: {menu:?}")).1.top()
+    };
+    let order = ["NEEDS YOU · 2", "Parse faster", "Not approved yet", "ACTIVE · 1", "Another open plan", "History"];
+    assert!(order.windows(2).all(|pair| y(pair[0]) < y(pair[1])), "{order:?}: {menu:?}");
+    assert!(!has(&menu, "A finished plan"), "behind History: {menu:?}");
+    for (name, state) in
+        [("Parse faster", "needs you"), ("Not approved yet", "needs approval"), ("Another open plan", "idle")]
+    {
+        assert!((y(name) - y(state)).abs() < 3.0, "{name} says {state}: {menu:?}");
+    }
+
+    // A row shows its board, whose button approves it.
+    let row = menu.iter().rfind(|(text, _)| text == "Not approved yet").unwrap().1.center();
+    drawn(ctx, world, client, view, WIDE, click(row));
+    let shown = settled(ctx, world, client, view, WIDE);
+    assert_eq!(view.desk.plan.as_deref(), Some("p3"));
+    assert!(!egui::Popup::is_any_open(ctx), "the menu closes");
+    let approve = on(&shown, "Approve plan");
+    drawn(ctx, world, client, view, WIDE, click(approve));
+    let approved = |world: &World| world.host.board.plans.iter().find(|plan| plan.id == "p3").unwrap().approved;
+    assert!(approved(world), "the host approved it");
+
+    // A row's close asks first, as the board's Close plan… does.
+    let shown = settled(ctx, world, client, view, WIDE);
+    drawn(ctx, world, client, view, WIDE, click(on_bar(&shown, "Not approved yet")));
+    let menu = settled(ctx, world, client, view, WIDE);
+    let row = menu.iter().rfind(|(text, _)| text == "Another open plan").unwrap().1;
+    let state =
+        menu.iter().rfind(|(text, rect)| text == "idle" && (rect.center().y - row.center().y).abs() < 3.0).unwrap().1;
+    drawn(ctx, world, client, view, WIDE, click(egui::pos2(state.right() + 17.0, row.center().y)));
+    let shown = settled(ctx, world, client, view, WIDE);
+    assert!(has(&shown, "Close “Another open plan”?"), "{shown:?}");
+    assert_eq!(world.host.board.plans.iter().find(|plan| plan.id == "p2").unwrap().status, PlanStatus::Open);
+    click_on(ctx, world, client, view, WIDE, "Cancel");
+
+    // History reads a finished plan's board.
+    let shown = settled(ctx, world, client, view, WIDE);
+    drawn(ctx, world, client, view, WIDE, click(on_bar(&shown, "Not approved yet")));
+    let menu = settled(ctx, world, client, view, WIDE);
+    drawn(ctx, world, client, view, WIDE, click(on(&menu, "History")));
+    let opened = settled(ctx, world, client, view, WIDE);
+    assert!(has(&opened, "A finished plan") && has(&opened, "View"), "{opened:?}");
+    for absent in ["Reopen", "Archive"] {
+        assert!(!has(&opened, absent), "atomics.v1 carries no {absent} from here: {opened:?}");
+    }
+    assert!(!has(&opened, "completed ·"), "a page has no date to give: {opened:?}");
+    drawn(ctx, world, client, view, WIDE, click(on(&opened, "View")));
+    let shown = settled(ctx, world, client, view, WIDE);
+    assert_eq!(view.desk.plan.as_deref(), Some("p4"));
+    assert!(has(&shown, "Completed") && !has(&shown, "Approve plan"), "{shown:?}");
+    assert!(in_bar(&shown, "A finished plan"), "the button names it while it shows: {shown:?}");
 }
 
 #[test]

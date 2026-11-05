@@ -1167,8 +1167,9 @@ or tab for the others:
   saved workspaces to open another (`open_workspace`); it is not drawn while none is open and none is saved. The
   Project menu (opening folders, saving workspaces) stays on the computer.
 - **Close plan…** offers Complete plan when the host negotiates `plan_complete`, and Archive. Completion goes
-  through the same journal and workflow checks as the desktop. An open plan's tab closes the same
-  way; a finished plan's tab has no close, and its board's Archive does that. A closed plan's board stays read-only.
+  through the same journal and workflow checks as the desktop. An open board's row in the Boards dropdown closes the
+  same way; a finished plan's row in History has no Archive, and its board's Archive does that. A closed plan's board
+  stays read-only.
   A plan that closes while it shows gives way to the first open plan, as on the desktop.
 - **`+ New`** (the wide top bar, phone's menu and Agents pane) opens a picker of what the host's board names:
   the agents its sessions and open plans use, and a scratch folder, project or existing worktree. The host's

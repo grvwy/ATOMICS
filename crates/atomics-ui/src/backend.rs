@@ -18,7 +18,7 @@ use egui::Color32;
 use crate::Command;
 use crate::theme::Palette;
 
-/// What a plan is doing, for its tab. Selection is independent of activity.
+/// What a plan is doing, for its row in the Boards dropdown. Selection is independent of activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanState {
     Running(usize),
@@ -48,7 +48,7 @@ impl PlanState {
         }
     }
 
-    /// The color a plan's goal and tab are drawn in.
+    /// The color a plan's goal and name are drawn in.
     pub fn color(self, palette: &Palette) -> Color32 {
         match self {
             Self::Running(_) => palette.accent,
@@ -59,21 +59,35 @@ impl PlanState {
     }
 }
 
-/// One plan as the tabs and the top bar show it.
+/// One plan as the Boards dropdown and the top bar show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanRow {
     pub id: String,
     pub goal: String,
-    /// The tab's name: the plan's ticket with its progress, else the goal.
+    /// Its short name: the plan's ticket with its progress, else the goal.
     pub tab_name: String,
     pub status: PlanStatus,
     pub state: PlanState,
+    /// The user approved its tasks.
+    pub approved: bool,
     /// Changed since the user last looked.
     pub changed: bool,
     pub done: usize,
     pub total: usize,
     /// Tasks in review or blocked.
     pub attention: usize,
+}
+
+impl PlanRow {
+    /// Open, with tasks that wait for the user to approve them.
+    pub fn awaits_approval(&self) -> bool {
+        self.status == PlanStatus::Open && self.total > 0 && !self.approved
+    }
+
+    /// Its board waits for the user: to approve the plan, or to answer one of its tasks or agents.
+    pub fn needs_user(&self) -> bool {
+        self.awaits_approval() || self.state == PlanState::NeedsYou
+    }
 }
 
 /// One session as the sidebar, the tab strip and the tile headers show it.

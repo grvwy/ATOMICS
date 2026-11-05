@@ -323,9 +323,10 @@ mod tests {
                                 assert!((width - *natural).abs() < 0.5, "{case}: {name} shrank");
                             }
                         }
-                        assert!(
-                            items.iter().any(|(name, _)| name == "Tabs" || name.starts_with("Repos ·")),
-                            "{case}: repository navigation must stay reachable"
+                        assert_eq!(
+                            items.iter().filter(|(name, _)| name == "Boards").count(),
+                            1,
+                            "{case}: the boards and whatever folded into their menu stay reachable"
                         );
                         // Check the rendered text too: distinct labels cannot paint
                         // across each other, even inside compound items such as CHIEF.
@@ -358,7 +359,6 @@ mod tests {
                         let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
                         assert!((chief.center().x - width / 2.0).abs() < 1.0, "{case}: the pill is centered");
                         if width == 5120.0 {
-                            assert!(!items.iter().any(|(n, _)| n == "Tabs"));
                             assert_eq!(items.iter().filter(|(n, _)| n.starts_with("Repos ·")).count(), 1);
                             assert!(!items.iter().any(|(n, _)| n.starts_with("repo-")));
                             assert!(items.iter().any(|(n, _)| n == "load"));
@@ -548,12 +548,14 @@ mod tests {
     }
 
     #[test]
-    fn urgent_plans_stay_visible_or_are_surfaced_by_tabs_at_supported_widths() {
+    fn the_dropdown_counts_the_boards_that_wait_and_lists_them_first_at_supported_widths() {
         with_app(
-            "app::topbar::tests::urgent_plans_stay_visible_or_are_surfaced_by_tabs_at_supported_widths",
+            "app::topbar::tests::the_dropdown_counts_the_boards_that_wait_and_lists_them_first_at_supported_widths",
             |app, ctx| {
                 fixture(app, 5);
+                // Running, approved; blocked, approved; not approved yet; and two finished.
                 app.runtime.plans[0].status = PlanStatus::Open;
+                app.runtime.plans[0].approved = true;
                 app.runtime.plans[0].goal = "A long running plan name that must yield before its running count".into();
                 app.runtime.plans[0].tasks = ["first", "second"]
                     .into_iter()
@@ -565,10 +567,13 @@ mod tests {
                     })
                     .collect();
                 app.runtime.plans[1].status = PlanStatus::Open;
+                app.runtime.plans[1].approved = true;
                 app.runtime.plans[1].goal = "A needs-you plan with a long descriptive name".into();
                 app.runtime.plans[1].tasks[0].status = TaskStatus::Blocked;
+                app.runtime.plans[2].goal = "An unapproved plan".into();
                 app.runtime.plans[3].status = PlanStatus::Completed;
                 app.runtime.plans[4].status = PlanStatus::Completed;
+                app.runtime.plan_view = false;
                 for id in ["first", "second"] {
                     app.runtime.sessions.push(session(
                         id,
@@ -577,64 +582,112 @@ mod tests {
                         Path::new("/project/ATOMICS"),
                     ));
                 }
+                app.runtime.toast = None;
                 app.runtime.changed_plans.insert(app.runtime.plans[0].id.clone());
-                app.runtime.changed_plans.insert(app.runtime.plans[1].id.clone());
+                let warning = app.palette().warning;
                 for width in [480.0, 900.0, 1200.0, 1400.0] {
                     let (items, output) = render(app, ctx, width, vec![]);
+                    let boards = items.iter().find(|(name, _)| name == "Boards").expect("the dropdown").1;
+                    let in_it = |text: &&egui::epaint::TextShape| boards.contains(text.visual_bounding_rect().center());
                     let labels: Vec<_> = output
                         .shapes
                         .iter()
                         .filter_map(|shape| if let egui::Shape::Text(text) = &shape.shape { Some(text) } else { None })
                         .collect();
-                    let needs_visible = items
-                        .iter()
-                        .any(|(name, _)| name.starts_with("◆ ") && name.trim_end_matches(" *").ends_with("needs you"));
-                    let surfaced = labels.iter().find(|text| {
-                        text.galley.text().starts_with("Tabs · ") && text.galley.text().ends_with("needs you")
-                    });
+                    // The count, in the color of what needs the user, and the word: no plan's name yet.
                     assert!(
-                        needs_visible || surfaced.is_some(),
-                        "width={width}: needs-you plan disappeared: {items:?}"
+                        labels.iter().copied().filter(in_it).any(|text| text.galley.text() == "2"
+                            && text.galley.job.sections.iter().any(|section| section.format.color == warning)),
+                        "width={width}: the count"
                     );
-                    if let Some(text) = surfaced {
+                    assert!(
+                        labels.iter().copied().filter(in_it).any(|text| text.galley.text() == "Boards"),
+                        "width={width}"
+                    );
+                    for finished in ["Plan 3:", "Plan 4:"] {
                         assert!(
-                            text.galley
-                                .job
-                                .sections
-                                .iter()
-                                .any(|section| section.format.color == app.palette().warning)
-                        );
-                        assert!(!text.galley.elided, "width={width}: urgency suffix on Tabs was clipped");
-                    }
-                    for text in labels.iter().filter(|text| {
-                        text.galley.text().starts_with("◆ ") && text.galley.text().contains("needs you")
-                            || text.galley.text().starts_with("● ") && text.galley.text().contains("2 running")
-                    }) {
-                        assert!(
-                            !text.galley.elided,
-                            "width={width}: important state was elided: {}",
-                            text.galley.text()
-                        );
-                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
-                        let clip = output
-                            .shapes
-                            .iter()
-                            .find(|shape| matches!(&shape.shape,egui::Shape::Text(other) if std::ptr::eq(other,*text)))
-                            .unwrap()
-                            .clip_rect;
-                        assert!(clip.expand(0.5).contains_rect(bounds), "width={width}: important label was clipped");
-                    }
-                    // The pill keeps the middle, so the plans share the left half of the bar with the brand.
-                    if width >= 1400.0 {
-                        assert!(needs_visible, "width={width}: needs-you should fit");
-                        assert!(
-                            items.iter().any(|(name, _)| name.starts_with("● ")
-                                && name.trim_end_matches(" *").ends_with("2 running")),
-                            "width={width}: running count disappeared: {items:?}"
+                            !labels.iter().any(|text| text.galley.text().starts_with(finished)),
+                            "width={width}: {finished} left the bar"
                         );
                     }
                     output.drop_without_applying_deltas();
+
+                    click(app, ctx, width, "Boards");
+                    render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    let (_, output) = render(app, ctx, width, vec![]);
+                    let labels: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| if let egui::Shape::Text(text) = &shape.shape { Some(text) } else { None })
+                        .collect();
+                    let at = |label: &str| {
+                        labels
+                            .iter()
+                            .rposition(|text| text.galley.text().starts_with(label))
+                            .unwrap_or_else(|| panic!("width={width}: {label}"))
+                    };
+                    let order = [
+                        at("NEEDS YOU · 2"),
+                        at("A needs-you plan"),
+                        at("An unapproved plan"),
+                        at("ACTIVE · 1"),
+                        at("A long running plan"),
+                        at("History"),
+                    ];
+                    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "width={width}: {order:?}");
+                    for state in ["needs you", "needs approval", "2 running"] {
+                        let text = labels[at(state)];
+                        assert!(!text.galley.elided, "width={width}: {state} was cut");
+                    }
+                    output.drop_without_applying_deltas();
+                    // Nothing is left of it after Escape; the menu is not in the next test's way.
+                    render(
+                        app,
+                        ctx,
+                        width,
+                        vec![egui::Event::Key {
+                            key: Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    )
+                    .1
+                    .drop_without_applying_deltas();
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn the_button_names_the_board_on_screen_and_gives_it_up_in_a_narrow_bar() {
+        with_app(
+            "app::topbar::tests::the_button_names_the_board_on_screen_and_gives_it_up_in_a_narrow_bar",
+            |app, ctx| {
+                fixture(app, 3);
+                app.runtime.toast = None;
+                app.runtime.config_error = None;
+                app.runtime.hook_error = None;
+                let goal = "Plan 2: resource budgets and built-in approval rules";
+                let name_of = |output: &egui::FullOutput, boards: Rect| {
+                    output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text)
+                            if text.galley.text() == goal && boards.contains(text.visual_bounding_rect().center()) =>
+                        {
+                            Some(text.galley.elided)
+                        }
+                        _ => None,
+                    })
+                };
+                let wide = render(app, ctx, 5120.0, vec![]);
+                let boards = wide.0.iter().find(|(name, _)| name == "Boards").unwrap().1;
+                assert_eq!(name_of(&wide.1, boards), Some(false), "room for the whole name");
+                wide.1.drop_without_applying_deltas();
+                let narrow = render(app, ctx, 700.0, vec![]);
+                let boards = narrow.0.iter().find(|(name, _)| name == "Boards").unwrap().1;
+                assert_eq!(name_of(&narrow.1, boards), Some(true), "it shortens rather than leaves the bar");
+                narrow.1.drop_without_applying_deltas();
             },
         );
     }
@@ -674,7 +727,7 @@ mod tests {
                     assert!(!items.iter().any(|(name, _)| name.starts_with("repo-")));
                     output.drop_without_applying_deltas();
                     if !repos_visible {
-                        click(app, ctx, width, "Tabs");
+                        click(app, ctx, width, "Boards");
                     }
                     click(app, ctx, width, "Repos · 22");
                     // A submenu sizes before its first paint.
@@ -703,7 +756,7 @@ mod tests {
                     let repos_visible = items.iter().any(|(name, _)| name == "repo-1");
                     output.drop_without_applying_deltas();
                     if !repos_visible {
-                        click(app, ctx, width, "Tabs");
+                        click(app, ctx, width, "Boards");
                     }
                     click(app, ctx, width, "repo-1");
                     render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
@@ -722,8 +775,8 @@ mod tests {
     }
 
     #[test]
-    fn overflow_tabs_and_actions_remain_clickable() {
-        with_app("app::topbar::tests::overflow_tabs_and_actions_remain_clickable", |app, ctx| {
+    fn boards_and_folded_actions_remain_clickable() {
+        with_app("app::topbar::tests::boards_and_folded_actions_remain_clickable", |app, ctx| {
             fixture(app, 6);
             app.runtime.toast = None;
             app.runtime.config_error = None;
@@ -744,9 +797,9 @@ mod tests {
                     click(app, ctx, width, segment);
                     assert!(app.runtime.panel == view && !app.runtime.diff_open, "width={width}: {segment} hides");
                 }
-                click(app, ctx, width, "Tabs");
+                click(app, ctx, width, "Boards");
                 click(app, ctx, width, "Plan 0:");
-                assert_eq!(app.runtime.selected_plan, 0, "width={width}: Tabs selection");
+                assert_eq!(app.runtime.selected_plan, 0, "width={width}: a board's row picks it");
                 assert!(app.runtime.plan_view);
                 if collapsed {
                     click(app, ctx, width, "Actions");

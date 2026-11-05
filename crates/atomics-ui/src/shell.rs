@@ -361,9 +361,9 @@ pub enum BrandSize {
 /// its size, whatever the chief, the plans or the notices do. The brand and the navigation share the half on
 /// its left, the actions the half on its right. The pill's size follows the bar's width alone: its words go
 /// under [`FULL_PILL_BAR`], its name under [`NAMED_PILL_BAR`]. Around it the load gauge goes first, the
-/// brand's agent count gives way to the plans that need the user, the actions fold into a menu and the brand
-/// keeps only its mark. Every item keeps
-/// its natural width; the navigation folds the plans it has no room for into its own menu.
+/// brand's agent count gives way to the Boards dropdown, the actions fold into a menu and the brand keeps only
+/// its mark. Every item keeps its natural width; the navigation folds the tabs it has no room for into the
+/// dropdown's menu.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopBarPlan {
     pub brand: BrandSize,
@@ -389,9 +389,9 @@ pub struct TopBarWidths {
     pub chief: [f32; 3],
     /// The brand at each [`BrandSize`], widest first.
     pub brand: [f32; 3],
-    /// The navigation with every plan that needs the user or runs in the row.
-    pub urgent: f32,
-    /// The navigation's least width: its menu, which says how many plans need the user.
+    /// The Boards dropdown as it wants to be, naming the board on screen.
+    pub boards: f32,
+    /// The navigation's least width: the dropdown with no more than its word and how many boards need the user.
     pub navigation: f32,
     /// The view switcher with its names, and without.
     pub switcher: [f32; 2],
@@ -411,7 +411,7 @@ impl TopBarPlan {
             w.brand[brand as usize] + w.gap + navigation <= side(chief)
         };
         // The pill's size follows the bar's width alone, so that it never changes while the window keeps its
-        // size: a plan that starts needing the user, or an item the host adds, moves nothing but its neighbours.
+        // size: a board that starts needing the user, or an item the host adds, moves nothing but its neighbours.
         let chief = if w.width >= FULL_PILL_BAR {
             PillSize::Full
         } else if w.width >= NAMED_PILL_BAR {
@@ -423,7 +423,7 @@ impl TopBarPlan {
         let right = |rest: f32, switcher: f32| switcher + if switcher > 0.0 { w.gap } else { 0.0 } + rest;
         let actions_menu = right(w.controls, w.switcher[0]) > side(chief);
         let compact_switcher = actions_menu && right(w.actions_menu, w.switcher[0]) > side(chief);
-        let brand = if left(BrandSize::Full, w.urgent, chief) {
+        let brand = if left(BrandSize::Full, w.boards, chief) {
             BrandSize::Full
         } else if left(BrandSize::Name, w.navigation, chief) {
             BrandSize::Name
@@ -446,17 +446,14 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let gap = ui.spacing().item_spacing.x;
     crate::update::keep_keyboard(ui.ctx());
     let palette = read(platform, |_, client| client.palette.clone());
-    let (urgent_label, urgent_color) = platform.draw(|backend, client, _| tabs::urgent_tabs_label(backend, client));
-    let navigation = measure(ui, |ui| {
-        ui.menu_button(RichText::new(&urgent_label).color(urgent_color), |_| {});
-    });
+    let (boards, navigation) = read(platform, |backend, client| crate::boards::widths(ui, backend, &client.palette));
     let widths = TopBarWidths {
         width: rect.width(),
         gap,
         chief: [PillSize::Full, PillSize::Name, PillSize::Mark].map(|size| chief::pill_width(ui, &palette, size)),
         brand: [BrandSize::Full, BrandSize::Name, BrandSize::Mark]
             .map(|size| measure(ui, |ui| brand(ui, platform, size))),
-        urgent: platform.draw(|backend, client, _| tabs::urgent_navigation_width(ui, backend, client)).max(navigation),
+        boards,
         navigation,
         switcher: [false, true].map(|compact| {
             measure(ui, |ui| platform.draw(|backend, client, _| switcher::draw(ui, compact, backend, client)))
@@ -622,14 +619,14 @@ mod tests {
     use super::*;
     use crate::chief::PillSize;
 
-    /// What a bar holds, measured roughly as the desktop draws it, with plans that need the user.
+    /// What a bar holds, measured roughly as the desktop draws it, with boards that need the user.
     fn widths(width: f32) -> TopBarWidths {
         TopBarWidths {
             width,
             gap: 7.0,
             chief: [214.0, 98.0, 56.0],
             brand: [164.0, 99.0, 33.0],
-            urgent: 453.0,
+            boards: 453.0,
             navigation: 138.0,
             switcher: [190.0, 110.0],
             controls: 226.0,
@@ -680,7 +677,7 @@ mod tests {
             assert!(now.0 != before.0 || (now.2, now.3) >= (before.2, before.3), "{width}: {last:?} -> {plan:?}");
             // Whatever the bar holds, the pill's size is the width's.
             let empty =
-                TopBarWidths { urgent: 0.0, navigation: 40.0, controls: 100.0, switcher: [0.0; 2], ..widths(width) };
+                TopBarWidths { boards: 0.0, navigation: 40.0, controls: 100.0, switcher: [0.0; 2], ..widths(width) };
             assert_eq!(TopBarPlan::choose(&empty).chief, plan.chief, "{width}");
             // What is drawn beside the pill fits its half.
             let side = (width - widths(width).chief[plan.chief as usize]) / 2.0 - 7.0;

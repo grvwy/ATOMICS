@@ -19,7 +19,7 @@ The diff panel shows the session's worktree against the merge-base with `base_re
 on that diff go to the agent as one message while it keeps working. Claude and Codex report their status
 through hooks. The top bar separates agents working from agents open (`2 working · 12 open`). With none working it says
 `12 idle` when every one is, and otherwise `12 open`, with who needs you, has finished or has exited on hover. It takes
-the same room in every case, so the tabs beside it keep theirs. This count excludes shells and the chief. The label folds away with
+the same room in every case, so the navigation beside it keeps its own. This count excludes shells and the chief. The label folds away with
 the brand's other details as the window narrows. A session follows its agent's main thread: threads the
 agent spawns or runs for itself, such as Codex's memory agent, report through the same pane but do not move
 its folder, title or status. Sessions are saved in `sessions.json` in the state folder, and Claude sessions
@@ -49,7 +49,7 @@ agent and its model. The plan appears on its own board (`cmd+b`), where you edit
 and so is a task branch that another task of the plan or of an open plan has, with a free name suggested. Dispatch gives each ready task a worktree and an agent whose
 first message is the brief. Agents answer with `atomics_report` (done, blocked or a question), which moves
 the card and wakes the chief's `atomics_wait`. The chief reads the result and the diff, steers, and accepts.
-Several plans can be open at once, each with its own tab. See
+Several plans can be open at once, each with a row in the top bar's Boards dropdown. See
 [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back).
 
 ## Integration branches and the final review

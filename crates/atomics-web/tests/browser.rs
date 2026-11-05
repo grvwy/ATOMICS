@@ -2508,10 +2508,15 @@ fn a_plan_closes_and_a_new_session_starts() {
 
     // Back on the plan, its board: Cancel keeps it open, and Archive plan archives it.
     let top = Rect::from_min_max(Pos2::ZERO, pos2(WIDE.0 / 2.0, 34.0));
-    let (plan, _) = until_on(&mut page, WIDE, &actions_dir(), "the plan tab", |page| {
+    let (marker, _) = until_on(&mut page, WIDE, &actions_dir(), "the Boards marker", |page| {
         boxes(page, palette.warning, 6, top, 1.0).into_iter().reduce(|a, b| a.union(b))
     });
-    page.click((f64::from(plan.center().x), f64::from(plan.center().y)));
+    page.click((f64::from(marker.center().x), f64::from(marker.center().y)));
+    let rows = Rect::from_min_max(pos2(0.0, 34.0), pos2(WIDE.0 / 2.0, 200.0));
+    let (row, _) = until_on(&mut page, WIDE, &actions_dir(), "the plan's row", |page| {
+        boxes(page, palette.warning, 6, rows, 1.0).into_iter().max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
+    });
+    page.click((f64::from(row.center().x), f64::from(row.center().y)));
     thread::sleep(Duration::from_millis(300));
     let board = Rect::from_min_max(pos2(WIDE.0 / 2.0, 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
     click_button(&mut page, &palette, board, "Close plan…", true);

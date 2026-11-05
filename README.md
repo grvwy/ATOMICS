@@ -473,7 +473,7 @@ Codex permission hooks show **needs you**, the command, working directory and re
 `atomics_list` and `atomics_result` also include the oldest pending request. The chief can answer with
 `atomics_approve {session, decision: "allow" | "allow_always" | "deny", message?}`.
 `allow_always` remembers the exact command, tool and directory for this session only; it does not
-write a global rule. Approval decisions and held input target the specified session, even while another plan tab
+write a global rule. Approval decisions and held input target the specified session, even while another plan
 is selected. Input held by one plan’s session is released only when that session’s permission request finishes.
 `message` is passed to Codex with the hook decision.
 
@@ -589,7 +589,7 @@ When the chief works on tickets, a **trace lane** under its terminal shows each 
 reads, children, related tickets and the plan it builds, each with a spinner, then a check or a cross. Click a ticket in it
 to read it in the Tickets panel. **Plan with chief** (a button in the Tickets panel's Read view, `cmd+enter`) creates an
 empty plan with the ticket's link and sends the chief a message with the ticket's key, title, URL and plan id (never its
-text), and the plan's tab says `planning…` until the chief's `atomics_plan_set` fills it. See
+text), and the plan's name says `planning…` until the chief's `atomics_plan_set` fills it. See
 [Tickets](docs/tickets.md#plan-with-chief).
 
 Every `[chief] heartbeat_secs` (default 300 seconds), ATOMICS checks every open plan for missing or exited
@@ -634,8 +634,8 @@ With several open plans, update/dispatch/integrate require the id and errors lis
 `atomics_plan_get` without `plan` lists open plans with their goal, done/total, approval and waiting tasks. With `plan` it
 gives a compact view that fits the MCP client's limit for one tool answer: per task its status, dependencies, session,
 branch, and its latest note and report summary cut short. Add `task` to read that task in full: brief, acceptance,
-report and its newest notes. Select a
-plan’s tab, then open its **plan board** with `cmd+b` or **Board** in the top bar's view switcher. It has columns for planned, running,
+report and its newest notes. Pick a
+plan in the top bar's **Boards** dropdown, then open its **plan board** with `cmd+b` or **Board** in the view switcher. It has columns for planned, running,
 blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
@@ -661,11 +661,11 @@ The brief also tells the agent that every worktree shares one git stash: see [Th
 Plans are stored separately in `plans/<id>.json` under the state directory, with status `open`, `completed` or `archived`. The old
 `plan.json` in that directory migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
-Open and completed plans get tabs; archived plans are hidden. Select a tab to see
+Open plans are listed in the **Boards** dropdown; completed and archived ones are under **History** in the same menu. Pick one to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All, Ungrouped and the Repos dropdown. Each plan has
 its own approval and automatic final review. Use `atomics_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
-**Closed plans** beside the plan tabs; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
+**History**; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. A wait answers within 100 s
 (default 90), inside the MCP client's 120 s limit for one call, and one answer carries what fits the client's limit
@@ -673,7 +673,7 @@ for tool text: when more events wait, it says so in `more`, and its cursor reads
 `atomics_list`, `atomics_result`, `atomics_read`, `atomics_diff` and `atomics_exec` cut long texts the same way and say
 how much they left out; `atomics_diff` takes `path` to read one file's hunks of a patch that was cut.
 
-Open a completed plan’s ✓ tab and its board. **Clean up plan…** previews only its recorded
+Open a completed plan’s board from **History** or from **Open board** on a finished task's tile. **Clean up plan…** previews only its recorded
 task and integration branches and their worktrees. Once the integration branch or every task branch is contained
 in the configured base (usually main), select the entries to remove. Uncommitted changes, unmerged commits and
 worktrees used by agent sessions are kept with a reason. Removal rechecks the preview and never forces Git;
@@ -692,19 +692,24 @@ must be integrated too. The board and dispatch use the same verified readiness. 
 finish within 150 s, says why on the task card and in `atomics_plan_get`, and runs again within 30 s. Dispatching checks
 such dependencies afresh and answers once their checks have, or after 100 s, inside the MCP client's limit for one call.
 
-Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
 The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count
 and total changed lines (additions plus deletions) across those sessions. Its button shows the selected project's name
-in a project view, otherwise **Repos · total changes**. Tabs that do not fit remain available in the Tabs menu.
+in a project view, otherwise **Repos · total changes**. Then comes one **Boards** dropdown. Its button names the board on
+screen, and a warning marker counts the boards that need you. Its menu lists those first, under **Needs you**: plans
+waiting for approval, and plans with a blocked task, a question or an agent's permission request. Then **Active** lists
+the other open boards, each with done/total and its state, then **History**. A row shows its board, and the board's
+**Approve plan** approves it. Each open board's row has a close button that asks first. Tabs that do not fit fold into this menu too, the selected one last.
 Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
-stays beside the fleet. Updating or dispatching another plan marks its tab with `*` and preserves the selected
-view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
-Click the plan tab later to return to that overview, or choose All or a project from Repos to see other sessions.
+stays beside the fleet. Updating or dispatching another plan puts a dot on the Boards button and on the plan's row, and
+preserves the selected view and chief. Creating a new plan selects it. Each fleet shows only sessions linked to that
+plan’s tasks. Pick the plan again later to return to that overview, or choose All or a project from Repos to see other
+sessions.
 
 Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.
-Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **diff** and
-**resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
-When every task is accepted, the plan tab shows ✓ and its board offers **Archive plan**. The chief stays running and
+Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **Open board**,
+**diff** and **resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
+When every task is accepted, its board offers **Archive plan**; closed as completed, the plan leaves the dropdown's open
+boards for **History**. The chief stays running and
 worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
 
 ## Tickets
@@ -738,7 +743,7 @@ ATOMICS registers the `atomics://` URL scheme, so another tool can send you stra
 
 ```
 atomics://open                                        focus ATOMICS
-atomics://open?plan=<plan id>                         select that open plan's tab
+atomics://open?plan=<plan id>                         show that open plan
 atomics://open?ticket=<key or ticket URL>&system=<name>   the ticket's plan, or offer to plan it
 ```
 
@@ -929,7 +934,7 @@ with its progress and a count of the tasks in review or blocked), **Diff** (the 
 number of changed files; the editor counts as the diff) and **Tickets** (when `[tickets]` is set; a dot while the ticket
 system wants a sign-in, else how many tickets on the plan's board no task follows). The view on screen is filled;
 picking it again hides the panel. Each window remembers its choice: the desktop in its state folder, a browser in
-its `localStorage`; picking another plan's tab keeps it. The CHIEF pill stays in the middle of the bar. The location
+its `localStorage`; a row of the Boards dropdown shows that board. The CHIEF pill stays in the middle of the bar. The location
 line over the agents says where the window is, plan › task › session ([Navigation](docs/navigation.md)).
 Click the load gauge or **Machine** in Actions to see the host's CPU, memory, disk space, test/QA queues,
 containers, listening ports and agent previews. The shared panel works in the desktop and connected clients;

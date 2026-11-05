@@ -150,6 +150,8 @@ pub fn pick_agent(ctx: &Context, backend: &dyn Backend, client: &mut Client, n: 
     let sessions = backend.session_list();
     let session = backend.visible_sessions().get(n).map(|&index| sessions[index].clone())?;
     let hints = backend.view_hints();
+    // A menu left open would cover the diff the chord brings up.
+    egui::Popup::close_all(ctx);
     // Only an open Tickets panel keeps its place; activating opens the panel, so ask first.
     let tickets_open = hints.panel == PanelMode::Tickets && hints.diff_open;
     client.pr_view = None;

@@ -1195,6 +1195,7 @@ fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
         tab_name: plan.goal.clone(),
         status: plan.status,
         state: plan_state(plan, mirror),
+        approved: plan.approved,
         changed: false,
         done: count(TaskStatus::Done),
         total: plan.tasks.len(),
@@ -1467,7 +1468,7 @@ impl Backend for RemoteBackend {
             Command::ClosePlan { status: PlanStatus::Completed, .. } if !self.has_capability(wire::PLAN_COMPLETE) => {
                 return false;
             }
-            // An open plan's tab asks, and archives. A finished one's has no close; its board's Archive does that.
+            // An open board's row asks, and archives. A finished one's offers no Archive; its board's Archive does that.
             Command::ClosePlanTab(plan) => {
                 let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
                 return open && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived });

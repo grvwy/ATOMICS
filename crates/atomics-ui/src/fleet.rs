@@ -10,7 +10,7 @@ use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::text::truncate;
 use crate::theme::lerp;
-use crate::{Backend, Client, Command, approvals, board};
+use crate::{Backend, Client, Command, approvals, board, boards};
 
 /// The height of a tile's header.
 pub const TILE_HEADER: f32 = 26.0;
@@ -418,6 +418,8 @@ pub fn tiles(
         client.send(Command::DismissMcp(id));
     }
     let mut task_action = None;
+    let mut show_board = None;
+    let plans = backend.plan_list();
     for (offset, done) in backend.completed_tasks().into_iter().take(layout.completed).enumerate() {
         let slot = tiled.len() + offset;
         let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
@@ -428,6 +430,13 @@ pub fn tiles(
             egui::UiBuilder::new().id_salt(("completed", done.plan, done.index)).max_rect(tile.shrink(14.0)),
         );
         child.label(RichText::new(&done.task.title).color(p.foreground).strong().size(13.0));
+        // Finished boards have left the top bar: the work they did leads back to them.
+        let show = plans.get(done.plan).map(|row| boards::show_command(row, done.plan));
+        if let Some(show) = show.filter(|show| backend.available(show))
+            && child.small_button("Open board").on_hover_text("The board of the plan this task belongs to").clicked()
+        {
+            show_board = Some(show);
+        }
         if let Some(action) = board::task_result_for(
             &mut child,
             &done.task,
@@ -446,6 +455,9 @@ pub fn tiles(
     }
     if let Some(command) = task_action.and_then(|(plan, task, action)| Command::task(plan, task, action)) {
         client.send(command);
+    }
+    if let Some(show) = show_board {
+        client.send(show);
     }
 
     if let Some((session, open_diff)) = activate {

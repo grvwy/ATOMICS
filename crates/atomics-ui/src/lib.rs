@@ -19,6 +19,7 @@
 pub mod approvals;
 mod backend;
 pub mod board;
+pub mod boards;
 pub mod chief;
 mod client;
 mod command;
