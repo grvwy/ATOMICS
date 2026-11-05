@@ -9,7 +9,9 @@ A session is one agent in a terminal tile: Claude, Codex or a shell. It works in
 project, an existing folder, or a scratch folder of its own outside any project (the **Ungrouped** tab).
 The diff panel shows the session's worktree against the merge-base with `base_ref`, and review comments
 on that diff go to the agent as one message while it keeps working. Claude and Codex report their status
-through hooks, so the top bar counts what needs you. A session follows its agent's main thread: threads the
+through hooks. The top bar separates agents working from agents open (`2 working · 12 open`), or says
+`12 idle` when none is working. This count excludes shells and the chief. The label folds away with
+the brand's other details as the window narrows. A session follows its agent's main thread: threads the
 agent spawns or runs for itself, such as Codex's memory agent, report through the same pane but do not move
 its folder, title or status. Sessions are saved in `sessions.json` in the state folder, and Claude sessions
 resume after a restart. See [What it does](../README.md#what-it-does).
@@ -23,7 +25,11 @@ repositories and the builds of bare tasks. It answers other agents' permission p
 (`atomics_approve`), and some tools are its alone: running checks inside a sandbox (`atomics_exec`), reading
 config and proposing changes you apply, and restarting ATOMICS. Every `[chief] heartbeat_secs` ATOMICS
 checks the fleet (idle or missing agents, waiting approvals, held messages) and tells the chief what it
-found. See [The chief agent](../README.md#the-chief-agent) and [Configuration](configuration.md).
+found. The chief's idle wake (`[chief] wake_secs`) also lists up to five finished agents to clean up,
+including Ungrouped agents: each has no turn or pending messages running, a clean worktree, and either an
+accepted task, a merged branch, or no task and no changes. The chief closes each listed agent with
+`atomics_close` or says why it should stay open. This list does not close agents by itself. See
+[The chief agent](../README.md#the-chief-agent) and [Configuration](configuration.md).
 
 ## Plans and approval
 
@@ -108,7 +114,12 @@ agents](../README.md#running-many-agents).
 
 ## Automatic cleanup
 
-Accepting an integrated task closes its agent. Completing a plan removes its clean task worktrees and
+Accepting a task closes its idle agent once its work is integrated, its branch is merged into `base_ref`,
+its pull request is recorded as landed (the task's or plan's `merged` lifecycle stage), or it made no changes.
+Background checks verify the worktree is clean before closing; uncommitted work keeps the agent open,
+with the reason on its card. A running turn or pending message also keeps it open. The session stays in
+**Recent** so it can be resumed. `[plan] close_done_agents = false` keeps accepted agents open.
+Completing a plan removes its clean task worktrees and
 deletes task branches merged into the integration branch; archiving removes clean worktrees and keeps
 branches (`[cleanup]`). Removing a worktree also removes its sandboxes, their MCP registrations and relay
 rules. ATOMICS records each sandbox in `sandbox-ownership.json` before making it, so a crash leaves nothing
