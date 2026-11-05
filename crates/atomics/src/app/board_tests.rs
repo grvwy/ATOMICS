@@ -214,79 +214,76 @@ fn branch_names_are_single_line_elided_and_show_the_full_name_on_hover() {
 
 #[test]
 fn a_narrow_board_scrolls_sideways_and_keeps_card_buttons() {
-    super::tests::with_app(
-        "app::board_tests::a_narrow_board_scrolls_sideways_and_keeps_card_buttons",
-        |app, ctx| {
-            populate(app);
-            for i in 0..3 {
-                frame(app, ctx, 740.0, i as f64, vec![]);
-            }
-            let rendered = frame(app, ctx, 740.0, 3.0, vec![]);
-            let first = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 0 ")).unwrap();
-            // Too narrow for five columns: they keep their width and sit side by side in a horizontal scroll.
-            for card in &rendered.cards {
-                assert!((card.width() - 240.0).abs() < 1.0, "card width {}", card.width());
-            }
-            assert!(first.pos.x < 60.0, "the first card starts at the panel's left: {:?}", first.pos);
-            let second = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 1 ")).unwrap();
-            assert!(second.pos.x >= first.pos.x + 240.0, "the columns keep their width");
-            assert!((second.pos.y - first.pos.y).abs() < 1.0, "the statuses share a row");
-            let pointer = first.pos + vec2(30.0, 8.0);
+    super::tests::with_app("app::board_tests::a_narrow_board_scrolls_sideways_and_keeps_card_buttons", |app, ctx| {
+        populate(app);
+        for i in 0..3 {
+            frame(app, ctx, 740.0, i as f64, vec![]);
+        }
+        let rendered = frame(app, ctx, 740.0, 3.0, vec![]);
+        let first = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 0 ")).unwrap();
+        // Too narrow for five columns: they keep their width and sit side by side in a horizontal scroll.
+        for card in &rendered.cards {
+            assert!((card.width() - 240.0).abs() < 1.0, "card width {}", card.width());
+        }
+        assert!(first.pos.x < 60.0, "the first card starts at the panel's left: {:?}", first.pos);
+        let second = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 1 ")).unwrap();
+        assert!(second.pos.x >= first.pos.x + 240.0, "the columns keep their width");
+        assert!((second.pos.y - first.pos.y).abs() < 1.0, "the statuses share a row");
+        let pointer = first.pos + vec2(30.0, 8.0);
+        frame(
+            app,
+            ctx,
+            740.0,
+            4.0,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                    delta: vec2(-2000.0, 0.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for time in 5..10 {
+            frame(app, ctx, 740.0, time as f64, vec![]);
+        }
+        let rendered = frame(app, ctx, 740.0, 10.0, vec![]);
+        let last = rendered
+            .text
+            .iter()
+            .find(|t| t.galley.text().starts_with("Readable 4 "))
+            .expect("the last status must be reachable");
+        assert!(last.pos.x > 0.0 && last.pos.x < 740.0, "{:?}", last.pos);
+        assert!((last.pos.y - first.pos.y).abs() < 1.0, "scrolling keeps the statuses in their row");
+        let card = rendered.cards.iter().find(|card| card.contains(last.pos)).expect("the last card is visible");
+        assert!(card.left() >= 0.0 && card.right() <= 740.0, "the last card fits in the panel: {card:?}");
+        for label in ["reopen", "integrate"] {
+            assert!(rendered.text.iter().any(|t| t.galley.text() == label), "missing {label} button");
+        }
+        let reopen = rendered.text.iter().find(|t| t.galley.text() == "reopen").unwrap();
+        let pos = reopen.pos + reopen.galley.rect.center().to_vec2();
+        frame(app, ctx, 740.0, 11.0, vec![egui::Event::PointerMoved(pos)]);
+        for (time, pressed) in [(12.0, true), (12.05, false)] {
             frame(
                 app,
                 ctx,
                 740.0,
-                4.0,
+                time,
                 vec![
-                    egui::Event::PointerMoved(pointer),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        phase: egui::TouchPhase::Move,
-                        source: egui::MouseWheelSource::Unknown,
-                        delta: vec2(-2000.0, 0.0),
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
                         modifiers: egui::Modifiers::NONE,
                     },
                 ],
             );
-            for time in 5..10 {
-                frame(app, ctx, 740.0, time as f64, vec![]);
-            }
-            let rendered = frame(app, ctx, 740.0, 10.0, vec![]);
-            let last = rendered
-                .text
-                .iter()
-                .find(|t| t.galley.text().starts_with("Readable 4 "))
-                .expect("the last status must be reachable");
-            assert!(last.pos.x > 0.0 && last.pos.x < 740.0, "{:?}", last.pos);
-            assert!((last.pos.y - first.pos.y).abs() < 1.0, "scrolling keeps the statuses in their row");
-            let card = rendered.cards.iter().find(|card| card.contains(last.pos)).expect("the last card is visible");
-            assert!(card.left() >= 0.0 && card.right() <= 740.0, "the last card fits in the panel: {card:?}");
-            for label in ["reopen", "integrate"] {
-                assert!(rendered.text.iter().any(|t| t.galley.text() == label), "missing {label} button");
-            }
-            let reopen = rendered.text.iter().find(|t| t.galley.text() == "reopen").unwrap();
-            let pos = reopen.pos + reopen.galley.rect.center().to_vec2();
-            frame(app, ctx, 740.0, 11.0, vec![egui::Event::PointerMoved(pos)]);
-            for (time, pressed) in [(12.0, true), (12.05, false)] {
-                frame(
-                    app,
-                    ctx,
-                    740.0,
-                    time,
-                    vec![
-                        egui::Event::PointerMoved(pos),
-                        egui::Event::PointerButton {
-                            pos,
-                            button: egui::PointerButton::Primary,
-                            pressed,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                );
-            }
-            assert_eq!(app.runtime.plans[0].tasks[4].status, TaskStatus::Review);
-        },
-    );
+        }
+        assert_eq!(app.runtime.plans[0].tasks[4].status, TaskStatus::Review);
+    });
 }
 
 /// A plan and its task, each following a ticket of `system`, the plan's without an address.
