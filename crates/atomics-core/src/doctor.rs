@@ -251,7 +251,7 @@ pub fn plans_check(home: &Path) -> Vec<String> {
     for entry in entries {
         let result = entry.map_err(anyhow::Error::from).and_then(|entry| {
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "json") {
+            if !crate::plan::is_plan_file(&path) {
                 return Ok(());
             }
             Plan::load(&path).map(|_| ()).map_err(|err| anyhow::anyhow!("{}: {err:#}", path.display()))

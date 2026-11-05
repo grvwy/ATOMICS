@@ -54,6 +54,13 @@ pub enum PlanStatus {
     Archived,
 }
 
+/// Whether a file in the plans folder holds a plan. Remote conversations keep a `.remote.json` beside their plan.
+#[cfg(feature = "native")]
+pub fn is_plan_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "json")
+        && !path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".remote.json"))
+}
+
 /// Load valid plan files, including completed and archived plans, and migrate the
 /// former single plan once. File names are the stable ids, including older archives.
 #[cfg(feature = "native")]
@@ -87,9 +94,7 @@ pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
                 continue;
             }
         };
-        if path.extension().is_none_or(|ext| ext != "json")
-            || path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".remote.json"))
-        {
+        if !is_plan_file(&path) {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| valid_id(id)) else {
