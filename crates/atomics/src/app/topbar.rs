@@ -424,14 +424,11 @@ mod tests {
             let cases: [(&[AgentStatus], &str); 7] = [
                 (&[AgentStatus::Idle, AgentStatus::Idle], "2 idle"),
                 (&[AgentStatus::Working, AgentStatus::NeedsInput], "1 working · 2 open"),
-                (&[AgentStatus::NeedsInput, AgentStatus::Idle], "1 needs you · 2 open"),
-                (&[AgentStatus::NeedsInput, AgentStatus::NeedsInput], "2 need you · 2 open"),
-                (&[AgentStatus::Done, AgentStatus::Idle], "1 finished · 2 open"),
-                (&[AgentStatus::Exited, AgentStatus::Idle], "1 exited · 2 open"),
-                (
-                    &[AgentStatus::NeedsInput, AgentStatus::Done, AgentStatus::Exited, AgentStatus::Idle],
-                    "1 needs you · 1 finished · 1 exited · 4 open",
-                ),
+                (&[AgentStatus::NeedsInput, AgentStatus::Idle], "2 open"),
+                (&[AgentStatus::NeedsInput, AgentStatus::NeedsInput], "2 open"),
+                (&[AgentStatus::Done, AgentStatus::Idle], "2 open"),
+                (&[AgentStatus::Exited, AgentStatus::Idle], "2 open"),
+                (&[AgentStatus::NeedsInput, AgentStatus::Done, AgentStatus::Exited, AgentStatus::Idle], "4 open"),
             ];
             for (statuses, expected) in cases {
                 app.runtime.sessions = statuses
@@ -450,6 +447,7 @@ mod tests {
                     });
                 output.drop_without_applying_deltas();
                 assert!(shown, "{statuses:?}: expected {expected}, the bar says {count:?}");
+                assert_eq!(count, None, "{statuses:?}: agents that are not idle do not read as idle");
             }
         });
     }

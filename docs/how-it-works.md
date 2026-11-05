@@ -9,8 +9,9 @@ A session is one agent in a terminal tile: Claude, Codex or a shell. It works in
 project, an existing folder, or a scratch folder of its own outside any project (the **Ungrouped** tab).
 The diff panel shows the session's worktree against the merge-base with `base_ref`, and review comments
 on that diff go to the agent as one message while it keeps working. Claude and Codex report their status
-through hooks. The top bar separates agents working from agents open (`2 working · 12 open`), or says
-`12 idle` when none is working. This count excludes shells and the chief. The label folds away with
+through hooks. The top bar separates agents working from agents open (`2 working · 12 open`). With none working it says
+`12 idle` when every one is, and otherwise `12 open`, with who needs you, has finished or has exited on hover. It takes
+the same room in every case, so the tabs beside it keep theirs. This count excludes shells and the chief. The label folds away with
 the brand's other details as the window narrows. A session follows its agent's main thread: threads the
 agent spawns or runs for itself, such as Codex's memory agent, report through the same pane but do not move
 its folder, title or status. Sessions are saved in `sessions.json` in the state folder, and Claude sessions
