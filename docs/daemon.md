@@ -1080,9 +1080,9 @@ loads the key it holds for `host_id` and dials `Noise_IK`; with none it asks to 
 
 **The device key** is kept per host in the client origin's IndexedDB (`web/device-store.js`): the host's key and
 the device key sealed with AES-GCM under a WebCrypto key made non-extractable. `navigator.storage.persist()` is
-asked for at every boot and after saving; refusal is reported only just after a pairing saves its key, without
-blocking use of the saved key. Boot-time requests remain silent. This is a
-best-effort request, not a guarantee against eviction, private browsing, or the user clearing site data. A copy
+asked for at every boot and after saving, silently: a refusal is nothing a person can act on, and it does not stop the
+saved key from being used. This is a best-effort request, not a guarantee against eviction, private browsing, or the
+user clearing site data. A copy
 of the database is ciphertext, but script on the client's origin can use the sealing key, which is why the
 client gets an origin of its own (design §4.2, §6.2). Nothing stores the raw device key in localStorage or sends
 it to the hosting page or a server.

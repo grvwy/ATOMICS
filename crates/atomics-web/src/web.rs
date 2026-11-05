@@ -227,7 +227,7 @@ impl App {
         client.palette.apply(&ctx, &BundledFonts);
         client.icon = load_icon(&ctx);
         let inbox: Inbox = Rc::default();
-        // Keep asking at boot, but a repeated denial should not produce a note on every visit.
+        // Best effort, and silent: a refusal is nothing a person can act on.
         wasm_bindgen_futures::spawn_local(async {
             let _ = request_persistence().await;
         });
@@ -418,7 +418,7 @@ impl App {
                             "This browser could not save its pairing. Reopening this page may require pairing again.";
                         push(&inbox, &ctx, Input::Note(note));
                     } else {
-                        persistence_note(&inbox, &ctx).await;
+                        let _ = request_persistence().await;
                     }
                 });
             }
@@ -464,19 +464,6 @@ fn stored_device(host_id: &str, stored: &JsValue) -> Result<Option<Device>, Devi
         return Err(DeviceReadError);
     }
     Ok(Some(Device { host_id: host_id.to_string(), host_key, secret: Secret::from_bytes(&bytes) }))
-}
-
-/// Request persistence after a pairing saves its key; boot-time requests remain silent.
-async fn persistence_note(inbox: &Inbox, ctx: &egui::Context) {
-    if request_persistence().await.as_bool() == Some(false) {
-        push(
-            inbox,
-            ctx,
-            Input::Note(
-                "This browser has not protected this site's storage from automatic cleanup. Your saved pairing can still be used.",
-            ),
-        );
-    }
 }
 
 impl eframe::App for App {
