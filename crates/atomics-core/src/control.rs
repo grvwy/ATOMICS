@@ -84,6 +84,9 @@ pub enum ControlRequest {
         args: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         isolation: Option<crate::isolation::IsolationMode>,
+        /// A person pressed Start: if no sandbox can be had for it, ask them what to do instead of failing.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        interactive: bool,
     },
     /// Types a message and submits it, or with `raw` writes the text as-is (keys).
     Send {

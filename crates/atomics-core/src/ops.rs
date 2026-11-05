@@ -310,6 +310,22 @@ pub enum SettingsTool {
         host: Option<String>,
     },
     CleanCredentials,
+    /// Look for git and the agents again, with the login shell's PATH as it is now.
+    CheckPrograms,
+    /// Where agents run on this machine, in this host's own config file. The user's own switch, so no proposal.
+    SetIsolation {
+        mode: crate::isolation::IsolationMode,
+    },
+    /// The setup screen was finished or skipped, so it no longer opens by itself. Settings brings it back.
+    FinishSetup,
+    /// Make a git repository of a folder on the host and open it as a project.
+    InitProject {
+        path: String,
+    },
+    /// Answer the question a start that could not get a sandbox asked: run it on this machine, or leave it.
+    AnswerStart {
+        run_here: bool,
+    },
 }
 
 /// What became of an operation.
@@ -626,6 +642,9 @@ impl HostCommand {
                 }
                 SettingsTool::RemoveCredential { kind, host } => {
                     bounds.id("kind", Some(kind)).id("host", host.as_deref());
+                }
+                SettingsTool::InitProject { path } => {
+                    bounds.id("path", Some(path));
                 }
                 _ => {}
             },

@@ -1455,7 +1455,10 @@ pub fn host() -> FakeHost {
 
 /// A host with shared settings, pairing and a host folder picker.
 pub fn management() -> FakeHost {
-    use atomics_core::projection::{DeviceInfo, ManagementInfo, PairingInfo, RemoteInfo, ThemeChoice, ThemesInfo};
+    use atomics_core::projection::{
+        DeviceInfo, ManagementInfo, PairingInfo, RemoteInfo, SetupConnection, SetupInfo, SetupProgram, ThemeChoice,
+        ThemesInfo,
+    };
     let mut host = self::host();
     let choice = |name: &str, selected, file| ThemeChoice {
         name: name.into(),
@@ -1503,6 +1506,43 @@ pub fn management() -> FakeHost {
                 {"id": "registry", "label": "Private registry"},
             ],
         }),
+        setup: SetupInfo {
+            programs: vec![
+                SetupProgram {
+                    name: "git".into(),
+                    agent: None,
+                    found: Some("/usr/bin/git".into()),
+                    install: "sudo apt-get install git".into(),
+                },
+                SetupProgram {
+                    name: "Claude Code".into(),
+                    agent: Some("claude".into()),
+                    found: Some("~/.local/bin/claude".into()),
+                    install: "curl -fsSL https://claude.ai/install.sh | bash".into(),
+                },
+                SetupProgram {
+                    name: "Codex".into(),
+                    agent: Some("codex".into()),
+                    found: None,
+                    install: "npm install -g @openai/codex".into(),
+                },
+            ],
+            connections: [
+                ("github", "GitHub", "See, review and merge pull requests here.", None),
+                ("azure", "Azure DevOps", "Uses the Azure CLI's sign-in.", Some("az login")),
+                ("tickets", "Tickets", "Follows a ticket system once the config has a [tickets] profile for it.", None),
+                ("remote", "Remote devices", "Follow and steer agents from a phone or another computer.", None),
+            ]
+            .map(|(id, name, note, command): (&str, &str, &str, Option<&str>)| SetupConnection {
+                id: id.into(),
+                name: name.into(),
+                connected: None,
+                note: note.into(),
+                command: command.map(str::to_string),
+            })
+            .into(),
+            ..SetupInfo::default()
+        },
         themes: ThemesInfo {
             choices: vec![choice("claude", true, false), choice("midnight", false, false), choice("dusk", false, true)],
             host_file: "config.d/host.toml".into(),

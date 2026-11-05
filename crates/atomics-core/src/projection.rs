@@ -286,6 +286,65 @@ pub struct ManagementInfo {
     pub tools: serde_json::Value,
     #[serde(default)]
     pub themes: ThemesInfo,
+    #[serde(default)]
+    pub setup: SetupInfo,
+}
+
+/// What the setup screen shows, and the question a start that could not get a sandbox asks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupInfo {
+    /// A first run that nobody has finished or skipped yet: the screen opens by itself.
+    pub first_run: bool,
+    /// The host is looking for the programs now.
+    pub checking: bool,
+    /// git and the agents, once the host has looked for them.
+    pub programs: Vec<SetupProgram>,
+    /// The first project open on the host.
+    pub project: Option<String>,
+    pub connections: Vec<SetupConnection>,
+    pub start_choice: Option<StartChoice>,
+}
+
+/// A program setup looks for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupProgram {
+    /// As a person calls it: Claude Code.
+    pub name: String,
+    /// The configured agent it runs; none for what no agent is, such as git.
+    pub agent: Option<String>,
+    /// Where it is, as the host shows a path.
+    pub found: Option<String>,
+    /// What to run to get it.
+    pub install: String,
+}
+
+/// Something ATOMICS can connect to, which can always wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupConnection {
+    /// `github`, `azure`, `tickets` or `remote`: says what its Connect button does.
+    pub id: String,
+    pub name: String,
+    /// What it is connected as.
+    pub connected: Option<String>,
+    /// What connecting it means, or what it still needs.
+    pub note: String,
+    /// What to run in a terminal, where it takes one.
+    pub command: Option<String>,
+}
+
+/// A person's start that could not get a sandbox, waiting for them to say what to do. ATOMICS never runs a sandboxed
+/// agent bare on its own, so this asks instead of failing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartChoice {
+    pub agent: String,
+    /// What is missing, and what the sandbox's own tool said.
+    pub why: String,
+    /// Its repository requires sandboxed agents, so running it on this machine is no option.
+    pub sandbox_required: bool,
 }
 
 /// What Settings offers to pick a theme from.

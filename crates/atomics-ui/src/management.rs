@@ -7,12 +7,23 @@ use egui::RichText;
 
 mod remote;
 mod settings;
+pub mod setup;
 
 #[derive(Default)]
 pub struct State {
     pub settings: bool,
     pub remote: bool,
     pub project: bool,
+    /// The setup screen shows.
+    pub setup: bool,
+    /// A first run has opened it, here, once.
+    setup_opened: bool,
+    /// It has asked the host to look for the programs since it opened.
+    setup_loaded: bool,
+    /// The connections it says will wait, by id.
+    later: Vec<String>,
+    /// The Settings section that opens as Settings next draws.
+    open_section: Option<String>,
     pub folder: Option<String>,
     pub folder_page: u32,
     pub filter: String,
@@ -55,9 +66,9 @@ impl State {
     }
 }
 
-/// Whether Settings, Remote or the project picker is open.
+/// Whether Settings, Remote, the setup screen or the project picker is open.
 pub fn window_open(client: &Client) -> bool {
-    client.management.settings || client.management.remote || client.management.project
+    client.management.settings || client.management.remote || client.management.project || client.management.setup
 }
 
 /// The windows' share of the keyboard. Every client calls this as its frame begins, before it draws anything that
@@ -76,8 +87,10 @@ pub fn begin_frame(ctx: &egui::Context, backend: &dyn Backend, client: &mut Clie
             &mut state.project
         } else if state.remote {
             &mut state.remote
-        } else {
+        } else if state.settings {
             &mut state.settings
+        } else {
+            &mut state.setup
         };
         *top = false;
     }
@@ -131,6 +144,8 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
     let Some(info) = backend.management() else { return };
     let screen = ctx.content_rect();
     let width = (screen.width() - 24.0).clamp(160.0, 780.0);
+    setup::track(ctx, backend, client, &info);
+    setup::window(ctx, backend, client, &info);
     if client.management.settings {
         // Its top stays put as sections open and close, so the row under the pointer does not move away.
         const TOP: f32 = 44.0;
@@ -149,7 +164,8 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
                     .max_height((screen.height() - TOP - WINDOW_CHROME).max(120.0))
                     .show(ui, |ui| settings::draw(ui, backend, client, &info));
             });
-        client.management.settings = open;
+        // Something in it may have closed it, as Open the setup screen does.
+        client.management.settings &= open;
     }
     if client.management.remote {
         let mut open = true;
@@ -174,6 +190,7 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
         client.management.project &= open;
     }
     proposal(ctx, backend, client, &info);
+    setup::start_choice(ctx, backend, client, &info);
     // What opened or closed as this frame drew moves the keyboard as the next begins.
     if window_open(client) != client.management.keyboard {
         ctx.request_repaint();
@@ -208,6 +225,15 @@ fn folder(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &
             }
             if ui.add_enabled(folder.project, egui::Button::new("Open this project or worktree")).clicked() {
                 client.send(Command::OpenProject(folder.worktree.as_deref().unwrap_or(&path).into()));
+                client.management.project = false;
+            }
+            let init =
+                HostAction::SettingsTool { tool: atomics_core::ops::SettingsTool::InitProject { path: path.clone() } };
+            if !folder.project
+                && allowed(backend, &init)
+                && ui.button("Make this folder a project (git init)").clicked()
+            {
+                client.send(Command::Manage(init));
                 client.management.project = false;
             }
             ui.horizontal(|ui| {

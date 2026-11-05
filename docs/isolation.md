@@ -4,10 +4,15 @@ ATOMICS runs each agent in one of two modes:
 
 | Mode | Where the agent runs | What it can reach |
 | --- | --- | --- |
-| `sandbox` (default) | Its own [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM, made with `sbx` | Its worktree, git's write folders, the folders you mount read-only, and the network sbx's policy allows |
+| `sandbox` | Its own [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM, made with `sbx` | Its worktree, git's write folders, the folders you mount read-only, and the network sbx's policy allows |
 | `bare` | Directly on this machine, in the tile's terminal | Everything you can reach: your files, credentials, SSH agent and network |
 
-Sandboxes are the default because an agent works unattended for long stretches. In a sandbox, a
+A new install runs agents `bare`, under your own login, because sandboxes need Docker's tools and a Docker account,
+and those can wait: the setup screen and Settings → Agents switch modes with a click, in this machine's own
+`config.d/<host>.toml`. A config file that names no mode means `sandbox`, so an install from before this keeps what it
+has.
+
+Sandboxes are the stronger choice because an agent works unattended for long stretches. In a sandbox, a
 mistake or a prompt injection reaches only what the sandbox mounts: the agent's worktree and its
 repository's git objects and refs. Bare mode is how ATOMICS ran agents before sandboxes, unchanged.
 
@@ -21,9 +26,11 @@ sbx login
 ```
 
 Before it makes or reattaches to a sandbox, ATOMICS checks that `sbx` is installed, recent enough and
-signed in. **ATOMICS never falls back to bare.** If a check fails, the agent does not start. Its tile
-and a toast say what to do, and a plan task dispatched to it is blocked with the reason. To run agents
-on this machine anyway, set `mode = "bare"`. `atomics doctor` shows whether sandboxes are ready.
+signed in. **ATOMICS never falls back to bare on its own.** If a check fails, the agent does not start. When you
+pressed Start, ATOMICS asks what to do: **Run on this machine** starts it there and keeps this machine on `bare`,
+**Set up sandboxes** opens Settings → Agents, and **Cancel** leaves it. A repository that requires sandboxes offers only
+the last two. A start nobody pressed, by the chief or another agent, has nobody to ask: its tile and a toast say what
+to do, and a plan task dispatched to it is blocked with the reason. `atomics doctor` shows whether sandboxes are ready.
 
 ## Fresh machine: one guided command
 

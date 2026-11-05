@@ -1954,6 +1954,113 @@ fn headless_shots() {
     }
 }
 
+/// A first run's host: the setup screen opens by itself, in every layout, and skipping it tells the host; a client that
+/// may not change the host never sees it; the question a refused start asks goes the same way.
+#[test]
+fn a_first_run_opens_the_setup_screen_once_and_skipping_it_tells_the_host() {
+    use atomics_core::ops::SettingsTool;
+    let first_run = || {
+        let mut host = fake_host::management();
+        host.board.host.management.as_mut().unwrap().setup.first_run = true;
+        host
+    };
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(first_run());
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        // Start and the way out stay in view at any size; the rest scrolls.
+        for label in ["Your agents", "Where agents run", "Start Claude Code", "Skip for now"] {
+            assert!(has(&shown, label), "{label} on {size:?}: {shown:?}");
+        }
+        if size == WIDE {
+            assert!(has(&shown, "A first project") && has(&shown, "Connections"), "{shown:?}");
+        }
+        assert!(!has(&shown, "Start Codex"), "not found on the host: {shown:?}");
+        assert_eq!(tools_sent(&world), [SettingsTool::CheckPrograms], "it looks as it opens, once");
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "Skip for now");
+        assert!(!has(&shown, "Your agents"), "{size:?}: {shown:?}");
+        assert_eq!(tools_sent(&world).last(), Some(&SettingsTool::FinishSetup), "{size:?}");
+        // The host's answer has not come back yet, and it does not open again meanwhile.
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!has(&shown, "Your agents"), "{size:?}: {shown:?}");
+    }
+    // With nothing running it has the window to itself, and a short window still shows the way on.
+    for size in [WIDE, (1100.0, 560.0)] {
+        let mut host = first_run();
+        host.board.sessions.clear();
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Your agents") && has(&shown, "Start Claude Code"), "{size:?}: {shown:?}");
+        assert!(!has(&shown, "Set up ATOMICS") && !has(&shown, "Settings"), "no window, no top bar: {shown:?}");
+        click_on(&ctx, &mut world, &mut client, &mut view, size, "Skip for now");
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        // Settings may have folded into a menu at this width; the welcome's own Start is there either way.
+        assert!(has(&shown, "Start claude") && !has(&shown, "Your agents"), "the usual window: {shown:?}");
+    }
+
+    let (ctx, mut world, mut client, mut view) = viewing(first_run());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "Your agents"), "a viewer has nothing to set up: {shown:?}");
+    assert!(tools_sent(&world).is_empty());
+
+    for size in [WIDE, PHONE] {
+        let mut host = fake_host::management();
+        host.board.host.management.as_mut().unwrap().setup.start_choice = Some(atomics_core::projection::StartChoice {
+            agent: "claude".into(),
+            why: "Docker Sandboxes (sbx) is not installed.".into(),
+            sandbox_required: false,
+        });
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Set up sandboxes"), "{size:?}: {shown:?}");
+        click_on(&ctx, &mut world, &mut client, &mut view, size, "Run on this machine");
+        assert_eq!(tools_sent(&world).last(), Some(&SettingsTool::AnswerStart { run_here: true }), "{size:?}");
+    }
+}
+
+/// The setup screen as a first run sees it. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where it goes.
+#[test]
+#[ignore]
+fn headless_setup_shots() {
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    let shots = [
+        ("page-1600", WIDE, true),
+        ("page-1100", (1100.0, 800.0), true),
+        ("page-short", (1100.0, 560.0), true),
+        ("window-1600", WIDE, false),
+        ("phone-390", PHONE, false),
+    ];
+    for (name, (width, height), empty) in shots {
+        let mut host = fake_host::management();
+        host.board.host.management.as_mut().unwrap().setup.first_run = true;
+        if empty {
+            host.board.sessions.clear();
+        }
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        let mut raster = crate::test_raster::Raster::default();
+        let mut last = None;
+        // Long enough for a window's fade-in to finish.
+        for _ in 0..40 {
+            view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height))),
+                time: Some(view.now_ms / 1000.0),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        let ppp = output.pixels_per_point;
+        let size = [(width * ppp).round() as usize, (height * ppp).round() as usize];
+        let image = raster.paint(&ctx, output, size, client.palette.background);
+        crate::test_raster::save_png(&dir.join(format!("setup-{name}.png")), &image).unwrap();
+    }
+}
+
 /// Settings and the ticket reader, each section open, at the wide window's size and on a phone's, through the same
 /// rasterizer. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
 #[test]
@@ -2461,6 +2568,8 @@ fn view_only_clients_read_settings_and_devices_but_cannot_change_them() {
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "midnight")));
         assert!(has(&shown, "View only: settings changes"), "{size:?}: {shown:?}");
+        // Theme opens by itself and takes most of a phone's height.
+        section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         assert!(has(&shown, "Effective configuration"), "{size:?}: {shown:?}");
         section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");

@@ -356,7 +356,16 @@ impl State {
                 if self.config.agent(&agent).is_none() {
                     return Err(not_found(format!("no agent {agent} is configured")));
                 }
-                ControlRequest::Start { agent, folder, repo, branch, prompt, args: Vec::new(), isolation: None }
+                ControlRequest::Start {
+                    agent,
+                    folder,
+                    repo,
+                    branch,
+                    prompt,
+                    args: Vec::new(),
+                    isolation: None,
+                    interactive: true,
+                }
             }
             SessionAction::Close { session } => {
                 self.session_by_id(&session)?;

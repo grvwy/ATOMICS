@@ -56,7 +56,7 @@ impl State {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
         env.insert("COLORFGBG".into(), self.theme.colorfgbg().into());
-        if let Some(shell_path) = SHELL_PATH.as_ref() {
+        if let Some(shell_path) = crate::setup::login_path_now().as_ref() {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;

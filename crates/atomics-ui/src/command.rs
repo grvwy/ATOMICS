@@ -174,6 +174,8 @@ pub enum Command {
     },
 
     // ── The ticket system's sign-in ────────────────────────────────────────────────────────────────────
+    /// Open the GitHub controls and start connecting; only a host's own window can.
+    ConnectGithub,
     /// Sign in to the ticket system, or again after the server refused the saved sign-in: the host's
     /// sign-in job, after which its ticket worker connects again. A desktop host may open its browser.
     SignInTickets,
@@ -346,6 +348,7 @@ impl Command {
                 | Command::HideChief
                 | Command::ResizeChief(_)
                 | Command::Toast(_)
+                | Command::ConnectGithub
         )
     }
 

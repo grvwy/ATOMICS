@@ -14,6 +14,11 @@ cleanup() {
 }
 trap cleanup EXIT
 export ATOMICS_HOME="$qa/state" ATOMICS_CONFIG="$qa/config.toml" ATOMICS_SOCKET="$qa/atomics.sock"
+# A person's first run: no config, in its usual place, so that the setup screen opens.
+if [[ -n ${ATOMICS_QA_FIRST_RUN:-} ]]; then
+    unset ATOMICS_CONFIG
+    export XDG_CONFIG_HOME="$qa/xdg-config"
+fi
 export XDG_RUNTIME_DIR="$qa/runtime"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 unset ATOMICS_PANE WAYLAND_DISPLAY

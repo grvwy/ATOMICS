@@ -109,6 +109,11 @@ pub struct Ready {
 /// How to opt out, which every refusal says: ATOMICS never runs a sandboxed agent bare on its own.
 const BARE: &str = "or set [isolation] mode = \"bare\" to run agents directly on this machine";
 
+/// A refusal with its way out taken off, for a person who is being offered that as a button.
+pub(crate) fn without_opt_out(why: &str) -> String {
+    why.replace(&format!(", {BARE}"), "").replace(&format!("; {BARE}"), "")
+}
+
 /// Checks that sbx can run sandboxes: installed, at least [`MIN_SBX_VERSION`], and signed in
 /// to Docker. A failure says what to do about it.
 pub fn preflight(program: &str) -> Result<Ready, String> {
@@ -818,7 +823,7 @@ pub(crate) fn sbx_env(command: &mut Command, ssh_agent: bool) {
     if !ssh_agent {
         command.env_remove("SSH_AUTH_SOCK");
     }
-    if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
+    if let Some(path) = crate::setup::login_path_now().as_ref() {
         command.env("PATH", path);
     }
 }

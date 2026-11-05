@@ -125,6 +125,11 @@ pub fn config_file() -> PathBuf {
     base.join("atomics").join("config.toml")
 }
 
+/// Someone named the config file, so it is no person's own config in its usual place.
+pub fn config_named() -> bool {
+    env_override("CONFIG").is_some()
+}
+
 /// `ATOMICS_<name>`, or `IMACS_<name>` as set for builds from before the rename to ATOMICS.
 pub fn env_override(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(format!("ATOMICS_{name}")).or_else(|| std::env::var_os(format!("IMACS_{name}")))

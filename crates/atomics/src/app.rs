@@ -75,6 +75,7 @@ mod restart;
 mod sandbox_settings;
 mod selfconfig;
 mod sessions;
+mod setup_screen;
 mod sidebar;
 mod themes;
 mod tickets;
@@ -209,11 +210,29 @@ struct AgentLaunch {
     ref_guard: Option<crate::ref_guard::Shared>,
     /// A sandboxed Claude's placeholder for the Claude subscription.
     relay: Option<crate::relay::Granted>,
+    /// A person pressed Start for it.
+    interactive: bool,
 }
 
 /// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
 /// session's relay placeholder and the MCP servers it needs that are not connected.
-type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>), String>;
+type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>), NotPrepared>;
+
+/// Why a launch did not get as far as starting its agent.
+#[derive(Debug)]
+enum NotPrepared {
+    /// No sandbox could be had for it: what a person who pressed Start gets asked about.
+    Sandbox(String),
+    Other(String),
+}
+
+impl From<NotPrepared> for String {
+    fn from(failure: NotPrepared) -> String {
+        match failure {
+            NotPrepared::Sandbox(why) | NotPrepared::Other(why) => why,
+        }
+    }
+}
 
 struct Pending {
     text: String,
@@ -285,6 +304,8 @@ struct Launch {
     task: Option<(String, String)>,
     /// That task's own isolation.
     isolation: Option<atomics_core::isolation::IsolationMode>,
+    /// A person pressed Start for it.
+    interactive: bool,
 }
 
 /// A background worktree job completed all preparation needed before launch.
@@ -511,6 +532,12 @@ pub(crate) struct State {
     shutting_down: bool,
     sandbox_check: Option<Receiver<Vec<String>>>,
     sandbox_lines: Vec<String>,
+    programs_check: Option<Receiver<Vec<atomics_core::projection::SetupProgram>>>,
+    setup_programs: Vec<atomics_core::projection::SetupProgram>,
+    /// A person's start that could not get a sandbox, until they say what to do.
+    start_choice: Option<setup_screen::PendingStart>,
+    /// The next launch comes from a person pressing Start, and so may ask them about it.
+    interactive_start: bool,
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
@@ -934,6 +961,9 @@ impl State {
         crate::sandbox::load_pins(&paths::git_pins_dir());
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
+        // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone
+        // named belongs to a test, a QA instance or a managed host, whose runs nobody sets up by hand.
+        let first_run = !config_path.exists() && !paths::config_named();
         let (mut config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
@@ -1038,6 +1068,10 @@ impl State {
             sbx: sbx.into(),
             sandbox_check: None,
             sandbox_lines: Vec::new(),
+            programs_check: None,
+            setup_programs: Vec::new(),
+            start_choice: None,
+            interactive_start: false,
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
             startup_cleanup: None,
@@ -1075,7 +1109,16 @@ impl State {
             output_delay: None,
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
             needs_input_checked: Instant::now() - NEEDS_INPUT_CHECK_INTERVAL,
-            store: Store::load(&paths::store_file()),
+            store: {
+                let mut store = Store::load(&paths::store_file());
+                if first_run {
+                    store.setup_pending = true;
+                    if let Err(error) = store.save(&paths::store_file()) {
+                        eprintln!("ATOMICS: could not save the first run: {error:#}");
+                    }
+                }
+                store
+            },
             dismissed: HashSet::new(),
             repos: Vec::new(),
             open_projects: Vec::new(),
@@ -1622,6 +1665,9 @@ mod client_tests;
 
 #[cfg(test)]
 mod sandbox_tests;
+
+#[cfg(test)]
+mod setup_tests;
 
 #[cfg(test)]
 mod ungrouped_tests;

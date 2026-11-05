@@ -1,0 +1,387 @@
+//! The setup screen and the question a refused start asks, in the desktop's own paint order, on a home with no config
+//! where it matters: a first run has to reach a first agent with clicks alone.
+use super::sandbox_tests::tick_until;
+use super::tests::{repository, request, session, with_app, with_login_state};
+use super::*;
+use atomics_core::config::AgentKind;
+use atomics_core::isolation::IsolationMode;
+use atomics_core::ops::{HostAction, SettingsTool};
+
+type Texts = Vec<(String, Pos2)>;
+
+fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> Texts {
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 1000.0))),
+            time: Some(ctx.input(|input| input.time) + 0.1),
+            events,
+            ..Default::default()
+        },
+        |ui| app.paint(ui),
+    );
+    app.runtime.drain_actions();
+    let texts = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(t) => {
+                Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2()))
+            }
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    texts
+}
+
+fn settle(app: &mut Desktop<'_>, ctx: &egui::Context) -> Texts {
+    frame(app, ctx, vec![]);
+    frame(app, ctx, vec![]);
+    frame(app, ctx, vec![])
+}
+
+fn has(texts: &Texts, text: &str) -> bool {
+    texts.iter().any(|(shown, _)| shown == text)
+}
+
+fn click_at(app: &mut Desktop<'_>, ctx: &egui::Context, pos: Pos2) -> Texts {
+    let event = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
+    frame(app, ctx, vec![event(true)]);
+    frame(app, ctx, vec![event(false)]);
+    settle(app, ctx)
+}
+
+fn click(app: &mut Desktop<'_>, ctx: &egui::Context, label: &str) -> Texts {
+    let shown = settle(app, ctx);
+    let pos = shown.iter().find(|(text, _)| text == label).unwrap_or_else(|| panic!("{label} in {shown:?}")).1;
+    click_at(app, ctx, pos)
+}
+
+/// The text `label` on the row of `row`.
+fn click_beside(app: &mut Desktop<'_>, ctx: &egui::Context, row: &str, label: &str) -> Texts {
+    let shown = settle(app, ctx);
+    let y = shown.iter().find(|(text, _)| text == row).unwrap_or_else(|| panic!("{row} in {shown:?}")).1.y;
+    let pos = shown
+        .iter()
+        .filter(|(text, _)| text == label)
+        .min_by(|a, b| (a.1.y - y).abs().total_cmp(&(b.1.y - y).abs()))
+        .unwrap_or_else(|| panic!("{label} in {shown:?}"))
+        .1;
+    click_at(app, ctx, pos)
+}
+
+/// The window's own control requests, as `App` hands them to the host, with the replies a window applies.
+fn run_requests(app: &mut Desktop<'_>) {
+    for command in std::mem::take(&mut app.runtime.client_commands) {
+        let response = request(app, serde_json::to_value(&command).unwrap());
+        assert!(response.ok, "{:?}", response.error);
+        app.control_reply(true, response);
+    }
+}
+
+/// A home with nothing in it, as a person's has, whose login shell's PATH finds these programs.
+fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::OsString)> {
+    let tools = home.join("login-tools");
+    std::fs::create_dir(&tools).unwrap();
+    for program in programs {
+        crate::test_support::write_program(tools.join(program), "#!/bin/sh\nexec cat\n");
+    }
+    let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+    let shell = home.join("login-shell");
+    crate::test_support::write_program(
+        &shell,
+        format!("#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nPATH='{login}'\nexport PATH\neval \"$4\"\n"),
+    );
+    vec![
+        (super::tests::FRESH_HOME, "1".into()),
+        ("XDG_CONFIG_HOME", home.join("xdg-config").into_os_string()),
+        ("SHELL", shell.into_os_string()),
+    ]
+}
+
+fn with_fresh_app(
+    name: &str,
+    programs: &'static [&'static str],
+    test: impl FnOnce(&mut Desktop<'_>, &egui::Context, &Path),
+) {
+    with_login_state(
+        name,
+        |home| fresh_home(home, programs),
+        |mut state, ctx| {
+            let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+            let home = paths::home();
+            test(&mut Desktop { runtime: &mut state, client: &mut client }, ctx, &home);
+            state.shutdown();
+        },
+    );
+}
+
+fn look_for_programs(app: &mut Desktop<'_>, ctx: &egui::Context) {
+    frame(app, ctx, vec![]);
+    frame(app, ctx, vec![]);
+    tick_until(app, ctx, "the programs", |app| {
+        app.runtime.programs_check.is_none() && !app.runtime.setup_programs.is_empty()
+    });
+}
+
+#[test]
+fn a_fresh_home_reaches_a_first_agent_with_clicks_and_every_connection_can_wait() {
+    with_fresh_app(
+        "app::setup_tests::a_fresh_home_reaches_a_first_agent_with_clicks_and_every_connection_can_wait",
+        &["claude"],
+        |app, ctx, _| {
+            assert!(app.runtime.store.setup_pending, "no config means a first run");
+            let file = std::fs::read_to_string(paths::config_file()).unwrap();
+            assert!(file.contains("\nmode = \"bare\"\n"), "a new install runs on this machine: {file}");
+
+            look_for_programs(app, ctx);
+            let shown = settle(app, ctx);
+            assert!(app.client.ui.management.setup, "it opens by itself");
+            for step in ["Your agents", "Where agents run", "A first project", "Connections", "Claude Code", "Codex"] {
+                assert!(has(&shown, step), "{step}: {shown:?}");
+            }
+            assert!(!has(&shown, "Project"), "it has the window to itself: {shown:?}");
+            assert!(has(&shown, "not found"), "Codex is not there: {shown:?}");
+            assert!(has(&shown, "Start Claude Code") && !has(&shown, "Start Codex"), "{shown:?}");
+
+            // Every connection waits with a click, and nothing asks about it again.
+            for row in ["GitHub", "Azure DevOps", "Tickets", "Remote devices"] {
+                let shown = click_beside(app, ctx, row, "Connect later");
+                assert!(has(&shown, row), "{shown:?}");
+            }
+            let shown = settle(app, ctx);
+            assert!(!has(&shown, "Connect later"), "{shown:?}");
+
+            // The first Start works, with nothing else done.
+            click(app, ctx, "Start Claude Code");
+            assert!(!app.client.ui.management.setup, "the agent takes the window");
+            assert!(!app.runtime.store.setup_pending, "done with");
+            assert!(!Store::load(&paths::store_file()).setup_pending, "and it stays done");
+            run_requests(app);
+            let [session] = &app.runtime.sessions[..] else { panic!("one agent: {:?}", app.runtime.sessions.len()) };
+            assert!(session.sandbox.is_none(), "on this machine");
+            assert!(session.scratch.is_some(), "in a scratch folder, with no project picked");
+            let id = session.id.clone();
+            assert!(app.runtime.start_choice.is_none());
+
+            // Ctrl+1 reaches it from here, and nothing types into its terminal.
+            let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+            app.runtime.diff_open = false;
+            frame(
+                app,
+                ctx,
+                vec![egui::Event::Key {
+                    key: Key::Num1,
+                    physical_key: Some(Key::Num1),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+            );
+            assert_eq!(app.runtime.active.as_deref(), Some(id.as_str()));
+            assert!(app.runtime.diff_open && app.runtime.panel == PanelMode::Diff, "its diff shows");
+        },
+    );
+}
+
+#[test]
+fn an_agent_installed_while_the_screen_shows_is_found_and_starts_without_a_restart() {
+    with_fresh_app(
+        "app::setup_tests::an_agent_installed_while_the_screen_shows_is_found_and_starts_without_a_restart",
+        &[],
+        |app, ctx, home| {
+            look_for_programs(app, ctx);
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Claude Code") && !has(&shown, "Start Claude Code"), "{shown:?}");
+            assert!(shown.iter().any(|(text, _)| text.starts_with("Copy: curl")), "how to get it: {shown:?}");
+
+            crate::test_support::write_program(home.join("login-tools/claude"), "#!/bin/sh\nexec cat\n");
+            click_beside(app, ctx, "Your agents", "Check again");
+            tick_until(app, ctx, "the second look", |app| app.runtime.programs_check.is_none());
+            click(app, ctx, "Start Claude Code");
+            run_requests(app);
+            let session = &app.runtime.sessions[0];
+            assert_ne!(session.status, AgentStatus::Exited, "{:?}", session.last_message);
+            assert!(crate::setup::find_program("claude").is_some(), "what starts from now on finds it too");
+        },
+    );
+}
+
+#[test]
+fn an_existing_install_gets_no_screen_and_keeps_its_settings() {
+    with_app("app::setup_tests::an_existing_install_gets_no_screen_and_keeps_its_settings", |app, ctx| {
+        let before = std::fs::read_to_string(paths::config_file()).unwrap();
+        let shown = settle(app, ctx);
+        assert!(!app.runtime.store.setup_pending && !app.client.ui.management.setup);
+        assert!(!has(&shown, "Your agents"), "{shown:?}");
+        assert_eq!(std::fs::read_to_string(paths::config_file()).unwrap(), before);
+    });
+}
+
+#[test]
+fn skipping_lasts_and_settings_brings_the_screen_back_as_a_window_over_agents() {
+    with_app(
+        "app::setup_tests::skipping_lasts_and_settings_brings_the_screen_back_as_a_window_over_agents",
+        |app, ctx| {
+            app.runtime.store.setup_pending = true;
+            look_for_programs(app, ctx);
+            assert!(app.client.ui.management.setup);
+            frame(
+                app,
+                ctx,
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: Some(Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            let shown = settle(app, ctx);
+            assert!(!app.client.ui.management.setup && !app.runtime.store.setup_pending, "Escape skips it");
+            assert!(!has(&shown, "Your agents"), "{shown:?}");
+
+            app.client.ui.management.settings = true;
+            settle(app, ctx);
+            click(app, ctx, "Getting started");
+            let shown = click(app, ctx, "Open the setup screen");
+            assert!(app.client.ui.management.setup && !app.client.ui.management.settings);
+            assert!(has(&shown, "Your agents") && has(&shown, "Close"), "{shown:?}");
+            assert!(!has(&shown, "Set up ATOMICS"), "with nothing running it has the window: {shown:?}");
+            let shown = click(app, ctx, "Close");
+            assert!(!app.client.ui.management.setup, "{shown:?}");
+
+            // Over a running agent it is a window, and the agent stays on screen behind it.
+            let root = paths::home();
+            app.runtime.sessions = vec![session("agent", AgentKind::Generic, AgentStatus::Working, &root)];
+            app.runtime.active = Some("agent".into());
+            app.runtime.ungrouped = true;
+            app.client.ui.management.setup = true;
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Set up ATOMICS") && has(&shown, "Your agents"), "{shown:?}");
+            app.client.ui.management.setup = false;
+            app.runtime.sessions.clear();
+        },
+    );
+}
+
+#[test]
+fn a_person_whose_start_has_no_sandbox_gets_asked_and_an_agents_start_does_not() {
+    with_app(
+        "app::setup_tests::a_person_whose_start_has_no_sandbox_gets_asked_and_an_agents_start_does_not",
+        |app, ctx| {
+            let main = std::fs::read_to_string(paths::config_file()).unwrap();
+            app.runtime
+                .manage(HostAction::SettingsTool { tool: SettingsTool::SetIsolation { mode: IsolationMode::Sandbox } })
+                .unwrap();
+            assert_eq!(app.runtime.config.isolation.mode, IsolationMode::Sandbox);
+            assert_eq!(
+                std::fs::read_to_string(paths::config_file()).unwrap(),
+                main,
+                "this machine's own file takes it"
+            );
+            let ask = |app: &mut Desktop<'_>| {
+                app.send(Command::Start { agent: "shell".into(), folder: None });
+                run_requests(app);
+                tick_until(app, ctx, "the sandbox's preparation", |app| app.runtime.pending_sandbox.is_empty());
+            };
+
+            // Leaving it takes the scratch folder with it, and nothing stays behind on screen.
+            ask(app);
+            let waiting = app.runtime.start_choice.as_ref().expect("asks");
+            let scratch = waiting.cwd.clone();
+            assert!(scratch.is_dir());
+            assert!(app.runtime.sessions.is_empty(), "no failed tile");
+            let why = app.runtime.management_info().setup.start_choice.unwrap().why;
+            assert!(why.contains("not installed"), "{why}");
+            assert!(!why.contains("[isolation]"), "the button is the way out, not a file to edit: {why}");
+            let shown = settle(app, ctx);
+            for label in ["Run on this machine", "Set up sandboxes", "Cancel"] {
+                assert!(has(&shown, label), "{label}: {shown:?}");
+            }
+            click(app, ctx, "Cancel");
+            assert!(app.runtime.start_choice.is_none() && !scratch.exists());
+            assert_eq!(app.runtime.config.isolation.mode, IsolationMode::Sandbox, "nothing changed");
+
+            // Setting them up goes to where that is done.
+            ask(app);
+            let shown = click(app, ctx, "Set up sandboxes");
+            assert!(app.runtime.start_choice.is_none() && app.client.ui.management.settings);
+            assert!(has(&shown, "Docker Sandboxes"), "the Agents section is open: {shown:?}");
+            app.client.ui.management.settings = false;
+            settle(app, ctx);
+
+            // An agent's start has nobody to ask: it fails as before.
+            let response = request(app, serde_json::json!({"cmd": "start", "agent": "shell"}));
+            assert!(response.ok, "{:?}", response.error);
+            tick_until(app, ctx, "the sandbox's preparation", |app| app.runtime.pending_sandbox.is_empty());
+            assert!(app.runtime.start_choice.is_none());
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::Exited);
+            app.runtime.sessions.clear();
+
+            // Running here runs it, and this machine keeps doing that.
+            ask(app);
+            let shown = click(app, ctx, "Run on this machine");
+            assert!(app.runtime.start_choice.is_none(), "{shown:?}");
+            let [session] = &app.runtime.sessions[..] else { panic!("the agent runs") };
+            assert!(session.sandbox.is_none());
+            assert_ne!(session.status, AgentStatus::Exited, "{:?}", session.last_message);
+            assert_eq!(app.runtime.active.as_deref(), Some(session.id.as_str()));
+            assert_eq!(app.runtime.config.isolation.mode, IsolationMode::Bare);
+            let [_, host_file] = Config::source_paths(&app.runtime.config_path);
+            assert!(std::fs::read_to_string(host_file).unwrap().contains("mode = \"bare\""));
+        },
+    );
+}
+
+#[test]
+fn a_repository_that_requires_sandboxes_offers_only_setting_them_up() {
+    with_app("app::setup_tests::a_repository_that_requires_sandboxes_offers_only_setting_them_up", |app, ctx| {
+        let (_dir, repo) = repository();
+        std::fs::create_dir_all(repo.join(".atomics")).unwrap();
+        std::fs::write(repo.join(".atomics/config.toml"), "[isolation]\nmode = \"sandbox\"\n").unwrap();
+        app.send(Command::Start { agent: "shell".into(), folder: Some(repo.clone()) });
+        run_requests(app);
+        tick_until(app, ctx, "the sandbox's preparation", |app| app.runtime.pending_sandbox.is_empty());
+        let choice = app.runtime.management_info().setup.start_choice.expect("asks");
+        assert!(choice.sandbox_required);
+        let shown = settle(app, ctx);
+        assert!(has(&shown, "Set up sandboxes") && !has(&shown, "Run on this machine"), "{shown:?}");
+        // Nor can another client force it.
+        app.runtime.manage(HostAction::SettingsTool { tool: SettingsTool::AnswerStart { run_here: true } }).unwrap();
+        assert!(app.runtime.sessions.is_empty() && app.runtime.start_choice.is_none());
+        assert!(repo.is_dir(), "only a scratch folder goes with the answer");
+    });
+}
+
+#[test]
+fn a_folder_with_no_repository_can_be_made_a_first_project_and_a_repository_stays_as_it_is() {
+    with_app(
+        "app::setup_tests::a_folder_with_no_repository_can_be_made_a_first_project_and_a_repository_stays_as_it_is",
+        |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let folder = dir.path().join("plain");
+            std::fs::create_dir(&folder).unwrap();
+            let init = |path: &Path| HostAction::SettingsTool {
+                tool: SettingsTool::InitProject { path: path.to_string_lossy().into_owned() },
+            };
+            app.runtime.manage(init(&folder)).unwrap();
+            assert!(folder.join(".git").exists());
+            let root = folder.canonicalize().unwrap();
+            assert!(app.runtime.open_projects.iter().any(|project| project.canonicalize().unwrap() == root));
+            assert_eq!(app.runtime.setup_info().project, Some(paths::display(&app.runtime.open_projects[0])));
+
+            let (_dir, repo) = repository();
+            let head = std::fs::read_to_string(repo.join(".git/HEAD")).unwrap();
+            app.runtime.manage(init(&repo)).unwrap();
+            assert_eq!(std::fs::read_to_string(repo.join(".git/HEAD")).unwrap(), head);
+            assert!(app.runtime.manage(init(&dir.path().join("missing"))).is_err());
+        },
+    );
+}

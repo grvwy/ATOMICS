@@ -603,7 +603,7 @@ impl State {
                 self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::InnerSize(vec2(width, height))));
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
             }
-            ControlRequest::Start { agent, folder, repo, branch, prompt, args, isolation } => {
+            ControlRequest::Start { agent, folder, repo, branch, prompt, args, isolation, interactive } => {
                 // Control and remote requests start work on the host; they do not navigate the desktop.
                 // A desktop start selects its own result when its reply comes back to that window.
                 let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
@@ -615,18 +615,23 @@ impl State {
                             paths::expand(&repo),
                             branch,
                             None,
-                            Launch { agent, prompt, args, reply: Some(reply), task: None, isolation },
+                            Launch { agent, prompt, args, reply: Some(reply), task: None, isolation, interactive },
                         );
                         return;
                     }
                     (Some(folder), _, _) => {
+                        self.interactive_start = interactive;
                         self.start_as(&agent, paths::expand(&folder), None, args, prompt, Role::Agent(isolation))
                     }
                     (None, Some(_), None) | (None, None, Some(_)) => {
                         Err("give a repo and a branch for a new worktree".to_string())
                     }
-                    (None, None, None) => self.start_scratch(&agent, args, prompt, isolation),
+                    (None, None, None) => {
+                        self.interactive_start = interactive;
+                        self.start_scratch(&agent, args, prompt, isolation)
+                    }
                 };
+                self.interactive_start = false;
                 (self.active, self.diff_root, self.focus_terminal) = selection;
                 match started {
                     Ok(id) => {

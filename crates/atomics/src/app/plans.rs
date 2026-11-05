@@ -816,6 +816,7 @@ impl State {
                 reply: None,
                 task: Some((self.plans[index].id.clone(), task.id.clone())),
                 isolation: task.isolation,
+                interactive: false,
             };
             let start = self.plans[index].start_branch(&task);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
@@ -1583,6 +1584,7 @@ mod tests {
                         reply: None,
                         task: Some(("collisions".into(), "ops".into())),
                         isolation: None,
+                        interactive: false,
                     },
                 );
                 let (_, result, _, _) = app

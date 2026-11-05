@@ -309,6 +309,7 @@ fn start_request(agent: String, folder: Option<PathBuf>) -> ControlRequest {
         prompt: None,
         args: Vec::new(),
         isolation: None,
+        interactive: true,
     }
 }
 
@@ -408,6 +409,10 @@ impl Desktop<'_> {
             Command::HideChief => self.runtime.chief_open = false,
             Command::ResizeChief(width) => self.runtime.store.chief_width = width,
             Command::Toast(text) => self.runtime.toast(text),
+            Command::ConnectGithub => {
+                self.runtime.github_set_modal(true);
+                self.runtime.github_connect();
+            }
             // The window's own control requests, which it sends to the host after the draw, as the new-session
             // dialog's.
             Command::Start { agent, folder } => self.runtime.client_commands.push(start_request(agent, folder)),

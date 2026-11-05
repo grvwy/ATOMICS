@@ -93,6 +93,11 @@ run=(docker run --rm --init --cap-drop ALL
     --mount type=volume,source=atomics-linux-qa-git,target=/usr/local/cargo/git
     --env "CARGO_BUILD_JOBS=${ATOMICS_LINUX_QA_JOBS:-2}")
 
+# ATOMICS_QA_FIRST_RUN=1 shows a person's first run instead of an instance with a named config.
+if [[ -n ${ATOMICS_QA_FIRST_RUN:-} ]]; then
+    run+=(--env ATOMICS_QA_FIRST_RUN=1)
+fi
+
 # Linked worktrees have an absolute .git pointer outside the checkout. Supply
 # that metadata read-only too, so build.rs and cargo/git inspection still work.
 git_common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)

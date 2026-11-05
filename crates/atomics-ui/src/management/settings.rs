@@ -26,9 +26,12 @@ pub(super) enum Confirm {
     CleanCredentials,
 }
 
+/// The section that says where agents run and what sandboxes need.
+pub(super) const AGENTS: &str = "Agents";
+
 /// What state a row is in. Painted, not typed: a browser has only egui's own fonts, and they draw none of these.
 #[derive(Clone, Copy)]
-enum Mark {
+pub(super) enum Mark {
     Check,
     Cross,
     Dot,
@@ -58,7 +61,7 @@ fn paint_mark(painter: &egui::Painter, center: egui::Pos2, mark: Mark, color: Co
 }
 
 /// A mark in the flow of a row, as tall as a line of text.
-fn mark(ui: &mut egui::Ui, mark: Mark, color: Color32) {
+pub(super) fn mark(ui: &mut egui::Ui, mark: Mark, color: Color32) {
     let height = ui.text_style_height(&egui::TextStyle::Body);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, height), Sense::hover());
     paint_mark(ui.painter(), rect.center(), mark, color);
@@ -103,6 +106,8 @@ const SHORTCUTS: [(&str, &str); 16] = [
 
 pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
     let p = client.palette.clone();
+    let forced = client.management.open_section.take();
+    let forced = forced.as_deref();
     let enabled = allowed(backend, &HostAction::SettingsTool { tool: SettingsTool::CheckSandbox });
     if !enabled {
         ui.colored_label(p.warning, "View only: settings changes require the host grant.");
@@ -115,26 +120,39 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     if let Some(update) = backend.update().filter(|update| update.has_news() || !backend.available(&Command::Update)) {
         let summary = update_summary(&update);
         ui.scope(|ui| {
-            section(ui, &p, "Updates", &summary, update.has_news(), |ui| updates(ui, backend, client, &update));
+            section(ui, &p, forced, "Updates", &summary, update.has_news(), |ui| updates(ui, backend, client, &update));
         });
     } else {
         ui.skip_ahead_auto_ids(1);
     }
     let selected = info.themes.choices.iter().find(|choice| choice.selected).map_or("", |choice| &choice.name);
-    section(ui, &p, "Theme", selected, true, |ui| theme(ui, backend, client, info));
-    section(ui, &p, "Shortcuts", "", false, |ui| shortcuts(ui, backend, client, info));
-    section(ui, &p, "Agents", &agents_summary(info), false, |ui| agents(ui, client, enabled, info));
-    section(ui, &p, "Connections", &connections_summary(info), false, |ui| {
+    section(ui, &p, forced, "Theme", selected, true, |ui| theme(ui, backend, client, info));
+    section(ui, &p, forced, "Shortcuts", "", false, |ui| shortcuts(ui, backend, client, info));
+    section(ui, &p, forced, AGENTS, &agents_summary(info), false, |ui| agents(ui, client, enabled, info));
+    section(ui, &p, forced, "Getting started", "", false, |ui| getting_started(ui, client));
+    section(ui, &p, forced, "Connections", &connections_summary(info), false, |ui| {
         connections(ui, backend, client, enabled, info)
     });
-    section(ui, &p, "Remote devices", &remote_summary(info), false, |ui| remote::draw(ui, backend, client, info));
-    section(ui, &p, "Credentials", &credentials_summary(info), false, |ui| credentials(ui, client, enabled, info));
-    section(ui, &p, "Advanced", "", false, |ui| advanced(ui, backend, client, enabled, info));
+    section(ui, &p, forced, "Remote devices", &remote_summary(info), false, |ui| {
+        remote::draw(ui, backend, client, info)
+    });
+    section(ui, &p, forced, "Credentials", &credentials_summary(info), false, |ui| {
+        credentials(ui, client, enabled, info)
+    });
+    section(ui, &p, forced, "Advanced", "", false, |ui| advanced(ui, backend, client, enabled, info));
     // The VM panel can be inserted as another Settings section without changing the shell.
 }
 
 /// A section's row, which opens it whole, and what shows once it is open. The summary says what is in it meanwhile.
-fn section(ui: &mut egui::Ui, p: &Palette, title: &str, summary: &str, open: bool, body: impl FnOnce(&mut egui::Ui)) {
+fn section(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    forced: Option<&str>,
+    title: &str,
+    summary: &str,
+    open: bool,
+    body: impl FnOnce(&mut egui::Ui),
+) {
     let mut label = LayoutJob::default();
     let style = ui.style().clone();
     let add = |label: &mut LayoutJob, text: RichText| {
@@ -144,14 +162,16 @@ fn section(ui: &mut egui::Ui, p: &Palette, title: &str, summary: &str, open: boo
     if !summary.is_empty() {
         add(&mut label, RichText::new(format!("  ·  {summary}")).size(12.0).color(p.muted));
     }
-    egui::CollapsingHeader::new(label).id_salt(title).default_open(open).show(ui, |ui| {
+    let header = egui::CollapsingHeader::new(label).id_salt(title).default_open(open);
+    let header = if forced == Some(title) { header.open(Some(true)) } else { header };
+    header.show(ui, |ui| {
         body(ui);
         ui.add_space(6.0);
     });
 }
 
 /// What a section's row and text say beside its controls.
-fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
+pub(super) fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
     ui.add(egui::Label::new(RichText::new(text).size(11.5).color(p.muted)).wrap());
 }
 
@@ -160,7 +180,7 @@ fn subheading(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.label(RichText::new(text).strong().color(p.foreground));
 }
 
-fn button(ui: &mut egui::Ui, client: &Client, text: impl Into<String>) -> egui::Response {
+pub(super) fn button(ui: &mut egui::Ui, client: &Client, text: impl Into<String>) -> egui::Response {
     ui.add(touch::sized(egui::Button::new(text.into()), client.touch))
 }
 
@@ -179,7 +199,7 @@ fn ask(ui: &mut egui::Ui, client: &Client, question: &str, yes: &str) -> Option<
     answer
 }
 
-fn tool(client: &mut Client, tool: SettingsTool) {
+pub(super) fn tool(client: &mut Client, tool: SettingsTool) {
     client.send(Command::Manage(HostAction::SettingsTool { tool }));
 }
 
@@ -393,7 +413,7 @@ fn configured_agents(info: &ManagementInfo) -> &[serde_json::Value] {
     info.config["values"]["agents"]["value"].as_array().map_or(&[], Vec::as_slice)
 }
 
-fn isolation(info: &ManagementInfo) -> &str {
+pub(super) fn isolation(info: &ManagementInfo) -> &str {
     info.config["values"]["isolation.mode"]["value"].as_str().unwrap_or("")
 }
 
@@ -411,9 +431,18 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
     let tools = &info.tools;
     let busy = tools["sandbox_busy"] == true;
     load(client, enabled, busy, SettingsTool::CheckSandbox);
-    if !isolation(info).is_empty() {
-        ui.label(format!("Agent isolation: {}", isolation(info)));
-    }
+    subheading(ui, &p, "Where agents run");
+    ui.add_enabled_ui(enabled, |ui| {
+        for (mode, text) in [
+            (atomics_core::isolation::IsolationMode::Bare, "This machine, under your own login"),
+            (atomics_core::isolation::IsolationMode::Sandbox, "Docker Sandboxes, each agent in a VM of its own"),
+        ] {
+            if ui.radio(isolation(info) == mode.name(), text).clicked() && isolation(info) != mode.name() {
+                tool(client, SettingsTool::SetIsolation { mode });
+            }
+        }
+    });
+    subheading(ui, &p, "Agents");
     for agent in configured_agents(info) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(agent["name"].as_str().unwrap_or_default()).strong());
@@ -455,10 +484,14 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
             }
         });
     }
-    subheading(ui, &p, "A fresh machine");
-    note(ui, &p, "For guided setup, run this in a terminal on the host:");
-    if button(ui, client, "Copy: atomics setup").clicked() {
-        ui.ctx().copy_text("atomics setup".into());
+}
+
+fn getting_started(ui: &mut egui::Ui, client: &mut Client) {
+    let p = client.palette.clone();
+    note(ui, &p, "Agents, where they run, a first project and connections, on one screen.");
+    if button(ui, client, "Open the setup screen").clicked() {
+        client.management.settings = false;
+        client.management.setup = true;
     }
 }
 
