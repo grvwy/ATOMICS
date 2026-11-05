@@ -501,6 +501,39 @@ mod install_script {
         refused(&machine, "no signature");
     }
 
+    /// The offline key is there for a release signed by hand, after the CI key was lost: `install.sh` takes that too.
+    #[test]
+    fn a_signature_from_the_offline_key_is_accepted_with_or_without_the_ci_key_on_the_branch() {
+        let machine = Machine::new();
+        let archive = good(&machine);
+        let offline = ThrowawayKey::new();
+        machine.feed(
+            "raw.githubusercontent.com/xmagit/ATOMICS/main/assets/release-signing-key-offline.pub",
+            offline.pem(),
+        );
+        let name = format!("atomics-{VERSION}-{TARGET}.tar.gz");
+        let base = format!("github.com/xmagit/ATOMICS/releases/download/v{VERSION}");
+        machine.feed(&format!("{base}/{name}.sig"), offline.sign(&archive));
+        let output = machine.install_script();
+        assert!(output.status.success(), "{output:?}");
+        assert!(machine.installed().is_file());
+        std::fs::remove_file(machine.installed()).unwrap();
+        std::fs::remove_file(machine.path("asked")).unwrap();
+
+        let ci = machine
+            .path("feed")
+            .join("raw.githubusercontent.com/xmagit/ATOMICS/main/assets/release-signing-key.pub".replace('/', "_"));
+        std::fs::remove_file(ci).unwrap();
+        let output = machine.install_script();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::remove_file(machine.installed()).unwrap();
+        std::fs::remove_file(machine.path("asked")).unwrap();
+
+        // Neither of the two is still no.
+        machine.feed(&format!("{base}/{name}.sig"), ThrowawayKey::new().sign(&archive));
+        refused(&machine, "not signed with an ATOMICS release key");
+    }
+
     #[test]
     fn with_no_keys_to_read_it_refuses_and_without_openssl_3_it_says_what_it_did_not_check() {
         let machine = Machine::new();

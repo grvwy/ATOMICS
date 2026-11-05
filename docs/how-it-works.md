@@ -147,10 +147,12 @@ browser or `--connect` shows the host's version and a hint: atomics.v1 has no op
 a window on the host, or `atomics update` in a terminal there, can.
 
 An update downloads `atomics-<version>-<target>.tar.gz` for this platform and checks its SHA-256 and its Ed25519
-signature against the public key built into the binary, before anything is unpacked. It then unpacks beside the
+signature against the public keys built into the binary, before anything is unpacked. There are two, one for releases
+and one kept offline to recover from losing it, and a signature from either will do: see [Desktop
+releases](releasing.md#the-two-release-keys). It then unpacks beside the
 install and runs the new program, which must report the version being installed, so an older signed build offered under
 a newer tag is refused. Then it swaps: a rename of the file on Linux, of the whole `.app` on a Mac. Any failure leaves
-the install as it was and says why. A build made without `assets/release-signing-key.pub` has no key: it can
+the install as it was and says why. A build made without those keys in `assets/` can
 still say a new version exists, and refuses to install one. A development build under a `target` folder is not replaced.
 
 Then ATOMICS restarts the way `atomics_restart` does, once that interrupts nothing it can see. Nobody chose this moment,

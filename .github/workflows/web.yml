@@ -55,8 +55,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           files=(target/web/atomics-web-*.tar.gz target/web/atomics-web-*.tar.gz.sha256)
+          # A prerelease until its signed desktop builds are attached, which waits for a person. The latest release is
+          # what installs and updates read, so they keep the one before this, and never find a release with no build.
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes ''
+            gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --title "$GITHUB_REF_NAME" --notes ''
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
 
   desktop:
@@ -79,14 +81,6 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       TARGET: ${{ matrix.target }}
     steps:
-      - name: Require the release signing key
-        env:
-          ATOMICS_RELEASE_SIGNING_KEY: ${{ secrets.ATOMICS_RELEASE_SIGNING_KEY }}
-        run: |
-          if [ -z "$ATOMICS_RELEASE_SIGNING_KEY" ]; then
-            echo '::error::Set the ATOMICS_RELEASE_SIGNING_KEY repository secret to an Ed25519 private key in PKCS#8 PEM format; see docs/releasing.md.'
-            exit 1
-          fi
       - uses: actions/checkout@v6
       - name: Check the release version
         run: |
@@ -96,6 +90,19 @@ jobs:
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
+      # A build carries its trust anchors from here on, so one without both could never be recovered from a lost key.
+      - name: Require both release keys in this commit
+        run: |
+          for key in assets/release-signing-key.pub assets/release-signing-key-offline.pub; do
+            if [ ! -f "$key" ]; then
+              echo "::error::$key is missing; docs/releasing.md says how to make the release keys."
+              exit 1
+            fi
+          done
+          if cmp -s assets/release-signing-key.pub assets/release-signing-key-offline.pub; then
+            echo '::error::The two release keys are the same key.'
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
@@ -107,11 +114,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev \
             libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev
-      - name: Select OpenSSL on macOS
-        if: runner.os == 'macOS'
-        run: |
-          brew install openssl@3
-          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - name: Build and pack the desktop
         id: pack
         env:
@@ -135,23 +137,74 @@ jobs:
           fi
           (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
           echo "archive=$out/$archive" >> "$GITHUB_OUTPUT"
-      - name: Sign and verify the archive
-        env:
-          ATOMICS_RELEASE_SIGNING_KEY: ${{ secrets.ATOMICS_RELEASE_SIGNING_KEY }}
-          ARCHIVE: ${{ steps.pack.outputs.archive }}
-        run: sh scripts/sign-release.sh "$ARCHIVE"
       - uses: actions/upload-artifact@v4
         with:
-          name: atomics-desktop-${{ matrix.target }}
+          name: atomics-unsigned-${{ matrix.target }}
           path: |
             target/desktop/atomics-*.tar.gz
             target/desktop/atomics-*.tar.gz.sha256
-            target/desktop/atomics-*.tar.gz.sig
+          if-no-files-found: error
+
+  # The only job that sees the signing key, and only once a person has approved it. Everything a build runs runs in the
+  # jobs above, on other machines, so nothing in the dependency tree comes near the key: no build, no cargo, no cache, and
+  # the signing script from the tagged commit. What it signs is data to it. Each action is pinned to a commit, since an
+  # action that moved could otherwise leave something behind for the step that holds the key.
+  sign:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Sign the desktop builds
+    needs: desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            assets
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: atomics-unsigned-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/unsigned
+      # By the names this release should have, and never by what the artifacts happen to hold.
+      - name: Check what the builds made
+        env:
+          UNSIGNED: ${{ runner.temp }}/unsigned
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            archive="atomics-$version-$target.tar.gz"
+            if [ -L "$UNSIGNED/$archive" ] || [ ! -f "$UNSIGNED/$archive" ]; then
+              echo "::error::The builds did not make $archive."
+              exit 1
+            fi
+            (cd "$UNSIGNED" && sha256sum --check --strict "$archive.sha256")
+          done
+      - name: Sign and verify each archive
+        env:
+          ATOMICS_RELEASE_SIGNING_KEY: ${{ secrets.ATOMICS_RELEASE_SIGNING_KEY }}
+          UNSIGNED: ${{ runner.temp }}/unsigned
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            sh scripts/sign-release.sh "$UNSIGNED/atomics-$version-$target.tar.gz"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: atomics-signatures
+          path: ${{ runner.temp }}/unsigned/atomics-*.tar.gz.sig
           if-no-files-found: error
 
   desktop-release:
-    # The web job creates the release. Desktop failures never block its upload.
-    needs: [desktop, release]
+    # The web job creates the release. Desktop failures and a signature nobody approved never block its upload.
+    needs: [sign, release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -160,13 +213,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: atomics-desktop-*
+          pattern: atomics-unsigned-*
           merge-multiple: true
           path: target/desktop
-      - name: Attach desktop builds to the release
+      - uses: actions/download-artifact@v4
+        with:
+          name: atomics-signatures
+          path: target/desktop
+      - name: Attach desktop builds to the release, and make it the latest
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           files=(target/desktop/atomics-*.tar.gz target/desktop/atomics-*.tar.gz.sha256 target/desktop/atomics-*.tar.gz.sig)
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          gh release edit "$GITHUB_REF_NAME" --prerelease=false --latest

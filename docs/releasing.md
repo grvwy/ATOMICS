@@ -1,11 +1,19 @@
 # Desktop releases
 
 A `v<version>` tag matching `workspace.package.version` in `Cargo.toml` runs
-`.github/workflows/web.yml`. The existing `bundle` and `release` jobs publish the web client.
-Independent `desktop` jobs build on GitHub-hosted Ubuntu 22.04 (x86_64) and macOS 15 (arm64),
-then `desktop-release` attaches both builds to the release created by the web job.
-A missing `ATOMICS_RELEASE_SIGNING_KEY` secret fails the desktop jobs immediately with a setup
-message; web publishing continues. Manual web workflow dispatch does not build desktops.
+`.github/workflows/web.yml`:
+
+1. `bundle` and `release` publish the web client, as a **prerelease**. The release that installs and updates read stays
+   the one before this, so nobody meets a release with no build for them, however long the next step waits.
+2. `desktop` builds on GitHub-hosted Ubuntu 22.04 (x86_64) and macOS 15 (arm64). It sees no key, and fails at once if the
+   commit lacks either public key below.
+3. `sign` **waits for the maintainer's approval** on the `release` Environment, then signs those builds. It is the only
+   job that sees the signing key, and it builds nothing: no cargo, no cache, no dependencies, and the signing script from
+   the tagged commit. So nothing a build runs, a `build.rs` or a proc macro, ever comes near the key.
+4. `desktop-release` attaches the builds and signatures and makes this the latest release.
+
+A failed build or a signature nobody approves leaves the web client published and the release a prerelease. Manual web
+workflow dispatch does not build desktops.
 
 Each desktop target produces three release assets:
 
@@ -30,39 +38,95 @@ updates itself when it finds a key built in; a debug build can also be pointed a
 (`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`). No release holds that path: the desktop job fails if the
 release binary contains the name, and a test keeps `debug-assertions` out of the release profile.
 
-## Provision the release key once
+## The two release keys
 
-Use OpenSSL 3 or later. On macOS, install `openssl@3` with Homebrew and put
-`$(brew --prefix openssl@3)/bin` first on `PATH`. The signing command uses
-[OpenSSL's Ed25519 support](https://docs.openssl.org/3.1/man1/openssl-pkeyutl/#ed25519-and-ed448-algorithms).
+Installed copies trust two public keys, built in from `assets/`, and accept a signature from either:
 
-The maintainer generates the production key on a trusted machine. Run these commands in the
-checkout, with shell tracing disabled; the private key stays in a private directory outside it:
+| Key | Private half | Public half |
+| --- | --- | --- |
+| CI | Only in the `release` Environment's `ATOMICS_RELEASE_SIGNING_KEY` secret | `assets/release-signing-key.pub` |
+| Offline | Encrypted, on no machine that builds or runs agents | `assets/release-signing-key-offline.pub` |
+
+Every release signs with the CI key. The offline key is what recovers from losing it: see [Rotation](#rotation). A key is
+Ed25519, and each public file is a PEM SubjectPublicKeyInfo: 44 bytes of DER, the 12-byte prefix
+`302a300506032b6570032100` and the 32-byte key, for verifiers that take raw keys. The signer rejects a key that does not
+match the public file it is checking against. Verification always uses keys already installed or on `main`; a key that
+came with a release is no trust anchor.
+
+## Provision the keys once
+
+This takes the maintainer, and runs nowhere else. First the Environment, with the maintainer as required reviewer, for
+`v*` tags only. Self-review stays allowed, since the same account pushes the tag:
 
 ```sh
-set +x
-umask 077
-key_dir=$(mktemp -d)
-openssl genpkey -algorithm ED25519 -out "$key_dir/release-private.pem"
-openssl pkey -in "$key_dir/release-private.pem" -pubout -out assets/release-signing-key.pub
-gh secret set ATOMICS_RELEASE_SIGNING_KEY < "$key_dir/release-private.pem"
+echo '{"prevent_self_review": false, "reviewers": [{"type": "User", "id": 45366887}], "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}' | gh api -X PUT repos/xmagit/ATOMICS/environments/release --input -
+gh api -X POST repos/xmagit/ATOMICS/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+gh api repos/xmagit/ATOMICS/environments/release --jq '.protection_rules[] | .type, .reviewers[]?.reviewer.login'
 ```
 
-`ATOMICS_RELEASE_SIGNING_KEY` is the complete **unencrypted PKCS#8 PEM** private key,
-including its header, footer and newlines. Keep a protected backup outside the repository;
-never log or commit the private key. Only the two desktop steps that need the secret receive it.
-The signer uses a mode-0600 temporary file, deletes it on exit, and verifies the signature before
-publishing it.
+The id is the `xmagit` account's (`gh api users/xmagit --jq .id`), and the last line should print `required_reviewers` and
+that login. These work in any shell, fish included.
 
-The public trust anchor belongs at **`assets/release-signing-key.pub`**, as a PEM SubjectPublicKeyInfo
-Ed25519 public key. Commit it before the first desktop tag and embed it in the app's updater.
-The maintainer provisions this file and the matching secret before releasing; desktop signing
-fails closed until both exist.
-The PEM decodes to a 44-byte DER value: the 12-byte prefix `302a300506032b6570032100` followed
-by the 32-byte Ed25519 public key, for verifiers that take raw public keys.
-The signer rejects a secret that does not match this public key. Verification must use the key
-embedded in the installed app; a key downloaded alongside a release is not a trust anchor.
-Changing the signing key requires distributing the new trust anchor to installed apps first.
+Or by hand: **Settings → Environments → New environment**, name it `release`, tick **Required reviewers** and add yourself,
+then under **Deployment branches and tags** choose **Selected branches and tags** and add a tag rule `v*`.
+
+Then the keys, on a trusted machine with OpenSSL 3 (on a Mac, `brew install openssl@3`), from a checkout of `main`:
+
+```sh
+scripts/make-release-keys.sh ~/atomics-release-offline.pem
+```
+
+It asks for a passphrase for the offline key, puts the CI key straight into the Environment, writes the encrypted offline
+key to the file named, and writes both public keys to `assets/`. It refuses to replace anything. Then:
+
+1. Move the offline key off this machine, and keep its passphrase apart from it. If both keys are ever lost, every install
+   has to be updated by hand.
+2. Commit the two public files through a pull request. A build made before this can never update itself, so this comes
+   before the first release that should.
+
+## Approving a release
+
+The run stops at `sign`, and GitHub notifies the reviewer. **Before approving, check that the run's commit is the one you
+meant to release, on `main`:** a tag can point anywhere, and its workflow comes from that commit. Approving signs whatever
+the builds made, so this is the moment a person vouches for them. Approve under **Review deployments** on the run, or
+reject it and nothing is signed.
+
+## Rotation
+
+Installed copies trust what they were built with, so a change reaches them in a release signed with a key they already
+have.
+
+**The CI key was lost, or leaked** (these are POSIX shell commands; in fish, run `sh` first):
+
+1. If it leaked, delete it now: `gh secret delete ATOMICS_RELEASE_SIGNING_KEY --env release --repo xmagit/ATOMICS`. A copy
+   that has not updated yet still accepts it, which is why step 5 should come soon: the Environment's reviewer gates this
+   workflow's use of the key, not a stolen copy.
+2. Make a new one, without replacing the offline key:
+
+   ```sh
+   umask 077; key_dir=$(mktemp -d)
+   openssl genpkey -algorithm ED25519 -out "$key_dir/ci.pem"
+   openssl pkey -in "$key_dir/ci.pem" -pubout -out assets/release-signing-key.pub
+   gh secret set ATOMICS_RELEASE_SIGNING_KEY --env release --repo xmagit/ATOMICS < "$key_dir/ci.pem"
+   rm -rf "$key_dir"
+   ```
+
+3. Commit the new public file, bump the version, and tag it. Reject the `sign` step: installed copies do not trust the new
+   key yet.
+4. Sign the builds with the offline key, on the trusted machine:
+
+   ```sh
+   gh run download <run-id> --pattern 'atomics-unsigned-*' --dir release-builds
+   ATOMICS_RELEASE_SIGNING_KEY="$(openssl pkey -in <offline key file>)" \
+     sh scripts/sign-release.sh release-builds/<artifact>/<archive> assets/release-signing-key-offline.pub
+   ```
+
+   Do that for each archive, then attach the archives with their `.sha256` and `.sig`, and make it the latest:
+   `gh release upload v<version> <files>`, then `gh release edit v<version> --prerelease=false --latest`.
+5. Every install that takes that release trusts the new CI key, and no longer the old one. Later releases sign in CI again.
+
+**The offline key was lost or leaked:** make a new one the same way, encrypted (`-aes-256-cbc`) and kept off this machine,
+commit its public file, and release normally: the CI key signs what brings it.
 
 ## Verify and test a release
 
@@ -82,6 +146,8 @@ openssl pkeyutl -verify -rawin -pubin -inkey /trusted/checkout/assets/release-si
 tar -tzf "$archive"
 ```
 
+A release signed by hand verifies against `release-signing-key-offline.pub` instead.
+
 Before tagging, check YAML with PyYAML installed:
 
 ```sh
@@ -92,11 +158,12 @@ sh -n scripts/install.sh
 python3 tests/test_release_signing.py
 ```
 
-Hosted builds and uploads cannot be proved by a local YAML check. After merging and provisioning
-the trust anchor and secret, the release chief must set the intended version in `Cargo.toml` and
-`Cargo.lock`, then run `git tag v0.1.7` and `git push origin v0.1.7` for the planned release.
-Watch it with `gh run watch <run-id> --exit-status`, and run the download/check commands above
-for **both** targets. Confirm that each archive has the documented contents and the web assets
-are still present. Exercise missing-secret behavior in a disposable fork with a matching version
-tag and no signing secret: both desktop jobs must show the explicit setup error while `bundle`
-and `release` succeed. Do not remove the production secret to test this case.
+Hosted builds and uploads cannot be proved by a local YAML check. After merging and provisioning the keys, the release
+chief sets the intended version in `Cargo.toml` and `Cargo.lock`, then runs `git tag v0.1.7` and `git push origin v0.1.7`
+for the planned release. The maintainer approves `sign`. Watch it with `gh run watch <run-id> --exit-status`, and run the
+download and check commands above for **both** targets. Confirm that each archive has the documented contents, that the
+web assets are still there, and that `gh release view` no longer calls it a prerelease.
+
+A signed build only proves itself by updating to the next one, so a first release needs a small second one soon after, on
+both platforms. To see a missing key's error without touching the real one, use a disposable fork with a matching version
+tag, two public files and no secret: `sign` must fail with the setup message, and `bundle` and `release` succeed.

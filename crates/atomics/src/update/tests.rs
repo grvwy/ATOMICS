@@ -45,14 +45,57 @@ fn the_public_key_is_read_from_its_pem_and_anything_else_is_refused() {
 }
 
 #[test]
-fn a_key_built_into_this_binary_is_one_it_can_use() {
-    // Absent until the maintainer provisions it; then every test run proves the file parses.
-    match BUILT_IN_KEY {
-        Some(_) => {
-            built_in_key().unwrap();
+fn the_keys_built_into_this_binary_are_ones_it_can_use_and_not_one_key_twice() {
+    // Absent until the maintainer provisions them; then every test run proves the files parse.
+    match built_in_keys(BUILT_IN_KEYS) {
+        Ok(keys) => {
+            assert!((1..=2).contains(&keys.len()));
+            assert!(keys.first() != keys.get(1), "the offline key is there for when the other is lost");
         }
-        None => assert_eq!(built_in_key().unwrap_err(), NO_KEY),
+        Err(why) => assert_eq!(why, NO_KEY),
     }
+}
+
+#[test]
+fn every_key_built_in_has_to_be_readable_or_updates_are_off() {
+    let (first, second) = (TestKey::new(), TestKey::new());
+    let (first_pem, second_pem) = (first.pem(), second.pem());
+    assert_eq!(built_in_keys(&[]).unwrap_err(), NO_KEY);
+    assert_eq!(built_in_keys(&[&first_pem]).unwrap(), [first.raw()]);
+    assert_eq!(built_in_keys(&[&first_pem, &second_pem]).unwrap(), [first.raw(), second.raw()]);
+    assert!(built_in_keys(&[&first_pem, "not a key"]).unwrap_err().contains("cannot be read"));
+    assert!(built_in_keys(&["not a key", &second_pem]).unwrap_err().contains("cannot be read"));
+}
+
+#[test]
+fn a_signature_from_either_key_is_accepted_and_from_any_other_is_not() {
+    let (ci, offline, other) = (TestKey::new(), TestKey::new(), TestKey::new());
+    let keys = [ci.raw(), offline.raw()];
+    let archive = b"archive bytes".as_slice();
+    let checksum = sha256_line(archive, ARCHIVE_NAME);
+    verify(archive, ARCHIVE_NAME, &checksum, &ci.sign(archive), &keys).unwrap();
+    verify(archive, ARCHIVE_NAME, &checksum, &offline.sign(archive), &keys).unwrap();
+    let error = verify(archive, ARCHIVE_NAME, &checksum, &other.sign(archive), &keys).unwrap_err();
+    assert!(error.to_string().contains("not signed"), "{error}");
+    // No keys trusts nothing.
+    assert!(verify(archive, ARCHIVE_NAME, &checksum, &ci.sign(archive), &[]).is_err());
+
+    // A release signed offline installs on a build that holds both keys, all the way through.
+    let install = Install::new();
+    let server = Server::start();
+    let release = install.archive(&[("atomics", NEW)]);
+    server.release(&release, &sha256_line(&release, ARCHIVE_NAME), &offline.sign(&release));
+    let target = InstallTarget::Binary(install.target.clone());
+    let feed = Feed { keys: Ok(keys.to_vec()), ..server.feed(Ok(ci.raw()), target.clone()) };
+    let found = feed.latest("1.0.0").unwrap().unwrap();
+    feed.install(&found, &|_| {}).unwrap();
+    assert_eq!(std::fs::read_to_string(&install.target).unwrap(), NEW);
+
+    // And not on a build that trusts only the CI key.
+    let again = Install::new();
+    let only_ci = server.feed(Ok(ci.raw()), InstallTarget::Binary(again.target.clone()));
+    assert!(failure(&only_ci, &only_ci.latest("1.0.0").unwrap().unwrap()).contains("not signed"));
+    again.untouched();
 }
 
 #[test]
@@ -61,7 +104,7 @@ fn verification_takes_the_checksum_and_the_signature_over_the_exact_bytes() {
     let archive = b"archive bytes".as_slice();
     let checksum = sha256_line(archive, ARCHIVE_NAME);
     let signature = key.sign(archive);
-    verify(archive, ARCHIVE_NAME, &checksum, &signature, &key.raw()).unwrap();
+    verify(archive, ARCHIVE_NAME, &checksum, &signature, &[key.raw()]).unwrap();
 
     type Case<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a str);
     let cases: [Case; 6] = [
@@ -73,13 +116,13 @@ fn verification_takes_the_checksum_and_the_signature_over_the_exact_bytes() {
         (archive, &checksum, &TestKey::new().sign(archive), "not signed"),
     ];
     for (bytes, sums, signed, expected) in cases {
-        let error = verify(bytes, ARCHIVE_NAME, sums, signed, &key.raw()).unwrap_err().to_string();
+        let error = verify(bytes, ARCHIVE_NAME, sums, signed, &[key.raw()]).unwrap_err().to_string();
         assert!(error.contains(expected), "{expected}: {error}");
     }
     // The signature of a tampered archive whose checksum was fixed up, with the key this binary trusts.
     let tampered = b"tampered".as_slice();
     let error =
-        verify(tampered, ARCHIVE_NAME, &sha256_line(tampered, ARCHIVE_NAME), &signature, &key.raw()).unwrap_err();
+        verify(tampered, ARCHIVE_NAME, &sha256_line(tampered, ARCHIVE_NAME), &signature, &[key.raw()]).unwrap_err();
     assert!(error.to_string().contains("not signed"), "{error}");
 }
 
