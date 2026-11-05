@@ -142,7 +142,7 @@ fn section(
 
 /// What a section's row and text say beside its controls.
 pub(super) fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
-    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(p.muted)).wrap());
+    ui.add(egui::Label::new(RichText::new(text).size(11.0).color(p.muted)).wrap());
 }
 
 fn subheading(ui: &mut egui::Ui, p: &Palette, text: &str) {
@@ -329,7 +329,7 @@ fn theme_row(ui: &mut egui::Ui, p: &Palette, choice: &ThemeChoice, enabled: bool
     }
     painter.rect_stroke(strip, 1.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
     let name = if choice.selected { p.accent } else { p.foreground };
-    painter.text(egui::pos2(strip.right() + 10.0, y), egui::Align2::LEFT_CENTER, &choice.name, p.ui(12.5), name);
+    painter.text(egui::pos2(strip.right() + 10.0, y), egui::Align2::LEFT_CENTER, &choice.name, p.ui(12.0), name);
     if choice.file {
         painter.text(
             rect.right_center() - Vec2::new(6.0, 0.0),
@@ -419,12 +419,12 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
             ui.label(RichText::new(agent["name"].as_str().unwrap_or_default()).strong());
             let kind = agent["kind"].as_str().unwrap_or_default();
             let runs = agent["isolation"].as_str().map_or(String::new(), |mode| format!(" · runs {mode}"));
-            ui.label(RichText::new(format!("{kind}{runs}")).size(11.5).color(p.muted));
+            ui.label(RichText::new(format!("{kind}{runs}")).size(11.0).color(p.muted));
         });
         if let Some(command) = agent["command"].as_array() {
             let words: Vec<_> = command.iter().filter_map(|word| word.as_str()).collect();
             if !words.is_empty() {
-                ui.add(egui::Label::new(RichText::new(words.join(" ")).monospace().size(11.5).color(p.muted)).wrap());
+                ui.add(egui::Label::new(RichText::new(words.join(" ")).monospace().size(11.0).color(p.muted)).wrap());
             }
         }
     }
@@ -597,7 +597,7 @@ fn connection(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, ena
         );
     }
     if let Some(error) = row["error"].as_str() {
-        ui.add(egui::Label::new(RichText::new(error).size(11.5).color(p.error)).wrap());
+        ui.add(egui::Label::new(RichText::new(error).size(11.0).color(p.error)).wrap());
     }
     if !busy {
         ui.add_enabled_ui(enabled, |ui| {
@@ -723,7 +723,7 @@ fn credential(ui: &mut egui::Ui, client: &mut Client, enabled: bool, entry: &ser
         }
         ui.label(RichText::new(label).strong());
         if !present {
-            ui.label(RichText::new("not set").size(11.5).color(p.muted));
+            ui.label(RichText::new("not set").size(11.0).color(p.muted));
         }
     });
     if let Some(route) = entry["route"].as_str() {

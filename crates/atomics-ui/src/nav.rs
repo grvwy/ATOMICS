@@ -318,12 +318,12 @@ pub fn location(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &m
     let count = crumbs.len();
     for (index, crumb) in crumbs.into_iter().enumerate() {
         if index > 0 {
-            child.label(RichText::new("›").color(p.quiet).size(12.5));
+            child.label(RichText::new("›").color(p.quiet).size(12.0));
         }
         // The last part is where the user is; the others shrink first when the line is short.
         let last = index + 1 == count;
         let max = if last { child.available_width() } else { (child.available_width() * 0.4).max(60.0) };
-        let text = RichText::new(&crumb.text).color(crumb.color).font(p.ui(12.5));
+        let text = RichText::new(&crumb.text).color(crumb.color).font(p.ui(12.0));
         let text = if last { text.strong() } else { text };
         let label = egui::Label::new(text).truncate().sense(if crumb.command.is_some() {
             Sense::click()

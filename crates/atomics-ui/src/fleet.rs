@@ -67,7 +67,7 @@ pub fn tab_strip(
                 } else {
                     p.muted
                 };
-                let text = RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.5);
+                let text = RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.0);
                 let response = ui.add(
                     egui::Button::new(text)
                         .fill(if active { lerp(p.panel, p.accent, 0.25) } else { Color32::TRANSPARENT })
@@ -154,7 +154,7 @@ pub fn tiles(
         if let Some(name) = &row.sandbox {
             let text =
                 view.sandbox_usage.as_ref().map_or_else(|| "Sandbox".to_string(), |usage| format!("Sandbox · {usage}"));
-            let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.0), p.info));
+            let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.5), p.info));
             badge_width = galley.size().x + SANDBOX_ICON + 19.0;
             let badge = Rect::from_min_max(
                 pos2(
@@ -249,7 +249,7 @@ pub fn tiles(
         );
         // The status in its own color between the place and the queue's note.
         let mut job = egui::text::LayoutJob::default();
-        let format = |color| egui::TextFormat { font_id: p.ui(11.5), color, ..Default::default() };
+        let format = |color| egui::TextFormat { font_id: p.ui(11.0), color, ..Default::default() };
         job.append(&place, 0.0, format(p.muted));
         job.append(row.status.label(), 0.0, format(status_color(row.status, &p)));
         job.append(&note, 0.0, format(p.muted));
@@ -330,7 +330,7 @@ pub fn tiles(
                     if ui.add_enabled(button.enabled, egui::Button::new(&button.label)).clicked() {
                         connect = Some((button.name.clone(), button.store_env, button.url.clone()));
                     }
-                    ui.label(RichText::new(&button.detail).size(11.5).color(p.muted)).on_hover_text(
+                    ui.label(RichText::new(&button.detail).size(11.0).color(p.muted)).on_hover_text(
                         "This agent needs an MCP server that is not connected. Connecting it opens its sign-in \
                          page in your browser, and every sandboxed session then gets it.",
                     );

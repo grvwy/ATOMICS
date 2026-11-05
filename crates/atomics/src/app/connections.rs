@@ -458,14 +458,14 @@ impl Desktop<'_> {
                         action = Some(Action::Disconnect(row.name.clone()));
                     }
                 });
-                ui.add(egui::Label::new(RichText::new(&row.detail).size(11.5).color(p.muted)).wrap());
+                ui.add(egui::Label::new(RichText::new(&row.detail).size(11.0).color(p.muted)).wrap());
                 if row.env > 0 {
                     ui.label(
                         RichText::new(format!(
                             "{} environment values, hidden: stored in the OS keychain only if you choose",
                             row.env
                         ))
-                        .size(11.5)
+                        .size(11.0)
                         .color(p.muted),
                     );
                 }
@@ -475,18 +475,18 @@ impl Desktop<'_> {
                             "{} header or token settings not imported: they hold secrets; set them up with sbx",
                             row.skipped
                         ))
-                        .size(11.5)
+                        .size(11.0)
                         .color(p.muted),
                     );
                 }
                 if let Some(error) = connections.errors.get(&row.name) {
-                    ui.add(egui::Label::new(RichText::new(error).size(11.5).color(p.error)).wrap());
+                    ui.add(egui::Label::new(RichText::new(error).size(11.0).color(p.error)).wrap());
                 }
                 ui.add_space(4.0);
             }
         });
         for note in &connections.notes {
-            ui.label(RichText::new(note).size(11.5).color(p.warning));
+            ui.label(RichText::new(note).size(11.0).color(p.warning));
         }
         ui.horizontal(|ui| {
             let import = if connections.importing { "Importing…" } else { "Import from Claude Code / Codex" };
@@ -501,7 +501,7 @@ impl Desktop<'_> {
             RichText::new(
                 "Import reads server definitions only, never sign-in tokens; environment values stay hidden.",
             )
-            .size(11.5)
+            .size(11.0)
             .color(p.muted),
         );
         ui.separator();
@@ -523,7 +523,7 @@ impl Desktop<'_> {
                 "claude.ai connectors stay in your claude.ai account and do not reach sandboxed Claude: its \
                  setup-token can only run models. Add the service's MCP URL here instead.",
             )
-            .size(11.5)
+            .size(11.0)
             .color(p.muted),
         );
         action

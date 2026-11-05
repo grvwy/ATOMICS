@@ -12,7 +12,7 @@ use crate::topbar::{measure, record_item};
 use crate::{Backend, Client, Command, PanelMode, PlanRow, PlanState};
 
 /// The size of the text on the button and in the rows.
-const FONT: f32 = 12.5;
+const FONT: f32 = 13.0;
 /// A row's height, and the widest the menu gets.
 const ROW: f32 = 28.0;
 const MENU_WIDTH: f32 = 480.0;
@@ -53,7 +53,7 @@ fn row_color(row: &PlanRow, p: &Palette) -> Color32 {
 }
 
 /// The down-pointing mark of a dropdown, in `rect`.
-fn chevron(painter: &egui::Painter, rect: Rect, color: Color32) {
+pub(crate) fn chevron(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let points = vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)];
     painter.add(egui::Shape::line(points, Stroke::new(1.3, color)));
@@ -303,10 +303,10 @@ fn board_row(ui: &mut egui::Ui, row: &PlanRow, selected: bool, can_close: bool, 
     }
     if row.total > 0 {
         let progress = format!("{}/{}", row.done, row.total);
-        painter.text(pos2(progress_right, y), egui::Align2::RIGHT_CENTER, progress, p.ui(11.5), p.muted);
+        painter.text(pos2(progress_right, y), egui::Align2::RIGHT_CENTER, progress, p.ui(11.0), p.muted);
     }
     let word = if row.needs_user() { p.warning } else { p.muted };
-    painter.text(pos2(state_right, y), egui::Align2::RIGHT_CENTER, state_word(row), p.ui(11.5), word);
+    painter.text(pos2(state_right, y), egui::Align2::RIGHT_CENTER, state_word(row), p.ui(11.0), word);
     let mut hover = row.goal.clone();
     if row.changed {
         hover.push_str("\nChanged since you last looked");

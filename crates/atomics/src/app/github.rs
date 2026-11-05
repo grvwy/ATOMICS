@@ -1121,7 +1121,7 @@ impl Desktop<'_> {
                 }
             }
             if let Some(error) = self.runtime.github.error() {
-                ui.label(RichText::new(error).color(p.warning).size(11.5));
+                ui.label(RichText::new(error).color(p.warning).size(11.0));
             }
         });
         if let Some(host) = self.runtime.github.revoke.clone() {
@@ -1371,7 +1371,7 @@ impl Desktop<'_> {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(repo.to_string()).strong());
                     if let Some(error) = self.runtime.github.repo_error(&repo) {
-                        ui.label(RichText::new(error).color(p.warning).size(11.5));
+                        ui.label(RichText::new(error).color(p.warning).size(11.0));
                     }
                 });
                 let mine: Vec<(usize, &Row)> = rows.iter().enumerate().filter(|(_, row)| row.repo == repo).collect();
@@ -1379,7 +1379,7 @@ impl Desktop<'_> {
                 let others = all.iter().filter(|row| row.repo == repo && row.group == Group::Other).count();
                 let grouped = all.iter().any(|row| row.repo == repo && row.group != Group::Other);
                 if mine.is_empty() && others == 0 {
-                    ui.label(RichText::new("No open pull requests").color(p.muted).size(11.5));
+                    ui.label(RichText::new("No open pull requests").color(p.muted).size(11.0));
                 }
                 // Headings only when the viewer has pull requests of their own or assigned here; the
                 // last pass (`None`) heads a folded Other group, whose rows are not listed.
@@ -1392,13 +1392,13 @@ impl Desktop<'_> {
                             let open = self.client.github.others_open(&repo, &all);
                             let label = format!("{} {} ({others})", if open { "▾" } else { "▸" }, group.label());
                             let toggle = ui.add(
-                                egui::Label::new(RichText::new(label).color(p.muted).size(11.5)).sense(Sense::click()),
+                                egui::Label::new(RichText::new(label).color(p.muted).size(11.0)).sense(Sense::click()),
                             );
                             if toggle.on_hover_text("Show or hide other people's pull requests").clicked() {
                                 self.client.github.others.insert(repo.clone(), !open);
                             }
                         } else {
-                            ui.label(RichText::new(group.label()).color(p.muted).size(11.5));
+                            ui.label(RichText::new(group.label()).color(p.muted).size(11.0));
                         }
                     }
                     let Some((i, row)) = row else { break };
@@ -1429,7 +1429,7 @@ impl Desktop<'_> {
                                 if row.counted { " ◆" } else { "" }
                             );
                             let response = ui.selectable_label(selected == Some(i), title);
-                            ui.label(RichText::new(status).color(p.muted).size(11.5));
+                            ui.label(RichText::new(status).color(p.muted).size(11.0));
                             response
                         })
                         .inner;
@@ -1458,7 +1458,7 @@ impl Desktop<'_> {
             let checks: Vec<String> =
                 details.check_runs.iter().map(|check| format!("{} {}", check.state.symbol(), check.name)).collect();
             if !checks.is_empty() {
-                ui.label(RichText::new(checks.join("  ")).size(11.5).color(p.muted));
+                ui.label(RichText::new(checks.join("  ")).size(11.0).color(p.muted));
             }
         }
         let methods = self.runtime.github.methods(&repo);
@@ -1583,16 +1583,16 @@ impl Desktop<'_> {
                     CheckState::None => p.muted,
                 };
                 let link =
-                    ui.add(egui::Label::new(RichText::new(run.label()).color(color).size(11.5)).sense(Sense::click()));
+                    ui.add(egui::Label::new(RichText::new(run.label()).color(color).size(11.0)).sense(Sense::click()));
                 if link.on_hover_text("Latest run; click to open it").clicked() {
                     self.runtime.github_open_url(run.url.clone());
                 }
             }
             Some(Ok(None)) => {
-                ui.label(RichText::new("never run").color(p.muted).size(11.5));
+                ui.label(RichText::new("never run").color(p.muted).size(11.0));
             }
             Some(Err(error)) => {
-                ui.label(RichText::new("run status unavailable").color(p.muted).size(11.5)).on_hover_text(error);
+                ui.label(RichText::new("run status unavailable").color(p.muted).size(11.0)).on_hover_text(error);
             }
             None => {}
         }

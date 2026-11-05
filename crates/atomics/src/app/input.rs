@@ -355,7 +355,7 @@ impl Desktop<'_> {
                         ui.label(
                             RichText::new(format!("in {}", paths::display(&paths::scratch_dir().join("…"))))
                                 .color(self.palette().muted)
-                                .size(11.5),
+                                .size(11.0),
                         );
                         ui.end_row();
                     } else if dialog.place == Place::Worktree {
@@ -372,7 +372,7 @@ impl Desktop<'_> {
                                 dialog.branch.trim(),
                             );
                             ui.label("");
-                            ui.label(RichText::new(paths::display(&path)).monospace().size(11.5));
+                            ui.label(RichText::new(paths::display(&path)).monospace().size(11.0));
                             ui.end_row();
                         }
                     } else {

@@ -4,11 +4,20 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{RichText, Stroke};
+use egui::{RichText, Stroke, vec2};
 
 use crate::boards;
+use crate::theme::Palette;
 use crate::topbar::{measure, record_item};
 use crate::{Backend, Client, Command, SessionRow, ViewHints};
+
+/// The size of a tab's text, as the bar's other buttons have it.
+const TEXT: f32 = 13.0;
+
+/// A tab's look: flat, and outlined while it is the one selected.
+fn tab_button<'a>(button: egui::Button<'a>, selected: bool, p: &Palette) -> egui::Button<'a> {
+    button.fill(egui::Color32::TRANSPARENT).stroke(if selected { Stroke::new(1.0, p.accent) } else { Stroke::NONE })
+}
 
 #[derive(Clone)]
 enum ViewTab {
@@ -145,17 +154,23 @@ impl Nav<'_> {
             let changes: usize = self.backend.repos().iter().map(|root| project_summary(&sessions, root).1).sum();
             format!("Repos · {changes}")
         };
-        let color = if selected { self.client.palette.accent } else { self.client.palette.foreground };
-        let response = ui
-            .menu_button(RichText::new(&label).font(self.client.palette.ui(12.5)).color(color), |ui| {
-                for root in self.backend.repos() {
-                    self.view_tab(ui, &ViewTab::Project(root), true);
-                }
-            })
-            .response;
-        if !in_menu {
-            record_item(ui, &label, &response);
+        let text = RichText::new(&label).font(self.client.palette.ui(TEXT)).color(self.client.palette.foreground);
+        let projects = |nav: &mut Self, ui: &mut egui::Ui| {
+            for root in nav.backend.repos() {
+                nav.view_tab(ui, &ViewTab::Project(root), true);
+            }
+        };
+        if in_menu {
+            ui.menu_button(text, |ui| projects(self, ui));
+            return;
         }
+        let muted = self.client.palette.muted;
+        let arrow = egui::Atom::paint(vec2(9.0, 9.0), move |ui: &egui::Ui, args: egui::AtomPaintArgs| {
+            boards::chevron(ui.painter(), args.rect, muted);
+        });
+        let button = tab_button(egui::Button::new((text, arrow)), selected, &self.client.palette);
+        let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| projects(self, ui));
+        record_item(ui, &label, &response);
     }
 
     /// A tab, in the row or (`in_menu`) in a menu, where a click also closes the menu.
@@ -166,31 +181,25 @@ impl Nav<'_> {
         }
         let p = self.client.palette.clone();
         let selected = self.view_tab_selected(tab);
-        let (label, hover, color) = match tab {
+        let (label, hover) = match tab {
             ViewTab::All => {
                 let agents = self.backend.session_list().iter().filter(|s| !s.chief).count();
-                (format!("All · {agents}"), "All projects".to_string(), p.foreground)
+                (format!("All · {agents}"), "All projects".to_string())
             }
             ViewTab::Ungrouped => {
                 let count = self.backend.session_list().iter().filter(|s| s.ungrouped).count();
                 let hover = "Sessions outside any plan. New sessions start here, in scratch folders of their own";
-                (format!("Ungrouped · {count}"), hover.to_string(), if selected { p.accent } else { p.foreground })
+                (format!("Ungrouped · {count}"), hover.to_string())
             }
             ViewTab::Project(root) => {
                 let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let (count, changes) = project_summary(&self.backend.session_list(), root);
-                (
-                    format!("{name} · {count} sessions · {changes} changes"),
-                    self.backend.display(root),
-                    if selected { p.accent } else { p.foreground },
-                )
+                (format!("{name} · {count} sessions · {changes} changes"), self.backend.display(root))
             }
             ViewTab::Repos => unreachable!(),
         };
-        let button = egui::Button::new(RichText::new(&label).font(p.ui(12.5)).color(color))
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(if selected { Stroke::new(1.0, p.accent) } else { Stroke::NONE });
-        let response = ui.add(button).on_hover_text(hover);
+        let text = RichText::new(&label).font(p.ui(TEXT)).color(p.foreground);
+        let response = ui.add(tab_button(egui::Button::new(text), selected, &p)).on_hover_text(hover);
         if !in_menu {
             record_item(ui, &label, &response);
         }

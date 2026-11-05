@@ -1352,7 +1352,7 @@ pub fn changed_files(
     };
     let diff = &prepared.diff;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("CHANGED").color(palette.accent).strong().size(11.0));
+        crate::sidebar::section(ui, palette, "CHANGED");
         ui.label(RichText::new(format!("{}", diff.files.len())).color(palette.muted).size(11.0));
         ui.label(RichText::new(format!("+{}", prepared.additions)).color(palette.success).size(11.0));
         ui.label(RichText::new(format!("−{}", prepared.deletions)).color(palette.error).size(11.0));

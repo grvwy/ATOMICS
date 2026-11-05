@@ -410,6 +410,43 @@ fn completed_and_archived_boards_are_read_only_even_with_ready_tasks() {
 }
 
 #[test]
+fn send_fills_with_the_accent_only_with_something_to_send() {
+    super::tests::with_app("app::board_tests::send_fills_with_the_accent_only_with_something_to_send", |app, ctx| {
+        populate(app);
+        let accent = app.palette().accent;
+        let filled = |app: &mut Desktop<'_>| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
+                    ..Default::default()
+                },
+                |ui| app.paint(ui),
+            );
+            app.runtime.drain_actions();
+            let label = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Send" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            });
+            let label = label.expect("the steer bar's Send");
+            let filled = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
+                    if rect.fill == accent && rect.rect.contains(label))
+            });
+            output.drop_without_applying_deltas();
+            filled
+        };
+        filled(app);
+        assert!(!filled(app), "nothing typed, nothing to send");
+        app.client.ui.steer_text = "   ".into();
+        assert!(!filled(app), "spaces send nothing either");
+        app.client.ui.steer_text = "go on".into();
+        assert!(filled(app));
+    });
+}
+
+#[test]
 fn approve_plan_fills_with_the_accent_and_writes_on_accent() {
     super::tests::with_app("app::board_tests::approve_plan_fills_with_the_accent_and_writes_on_accent", |app, ctx| {
         populate(app);

@@ -333,7 +333,7 @@ fn ticket_row(
         painter.galley(pos2(bar.right() + 4.0, y + 1.0), text, p.muted);
         x = bar.right() + 4.0 + width + 8.0;
     }
-    let key = fit(ui, card.link.label(), p.mono(11.5), p.accent, rect.right() - x);
+    let key = fit(ui, card.link.label(), p.mono(11.0), p.accent, rect.right() - x);
     let width = key.size().x;
     painter.galley(pos2(x, y), key, p.accent);
     x += width + 8.0;
@@ -344,7 +344,7 @@ fn ticket_row(
     if x < rect.right() - 12.0
         && let Some(title) = card.link.title.as_deref()
     {
-        let galley = fit(ui, title, p.ui(11.5), p.foreground, rect.right() - x);
+        let galley = fit(ui, title, p.ui(11.0), p.foreground, rect.right() - x);
         painter.galley(pos2(x, y), galley, p.foreground);
     }
 }
@@ -519,7 +519,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
                 let title_w = title.size().x;
                 painter.galley(pos2(x, y), title, p.foreground);
                 if !view.detail.is_empty() && meta_left - x - title_w > 30.0 {
-                    let galley = fit(ui, &view.detail, p.ui(11.5), p.muted, meta_left - x - title_w - 10.0);
+                    let galley = fit(ui, &view.detail, p.ui(11.0), p.muted, meta_left - x - title_w - 10.0);
                     painter.galley(pos2(x + title_w + 8.0, y + 0.5), galley, p.muted);
                 }
                 let range = score_range(&entry.cards);
@@ -547,7 +547,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
                         }
                         Line::Text(text) => {
                             let color = if entry.state == TraceState::Error { p.error } else { p.muted };
-                            let galley = fit(ui, text, p.ui(11.5), color, row.width());
+                            let galley = fit(ui, text, p.ui(11.0), color, row.width());
                             painter.galley(row.min + vec2(0.0, 2.0), galley, color);
                         }
                     }
