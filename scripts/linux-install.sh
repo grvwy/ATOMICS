@@ -28,10 +28,15 @@ remove_old_names() {
 }
 
 if [ "$action" = uninstall ]; then
-  rm -f -- "$bin/atomics" "$desktop" "$icon" "$icon_png"
+  rm -f -- "$bin/atomics" "$bin/atomics.previous" "$desktop" "$icon" "$icon_png"
   remove_old_names
 else
   cd "$root"
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+    echo 'Building ATOMICS takes Rust. Get it from https://rustup.rs, run: . "$HOME/.cargo/env", then run this again.' >&2
+    echo 'To install without building: curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh' >&2
+    exit 1
+  fi
   target_dir=${CARGO_TARGET_DIR:-"$root/target"}
   host=$(rustc -vV | sed -n 's/^host: //p')
   case "$host" in
@@ -46,7 +51,15 @@ else
   trap 'rm -f -- "$staged"' EXIT
   trap 'exit 1' HUP INT TERM
   install -m 755 -- "$target_dir/$host/release/atomics" "$staged"
+  # What goes under the real name has to run here, and be on the disk through a power cut.
+  said=$("$staged" --version 2>&1) || { echo "The new build does not run: $said" >&2; exit 1; }
+  sync "$staged" 2>/dev/null || sync
+  # What this replaces is kept: `atomics rollback` goes back.
+  if [ -f "$bin/atomics" ]; then
+    ln -f -- "$bin/atomics" "$bin/atomics.previous" 2>/dev/null || cp -f -- "$bin/atomics" "$bin/atomics.previous"
+  fi
   mv -f -- "$staged" "$bin/atomics"
+  sync "$bin" 2>/dev/null || sync
   remove_old_names
   install -m 644 -- "$root/assets/icon.svg" "$icon"
   install -m 644 -- "$root/assets/icon.png" "$icon_png"

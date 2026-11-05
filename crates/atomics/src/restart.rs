@@ -24,6 +24,13 @@ impl Target {
         Ok(Self { executable, command })
     }
 
+    /// The program at `executable`, with what `current` gives this one: the window moving to where it was installed.
+    pub fn at(executable: PathBuf, workspace: Option<&str>) -> Result<Self> {
+        let args = with_workspace(std::env::args_os().skip(1).collect(), workspace);
+        let command = relaunch_command(&executable, &args, cfg!(target_os = "macos"))?;
+        Ok(Self { executable, command })
+    }
+
     /// This installation with other arguments: the window switching from a host's client to the host.
     pub fn with_args(args: &[OsString]) -> Result<Self> {
         let executable = crate::setup::executable_path().context("locating this installation")?;

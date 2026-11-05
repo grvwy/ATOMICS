@@ -335,6 +335,11 @@ pub enum SettingsTool {
     },
     /// Stop the setup step under way.
     CancelSetup,
+    /// A connection can wait, or no longer has to. It stays that way through restarts and updates.
+    ConnectLater {
+        id: String,
+        later: bool,
+    },
 }
 
 /// What became of an operation.
@@ -657,6 +662,9 @@ impl HostCommand {
                 }
                 SettingsTool::RunSetup { value, .. } => {
                     bounds.text("value", value.as_deref());
+                }
+                SettingsTool::ConnectLater { id, .. } => {
+                    bounds.id("id", Some(id));
                 }
                 _ => {}
             },

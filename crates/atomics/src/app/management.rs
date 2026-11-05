@@ -261,6 +261,9 @@ impl State {
                 self.run_setup(action, value).map_err(|e| WireError::new(ErrorCode::Conflict, e))?;
             }
             SettingsTool::CancelSetup => self.cancel_setup(),
+            SettingsTool::ConnectLater { id, later } => {
+                self.connect_later(id, later).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+            }
             SettingsTool::FinishSetup => {
                 self.finish_setup().map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
             }

@@ -182,6 +182,7 @@ pub(crate) fn status(machine: &Machine) -> Vec<SetupStep> {
 /// What a step is doing, for the person watching it.
 pub(crate) fn progress(action: SetupAction) -> &'static str {
     match action {
+        SetupAction::InstallSelf => "Installing ATOMICS…",
         SetupAction::InstallClaude => "Installing Claude Code…",
         SetupAction::InstallCodex => "Installing Codex…",
         SetupAction::InstallGit => "Asking macOS to install git…",
@@ -210,6 +211,7 @@ impl Job {
         let stop = Some(self.stop.as_ref());
         let pasted = || self.value.as_deref().unwrap_or_default();
         match self.action {
+            SetupAction::InstallSelf => crate::install::install_self().map(drop),
             SetupAction::InstallClaude => install("claude", "claude", &self.stop),
             SetupAction::InstallCodex => install("codex", "codex", &self.stop),
             SetupAction::InstallGit => install("git", "git", &self.stop),

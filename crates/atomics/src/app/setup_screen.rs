@@ -81,6 +81,11 @@ impl State {
             sandbox_steps: self.sandbox_steps.clone(),
             job: self.setup_job.as_ref().map(|job| SetupJob { action: job.action, progress: job.progress().into() }),
             failure: self.setup_failure.clone(),
+            later: self.store.setup_later.clone(),
+            install: self.install_offer.as_ref().map(|(from, to)| atomics_core::projection::SetupInstall {
+                from: paths::display(from),
+                to: paths::display(to),
+            }),
             start_choice: self.start_choice.as_ref().map(|pending| StartChoice {
                 agent: pending.agent.clone(),
                 why: pending.why.clone(),
@@ -242,8 +247,23 @@ impl State {
         }
     }
 
+    /// A connection can wait, or no longer has to. It is saved at once: nobody should be asked again after a restart.
+    pub(super) fn connect_later(&mut self, id: String, later: bool) -> Result<(), String> {
+        let list = &mut self.store.setup_later;
+        let known = list.contains(&id);
+        match later {
+            true if !known => list.push(id),
+            false if known => list.retain(|other| *other != id),
+            _ => return Ok(()),
+        }
+        self.store.save(&paths::store_file()).map_err(|err| format!("Could not save that: {err:#}"))
+    }
+
     fn setup_finished(&mut self, action: SetupAction, result: anyhow::Result<()>) {
         self.setup_job = None;
+        if action == SetupAction::InstallSelf && result.is_ok() {
+            self.installed_self();
+        }
         self.setup_failure = match result {
             Ok(()) => None,
             // Whoever stopped it knows.
@@ -251,6 +271,30 @@ impl State {
             Err(error) => Some(SetupFailure { action, why: format!("{error:#}") }),
         };
         self.setup_look_again = true;
+    }
+
+    /// It is in place. With nothing running, this window reopens from there, since what starts agents and what updates
+    /// should be the installed copy; over running agents it stays as it is, and the next start uses that copy.
+    fn installed_self(&mut self) {
+        let Some((_, to)) = self.install_offer.take() else { return };
+        let shown = paths::display(&to);
+        if !self.sessions.is_empty() {
+            self.toast(format!("Installed at {shown}. It opens from there next time."));
+            return;
+        }
+        let workspace = self.workspace.clone();
+        let answer = self.restart_using(false, Some("installed".into()), move || {
+            let program = crate::install::program_at(&to, cfg!(target_os = "macos"));
+            crate::restart::Target::at(program, workspace.as_deref())
+        });
+        if let Some(error) = answer.error {
+            self.toast(format!("Installed at {shown}. Open it from there; it could not reopen by itself: {error}"));
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn installed_self_for_test(&mut self) {
+        self.installed_self();
     }
 
     /// Looks again once nothing that may be older than the last step is under way.

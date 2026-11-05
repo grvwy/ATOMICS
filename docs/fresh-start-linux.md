@@ -16,8 +16,8 @@ as its state folder.
 | --- | --- |
 | Ubuntu 24.04 or newer, in a desktop session | Docker Sandboxes support it. Other distributions can use sbx's static build; doctor warns, and setup carries on. |
 | Hardware virtualization, `/dev/kvm`, and your session in the `kvm` group | Every sandbox is a microVM. |
-| rustup and stable Rust | `scripts/linux-install.sh` builds ATOMICS from this checkout. |
-| The build libraries and a Vulkan driver | The window (eframe/wgpu) and audio. |
+| rustup | Only to build from a checkout, which then uses the Rust `rust-toolchain.toml` names. The one-line install in step 2 needs none. |
+| The build libraries (only to build) and a Vulkan driver | The window (eframe/wgpu) and audio. A release's program needs glibc 2.35 or newer and libasound2. |
 | `secret-tool` and an unlocked Secret Service keyring | ATOMICS's credential store. There is no plaintext fallback. |
 | `xdg-open` (`xdg-utils`) and the desktop portal | Opening files, ticket links and sign-in pages; file dialogs. |
 | Docker Sandboxes, `sbx` v0.50.1 or newer | Sandboxed agents. |
@@ -57,20 +57,27 @@ Optional:
 
 ## 2. Install ATOMICS
 
-Clone this repository, then from the checkout:
+```sh
+curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh
+```
+
+It checks the download's SHA-256 and its signature against the release keys on the repository's main branch, and with
+no OpenSSL 3 here it says that it could not check the signature. The program then installs itself. To build from a
+checkout instead, clone this repository, and from the checkout:
 
 ```sh
-scripts/linux-install.sh
+scripts/linux-install.sh       # asks for rustup if it is missing
 atomics --version
 ```
 
-The installer builds a release binary for the native target and atomically replaces `~/.local/bin/atomics`,
+That builds a release binary for the native target and atomically replaces `~/.local/bin/atomics`,
 even while ATOMICS runs. It installs a desktop entry and icon under `~/.local/share`, and asks nothing: open ATOMICS
 from your applications menu, and its first run opens the setup screen ([First run](how-it-works.md#first-run)). To run
 `atomics` from a terminal too, add `~/.local/bin` to `PATH`; it prints the exact line if it is missing. Started from the
 desktop entry, ATOMICS adds your login shell's `PATH` to the bare one the launcher gives, so set `PATH` in your shell's
 startup files as usual; `atomics doctor` says where `PATH` came from.
-`scripts/linux-install.sh --uninstall` removes the binary, desktop entry and icon, and keeps config and state.
+`scripts/linux-install.sh --uninstall` removes the binary, what an update kept, the desktop entry and icon, and keeps
+config and state.
 
 ## 3. Set up sandboxes
 
@@ -241,6 +248,9 @@ starts in the project's main checkout with every ATOMICS tool. A good first requ
 board; see [The chief agent](../README.md#the-chief-agent).
 
 ## 10. Restart onto a new build
+
+ATOMICS updates itself: see [Updates](how-it-works.md#updates), which also has the one command that goes back. From a
+checkout:
 
 ```sh
 git pull

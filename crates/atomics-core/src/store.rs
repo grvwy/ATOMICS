@@ -63,6 +63,9 @@ pub struct Store {
     /// This install started with no config and nobody has finished or skipped the setup screen yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub setup_pending: bool,
+    /// The connections someone said will wait, by id: they stay that way through restarts and updates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_later: Vec<String>,
     #[serde(default)]
     pub chief_dock: Option<ChiefDock>,
     #[serde(default)]

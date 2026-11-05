@@ -174,6 +174,26 @@ branch, and runs the checkout's install script through `atomics queue` at `nice 
 with the toolchain from the checkout's `rust-toolchain.toml` or `rust-toolchain` if it has one. The script's output is
 in `update.log` in the state folder. A script that stops may already have put the new program in place, and says so.
 
+An update replaces the program and nothing else. Config, `config.d`, plans, sessions, paired devices, keychain items, the
+setup screen's Skip and each **Connect later** are not its to touch, and a test holds it to that byte for byte, after the
+update and after the new version has run.
+
+**The way back.** An update keeps what it replaced: `atomics.previous` beside the program on Linux, and
+`.atomics-previous` beside `ATOMICS.app` on a Mac, whatever a checkout builds included. One command goes back, from
+the copy that was kept, so that it works even when the new version will not start:
+
+```sh
+~/.local/bin/atomics.previous rollback                                # Linux
+~/Applications/.atomics-previous/Contents/MacOS/atomics rollback      # Mac
+```
+
+`atomics rollback` does the same from the current version, and running it again goes forward again. It never happens by
+itself, and the new version is still offered afterwards. Only one previous version is kept.
+
+An install the update cannot serve says so before anyone presses anything. With `[update] source`, Linux builds install
+to `~/.local/bin/atomics`, so ATOMICS running from anywhere else is told to start that one; a build goes in place only
+once it has run here. `atomics update` from one install leaves a window running another alone, and says so.
+
 ## Tickets
 
 Plans can follow Relay, Linear or any ticket system with an MCP server. ATOMICS talks to that server on

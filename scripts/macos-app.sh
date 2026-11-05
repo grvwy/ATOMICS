@@ -8,6 +8,8 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest=${1:-"$HOME/Applications"}
 app="$dest/ATOMICS.app"
+# What this replaces is kept here, under a name macOS does not offer as an app: `atomics rollback` goes back.
+previous="$dest/.atomics-previous"
 target_dir=${CARGO_TARGET_DIR:-"$root/target"}
 target=${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
 
@@ -15,9 +17,13 @@ cargo build --release --locked --manifest-path "$root/Cargo.toml" -p atomics \
   --target "$target" --target-dir "$target_dir"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)
 
-work=$(mktemp -d)
+mkdir -p "$dest"
+# Assembled beside where it goes, on the same disk, and swapped in only once it is whole: a failure on the way leaves the
+# app that was there.
+work=$(mktemp -d "$dest/.atomics-update-XXXXXX")
 trap 'rm -rf "$work"' EXIT
 iconset="$work/ATOMICS.iconset"
+new="$work/ATOMICS.app"
 mkdir -p "$iconset"
 render() { # size output
   if command -v rsvg-convert >/dev/null 2>&1; then
@@ -31,11 +37,10 @@ for size in 16 32 128 256 512; do
   render $((size * 2)) "$iconset/icon_${size}x${size}@2x.png"
 done
 
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$target_dir/$target/release/atomics" "$app/Contents/MacOS/atomics"
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/ATOMICS.icns"
-cat > "$app/Contents/Info.plist" <<EOF
+mkdir -p "$new/Contents/MacOS" "$new/Contents/Resources"
+cp "$target_dir/$target/release/atomics" "$new/Contents/MacOS/atomics"
+iconutil -c icns "$iconset" -o "$new/Contents/Resources/ATOMICS.icns"
+cat > "$new/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -66,7 +71,22 @@ cat > "$app/Contents/Info.plist" <<EOF
 EOF
 
 # Ad-hoc signature: lets macOS remember the microphone permission for the app.
-codesign --force --deep --sign - "$app" >/dev/null 2>&1 || echo "codesign failed; the app still runs" >&2
+codesign --force --deep --sign - "$new" >/dev/null 2>&1 || echo "codesign failed; the app still runs" >&2
+# A build for this Mac has to run here before it goes under the real name.
+if [ "$target" = "$(rustc -vV | sed -n 's/^host: //p')" ]; then
+  said=$("$new/Contents/MacOS/atomics" --version 2>&1) || { echo "The new build does not run: $said" >&2; exit 1; }
+fi
+sync
+if [ -d "$app" ]; then
+  rm -rf "$previous"
+  mv "$app" "$previous"
+fi
+if ! mv "$new" "$app"; then
+  [ -d "$previous" ] && mv "$previous" "$app"
+  echo "Could not put the new app at $app" >&2
+  exit 1
+fi
+sync
 # The bundle builds from before the rename to ATOMICS made.
 rm -rf -- "$dest/IMACS.app"
 echo "$app"

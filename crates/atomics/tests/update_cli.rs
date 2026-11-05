@@ -55,9 +55,21 @@ impl Fixture {
         git(&self.other, &["rev-parse", "HEAD"])
     }
 
+    /// The real program where the install script puts it: a checkout only updates that one.
     fn atomics(&self, args: &[&str]) -> Output {
+        let installed = self.dir.path().join(".local/bin/atomics");
+        if !installed.exists() {
+            std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+            std::fs::hard_link(env!("CARGO_BIN_EXE_atomics"), &installed)
+                .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_atomics"), &installed).map(drop))
+                .unwrap();
+        }
+        self.atomics_from(&installed, args)
+    }
+
+    fn atomics_from(&self, program: &Path, args: &[&str]) -> Output {
         test_support::output(
-            Command::new(env!("CARGO_BIN_EXE_atomics"))
+            Command::new(program)
                 .args(args)
                 .env("HOME", self.dir.path())
                 .env("ATOMICS_HOME", self.dir.path().join("state"))
@@ -123,6 +135,22 @@ fn update_moves_the_checkout_and_runs_its_install_script_at_low_priority_in_the_
     assert_eq!(ran.lines().collect::<Vec<_>>(), ["19", "--no-setup"], "{said}");
     let log = std::fs::read_to_string(fixture.dir.path().join("state/update.log")).unwrap();
     assert!(log.contains("atomics queue: no ATOMICS socket"), "it went through the queue: {log}");
+}
+
+/// The script installs to one place and a restart reruns what is running: anything else would rerun the old build and
+/// offer the same update again, a full build each time.
+#[test]
+#[cfg(target_os = "linux")]
+fn running_from_anywhere_but_where_the_script_installs_is_refused_before_anything_moves() {
+    let fixture = Fixture::new(RECORDS);
+    fixture.push("Add the thing");
+    let before = git(&fixture.checkout, &["rev-parse", "HEAD"]);
+    let output = fixture.atomics_from(Path::new(env!("CARGO_BIN_EXE_atomics")), &["update"]);
+    assert!(!output.status.success(), "{output:?}");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("installs to") && said.contains("but this runs from"), "{said}");
+    assert_eq!(git(&fixture.checkout, &["rev-parse", "HEAD"]), before);
+    assert!(!fixture.checkout.join("ran").exists());
 }
 
 #[test]

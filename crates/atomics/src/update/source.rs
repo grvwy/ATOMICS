@@ -78,6 +78,26 @@ impl Source {
         matches!(git::is_ancestor(&self.checkout, "HEAD", &build), Ok(Some(false)))
     }
 
+    /// Why this install cannot build from a checkout. On Linux the install script always installs to one place, and a
+    /// restart reruns the program running now: from anywhere else that would rerun the old build, and offer the same
+    /// update again, a full build each time.
+    pub fn unavailable(&self) -> Option<String> {
+        if cfg!(target_os = "macos") {
+            return None;
+        }
+        let running = crate::setup::executable_path().ok()?;
+        let installs_to = atomics_core::paths::home().join(".local/bin/atomics");
+        let resolved = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        (resolved(&running) != resolved(&installs_to)).then(|| {
+            format!(
+                "Building from {} installs to {}, but this runs from {}. Start that one to update from a checkout.",
+                self.checkout.display(),
+                installs_to.display(),
+                running.display()
+            )
+        })
+    }
+
     pub fn install(&self, progress: &dyn Fn(String)) -> Result<()> {
         progress(format!("Fetching {REMOTE_MAIN}"));
         let changes = self.git(&["status", "--porcelain", "--untracked-files=no"])?;

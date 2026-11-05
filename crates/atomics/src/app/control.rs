@@ -124,7 +124,7 @@ impl State {
                 }
             }
             ControlRequest::Restart { force, reason, pane } => done(self.restart(force, reason, pane.as_deref())),
-            ControlRequest::UpdateInstalled { version } => done(self.update_installed(version)),
+            ControlRequest::UpdateInstalled { version, program } => done(self.update_installed(version, program)),
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::PairClient { name } => done(self.pair_client(&name)),
             ControlRequest::UnpairClient { name } => done(self.unpair_client(&name)),

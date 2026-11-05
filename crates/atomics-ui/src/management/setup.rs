@@ -96,11 +96,8 @@ pub(super) fn track(ctx: &egui::Context, backend: &dyn Backend, client: &mut Cli
         if !std::mem::replace(&mut state.setup_loaded, true) && enabled && !info.setup.checking {
             tool(client, SettingsTool::CheckPrograms);
         }
-    } else if std::mem::take(&mut state.setup_loaded) {
-        state.later.clear();
-        if info.setup.first_run && enabled {
-            tool(client, SettingsTool::FinishSetup);
-        }
+    } else if std::mem::take(&mut state.setup_loaded) && info.setup.first_run && enabled {
+        tool(client, SettingsTool::FinishSetup);
     }
 }
 
@@ -137,6 +134,22 @@ fn steps(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &M
     ui.vertical_centered(|ui| {
         note(ui, &p, "Everything here can wait, and Settings brings this screen back.");
     });
+    if let Some(install) = &setup.install {
+        step(ui, &p, false, "Install ATOMICS", |ui| {
+            note(
+                ui,
+                &p,
+                format!(
+                    "This runs from {}. Install it at {} so that it opens from your applications menu and can update \
+                     itself. With nothing running, it reopens from there.",
+                    install.from, install.to
+                ),
+            );
+            let click = SetupClick::new(SetupAction::InstallSelf, "Install");
+            ui.horizontal_wrapped(|ui| run_button(ui, client, enabled, setup, &click));
+            failure(ui, client, setup, SetupAction::InstallSelf);
+        });
+    }
     let usable = setup.programs.iter().any(|program| program.agent.is_some() && program.found.is_some());
     step(ui, &p, usable, "Your agents", |ui| programs(ui, client, enabled, setup));
     step(ui, &p, true, "Where agents run", |ui| where_agents_run(ui, client, enabled, info));
@@ -352,16 +365,19 @@ fn connection(
         ui.label(RichText::new(&row.name).strong());
         if let Some(who) = &row.connected {
             note(ui, &p, who.clone());
-        } else if client.management.later.contains(&row.id) {
+        } else if setup.later.contains(&row.id) {
             note(ui, &p, "Later");
+            if ui.add_enabled(enabled, touch::sized(egui::Button::new("Connect now"), client.touch)).clicked() {
+                tool(client, SettingsTool::ConnectLater { id: row.id.clone(), later: false });
+            }
         } else {
             connect_button(ui, backend, client, enabled, setup, row);
-            if button(ui, client, "Connect later").clicked() {
-                client.management.later.push(row.id.clone());
+            if ui.add_enabled(enabled, touch::sized(egui::Button::new("Connect later"), client.touch)).clicked() {
+                tool(client, SettingsTool::ConnectLater { id: row.id.clone(), later: true });
             }
         }
     });
-    if row.connected.is_none() && !client.management.later.contains(&row.id) {
+    if row.connected.is_none() && !setup.later.contains(&row.id) {
         note(ui, &p, row.note.clone());
         if let Some(click) = &row.click {
             failure(ui, client, setup, click.action);

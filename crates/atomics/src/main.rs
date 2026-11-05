@@ -20,6 +20,7 @@ mod headless;
 mod highlight;
 mod hook_client;
 mod host;
+mod install;
 mod instance;
 mod ipc;
 mod lifecycle;
@@ -106,6 +107,10 @@ enum Command {
     },
     /// Check required tools, configuration and integrations
     Doctor,
+    /// Install this program for your user: where it goes, its menu entry and icon, and on a Mac `atomics` on PATH
+    Install,
+    /// Go back to the version the last update replaced; run it again to go forward again
+    Rollback,
     /// Sign in to or out of the ticket system's MCP server (browser OAuth)
     Tickets {
         #[command(subcommand)]
@@ -332,6 +337,7 @@ fn main() -> eframe::Result {
                 | Command::Tickets { .. }
                 | Command::Queue { .. }
                 | Command::Update { .. }
+                | Command::Install
         )
     ) {
         // SAFETY: no other thread exists yet.
@@ -442,6 +448,8 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         Some(Command::Update { check }) => std::process::exit(update::run_cli(check)),
+        Some(Command::Install) => std::process::exit(install::run_cli()),
+        Some(Command::Rollback) => std::process::exit(update::run_rollback_cli()),
         Some(Command::Queue { class, command }) => {
             let class =
                 atomics_core::governor::SlotClass::parse(&class).unwrap_or(atomics_core::governor::SlotClass::Test);

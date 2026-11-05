@@ -2,6 +2,9 @@
 //! as it was. A version comes from a signed release, checked against the key built into this binary before anything
 //! is unpacked, or from a checkout the user names ([`source`]). The window and `atomics update` share all of it.
 //! Restarting into what was installed is [`crate::app`]'s safe restart.
+//!
+//! An update replaces the program and nothing else: config, plans, sessions, paired devices and keychain items are not
+//! its to touch. What it replaced is kept beside the install, and `atomics rollback` swaps back ([`rollback`]).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,7 +38,11 @@ const NO_KEY: &str = "This build has no release signing key, so it cannot check 
                       one. Install the new version by hand, or set [update] source to build from a checkout.";
 
 /// The folders an update unpacks into, beside what it replaces. One left by a crash goes with the next update.
-const STAGING: &str = ".atomics-update-";
+pub(crate) const STAGING: &str = ".atomics-update-";
+/// Where a bundle's previous version is kept: not an `.app`, so that macOS offers no second ATOMICS.
+const PREVIOUS_BUNDLE: &str = ".atomics-previous";
+/// What a program's previous version is called, beside it.
+const PREVIOUS_SUFFIX: &str = ".previous";
 
 /// Where new versions come from.
 #[derive(Clone)]
@@ -88,7 +95,10 @@ impl Mode {
 
     /// Why this install cannot take `found`, said before anyone presses anything.
     pub fn unavailable(&self, found: &Found) -> Option<String> {
-        let Mode::Releases(feed) = self else { return None };
+        let feed = match self {
+            Mode::Releases(feed) => feed,
+            Mode::Source(source) => return source.unavailable(),
+        };
         if let Err(why) = &feed.key {
             return Some(why.clone());
         }
@@ -146,6 +156,26 @@ impl Feed {
             target: None,
             remote: true,
         }
+        .test_feed()
+    }
+
+    /// In a debug build only, another feed and key, so that a test can update the real program from a server of its own.
+    /// No release build has this: there, nothing at run time can name another key, which CI checks of each release.
+    #[cfg(debug_assertions)]
+    fn test_feed(self) -> Feed {
+        let (Some(url), Some(key)) =
+            (std::env::var_os("ATOMICS_TEST_RELEASE_FEED"), std::env::var_os("ATOMICS_TEST_RELEASE_KEY"))
+        else {
+            return self;
+        };
+        let key =
+            std::fs::read_to_string(key).map_err(|error| error.to_string()).and_then(|pem| parse_public_key(&pem));
+        Feed { url: url.to_string_lossy().into_owned(), key, remote: false, ..self }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn test_feed(self) -> Feed {
+        self
     }
 
     fn agent(&self, config: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
@@ -339,6 +369,33 @@ impl InstallTarget {
         }
     }
 
+    /// Where what this replaces is kept. A program's previous version sits beside it, and a bundle's under a name macOS
+    /// does not offer as an app.
+    pub(crate) fn previous(&self) -> PathBuf {
+        match self {
+            Self::Binary(path) => {
+                let mut name = path.file_name().unwrap_or_default().to_os_string();
+                name.push(PREVIOUS_SUFFIX);
+                path.with_file_name(name)
+            }
+            Self::Bundle(path) => path.with_file_name(PREVIOUS_BUNDLE),
+        }
+    }
+
+    /// The install this is, or the install this is the kept previous version of.
+    fn of_rollback(executable: &Path, macos: bool) -> Result<Self> {
+        let resolved = executable.canonicalize().unwrap_or_else(|_| executable.to_path_buf());
+        if resolved.file_name().is_some_and(|name| name.to_string_lossy() == format!("atomics{PREVIOUS_SUFFIX}")) {
+            return Ok(Self::Binary(resolved.with_file_name("atomics")));
+        }
+        if let Some(kept) =
+            resolved.ancestors().nth(3).filter(|kept| kept.file_name().is_some_and(|n| n == PREVIOUS_BUNDLE))
+        {
+            return Ok(Self::Bundle(kept.with_file_name("ATOMICS.app")));
+        }
+        Self::of(&resolved, macos)
+    }
+
     /// Unpacks beside what it replaces, on the same filesystem, so the last step is one rename.
     fn install(&self, archive: &[u8], version: &str) -> Result<()> {
         let target = self.path();
@@ -353,34 +410,81 @@ impl InstallTarget {
         let unpacked = staging.path().join("unpacked");
         std::fs::create_dir(&unpacked).with_context(|| format!("Could not write to {}", parent.display()))?;
         unpack(&download, &unpacked)?;
-        match self {
-            Self::Binary(target) => {
-                let new = unpacked.join("atomics");
-                must_run(&new)?;
-                must_report(&new, version)?;
-                on_disk(&new).with_context(|| format!("Could not write to {}", parent.display()))?;
-                std::fs::rename(&new, target)
-            }
-            Self::Bundle(target) => {
-                let new = unpacked.join("ATOMICS.app");
-                let program = new.join("Contents/MacOS/atomics");
-                must_run(&program)?;
-                must_report(&program, version)?;
-                on_disk(&new).with_context(|| format!("Could not write to {}", parent.display()))?;
-                swap_bundle(&new, target, &staging.path().join("previous.app"))
-            }
-        }
-        .with_context(|| format!("Could not replace {}", target.display()))?;
-        // The swap is done and stands; this only makes it last through a power cut, where a folder can sync at all.
-        let _ = std::fs::File::open(parent).and_then(|folder| folder.sync_all());
-        Ok(())
+        let new = match self {
+            Self::Binary(_) => unpacked.join("atomics"),
+            Self::Bundle(_) => unpacked.join("ATOMICS.app"),
+        };
+        must_report_in(self, &new, version)?;
+        place(self, &new, staging.path())
     }
+}
+
+/// Refuses an archive whose program does not run, or does not name `version`.
+fn must_report_in(target: &InstallTarget, new: &Path, version: &str) -> Result<()> {
+    let program = match target {
+        InstallTarget::Binary(_) => new.to_path_buf(),
+        InstallTarget::Bundle(_) => new.join("Contents/MacOS/atomics"),
+    };
+    must_run(&program)?;
+    must_report(&program, version)
+}
+
+/// Puts `new`, staged in `staging` on the install's filesystem, where `target` says, keeping what was there. It must run
+/// here first. The name stays taken throughout where the system can do that, and everything is on the disk before it
+/// goes under the real name, so that a power cut finds one version or the other.
+pub(crate) fn place(target: &InstallTarget, new: &Path, staging: &Path) -> Result<()> {
+    let path = target.path();
+    let parent = path.parent().context("the install has no folder")?;
+    let program = match target {
+        InstallTarget::Binary(_) => new.to_path_buf(),
+        InstallTarget::Bundle(_) => new.join("Contents/MacOS/atomics"),
+    };
+    must_run(&program)?;
+    on_disk(new).with_context(|| format!("Could not write to {}", parent.display()))?;
+    match target {
+        InstallTarget::Binary(path) => {
+            keep_previous(path, &target.previous(), staging).and_then(|()| std::fs::rename(new, path))
+        }
+        InstallTarget::Bundle(path) => replace_bundle(new, path, &target.previous(), staging),
+    }
+    .with_context(|| format!("Could not replace {}", path.display()))?;
+    // The swap is done and stands; this only makes it last through a power cut, where a folder can sync at all.
+    let _ = std::fs::File::open(parent).and_then(|folder| folder.sync_all());
+    Ok(())
+}
+
+/// Keeps the program at `path` under `previous`, with the name it has now staying in place: another name for the same
+/// file, or a copy where a link cannot be made. The file a running program holds is the one kept, unchanged.
+fn keep_previous(path: &Path, previous: &Path, staging: &Path) -> std::io::Result<()> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return Ok(());
+    }
+    let kept = staging.join("kept");
+    if std::fs::hard_link(path, &kept).is_err() {
+        std::fs::copy(path, &kept)?;
+        std::fs::File::open(&kept)?.sync_all()?;
+    }
+    std::fs::rename(&kept, previous)
+}
+
+/// Swaps the bundle `new` in, and moves what was there to `previous`, in place of what was kept before.
+fn replace_bundle(new: &Path, target: &Path, previous: &Path, staging: &Path) -> std::io::Result<()> {
+    if !target.exists() {
+        return std::fs::rename(new, target);
+    }
+    let aside = staging.join("previous.app");
+    swap_bundle(new, target, &aside)?;
+    // The swap stands whatever happens to the copy kept.
+    let old = if new.exists() { new } else { aside.as_path() };
+    let _ = std::fs::remove_dir_all(previous);
+    let _ = std::fs::rename(old, previous);
+    Ok(())
 }
 
 /// Puts `path` on the disk, all of it where it is a folder, so that a power cut after the rename finds the new program
 /// and not an empty file under its name. A link's target is inside what gets synced, and a folder that cannot sync
 /// only risks its own names.
-fn on_disk(path: &Path) -> std::io::Result<()> {
+pub(crate) fn on_disk(path: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_symlink() {
         return Ok(());
@@ -422,7 +526,7 @@ fn unpack(archive: &Path, folder: &Path) -> Result<()> {
 }
 
 /// Refuses what would leave a broken install behind: a program that is missing, or does not run here.
-fn must_run(program: &Path) -> Result<()> {
+pub(crate) fn must_run(program: &Path) -> Result<()> {
     if !std::fs::symlink_metadata(program).is_ok_and(|meta| meta.is_file()) {
         bail!("The release does not hold {}.", program.file_name().unwrap_or_default().to_string_lossy());
     }
@@ -464,6 +568,30 @@ fn swap_bundle(new: &Path, target: &Path, aside: &Path) -> std::io::Result<()> {
     })
 }
 
+/// `first` and `second` trade names at once, where the system can.
+#[cfg(target_os = "linux")]
+fn exchange(first: &Path, second: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let first = std::ffi::CString::new(first.as_os_str().as_bytes())?;
+    let second = std::ffi::CString::new(second.as_os_str().as_bytes())?;
+    const RENAME_EXCHANGE: libc::c_uint = 2;
+    // SAFETY: both are valid NUL-terminated paths for the duration of the call.
+    let done = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    };
+    if done != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn exchange(first: &Path, second: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -494,6 +622,71 @@ pub fn lock(home: &Path) -> Result<Lock> {
         bail!("Another update is under way.");
     }
     Ok(Lock(file))
+}
+
+/// `previous` and `target` trade places, so that doing this again goes forward again. Where the system cannot trade two
+/// names at once, three renames do it and put things back if one fails.
+fn trade_places(previous: &Path, target: &Path, aside: &Path) -> std::io::Result<()> {
+    if exchange(previous, target).is_ok() {
+        return Ok(());
+    }
+    if !target.exists() {
+        return std::fs::rename(previous, target);
+    }
+    std::fs::rename(target, aside)?;
+    if let Err(error) = std::fs::rename(previous, target) {
+        let _ = std::fs::rename(aside, target);
+        return Err(error);
+    }
+    std::fs::rename(aside, previous).inspect_err(|_| {
+        let _ = std::fs::rename(target, previous);
+        let _ = std::fs::rename(aside, target);
+    })
+}
+
+/// Goes back to the version the last update replaced, from either of the two: the kept copy can run this when the new
+/// one will not start at all. What the update replaced has to run here. Doing it again goes forward again.
+pub fn rollback(executable: &Path, macos: bool) -> Result<String> {
+    let target = InstallTarget::of_rollback(executable, macos)?;
+    let previous = target.previous();
+    if !previous.exists() {
+        bail!("No previous version is kept at {}: an update keeps the one it replaces.", previous.display());
+    }
+    let program = match &target {
+        InstallTarget::Binary(_) => previous.clone(),
+        InstallTarget::Bundle(_) => previous.join("Contents/MacOS/atomics"),
+    };
+    must_run(&program)?;
+    let version = crate::restart::version_output(&program)
+        .ok()
+        .and_then(|output| reported_version(&output).map(str::to_string))
+        .unwrap_or_else(|| "the previous version".into());
+    let parent = target.path().parent().context("the install has no folder")?;
+    let aside = parent.join(format!("{STAGING}rollback-{}", std::process::id()));
+    trade_places(&previous, target.path(), &aside)
+        .with_context(|| format!("Could not swap {} and {}", previous.display(), target.path().display()))?;
+    let _ = std::fs::File::open(parent).and_then(|folder| folder.sync_all());
+    Ok(version)
+}
+
+/// `atomics rollback`.
+pub fn run_rollback_cli() -> i32 {
+    // An update under way holds this too: the two must not trade places under each other.
+    let result = lock(&atomics_core::paths::atomics_home()).and_then(|_lock| {
+        let executable = crate::setup::executable_path().context("locating this installation")?;
+        rollback(&executable, cfg!(target_os = "macos"))
+    });
+    match result {
+        Ok(version) => {
+            println!("ATOMICS {version} is back in place. Running this again goes forward again.");
+            println!("A running ATOMICS keeps the version it started with until it restarts.");
+            0
+        }
+        Err(error) => {
+            eprintln!("atomics rollback: {error:#}");
+            1
+        }
+    }
 }
 
 /// `atomics update [--check]`. The check asks whatever `[update] check` says: someone asked.
@@ -534,7 +727,8 @@ fn cli(check_only: bool) -> Result<()> {
     let _lock = lock(&atomics_core::paths::atomics_home())?;
     mode.install(&found, &|step| println!("{step}"))?;
     println!("Installed {}.", found.version);
-    let request = ControlRequest::UpdateInstalled { version: found.version };
+    let program = crate::setup::executable_path().ok().map(|path| path.to_string_lossy().into_owned());
+    let request = ControlRequest::UpdateInstalled { version: found.version, program };
     match crate::ipc::request_at(&atomics_core::paths::socket_path(), &request) {
         Ok(answer) if answer.ok => println!("ATOMICS restarts when agents finish; its Update button can cancel that."),
         Ok(answer) => println!("{}", answer.error.unwrap_or_default()),
