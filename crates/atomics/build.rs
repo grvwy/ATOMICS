@@ -22,11 +22,15 @@ fn main() {
     release_signing_key();
 }
 
-/// Builds the release trust anchor in when the checkout has it, and nothing otherwise: the updater then refuses
-/// to install a download. The folder is what is watched, because a missing file would rerun this every build.
+/// Builds in the release trust anchors the checkout has: the key CI signs with and the offline one kept to recover from
+/// losing it. With neither the updater refuses to install a download; a release needs both, which its workflow checks.
+/// The folder is what is watched, because a missing file would rerun this every build.
 fn release_signing_key() {
     println!("cargo:rerun-if-changed=../../assets");
-    let key = std::fs::read_to_string("../../assets/release-signing-key.pub").ok();
-    let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("cargo's output folder")).join("release_key.rs");
-    std::fs::write(out, format!("{key:?}")).expect("writing the release key's source");
+    let keys: Vec<String> = ["release-signing-key.pub", "release-signing-key-offline.pub"]
+        .into_iter()
+        .filter_map(|name| std::fs::read_to_string(format!("../../assets/{name}")).ok())
+        .collect();
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("cargo's output folder")).join("release_keys.rs");
+    std::fs::write(out, format!("&{keys:?}")).expect("writing the release keys' source");
 }

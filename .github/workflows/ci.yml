@@ -55,6 +55,9 @@ jobs:
             libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Check how releases are signed
+        if: runner.os == 'Linux'
+        run: python3 tests/test_release_signing.py
       - name: Configure git for tests
         run: |
           git config --global user.name 'CI'

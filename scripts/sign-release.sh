@@ -1,5 +1,6 @@
 #!/bin/sh
-# Sign the archive bytes with Ed25519, then verify against the app's public key.
+# Sign the archive bytes with Ed25519, then verify against the app's public key. A release job signs with the CI key; a
+# release signed by hand after that was lost names the offline key's public file (docs/releasing.md, Rotation).
 # Usage: ATOMICS_RELEASE_SIGNING_KEY=<PKCS#8 PEM> sh scripts/sign-release.sh archive [public-key]
 set +x
 set -eu

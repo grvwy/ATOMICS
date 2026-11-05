@@ -88,7 +88,7 @@ impl Server {
     pub(super) fn feed(&self, key: Result<[u8; 32], String>, target: InstallTarget) -> Feed {
         Feed {
             url: format!("{}/latest", self.base),
-            key,
+            keys: key.map(|key| vec![key]),
             platform: "test-platform".into(),
             target: Some(target),
             remote: false,

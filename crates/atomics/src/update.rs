@@ -1,5 +1,5 @@
 //! Updating this installation: finding a newer version, and installing one so that any failure leaves the old one
-//! as it was. A version comes from a signed release, checked against the key built into this binary before anything
+//! as it was. A version comes from a signed release, checked against the keys built into this binary before anything
 //! is unpacked, or from a checkout the user names ([`source`]). The window and `atomics update` share all of it.
 //! Restarting into what was installed is [`crate::app`]'s safe restart.
 //!
@@ -29,9 +29,11 @@ const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
 const MAX_ANSWER: u64 = 4 * 1024 * 1024;
 const MAX_SIDECAR: u64 = 4 * 1024;
 
-/// `assets/release-signing-key.pub` when this binary was built, if the checkout had it. It is the only trust
-/// anchor: nothing at run time can name another key, and a key that came with a download proves nothing.
-const BUILT_IN_KEY: Option<&str> = include!(concat!(env!("OUT_DIR"), "/release_key.rs"));
+/// The public keys in `assets/` when this binary was built, if the checkout had them: the one CI signs releases with, and
+/// an offline one kept for when that is lost or leaks. A signature from either will do, so that a release signed offline
+/// can bring a new CI key to every install. They are the only trust anchors: nothing at run time can name another, and a
+/// key that came with a download proves nothing.
+const BUILT_IN_KEYS: &[&str] = include!(concat!(env!("OUT_DIR"), "/release_keys.rs"));
 /// What a PEM Ed25519 public key decodes to, before the 32 bytes of the key itself.
 const ED25519_PUBLIC_KEY_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
 const NO_KEY: &str = "This build has no release signing key, so it cannot check a download and will not install \
@@ -99,7 +101,7 @@ impl Mode {
             Mode::Releases(feed) => feed,
             Mode::Source(source) => return source.unavailable(),
         };
-        if let Err(why) = &feed.key {
+        if let Err(why) = &feed.keys {
             return Some(why.clone());
         }
         if found.assets.is_none() {
@@ -122,7 +124,8 @@ impl Mode {
 pub struct Feed {
     /// The latest release's address.
     url: String,
-    key: Result<[u8; 32], String>,
+    /// What a release's signature may be from.
+    keys: Result<Vec<[u8; 32]>, String>,
     /// This platform, as release archives name it.
     platform: String,
     /// What a release replaces: this installation, unless a test says otherwise.
@@ -151,7 +154,7 @@ impl Feed {
         let repository = env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://github.com/").trim_end_matches('/');
         Feed {
             url: format!("https://api.github.com/repos/{repository}/releases/latest"),
-            key: built_in_key(),
+            keys: built_in_keys(BUILT_IN_KEYS),
             platform: env!("ATOMICS_TARGET").into(),
             target: None,
             remote: true,
@@ -168,9 +171,9 @@ impl Feed {
         else {
             return self;
         };
-        let key =
+        let keys =
             std::fs::read_to_string(key).map_err(|error| error.to_string()).and_then(|pem| parse_public_key(&pem));
-        Feed { url: url.to_string_lossy().into_owned(), key, remote: false, ..self }
+        Feed { url: url.to_string_lossy().into_owned(), keys: keys.map(|key| vec![key]), remote: false, ..self }
     }
 
     #[cfg(not(debug_assertions))]
@@ -237,7 +240,7 @@ impl Feed {
     /// Nothing is unpacked before the checksum and the signature hold, and nothing is replaced before what was
     /// unpacked runs.
     fn install(&self, found: &Found, progress: &dyn Fn(String)) -> Result<()> {
-        let key = self.key.as_ref().map_err(|why| anyhow!("{why}"))?;
+        let keys = self.keys.as_ref().map_err(|why| anyhow!("{why}"))?;
         let assets = found
             .assets
             .as_ref()
@@ -255,7 +258,7 @@ impl Feed {
             let checksum = download(&agent, &assets.checksum, MAX_SIDECAR, "the release's checksum")?;
             let signature = download(&agent, &assets.signature, MAX_SIDECAR, "the release's signature")?;
             progress(format!("Verifying {}", found.version));
-            verify(&archive, &assets.name, &checksum, &signature, key)?;
+            verify(&archive, &assets.name, &checksum, &signature, keys)?;
             progress(format!("Installing {}", found.version));
             target.install(&archive, &found.version)
         })();
@@ -296,12 +299,17 @@ fn parse_public_key(pem: &str) -> Result<[u8; 32], String> {
     der.strip_prefix(&ED25519_PUBLIC_KEY_PREFIX).and_then(|raw| raw.try_into().ok()).ok_or_else(bad)
 }
 
-fn built_in_key() -> Result<[u8; 32], String> {
-    BUILT_IN_KEY.ok_or_else(|| NO_KEY.to_string()).and_then(parse_public_key)
+/// Every key in `pems`, or why updates are off: a build with a key it cannot read is a broken build, and guessing which of
+/// its keys still counts is no way to treat a trust anchor.
+fn built_in_keys(pems: &[&str]) -> Result<Vec<[u8; 32]>, String> {
+    if pems.is_empty() {
+        return Err(NO_KEY.to_string());
+    }
+    pems.iter().copied().map(parse_public_key).collect()
 }
 
-/// The checksum, then the raw 64-byte Ed25519 signature over the archive's exact bytes.
-fn verify(archive: &[u8], name: &str, checksum: &[u8], signature: &[u8], key: &[u8; 32]) -> Result<()> {
+/// The checksum, then the raw 64-byte Ed25519 signature over the archive's exact bytes, from any one of `keys`.
+fn verify(archive: &[u8], name: &str, checksum: &[u8], signature: &[u8], keys: &[[u8; 32]]) -> Result<()> {
     let listed = std::str::from_utf8(checksum)
         .ok()
         .and_then(|text| {
@@ -320,9 +328,11 @@ fn verify(archive: &[u8], name: &str, checksum: &[u8], signature: &[u8], key: &[
         bail!("The download is damaged: its SHA-256 does not match the release's.");
     }
     let verified = signature.len() == 64
-        && ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key).verify(archive, signature).is_ok();
+        && keys.iter().any(|key| {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key).verify(archive, signature).is_ok()
+        });
     if !verified {
-        bail!("The download is not signed with the release key built into ATOMICS.");
+        bail!("The download is not signed with a release key built into ATOMICS.");
     }
     Ok(())
 }
