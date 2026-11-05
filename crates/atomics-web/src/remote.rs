@@ -67,6 +67,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::PLAN_COMPLETE,
     wire::TRACE,
     wire::FIT,
+    wire::MACHINE,
 ];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
@@ -88,6 +89,7 @@ pub struct Welcome {
 }
 
 pub struct RemoteBackend {
+    native_previews: Cell<bool>,
     state: RefCell<State>,
     /// Operation IDs: this client's random prefix and a counter.
     prefix: String,
@@ -95,6 +97,12 @@ pub struct RemoteBackend {
 }
 
 struct State {
+    machine: Option<atomics_core::machine::Machine>,
+    machine_open: bool,
+    machine_subscribed: bool,
+    preview_actions: Vec<Command>,
+    tunnel_messages: Vec<Message>,
+    active_previews: Vec<u16>,
     folders: HashMap<(String, String), Folder>,
     shown_folders: HashSet<(String, String)>,
     /// Whole-file previews, one per worktree, requested explicitly by this client.
@@ -280,6 +288,12 @@ impl RemoteBackend {
     /// page a random one, so two pages never reuse an ID.
     pub fn new(prefix: &str) -> Self {
         let state = State {
+            machine: None,
+            machine_open: false,
+            machine_subscribed: false,
+            preview_actions: Vec::new(),
+            tunnel_messages: Vec::new(),
+            active_previews: Vec::new(),
             folders: HashMap::new(),
             shown_folders: HashSet::new(),
             files: HashMap::new(),
@@ -313,7 +327,43 @@ impl RemoteBackend {
             trace_wanted: None,
             trace_request: None,
         };
-        Self { state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
+        Self {
+            native_previews: Cell::new(false),
+            state: RefCell::new(state),
+            prefix: prefix.to_string(),
+            ops: Cell::new(0),
+        }
+    }
+
+    /// Whether a dashboard forward is still present in the latest host sample.
+    pub fn machine_previewable(&self, port: u16) -> bool {
+        self.machine_available() && self.state.borrow().machine.as_ref().is_some_and(|m| m.previewable(port))
+    }
+
+    /// Set only by a native platform that implements local TCP listeners.
+    pub fn enable_native_previews(&self) {
+        self.native_previews.set(true);
+    }
+    pub fn tunnels(&self) -> bool {
+        self.native_previews.get()
+            && self.state.borrow().welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TUNNEL))
+    }
+    pub fn take_preview_actions(&self) -> Vec<Command> {
+        std::mem::take(&mut self.state.borrow_mut().preview_actions)
+    }
+    pub fn take_tunnel_messages(&self) -> Vec<Message> {
+        std::mem::take(&mut self.state.borrow_mut().tunnel_messages)
+    }
+    pub fn send_tunnel(&self, message: Message) {
+        if self.tunnels() {
+            self.state.borrow_mut().outgoing.push(Envelope::new(message));
+        }
+    }
+    pub fn set_active_previews(&self, ports: Vec<u16>) {
+        self.state.borrow_mut().active_previews = ports;
+    }
+    pub fn preview_error(&self, error: String) {
+        self.say(&error);
     }
 
     fn next_op(&self) -> String {
@@ -333,7 +383,12 @@ impl RemoteBackend {
         Envelope::new(Message::Hello {
             client_id: client_id.to_string(),
             versions: vec![VERSION],
-            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+            capabilities: CAPABILITIES
+                .iter()
+                .copied()
+                .chain(self.native_previews.get().then_some(wire::TUNNEL))
+                .map(str::to_string)
+                .collect(),
             prior_epoch,
             prior_cursor: prior_cursor.map(Seq),
         })
@@ -344,6 +399,11 @@ impl RemoteBackend {
     pub fn disconnected(&self) {
         let mut s = self.state.borrow_mut();
         s.welcome = None;
+        s.preview_actions.clear();
+        s.tunnel_messages.clear();
+        s.active_previews.clear();
+        s.machine = None;
+        s.machine_subscribed = false;
         s.resyncing = false;
         s.outgoing.clear();
         s.requests.clear();
@@ -475,6 +535,23 @@ impl RemoteBackend {
         }
         // A session that changed may have a terminal now that it had not when its screen was asked for.
         match &envelope.message {
+            message @ (Message::TunnelOpened { .. }
+            | Message::TunnelRefused { .. }
+            | Message::TunnelData { .. }
+            | Message::TunnelAck { .. }
+            | Message::TunnelClose { .. }) => {
+                if self.native_previews.get()
+                    && s.welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TUNNEL))
+                {
+                    if s.tunnel_messages.len() < wire::MAX_QUEUED_FRAMES {
+                        s.tunnel_messages.push(message.clone());
+                    } else {
+                        s.welcome = None;
+                        s.notice = Some("Preview peer exceeded the receive queue".into());
+                    }
+                }
+                return;
+            }
             Message::SessionUpsert { session, .. } => s.screens.session_changed(Some(&session.id)),
             Message::StateSnapshot { .. } => s.screens.session_changed(None),
             Message::HostUpsert { host, .. } => {
@@ -713,8 +790,21 @@ impl State {
                     preview.error = None;
                 }
             }
+            Message::Machine { snapshot } => {
+                if self.machine_subscribed
+                    && self.welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::MACHINE))
+                {
+                    self.machine = Some(snapshot.clone());
+                }
+            }
             Message::Welcome { capabilities, limits, role, may, .. } => {
                 self.welcome = Some(Welcome { role: *role, may: may.clone(), capabilities: capabilities.clone() });
+                self.machine = None;
+                self.machine_subscribed =
+                    self.machine_open && may.contains(&Grant::Host) && capabilities.iter().any(|c| c == wire::MACHINE);
+                if self.machine_subscribed {
+                    self.outgoing.push(Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Machine] }));
+                }
                 self.trace_revision = None;
                 self.trace_wanted = None;
                 self.trace_request = None;
@@ -1214,6 +1304,46 @@ fn known_agents(mirror: &Mirror) -> Vec<String> {
 }
 
 impl Backend for RemoteBackend {
+    fn machine_available(&self) -> bool {
+        self.state
+            .borrow()
+            .welcome
+            .as_ref()
+            .is_some_and(|w| w.capabilities.iter().any(|c| c == wire::MACHINE) && w.may.contains(&Grant::Host))
+    }
+    fn machine(&self) -> Option<atomics_core::machine::Machine> {
+        self.state.borrow().machine.clone()
+    }
+    fn watch_machine(&self, open: bool) {
+        let available = self.machine_available();
+        let mut s = self.state.borrow_mut();
+        s.machine_open = open;
+        let subscribe = open && available;
+        if s.machine_subscribed != subscribe {
+            s.machine_subscribed = subscribe;
+            let topics = vec![wire::Topic::Machine];
+            s.outgoing.push(Envelope::new(if subscribe {
+                Message::Subscribe { topics }
+            } else {
+                Message::Unsubscribe { topics }
+            }));
+        }
+    }
+    fn can_preview(&self) -> bool {
+        self.tunnels()
+    }
+    fn preview_active(&self, port: u16) -> bool {
+        self.state.borrow().active_previews.contains(&port)
+    }
+    fn previews(&self, session: Option<&str>) -> Vec<atomics_core::preview::Preview> {
+        self.with_mirror(|m| {
+            m.sessions
+                .values()
+                .filter(|s| session.is_none_or(|id| s.id == id))
+                .flat_map(|s| s.previews.clone())
+                .collect()
+        })
+    }
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         self.state.borrow().mirror.host.editors.clone()
     }
@@ -1241,6 +1371,15 @@ impl Backend for RemoteBackend {
     }
 
     fn send(&self, command: Command) {
+        if matches!(command, Command::OpenPreview { .. } | Command::StopPreview { .. }) {
+            if self.tunnels() {
+                let mut s = self.state.borrow_mut();
+                if s.preview_actions.len() < wire::MAX_TUNNELS {
+                    s.preview_actions.push(command);
+                }
+            }
+            return;
+        }
         if let Command::RefreshDiff(root) = &command {
             return self.refetch(root);
         }

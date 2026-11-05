@@ -32,6 +32,7 @@ pub mod hook;
 pub mod isolation;
 pub mod layout;
 pub mod lease;
+pub mod machine;
 pub mod mcp_import;
 pub mod mirror;
 pub mod noise;
@@ -39,6 +40,7 @@ pub mod ops;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod preview;
 pub mod projection;
 pub mod remote;
 pub mod repo_workflow;

@@ -3296,6 +3296,7 @@ fn agents() -> fake_host::FakeHost {
     for (id, root, file) in [("s0", "/w/zero", "src/zero.rs"), ("s2", "/w/two", "src/two.rs")] {
         let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
         host.board.sessions.push(atomics_core::projection::SessionInfo {
+            previews: Vec::new(),
             id: id.into(),
             title: format!("Agent {id}"),
             task: None,
@@ -3558,6 +3559,7 @@ fn in_editor_mode_the_nth_agents_editor_takes_the_keyboard() {
     let mut host = fake_host::panels_host();
     let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
     host.board.sessions.push(atomics_core::projection::SessionInfo {
+        previews: Vec::new(),
         id: "s2".into(),
         task: None,
         worktree: Some("/w/two".into()),
@@ -3764,4 +3766,146 @@ fn selecting_the_active_agent_with_a_chord_replaces_a_pull_request_with_its_diff
     assert!(diff_asked(&world, WORKTREE));
     assert!(panel_has_the_keys(&ctx));
     no_bytes(&world);
+}
+
+#[test]
+fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
+    use atomics_core::preview::Preview;
+    use atomics_core::wire::{Envelope, Limits, Resume, Role, Seq, VERSION};
+    let mut host = fake_host::host();
+    let session = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+    session.previews = vec![
+        Preview { port: 5173, path: "/demo".into(), label: "Web".into() },
+        Preview { port: 8080, path: String::new(), label: "API".into() },
+    ];
+    let id = session.id.clone();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    world.driver.remote.enable_native_previews();
+    let mut welcome = world.driver.remote.welcome().unwrap();
+    welcome.capabilities.push(atomics_core::wire::TUNNEL.into());
+    let epoch = world.host.epoch.clone();
+    let after = world.driver.remote.with_mirror(|m| m.resume_point().1.unwrap());
+    world.driver.remote.receive(Envelope::host(
+        &epoch,
+        Message::Welcome {
+            version: VERSION,
+            capabilities: welcome.capabilities,
+            limits: Limits::default(),
+            role: Role::Controller,
+            resume: Resume::Replay { after: Seq(after) },
+            may: welcome.may,
+        },
+    ));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let at = on(&shown, "Preview");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Web · 5173"));
+    assert!(has(&shown, "API · 8080"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Web · 5173")));
+    assert!(
+        matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { session: Some(session), preview }] if session == &id && preview.port == 5173 && preview.path == "/demo")
+    );
+    world.driver.remote.set_active_previews(vec![5173]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Preview")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Stop port 5173")));
+    assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
+}
+
+#[test]
+fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_width() {
+    use atomics_core::machine::{Container, Disk, Machine, Memory, Port};
+    use atomics_core::preview::Preview;
+    for size in [WIDE, (320.0, 844.0)] {
+        let mut host = fake_host::explorer();
+        host.board.sessions[0].previews = vec![Preview { port: 5173, path: "/".into(), label: "Web".into() }];
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.machine_open = true;
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let snapshot = Machine {
+            sampled_at: 1,
+            truncated: false,
+            cores: 8,
+            load: Some([1.5, 1.2, 0.9]),
+            cpu_busy: Some(25.0),
+            memory: Some(Memory { total: 8 << 30, available: 6 << 30 }),
+            disks: vec![Disk { path: "/srv/work".into(), total: 64 << 30, free: 32 << 30 }],
+            containers: Some(vec![Container {
+                name: "web-1".into(),
+                image: "app.example/web:1".into(),
+                state: "running".into(),
+                status: "Up 1 hour".into(),
+                ports: "0.0.0.0:8080->80/tcp".into(),
+                cpu_percent: Some(2.0),
+                memory: Some("32MiB / 2GiB".into()),
+            }]),
+            ports: vec![Port {
+                address: "127.0.0.1".into(),
+                port: 8080,
+                pid: Some(123),
+                process: Some("web".into()),
+                previewable: true,
+                ..Default::default()
+            }],
+        };
+        world
+            .driver
+            .remote
+            .receive(atomics_core::wire::Envelope::host(&world.host.epoch, Message::Machine { snapshot }));
+        let mut shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        for _ in 0..5 {
+            let pointer = on(&shown, "Resources") + vec2(60.0, 100.0);
+            shown.extend(drawn(
+                &ctx,
+                &mut world,
+                &mut client,
+                &mut view,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        delta: vec2(0.0, -220.0),
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            ));
+            shown.extend(settled(&ctx, &mut world, &mut client, &mut view, size));
+        }
+        for label in ["Machine", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"] {
+            assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
+        }
+        // The window stays inside the screen, with horizontal table scrolling at narrow widths.
+        let title = shown.iter().find(|(label, _)| label == "Resources").unwrap().1;
+        assert!(title.left() >= 0.0 && title.right() <= size.0, "{title:?}");
+        assert!(world.driver.remote.machine().is_some());
+        client.machine_open = false;
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+    }
+}
+
+#[test]
+fn machine_opens_from_the_load_gauge_and_browser_preview_stays_disabled() {
+    use atomics_core::machine::{Machine, Port};
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "load 4.2");
+    assert!(client.machine_open);
+    assert!(has(&shown, "Waiting for machine data"));
+    let snapshot = Machine {
+        cores: 4,
+        sampled_at: 1,
+        ports: vec![Port { address: "127.0.0.1".into(), port: 8080, previewable: true, ..Default::default() }],
+        ..Default::default()
+    };
+    world.driver.remote.receive(atomics_core::wire::Envelope::host(&world.host.epoch, Message::Machine { snapshot }));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Docker not available"));
+    assert!(has(&shown, "Preview"));
+    assert!(!world.driver.remote.can_preview());
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Preview");
+    assert!(world.driver.remote.take_preview_actions().is_empty());
 }

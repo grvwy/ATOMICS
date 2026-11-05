@@ -10,6 +10,22 @@ impl State {
         }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
+        let roots = self
+            .sessions
+            .iter()
+            .filter(|s| s.status != AgentStatus::Exited)
+            .map(|s| (s.id.clone(), s.terminal.as_ref().map(|t| t.process_id())))
+            .collect();
+        changed |= self.previews.tick(roots, self.wake.clone());
+        let machine_roots = self
+            .sessions
+            .iter()
+            .filter(|s| s.status != AgentStatus::Exited && s.sandbox.is_none())
+            .map(|s| (s.id.clone(), s.terminal.as_ref().map(|t| t.process_id())))
+            .collect();
+        let mut machine_paths = self.open_projects.clone();
+        machine_paths.push(paths::atomics_home());
+        changed |= self.machine.tick(machine_paths, machine_roots, self.wake.clone());
         changed |= self.poll_sandbox_check();
         changed |= self.poll_connections();
         changed |= self.github_tick();

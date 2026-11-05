@@ -54,6 +54,8 @@ pub const CAPABILITIES: &[&str] = &[
     PLAN_COMPLETE,
     TRACE,
     FIT,
+    TUNNEL,
+    MACHINE,
 ];
 /// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
 pub const EXPLORER: &str = "explorer";
@@ -78,6 +80,13 @@ pub const TRACE: &str = "trace";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
+/// Bounded TCP previews, offered only on native remote connections.
+pub const TUNNEL: &str = "tunnel";
+/// Host machine snapshots, only for controllers with the host grant.
+pub const MACHINE: &str = "machine";
+pub const MAX_TUNNELS: usize = 16;
+pub const TUNNEL_WINDOW: u32 = 64 * 1024;
+pub const TUNNEL_CHUNK: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -347,6 +356,7 @@ pub enum Topic {
         path: String,
     },
     Trace,
+    Machine,
     Diff {
         worktree: String,
     },
@@ -366,6 +376,7 @@ impl Topic {
         match self {
             Topic::Folder { worktree, path } => format!("folder:{}:{worktree}:{path}", worktree.len()),
             Topic::Trace => "trace".into(),
+            Topic::Machine => "machine".into(),
             Topic::Diff { worktree } => format!("diff:{worktree}"),
             Topic::Plan { id } => format!("plan:{id}"),
             Topic::Screen { session, .. } => format!("screen:{session}"),
@@ -387,6 +398,36 @@ pub struct Revisions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Message {
+    Machine {
+        snapshot: crate::machine::Machine,
+    },
+    TunnelOpen {
+        id: String,
+        port: u16,
+    },
+    TunnelOpened {
+        id: String,
+    },
+    TunnelRefused {
+        id: String,
+        reason: String,
+    },
+    /// Standard base64; decoded payload is at most TUNNEL_CHUNK bytes.
+    TunnelData {
+        id: String,
+        bytes: String,
+    },
+    /// Credit returned only after bytes reach the TCP socket.
+    TunnelAck {
+        id: String,
+        bytes: u32,
+    },
+    /// EOF in the sender's direction; the other direction may finish independently.
+    TunnelClose {
+        id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        abort: bool,
+    },
     FolderGet {
         worktree: String,
         path: String,
@@ -601,6 +642,13 @@ pub enum Message {
 }
 
 const KINDS: &[&str] = &[
+    "machine",
+    "tunnel_open",
+    "tunnel_opened",
+    "tunnel_refused",
+    "tunnel_data",
+    "tunnel_ack",
+    "tunnel_close",
     "folder_get",
     "folder_page",
     "hello",
@@ -709,7 +757,33 @@ impl Message {
         let long = |what: &str, s: &str| {
             (s.len() > MAX_ID_BYTES).then(|| WireError::new(ErrorCode::Oversize, format!("{what} is too long")))
         };
+        let preview_bounds = |session: &SessionInfo| {
+            too_many("previews", session.previews.len(), crate::preview::MAX_PREVIEWS).or_else(|| {
+                session
+                    .previews
+                    .iter()
+                    .find_map(|p| p.validate().err().map(|e| WireError::new(ErrorCode::Malformed, e)))
+            })
+        };
         let failure = match self {
+            Message::Machine { snapshot } => too_many("ports", snapshot.ports.len(), crate::machine::MAX_PORTS)
+                .or_else(|| {
+                    too_many(
+                        "containers",
+                        snapshot.containers.as_ref().map_or(0, Vec::len),
+                        crate::machine::MAX_CONTAINERS,
+                    )
+                })
+                .or_else(|| too_many("disks", snapshot.disks.len(), crate::machine::MAX_DISKS)),
+            Message::TunnelOpen { id, port } => long("id", id)
+                .or_else(|| (*port == 0).then(|| WireError::new(ErrorCode::Malformed, "port must be nonzero"))),
+            Message::TunnelOpened { id } | Message::TunnelClose { id, .. } => long("id", id),
+            Message::TunnelRefused { id, reason } => long("id", id).or_else(|| long("reason", reason)),
+            Message::TunnelAck { id, bytes } => long("id", id).or_else(|| {
+                (*bytes == 0 || *bytes > TUNNEL_WINDOW)
+                    .then(|| WireError::new(ErrorCode::Malformed, "invalid tunnel credit"))
+            }),
+            Message::TunnelData { id, bytes } => long("id", id).or_else(|| crate::preview::decode(bytes).err()),
             Message::Hello { client_id, versions, capabilities, prior_epoch, .. } => {
                 too_many("versions", versions.len(), MAX_VERSIONS)
                     .or_else(|| too_many("capabilities", capabilities.len(), MAX_CAPABILITIES))
@@ -722,7 +796,7 @@ impl Message {
             Message::Subscribe { topics } | Message::Unsubscribe { topics } => {
                 too_many("topics", topics.len(), MAX_SUBSCRIPTIONS).or_else(|| {
                     topics.iter().find_map(|t| match t {
-                        Topic::Trace => None,
+                        Topic::Trace | Topic::Machine => None,
                         Topic::Diff { worktree } => long("worktree", worktree),
                         Topic::Plan { id } => long("plan id", id),
                         Topic::Screen { session, .. } => long("session", session),
@@ -765,8 +839,13 @@ impl Message {
                 .or_else(|| long("worktree", &page.worktree))
                 .or_else(|| long("path", &page.path))
                 .or_else(|| page.entries.iter().find_map(|entry| long("entry path", &entry.path))),
-            Message::StateSnapshot { part: Some(part), .. } => (part.count == 0 || part.index >= part.count)
-                .then(|| WireError::new(ErrorCode::Malformed, "a snapshot part is out of range")),
+            Message::SessionUpsert { session, .. } => preview_bounds(session),
+            Message::StateSnapshot { part, sessions, .. } => part
+                .and_then(|part| {
+                    (part.count == 0 || part.index >= part.count)
+                        .then(|| WireError::new(ErrorCode::Malformed, "a snapshot part is out of range"))
+                })
+                .or_else(|| sessions.iter().find_map(preview_bounds)),
             Message::Resync { reason, screens } => too_many("screens", screens.len(), MAX_SUBSCRIPTIONS)
                 .or_else(|| reason.as_deref().and_then(|r| long("reason", r)))
                 .or_else(|| screens.iter().find_map(|s| long("session", s))),
@@ -825,6 +904,29 @@ pub fn json_len<T: Serialize + ?Sized>(value: &T) -> usize {
     }
     let mut count = Count(0);
     serde_json::to_writer(&mut count, value).map_or(0, |()| count.0)
+}
+
+/// A machine sample stays within the connection's frame budget. Prefer fewer rows over a
+/// stream of oversize errors; the resource readings remain, and the UI reports omitted rows.
+pub fn machine_frame(epoch: &str, snapshot: &crate::machine::Machine, budget: usize) -> Result<String, WireError> {
+    let mut envelope = Envelope::host(epoch, Message::Machine { snapshot: snapshot.clone() });
+    let budget = budget.min(MAX_FRAME_BYTES);
+    while json_len(&envelope) > budget {
+        let Message::Machine { snapshot } = &mut envelope.message else { unreachable!() };
+        snapshot.truncated = true;
+        let containers = snapshot.containers.as_ref();
+        let sizes = [json_len(&snapshot.ports), json_len(&containers), json_len(&snapshot.disks)];
+        match sizes.iter().enumerate().max_by_key(|(_, size)| *size).map(|(i, _)| i) {
+            Some(0) if !snapshot.ports.is_empty() => snapshot.ports.truncate(snapshot.ports.len() / 2),
+            Some(1) if snapshot.containers.as_ref().is_some_and(|v| !v.is_empty()) => {
+                let containers = snapshot.containers.as_mut().expect("present");
+                containers.truncate(containers.len() / 2);
+            }
+            Some(2) if !snapshot.disks.is_empty() => snapshot.disks.truncate(snapshot.disks.len() / 2),
+            _ => return Err(WireError::new(ErrorCode::Oversize, "machine resource readings exceed the frame limit")),
+        }
+    }
+    encode(&envelope)
 }
 
 /// One part of a board cut into `state_snapshot` parts.

@@ -61,6 +61,8 @@ pub struct TaskLink {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<crate::preview::Preview>,
     pub id: String,
     pub agent: String,
     pub title: String,
@@ -526,6 +528,9 @@ pub struct DiffFileBody {
 /// and the protocol thread (a reader).
 #[derive(Debug, Default)]
 pub struct Projections {
+    /// Machine samples have their own demand and do not advance the board cursor.
+    pub machine: Published<crate::machine::Machine>,
+    pub machine_watchers: Arc<std::sync::atomic::AtomicUsize>,
     pub sessions: Published<Vec<SessionInfo>>,
     pub plans: Published<Vec<PlanInfo>>,
     pub approvals: Published<Vec<ApprovalInfo>>,
@@ -625,6 +630,7 @@ mod tests {
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {
+            previews: Vec::new(),
             id: id.into(),
             agent: "claude".into(),
             title: id.into(),

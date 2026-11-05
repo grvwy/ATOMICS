@@ -341,6 +341,9 @@ impl State {
         self.publish_diffs(out, cache, bodies);
         out.publish_host(self.host_info());
         out.trace.publish(self.trace_data());
+        if let Some(snapshot) = &self.machine.snapshot {
+            out.machine.publish(snapshot.clone());
+        }
     }
 
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
@@ -389,6 +392,11 @@ impl State {
         self.sessions
             .iter()
             .map(|s| SessionInfo {
+                previews: if s.status == atomics_core::session::AgentStatus::Exited {
+                    Vec::new()
+                } else {
+                    self.previews.list(&s.id)
+                },
                 id: s.id.clone(),
                 agent: s.agent.clone(),
                 title: s.title.clone(),

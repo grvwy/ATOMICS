@@ -173,6 +173,26 @@ impl Backend for Local<'_> {
         self.0.plans.get(index).map(Plan::digest)
     }
 
+    fn machine_available(&self) -> bool {
+        true
+    }
+    fn machine(&self) -> Option<atomics_core::machine::Machine> {
+        self.0.machine.snapshot.clone()
+    }
+    fn watch_machine(&self, open: bool) {
+        if self.0.machine.desktop_open.swap(open, std::sync::atomic::Ordering::AcqRel) != open {
+            self.0.wake.notify();
+        }
+    }
+    fn previews(&self, session: Option<&str>) -> Vec<atomics_core::preview::Preview> {
+        match session {
+            Some(id) if self.0.sessions.iter().any(|s| s.id == id && s.status != AgentStatus::Exited) => {
+                self.0.previews.list(id)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn session_list(&self) -> Vec<SessionRow> {
         self.0.sessions.iter().map(|session| self.session(session)).collect()
     }
