@@ -147,6 +147,8 @@ pub struct Terminal {
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
     pub shared: Arc<Shared>,
+    /// The PTY's own end, to ask who holds the terminal.
+    master: std::fs::File,
 }
 
 /// Remove instance routing from every terminal, including inherited bundle settings, then route it to the
@@ -301,6 +303,7 @@ impl Terminal {
         let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, size, 0)?;
         let process_id = pty.child().id();
+        let master = pty.file().try_clone()?;
         let shared = Arc::new(Shared::new(wake, size, colors));
         let pty = CountedPty::new(pty, shared.clone())?;
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
@@ -310,7 +313,7 @@ impl Terminal {
         let sender = event_loop.channel();
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
-        Ok(Terminal { process_id, stopped: AtomicBool::new(false), term, sender, shared })
+        Ok(Terminal { process_id, stopped: AtomicBool::new(false), term, sender, shared, master })
     }
 
     /// Colors answered to later color queries, after a theme change.
@@ -353,6 +356,16 @@ impl Terminal {
 
     pub fn exited(&self) -> bool {
         self.shared.exited.load(Ordering::Acquire)
+    }
+
+    /// Whether something other than the program started here holds the terminal: what an interactive shell runs,
+    /// which gets a process group of its own. A program that runs things itself keeps the terminal, and what runs
+    /// inside a sandbox looks the same from here, so neither shows.
+    pub fn foreground_process(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: tcgetpgrp on a descriptor this terminal owns.
+        let holder = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        holder > 0 && holder != self.process_id as i32
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {

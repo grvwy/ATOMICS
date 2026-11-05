@@ -27,7 +27,8 @@ config and proposing changes you apply, and restarting ATOMICS. Every `[chief] h
 checks the fleet (idle or missing agents, waiting approvals, held messages) and tells the chief what it
 found. The chief's idle wake (`[chief] wake_secs`) also lists up to five finished agents to clean up,
 including Ungrouped agents: each has no turn or pending messages running, a clean worktree, and either an
-accepted task, a merged branch, or no task and no changes. The chief closes each listed agent with
+accepted task or, with no task at all, a merged branch or no changes. A task still open is the chief's to accept,
+whatever its branch looks like. The chief closes each listed agent with
 `atomics_close` or says why it should stay open. This list does not close agents by itself. See
 [The chief agent](../README.md#the-chief-agent) and [Configuration](configuration.md).
 
@@ -132,8 +133,9 @@ home are never touched. See [Lifecycle](isolation.md#lifecycle).
 On start and every 6 hours ATOMICS reads the latest release from GitHub's public API. With a newer one, a quiet
 **Update** button joins the top bar, folding into **Actions** like the items around it, which then wears a small dot,
 and Settings gets an Updates section with both versions and a link to the notes. Otherwise nothing shows. The button
-opens nothing and leaves the keyboard where it was. A browser or `--connect` shows the host's version and a hint: atomics.v1 has no operation that
-starts an update, so only a window on the host, or `atomics update` in a terminal there, can.
+opens nothing and leaves the keyboard where it was: in a terminal, the diff or a field, or nowhere if nothing had it. A
+browser or `--connect` shows the host's version and a hint: atomics.v1 has no operation that starts an update, so only
+a window on the host, or `atomics update` in a terminal there, can.
 
 An update downloads `atomics-<version>-<target>.tar.gz` for this platform and checks its SHA-256 and its Ed25519
 signature against the public key built into the binary, before anything is unpacked. It then unpacks beside the
@@ -142,17 +144,26 @@ a newer tag is refused. Then it swaps: a rename of the file on Linux, of the who
 the install as it was and says why. A build made without `assets/release-signing-key.pub` has no key: it can
 still say a new version exists, and refuses to install one. A development build under a `target` folder is not replaced.
 
-Then ATOMICS restarts the way `atomics_restart` does. While agents work, or anything else [holds a restart
-back](../README.md#restart-onto-a-new-build), the top bar says **Restarts when agents finish**, with a **Cancel** that keeps the
-new version installed for the next start and offers **Restart to update**. Nothing forces it. A headless host does not
-restart itself; `atomics update` says to use its service manager.
+Then ATOMICS restarts the way `atomics_restart` does, once that interrupts nothing it can see. Nobody chose this moment,
+so it waits for more than a restart someone asks for: everything that [holds a restart
+back](../README.md#restart-onto-a-new-build), the chief's turn, a turn still on an agent's screen, background work an
+agent's footer lists (shells, monitors, subagents), a shell running a command, and any running editor, whose unsaved work
+nothing can see. Quit the editor to let it go. Meanwhile the top bar says **Restarts when agents finish**, what is in the
+way on hover, with a **Cancel** that keeps the new version installed for the next start and offers **Restart to update**.
+On a folded bar this stays beside **Actions** where it fits; where it does not, it is inside the menu, whose dot turns to
+the warning colour and has the state on hover.
+
+With nothing left in the way, a notice over the window counts down 10 seconds with its own **Cancel**, at any width, for
+what ATOMICS cannot see: a half-typed prompt, or a job a shell left in the background. Anything that comes up stops the
+count, and the next one starts over. Nothing forces any of it. A headless host does not restart itself; `atomics update`
+says to use its service manager.
 
 With [`[update] source`](configuration.md#updates) a checkout is the source, for working on ATOMICS itself. The check
 fetches and compares the checkout, and this build, with `origin/main`. The button refuses a checkout with uncommitted
 changes or with commits no branch holds. Otherwise it fast-forwards `main`, or detaches on `origin/main` from any other
 branch, and runs the checkout's install script through `atomics queue` at `nice 19`, in the agents' compiler job pool,
 with the toolchain from the checkout's `rust-toolchain.toml` or `rust-toolchain` if it has one. The script's output is
-in `update.log` in the state folder.
+in `update.log` in the state folder. A script that stops may already have put the new program in place, and says so.
 
 ## Tickets
 

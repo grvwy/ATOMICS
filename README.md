@@ -261,7 +261,9 @@ atomics ctl '{"cmd":"restart","reason":"installed the new build"}'
 Restart refuses and lists blockers while another agent is working or starting, an approval or question is pending,
 messages await delivery, a queue slot is held or waiting, a worktree/cleanup or integration job is running, or a plan
 brief is still focused for editing. Finish the edit and wait for agents and queued work. Idle and accepted agents
-are fine; the chief's own turn can hand off. `force: true` bypasses those busy checks and may interrupt work, but never
+are fine. The chief that calls `atomics_restart` hands off its own turn; from anywhere else a working chief waits like
+any agent. An update's restart waits for more, since nobody chose its moment: see
+[Updates](docs/how-it-works.md#updates). `force: true` bypasses those busy checks and may interrupt work, but never
 bypasses saving state or validating that the installed executable exists and successfully runs `--version`.
 
 ATOMICS saves every plan, the session store (including Claude resume IDs and the chief's role), and the layout, then

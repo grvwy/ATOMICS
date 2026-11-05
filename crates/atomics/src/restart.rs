@@ -96,11 +96,19 @@ fn with_workspace(args: Vec<OsString>, workspace: Option<&str>) -> Vec<OsString>
     kept
 }
 
+/// The `.app` that `executable` is the program of. Only its own `Contents/MacOS/atomics` makes a folder one: a
+/// development build somewhere under a folder that happens to end in `.app` is not in a bundle, and an update must not
+/// swap that folder away.
+pub(crate) fn bundle_of(executable: &Path) -> Option<&Path> {
+    let bundle = executable.ancestors().nth(3)?;
+    let inside = executable.strip_prefix(bundle).ok()?;
+    (bundle.extension().is_some_and(|ext| ext == "app") && inside == Path::new("Contents/MacOS/atomics"))
+        .then_some(bundle)
+}
+
 fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result<Vec<OsString>> {
     let mut command = if macos {
-        let bundle = executable
-            .ancestors()
-            .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+        let bundle = bundle_of(executable)
             .context("restart on macOS requires an installed .app bundle; rebuild/install it first")?;
         let mut command = vec!["/usr/bin/open".into(), "-n".into(), "-a".into(), bundle.as_os_str().to_owned()];
         // LaunchServices does not inherit the caller's environment. Preserve instance
@@ -230,6 +238,8 @@ mod tests {
         assert_eq!(linux[0], executable);
         assert_eq!(&linux[1..], args);
         assert!(relaunch_command(Path::new("/tmp/atomics"), &[], true).is_err());
+        // A development build under a folder that only happens to end in `.app` is not in a bundle.
+        assert!(relaunch_command(Path::new("/tmp/work.app/target/debug/atomics"), &[], true).is_err());
     }
 
     #[test]

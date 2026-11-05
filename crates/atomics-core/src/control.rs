@@ -46,6 +46,10 @@ pub enum ControlRequest {
         force: bool,
         #[serde(default)]
         reason: Option<String>,
+        /// The session asking, when its own MCP server sends this: a chief's own turn does not hold back the restart
+        /// it asked for.
+        #[serde(default)]
+        pane: Option<String>,
     },
     /// `atomics update` installed a new version from a terminal: restart when agents finish, as the Update
     /// button does. It never forces.

@@ -449,7 +449,7 @@ fn a_window_opened_by_its_button_gives_the_keyboard_back_to_the_terminal() {
         agent(app, dir.path(), "agent");
         app.runtime.active = Some("agent".into());
         at_the_terminal(app, ctx);
-        // A click on the button: the press alone takes the keyboard off the terminal.
+        // A click on the button takes the keyboard off the terminal.
         click_on(app, ctx, "Settings");
         assert!(app.client.ui.management.settings, "the click opened it");
         typed(app, ctx, "nope");
@@ -641,7 +641,7 @@ fn agent_with_diff(app: &mut Desktop<'_>, root: &Path, id: &str) {
 }
 
 /// Two agents with their diffs, the first active; the chief first in the list, which N doesn't count.
-fn two_agents(app: &mut Desktop<'_>, dir: &Path) -> (PathBuf, PathBuf) {
+pub(super) fn two_agents(app: &mut Desktop<'_>, dir: &Path) -> (PathBuf, PathBuf) {
     let (first, second) = (dir.join("first"), dir.join("second"));
     app.runtime.sessions.clear();
     let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir.clone());
@@ -685,7 +685,7 @@ fn shows_the_diff_of(app: &mut Desktop<'_>, ctx: &egui::Context, id: &str, root:
 }
 
 /// No byte has reached these terminals: the marker written now is the first thing each reads.
-fn untouched(app: &Desktop<'_>, agents: &[(&str, &Path)], marker: &str) {
+pub(super) fn untouched(app: &Desktop<'_>, agents: &[(&str, &Path)], marker: &str) {
     for (id, root) in agents {
         let terminal = app.runtime.sessions.iter().find(|s| s.id == *id).and_then(|s| s.terminal.as_ref());
         terminal.unwrap().write(marker.as_bytes().to_vec());

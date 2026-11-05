@@ -2439,6 +2439,17 @@ fn a_client_shows_the_hosts_version_and_a_new_one_and_cannot_start_an_update() {
             assert!(has(&shown, line), "{size:?}: {line}: {shown:?}");
         }
         assert!(!button(&shown), "{size:?}: {shown:?}");
+
+        // The countdown says what is about to happen to the connection, and has nothing to press.
+        let mut host = fake_host::management();
+        host.board.host.update = Some(UpdateInfo {
+            phase: atomics_core::projection::UpdatePhase::RestartsIn { seconds: 7 },
+            ..update(Some("9.0.0"))
+        });
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "The host restarts in 7 s to update"), "{size:?}: {shown:?}");
+        assert!(!has(&shown, "Cancel"), "{size:?}: {shown:?}");
     }
 }
 

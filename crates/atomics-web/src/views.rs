@@ -843,6 +843,7 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     topbar::slot(ui, "phone-actions", right, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let backend: &dyn Backend = &driver.remote;
+            atomics_ui::update::countdown(ui.ctx(), backend, client);
             // The phone's ⋯ menu also carries the host's usage and governor details.
             let (shown, mut clicked) = (view.place.clone(), false);
             layout_menu(ui, view, |ui| {

@@ -1,12 +1,16 @@
 //! The window's and the host's side of updating: the check on start and every 6 hours, the Update button's job, and
 //! the wait to restart into what it installed. What is installed, and how, is [`crate::update`]. The restart is
-//! always the safe one: it waits for [`State::restart_blockers`] and is never forced.
+//! always the safe one and never forced: it waits for [`State::update_blockers`], then for [`COUNTDOWN`].
 
 use super::*;
 use crate::update::{CHECK_EVERY, Found, Mode};
 use atomics_core::config::UpdateConfig;
 use atomics_core::projection::{UpdateInfo, UpdatePhase};
 use std::sync::mpsc::TryRecvError;
+
+/// How long the window stays once nothing known is in the way, so that someone can stop it for what the host cannot
+/// know of: a half-typed prompt, or a program a shell left unsaved in the background.
+const COUNTDOWN: Duration = Duration::from_secs(10);
 
 enum JobEvent {
     Step(String),
@@ -25,6 +29,8 @@ pub(super) struct Updates {
     /// The version installed or being installed.
     version: Option<String>,
     next_check: Option<Instant>,
+    /// When the window closes, once nothing known is in the way.
+    restart_at: Option<Instant>,
     check: Option<Receiver<Result<Option<Found>, String>>>,
     job: Option<Receiver<JobEvent>>,
     /// In a test, where updates come from: nothing there reaches the network unless it says so.
@@ -48,6 +54,7 @@ impl Updates {
             phase: UpdatePhase::Idle,
             version: None,
             next_check: first_check(&config.update),
+            restart_at: None,
             check: None,
             job: None,
             #[cfg(test)]
@@ -97,7 +104,7 @@ impl State {
         }
         self.start_check_when_due();
         changed |= self.read_update_job();
-        if matches!(self.update.phase, UpdatePhase::WaitingForAgents { .. }) {
+        if matches!(self.update.phase, UpdatePhase::WaitingForAgents { .. } | UpdatePhase::RestartsIn { .. }) {
             let workspace = self.workspace.clone();
             changed |= self.restart_when_clear(move || crate::restart::Target::current(workspace.as_deref()));
         }
@@ -168,11 +175,14 @@ impl State {
     pub(super) fn start_update(&mut self) {
         match &self.update.phase {
             UpdatePhase::Installed { .. } => {
-                self.update.phase = UpdatePhase::WaitingForAgents { blockers: self.restart_blockers() };
+                self.update.phase = UpdatePhase::WaitingForAgents { blockers: self.update_blockers() };
                 return;
             }
             UpdatePhase::Idle | UpdatePhase::Failed { .. } => {}
-            UpdatePhase::Working { .. } | UpdatePhase::WaitingForAgents { .. } | UpdatePhase::Unknown => return,
+            UpdatePhase::Working { .. }
+            | UpdatePhase::WaitingForAgents { .. }
+            | UpdatePhase::RestartsIn { .. }
+            | UpdatePhase::Unknown => return,
         }
         let Some(found) = self.update.found.clone() else { return };
         if let Some(why) = &self.update.unavailable {
@@ -206,7 +216,7 @@ impl State {
                     self.update.job = None;
                     match result {
                         Ok(()) => {
-                            self.update.phase = UpdatePhase::WaitingForAgents { blockers: self.restart_blockers() };
+                            self.update.phase = UpdatePhase::WaitingForAgents { blockers: self.update_blockers() };
                         }
                         Err(error) => self.update_failed(error),
                     }
@@ -234,19 +244,25 @@ impl State {
             return ControlResponse::error("this ATOMICS is installing an update itself");
         }
         self.update.version = Some(version);
-        self.update.phase = UpdatePhase::WaitingForAgents { blockers: self.restart_blockers() };
+        self.update.restart_at = None;
+        self.update.phase = UpdatePhase::WaitingForAgents { blockers: self.update_blockers() };
         ControlResponse::ok(json!({"waiting": true}))
     }
 
-    /// Restarts once nothing is in the way, and otherwise says what is. Nothing here can force it.
+    /// Says what is in the way, and once nothing is, counts down and restarts. Anything that comes up during the
+    /// countdown stops it, and the next one starts over. Nothing here can force it.
     fn restart_when_clear(&mut self, target: impl FnOnce() -> anyhow::Result<crate::restart::Target>) -> bool {
-        let blockers = self.restart_blockers();
+        let blockers = self.update_blockers();
         if !blockers.is_empty() {
-            let phase = UpdatePhase::WaitingForAgents { blockers };
-            let changed = self.update.phase != phase;
-            self.update.phase = phase;
-            return changed;
+            self.update.restart_at = None;
+            return self.show_update_phase(UpdatePhase::WaitingForAgents { blockers });
         }
+        let now = Instant::now();
+        let at = *self.update.restart_at.get_or_insert(now + COUNTDOWN);
+        if now < at {
+            return self.show_update_phase(UpdatePhase::RestartsIn { seconds: (at - now).as_secs_f64().ceil() as u64 });
+        }
+        self.update.restart_at = None;
         let version = self.update.version.clone().unwrap_or_default();
         let response = self.restart_using(false, Some(format!("update to {version}")), target);
         if !response.ok {
@@ -257,9 +273,16 @@ impl State {
         true
     }
 
+    fn show_update_phase(&mut self, phase: UpdatePhase) -> bool {
+        let changed = self.update.phase != phase;
+        self.update.phase = phase;
+        changed
+    }
+
     /// The Cancel button: the new version stays installed, and this host stays on the old one for now.
     pub(super) fn cancel_update_wait(&mut self) {
-        if matches!(self.update.phase, UpdatePhase::WaitingForAgents { .. }) {
+        if matches!(self.update.phase, UpdatePhase::WaitingForAgents { .. } | UpdatePhase::RestartsIn { .. }) {
+            self.update.restart_at = None;
             let version = self.update.version.clone().unwrap_or_default();
             self.update.phase = UpdatePhase::Installed { version };
         }
@@ -268,6 +291,7 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    use super::super::key_tests::{two_agents, untouched};
     use super::super::tests::{session, with_app};
     use super::*;
     use crate::update::test_support::{Release, found, signed_feed_failing, signed_feed_with};
@@ -360,11 +384,18 @@ mod tests {
                         let case = format!("width={width}, {phase:?}");
                         let row = items(app, ctx, width);
                         let collapsed = row.iter().any(|(item, _)| item == "Actions");
+                        let under_way =
+                            matches!(phase, UpdatePhase::Working { .. } | UpdatePhase::WaitingForAgents { .. });
+                        // An update under way stays beside the folded menu where it fits.
+                        let beside = collapsed && under_way && row.iter().any(|(item, _)| item == name);
                         assert_eq!(
                             row.iter().filter(|(item, _)| item == name).count(),
-                            usize::from(!collapsed),
+                            usize::from(!collapsed || beside),
                             "{case}: in the bar, or folded into Actions: {row:?}"
                         );
+                        if under_way && width >= 1500.0 {
+                            assert!(!collapsed || beside, "{case}: there is room for it: {row:?}");
+                        }
                         let bar = Rect::from_min_size(pos2(10.0, 0.0), vec2(width - 20.0, 34.0)).expand(0.5);
                         for (at, (item, rect)) in row.iter().enumerate() {
                             assert!(bar.contains_rect(*rect), "{case}: {item} outside the bar: {row:?}");
@@ -374,9 +405,8 @@ mod tests {
                         }
                         let chief = row.iter().find(|(item, _)| item == "chief").unwrap().1;
                         assert!((chief.center().x - width / 2.0).abs() < 1.0, "{case}: the pill stays in the middle");
-                        let pressable = matches!(phase, UpdatePhase::Idle | UpdatePhase::Installed { .. });
-                        assert_eq!(dot(app, ctx, width), collapsed && pressable, "{case}: the dot on Actions");
-                        if collapsed {
+                        assert_eq!(dot(app, ctx, width), collapsed && !beside, "{case}: the dot on Actions");
+                        if collapsed && !beside {
                             click(app, ctx, width, "Actions");
                             // A menu sizes before its first paint.
                             items(app, ctx, width);
@@ -403,16 +433,22 @@ mod tests {
     /// Whether the Actions button wears the dot, whole, inside the button. The chief's pill has accent circles of its
     /// own, so only what is on the button counts.
     fn dot(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32) -> bool {
-        let accent = app.palette().accent;
+        dot_color(app, ctx, width).is_some()
+    }
+
+    fn dot_color(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32) -> Option<egui::Color32> {
+        let (accent, warning) = (app.palette().accent, app.palette().warning);
         let (row, output) = paint(app, ctx, width, vec![]);
         let actions = row.iter().find(|(item, _)| item == "Actions").map(|(_, rect)| *rect);
-        let found = actions.is_some_and(|actions| {
-            output.shapes.iter().any(|shape| match &shape.shape {
-                egui::Shape::Circle(circle) if circle.fill == accent && actions.contains(circle.center) => {
+        let found = actions.and_then(|actions| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle)
+                    if [accent, warning].contains(&circle.fill) && actions.contains(circle.center) =>
+                {
                     assert!(actions.contains_rect(circle.visual_bounding_rect()), "{circle:?} outside {actions:?}");
-                    true
+                    Some(circle.fill)
                 }
-                _ => false,
+                _ => None,
             })
         });
         output.drop_without_applying_deltas();
@@ -454,12 +490,17 @@ mod tests {
                     assert!(dot(app, ctx, width), "{phase:?}");
                 }
 
-                // Nothing to press: an update under way or waiting, or a version this build cannot install.
+                // With no room for it beside the menu, an update under way marks the menu in another colour: pressing
+                // Update must change what the bar shows, and a restart nobody can see coming must not happen.
                 let working = UpdatePhase::Working { step: "Downloading 9.0.0".into() };
                 let waiting = UpdatePhase::WaitingForAgents { blockers: vec!["agent x is working".into()] };
+                let narrow = 480.0;
+                assert_eq!(dot_color(app, ctx, narrow), Some(app.palette().accent));
                 for phase in [working, waiting] {
                     app.runtime.update.phase = phase.clone();
-                    assert!(!dot(app, ctx, width), "{phase:?}");
+                    let row = items(app, ctx, narrow);
+                    assert!(!row.iter().any(|(item, _)| item == "Update" || item == "Cancel"), "no room: {row:?}");
+                    assert_eq!(dot_color(app, ctx, narrow), Some(app.palette().warning), "{phase:?}");
                 }
                 app.runtime.update.phase = UpdatePhase::Idle;
                 app.runtime.update.unavailable = Some("This build has no release signing key.".into());
@@ -577,6 +618,11 @@ mod tests {
         );
     }
 
+    /// The countdown has run out.
+    fn countdown_over(app: &mut Desktop<'_>) {
+        app.runtime.update.restart_at = Some(Instant::now());
+    }
+
     /// Runs the job the button started to its end.
     fn finish_job(app: &mut Desktop<'_>) {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -657,6 +703,7 @@ mod tests {
             app.runtime.sessions[0].status = AgentStatus::Idle;
             let program = paths::atomics_home().join("version-probe");
             crate::test_support::write_program(&program, "#!/bin/sh\ntest \"$1\" = --version\n");
+            countdown_over(app);
             app.runtime.restart_when_clear(|| {
                 Ok(crate::restart::Target { executable: program.clone(), command: vec!["/usr/bin/true".into()] })
             });
@@ -671,6 +718,7 @@ mod tests {
             "app::update::tests::a_restart_that_fails_keeps_the_new_version_installed_and_offers_it_again",
             |app, _| {
                 assert!(app.runtime.update_installed("9.0.0".into()).ok, "as atomics update asks");
+                countdown_over(app);
                 app.runtime.restart_when_clear(|| {
                     Ok(crate::restart::Target { executable: "/missing/atomics".into(), command: vec![] })
                 });
@@ -782,5 +830,460 @@ mod tests {
         assert_eq!(app.runtime.active.as_deref(), Some("second"));
         assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "the keyboard stays with the diff");
         finish_job(app);
+    }
+
+    /// What holds the keyboard when the button is pressed.
+    #[derive(Clone, Copy, Debug)]
+    enum Holder {
+        Diff,
+        SettingsField,
+        Nothing,
+    }
+
+    /// A click on the text `label` where the last frame drew it.
+    fn click_text(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, label: &str) {
+        let (_, output) = paint(app, ctx, width, vec![]);
+        let at = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect().center()),
+            _ => None,
+        });
+        output.drop_without_applying_deltas();
+        let at = at.unwrap_or_else(|| panic!("{label} is not drawn"));
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)], vec![]] {
+            paint(app, ctx, width, events).1.drop_without_applying_deltas();
+        }
+    }
+
+    /// A key as the window gets it: pressed in one frame, released in the next.
+    fn key(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, key: Key, modifiers: egui::Modifiers) {
+        let event = |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers };
+        let press = vec![egui::Event::ModifiersChanged(modifiers), event(true)];
+        paint(app, ctx, width, press).1.drop_without_applying_deltas();
+        let release = vec![event(false), egui::Event::ModifiersChanged(egui::Modifiers::NONE)];
+        paint(app, ctx, width, release).1.drop_without_applying_deltas();
+    }
+
+    /// `holder` has the keyboard, and Update appears and is pressed, in the bar or through the Actions menu where
+    /// `width` folds it. The keyboard stays exactly where it was, no terminal behind gets a key, and Ctrl+2 still goes
+    /// to the second agent's diff.
+    fn keyboard_stays_with(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, holder: Holder) {
+        let dir = crate::test_support::tempdir().unwrap();
+        let (first, second) = two_agents(app, dir.path());
+        let run = |app: &mut Desktop<'_>, events| paint(app, ctx, width, events).1.drop_without_applying_deltas();
+        app.client.focus_terminal = app.runtime.active.clone();
+        run(app, vec![]);
+        run(app, vec![]);
+        assert!(ctx.memory(|m| m.focused()).is_some(), "the terminal has the keyboard");
+        match holder {
+            Holder::Diff => {
+                key(app, ctx, width, Key::ArrowDown, egui::Modifiers::SHIFT);
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "the diff has the keyboard");
+            }
+            Holder::SettingsField => {
+                app.client.ui.management.settings = true;
+                run(app, vec![]);
+                run(app, vec![]);
+                click_text(app, ctx, width, "Advanced");
+                for _ in 0..8 {
+                    run(app, vec![]);
+                }
+                click_text(app, ctx, width, "Find a setting");
+                run(app, vec![egui::Event::Text("x".into())]);
+                assert_eq!(app.client.ui.management.filter, "x", "the field has the keyboard");
+            }
+            Holder::Nothing => {
+                let held = ctx.memory(|m| m.focused()).unwrap();
+                ctx.memory_mut(|m| m.surrender_focus(held));
+                run(app, vec![]);
+                assert_eq!(ctx.memory(|m| m.focused()), None);
+            }
+        }
+        let held = ctx.memory(|m| m.focused());
+
+        let release = Release::signed();
+        app.runtime.update.test_mode = Some(signed_feed_failing(&release));
+        app.runtime.update.found = Some(signed_feed_failing(&release).check().unwrap().unwrap());
+        run(app, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), held, "{holder:?}, {width}: appearing takes nothing");
+        if items(app, ctx, width).iter().any(|(item, _)| item == "Actions") {
+            click(app, ctx, width, "Actions");
+            // A menu sizes before its first paint.
+            run(app, vec![]);
+        }
+        click(app, ctx, width, "Update");
+        assert!(matches!(app.runtime.update.phase, UpdatePhase::Working { .. } | UpdatePhase::Failed { .. }));
+        run(app, vec![]);
+        run(app, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), held, "{holder:?}, {width}: the keyboard stays where it was");
+
+        // The keys after it go where they went before it.
+        match holder {
+            Holder::Diff => {
+                key(app, ctx, width, Key::PageDown, egui::Modifiers::NONE);
+                key(app, ctx, width, Key::ArrowDown, egui::Modifiers::NONE);
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "{holder:?}, {width}: stays with the diff");
+            }
+            Holder::SettingsField => {
+                run(app, vec![egui::Event::Text("y".into())]);
+                assert_eq!(app.client.ui.management.filter, "xy", "{holder:?}, {width}: typing stays in the field");
+            }
+            Holder::Nothing => {
+                key(app, ctx, width, Key::PageDown, egui::Modifiers::NONE);
+                run(app, vec![egui::Event::Text("typed".into())]);
+                assert_eq!(ctx.memory(|m| m.focused()), None, "{holder:?}, {width}: nothing took it");
+            }
+        }
+
+        // Ctrl+2 (Command on a Mac) still goes to the second agent's diff.
+        let chord = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+        key(app, ctx, width, Key::Num2, chord);
+        run(app, vec![]);
+        assert_eq!(app.runtime.active.as_deref(), Some("second"), "{holder:?}, {width}");
+        assert_eq!(app.runtime.diff_target().as_deref(), Some(second.as_path()), "{holder:?}, {width}");
+        assert!(app.runtime.panel == PanelMode::Diff && app.runtime.diff_open, "{holder:?}, {width}: the diff shows");
+        match holder {
+            Holder::SettingsField => {
+                assert_eq!(ctx.memory(|m| m.focused()), held, "{width}: the open window keeps its field's keyboard");
+            }
+            _ => assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "{holder:?}, {width}: with the diff"),
+        }
+        untouched(app, &[("first", &first), ("second", &second)], "end");
+        finish_job(app);
+    }
+
+    #[test]
+    fn an_agent_chord_on_the_frame_after_the_press_keeps_the_keyboard_it_moved() {
+        with_app(
+            "app::update::tests::an_agent_chord_on_the_frame_after_the_press_keeps_the_keyboard_it_moved",
+            |app, ctx| {
+                let width = 2400.0;
+                let dir = crate::test_support::tempdir().unwrap();
+                let (first, second) = two_agents(app, dir.path());
+                let run =
+                    |app: &mut Desktop<'_>, events| paint(app, ctx, width, events).1.drop_without_applying_deltas();
+                app.client.focus_terminal = app.runtime.active.clone();
+                run(app, vec![]);
+                run(app, vec![]);
+                let release = Release::signed();
+                app.runtime.update.test_mode = Some(signed_feed_failing(&release));
+                app.runtime.update.found = Some(signed_feed_failing(&release).check().unwrap().unwrap());
+                let at =
+                    items(app, ctx, width).iter().find(|(item, _)| item == "Update").expect("in the bar").1.center();
+                let button = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                run(app, vec![egui::Event::PointerMoved(at)]);
+                run(app, vec![button(true)]);
+                run(app, vec![button(false)]);
+                assert!(matches!(app.runtime.update.phase, UpdatePhase::Working { .. } | UpdatePhase::Failed { .. }));
+
+                // With nothing in between.
+                let chord = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+                key(app, ctx, width, Key::Num2, chord);
+                run(app, vec![]);
+                assert_eq!(app.runtime.active.as_deref(), Some("second"));
+                assert_eq!(app.runtime.diff_target().as_deref(), Some(second.as_path()));
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "the keyboard stays with the diff");
+                untouched(app, &[("first", &first), ("second", &second)], "end");
+                finish_job(app);
+            },
+        );
+    }
+
+    #[test]
+    fn the_button_leaves_the_keyboard_in_the_diff() {
+        with_app("app::update::tests::the_button_leaves_the_keyboard_in_the_diff", |app, ctx| {
+            keyboard_stays_with(app, ctx, 2400.0, Holder::Diff)
+        });
+    }
+
+    #[test]
+    fn the_button_folded_under_actions_leaves_the_keyboard_in_the_diff() {
+        with_app("app::update::tests::the_button_folded_under_actions_leaves_the_keyboard_in_the_diff", |app, ctx| {
+            keyboard_stays_with(app, ctx, 900.0, Holder::Diff)
+        });
+    }
+
+    #[test]
+    fn the_button_leaves_the_keyboard_in_a_settings_field() {
+        with_app("app::update::tests::the_button_leaves_the_keyboard_in_a_settings_field", |app, ctx| {
+            keyboard_stays_with(app, ctx, 2400.0, Holder::SettingsField)
+        });
+    }
+
+    #[test]
+    fn the_button_folded_under_actions_leaves_the_keyboard_in_a_settings_field() {
+        with_app(
+            "app::update::tests::the_button_folded_under_actions_leaves_the_keyboard_in_a_settings_field",
+            |app, ctx| keyboard_stays_with(app, ctx, 900.0, Holder::SettingsField),
+        );
+    }
+
+    #[test]
+    fn the_button_gives_nothing_the_keyboard_when_nothing_held_it() {
+        with_app("app::update::tests::the_button_gives_nothing_the_keyboard_when_nothing_held_it", |app, ctx| {
+            keyboard_stays_with(app, ctx, 2400.0, Holder::Nothing)
+        });
+    }
+
+    #[test]
+    fn the_button_folded_under_actions_gives_nothing_the_keyboard_when_nothing_held_it() {
+        with_app(
+            "app::update::tests::the_button_folded_under_actions_gives_nothing_the_keyboard_when_nothing_held_it",
+            |app, ctx| keyboard_stays_with(app, ctx, 900.0, Holder::Nothing),
+        );
+    }
+
+    /// The wait for agents says `expected` holds the restart back, and nothing restarts.
+    fn holds_the_restart(app: &mut Desktop<'_>, expected: &str) {
+        let target = || -> anyhow::Result<crate::restart::Target> { panic!("the restart went over {expected}") };
+        app.runtime.restart_when_clear(target);
+        assert!(!app.runtime.restarting, "{expected}");
+        let UpdatePhase::WaitingForAgents { blockers } = &app.runtime.update.phase else {
+            panic!("{expected}: {:?}", app.runtime.update.phase)
+        };
+        assert!(blockers.iter().any(|blocker| blocker.contains(expected)), "{expected}: {blockers:?}");
+    }
+
+    /// A live terminal running `script` with `text` as its `$0`, once `shown` is on its screen.
+    fn terminal_running(app: &Desktop<'_>, root: &Path, program: &str, args: &[&str], shown: &str) -> Terminal {
+        let terminal = Terminal::spawn(
+            app.runtime.wake.clone(),
+            app.runtime.theme.terminal_colors(),
+            program.into(),
+            args.iter().map(|arg| arg.to_string()).collect(),
+            root,
+            HashMap::from([("PS1".to_string(), "ready> ".to_string())]),
+            100,
+        )
+        .unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while !terminal.screen_text(24).contains(shown) {
+            assert!(Instant::now() < deadline, "{shown} never showed: {}", terminal.screen_text(24));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        terminal
+    }
+
+    /// A program that prints `text` as the last line of its screen and stays.
+    fn footer(app: &Desktop<'_>, root: &Path, text: &str) -> Terminal {
+        let script = "printf '%s\\n' \"$0\"; exec sleep 300";
+        terminal_running(app, root, "/bin/sh", &["-c", script, text], text)
+    }
+
+    #[test]
+    fn a_working_chief_holds_the_update_restart_back() {
+        with_app("app::update::tests::a_working_chief_holds_the_update_restart_back", |app, _| {
+            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            holds_the_restart(app, "chief");
+        });
+    }
+
+    #[test]
+    fn an_agent_whose_screen_is_still_in_a_turn_holds_the_update_restart_back() {
+        with_app(
+            "app::update::tests::an_agent_whose_screen_is_still_in_a_turn_holds_the_update_restart_back",
+            |app, _| {
+                assert!(app.runtime.update_installed("9.0.0".into()).ok);
+                let dir = crate::test_support::tempdir().unwrap();
+                // Where a sandboxed agent's report arrives before its turn ends.
+                let mut worker = session("worker", AgentKind::Claude, AgentStatus::Done, dir.path());
+                worker.screen_busy = true;
+                worker.terminal = Some(footer(app, dir.path(), "esc to interrupt"));
+                app.runtime.sessions = vec![worker];
+                holds_the_restart(app, "worker");
+            },
+        );
+    }
+
+    #[test]
+    fn an_idle_agent_with_background_work_holds_the_update_restart_back() {
+        with_app("app::update::tests::an_idle_agent_with_background_work_holds_the_update_restart_back", |app, _| {
+            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            let dir = crate::test_support::tempdir().unwrap();
+            let mut worker = session("worker", AgentKind::Claude, AgentStatus::Idle, dir.path());
+            worker.terminal = Some(footer(app, dir.path(), "  ⏵⏵ auto mode on · 1 shell · ← 1 agent"));
+            app.runtime.sessions = vec![worker];
+            holds_the_restart(app, "1 shell");
+        });
+    }
+
+    #[test]
+    fn a_shell_running_a_command_holds_the_update_restart_back() {
+        with_app("app::update::tests::a_shell_running_a_command_holds_the_update_restart_back", |app, _| {
+            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            let dir = crate::test_support::tempdir().unwrap();
+            let terminal = terminal_running(app, dir.path(), "/bin/sh", &["-i"], "ready>");
+            assert!(!terminal.foreground_process(), "at its prompt");
+            terminal.write(b"sleep 300\r".to_vec());
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            while !terminal.foreground_process() {
+                assert!(Instant::now() < deadline, "the shell never ran it: {}", terminal.screen_text(24));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut shell = session("shell", AgentKind::Shell, AgentStatus::Idle, dir.path());
+            shell.terminal = Some(terminal);
+            app.runtime.sessions = vec![shell];
+            holds_the_restart(app, "shell");
+
+            // Back at its prompt it holds nothing. What is typed there is what the countdown is for.
+            let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+            terminal.write(b"\x03".to_vec());
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            while terminal.foreground_process() {
+                assert!(Instant::now() < deadline, "the command did not stop: {}", terminal.screen_text(24));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.runtime.restart_when_clear(|| panic!("the countdown comes first"));
+            assert_eq!(app.runtime.update.phase, UpdatePhase::RestartsIn { seconds: COUNTDOWN.as_secs() });
+        });
+    }
+
+    #[test]
+    fn a_running_editor_holds_the_update_restart_back() {
+        with_app("app::update::tests::a_running_editor_holds_the_update_restart_back", |app, _| {
+            assert!(app.runtime.update_installed("9.0.0".into()).ok);
+            let dir = crate::test_support::tempdir().unwrap();
+            let editor = footer(app, dir.path(), "unsaved");
+            app.runtime.editors.insert(dir.path().to_path_buf(), editor);
+            holds_the_restart(app, "editor");
+
+            // Quit, it holds nothing.
+            let editor = &app.runtime.editors[dir.path()];
+            // SAFETY: a signal to the process this terminal started.
+            unsafe { libc::kill(editor.process_id() as i32, libc::SIGTERM) };
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            while !editor.exited() {
+                assert!(Instant::now() < deadline, "the editor did not stop");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.runtime.restart_when_clear(|| panic!("the countdown comes first"));
+            assert_eq!(app.runtime.update.phase, UpdatePhase::RestartsIn { seconds: COUNTDOWN.as_secs() });
+        });
+    }
+
+    #[test]
+    fn with_nothing_in_the_way_the_window_counts_down_and_anything_new_starts_it_over() {
+        with_app(
+            "app::update::tests::with_nothing_in_the_way_the_window_counts_down_and_anything_new_starts_it_over",
+            |app, _| {
+                let whole = UpdatePhase::RestartsIn { seconds: COUNTDOWN.as_secs() };
+                let target =
+                    || -> anyhow::Result<crate::restart::Target> { panic!("the window closed during the countdown") };
+                assert!(app.runtime.update_installed("9.0.0".into()).ok);
+                app.runtime.restart_when_clear(target);
+                assert_eq!(app.runtime.update.phase, whole);
+                assert!(!app.runtime.restarting);
+
+                // An agent starts a turn: back to waiting, and the next countdown is a whole one.
+                app.runtime.update.restart_at = Some(Instant::now() + Duration::from_millis(1));
+                app.runtime.sessions =
+                    vec![session("worker", AgentKind::Claude, AgentStatus::Working, &app.runtime.launch_dir)];
+                holds_the_restart(app, "worker");
+                assert!(app.runtime.update.restart_at.is_none());
+                app.runtime.sessions[0].status = AgentStatus::Idle;
+                app.runtime.restart_when_clear(target);
+                assert_eq!(app.runtime.update.phase, whole);
+
+                // It runs out and restarts.
+                let program = paths::atomics_home().join("version-probe");
+                crate::test_support::write_program(&program, "#!/bin/sh\ntest \"$1\" = --version\n");
+                countdown_over(app);
+                app.runtime.restart_when_clear(|| {
+                    Ok(crate::restart::Target { executable: program.clone(), command: vec!["/usr/bin/true".into()] })
+                });
+                assert!(app.runtime.restarting);
+            },
+        );
+    }
+
+    #[test]
+    fn cancel_stops_the_countdown_and_pressing_again_counts_from_the_start() {
+        with_app(
+            "app::update::tests::cancel_stops_the_countdown_and_pressing_again_counts_from_the_start",
+            |app, _| {
+                let target = || -> anyhow::Result<crate::restart::Target> { panic!("nothing restarts here") };
+                assert!(app.runtime.update_installed("9.0.0".into()).ok);
+                app.runtime.restart_when_clear(target);
+                countdown_over(app);
+                app.runtime.cancel_update_wait();
+                assert_eq!(app.runtime.update.phase, UpdatePhase::Installed { version: "9.0.0".into() });
+                app.runtime.poll_update();
+                assert!(!app.runtime.restarting, "a cancelled countdown does not run on");
+
+                app.runtime.start_update();
+                assert!(matches!(app.runtime.update.phase, UpdatePhase::WaitingForAgents { .. }));
+                app.runtime.restart_when_clear(target);
+                assert_eq!(app.runtime.update.phase, UpdatePhase::RestartsIn { seconds: COUNTDOWN.as_secs() });
+            },
+        );
+    }
+
+    #[test]
+    fn the_countdown_shows_at_every_width_and_its_cancel_leaves_the_keyboard_and_agent_chords_alone() {
+        with_app(
+            "app::update::tests::the_countdown_shows_at_every_width_and_its_cancel_leaves_the_keyboard_and_agent_chords_alone",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let (first, second) = two_agents(app, dir.path());
+                app.runtime.update.version = Some("9.0.0".into());
+                for width in [480.0, 700.0, 900.0, 1500.0, 2400.0] {
+                    app.client.focus_terminal = app.runtime.active.clone();
+                    let run = |app: &mut Desktop<'_>| paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    run(app);
+                    run(app);
+                    let holder = ctx.memory(|m| m.focused()).expect("the terminal has the keyboard");
+
+                    app.runtime.update.phase = UpdatePhase::RestartsIn { seconds: 7 };
+                    // An area sizes before its first paint.
+                    run(app);
+                    let row = items(app, ctx, width);
+                    let window = Rect::from_min_size(Pos2::ZERO, vec2(width, 800.0));
+                    for name in ["countdown", "Cancel"] {
+                        let rect =
+                            row.iter().find(|(item, _)| item == name).unwrap_or_else(|| panic!("{width}: {name}"));
+                        assert!(window.contains_rect(rect.1), "{width}: {name} at {:?}", rect.1);
+                    }
+                    let text = drawn(app, ctx, width);
+                    assert!(text.iter().any(|t| t == "Restarting in 7 s to update"), "{width}: {text:?}");
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(holder), "{width}: appearing takes nothing");
+
+                    click(app, ctx, width, "Cancel");
+                    assert_eq!(app.runtime.update.phase, UpdatePhase::Installed { version: "9.0.0".into() }, "{width}");
+                    run(app);
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(holder), "{width}: the keyboard stays");
+                }
+
+                // Ctrl+2 (Command on a Mac) goes to the second agent's diff while it counts, and after Cancel too.
+                let chord = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+                let width = 900.0;
+                app.runtime.update.phase = UpdatePhase::RestartsIn { seconds: 7 };
+                key(app, ctx, width, Key::Num2, chord);
+                paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                assert_eq!(app.runtime.active.as_deref(), Some("second"));
+                assert_eq!(app.runtime.diff_target().as_deref(), Some(second.as_path()));
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "with the diff");
+                click(app, ctx, width, "Cancel");
+                paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())), "still with the diff");
+                key(app, ctx, width, Key::Num1, chord);
+                paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                assert_eq!(app.runtime.active.as_deref(), Some("first"));
+                assert_eq!(app.runtime.diff_target().as_deref(), Some(first.as_path()));
+                untouched(app, &[("first", &first), ("second", &second)], "end");
+            },
+        );
     }
 }

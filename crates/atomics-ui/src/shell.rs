@@ -366,6 +366,8 @@ pub struct TopBarPlan {
     pub compact_switcher: bool,
     pub actions_menu: bool,
     pub show_load: bool,
+    /// An update under way stays in the row, beside the folded Actions menu.
+    pub update_beside: bool,
 }
 
 /// The bar's least inner width for the full pill, and for the pill with its name.
@@ -390,6 +392,8 @@ pub struct TopBarWidths {
     pub controls: f32,
     pub controls_with_load: f32,
     pub actions_menu: f32,
+    /// An update under way, which stays beside the folded menu where it fits. Nothing while none is.
+    pub update: f32,
 }
 
 impl TopBarPlan {
@@ -421,7 +425,10 @@ impl TopBarPlan {
             BrandSize::Mark
         };
         let show_load = chief == PillSize::Full && right(w.controls_with_load, w.switcher[0]) <= side(chief);
-        TopBarPlan { brand, chief, compact_switcher, actions_menu, show_load }
+        let switcher = w.switcher[usize::from(compact_switcher)];
+        let update_beside =
+            actions_menu && w.update > 0.0 && right(w.actions_menu + w.gap + w.update, switcher) <= side(chief);
+        TopBarPlan { brand, chief, compact_switcher, actions_menu, show_load, update_beside }
     }
 }
 
@@ -431,6 +438,7 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     use chief::PillSize;
     let rect = ui.available_rect_before_wrap();
     let gap = ui.spacing().item_spacing.x;
+    crate::update::keep_keyboard(ui.ctx());
     let palette = read(platform, |_, client| client.palette.clone());
     let (urgent_label, urgent_color) = platform.draw(|backend, client, _| tabs::urgent_tabs_label(backend, client));
     let navigation = measure(ui, |ui| {
@@ -447,11 +455,12 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         switcher: [false, true].map(|compact| {
             measure(ui, |ui| platform.draw(|backend, client, _| switcher::draw(ui, compact, backend, client)))
         }),
-        controls: measure(ui, |ui| top_bar_controls(ui, platform, false, false)),
-        controls_with_load: measure(ui, |ui| top_bar_controls(ui, platform, true, false)),
+        controls: measure(ui, |ui| top_bar_controls(ui, platform, false, false, true)),
+        controls_with_load: measure(ui, |ui| top_bar_controls(ui, platform, true, false, true)),
         actions_menu: measure(ui, |ui| {
             ui.menu_button("Actions", |_| {});
         }),
+        update: measure(ui, |ui| platform.draw(|backend, client, _| crate::update::status(ui, backend, client))),
     };
     let plan = TopBarPlan::choose(&widths);
     let brand_width = widths.brand[plan.brand as usize];
@@ -467,7 +476,9 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let switcher = widths.switcher[usize::from(plan.compact_switcher)];
     let used = switcher
         + if switcher > 0.0 { gap } else { 0.0 }
-        + if plan.actions_menu {
+        + if plan.update_beside {
+            widths.update + gap + widths.actions_menu
+        } else if plan.actions_menu {
             widths.actions_menu
         } else if plan.show_load {
             widths.controls_with_load
@@ -477,13 +488,18 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     slot(ui, "actions", actions.with_min_x((actions.right() - used).max(actions.left())), |ui| {
         platform.draw(|backend, client, _| switcher::draw(ui, plan.compact_switcher, backend, client));
         if plan.actions_menu {
-            let response = ui.menu_button("Actions", |ui| top_bar_controls(ui, platform, false, true)).response;
+            if plan.update_beside {
+                platform.draw(|backend, client, _| crate::update::status(ui, backend, client));
+            }
+            let update_inside = !plan.update_beside;
+            let response =
+                ui.menu_button("Actions", |ui| top_bar_controls(ui, platform, false, true, update_inside)).response;
             record_item(ui, "Actions", &response);
-            if read(platform, |backend, _| crate::update::offered(backend)) {
-                crate::update::paint_dot(ui, &response, &palette);
+            if update_inside {
+                read(platform, |backend, _| crate::update::mark_menu(ui, &response, backend, &palette));
             }
         } else {
-            top_bar_controls(ui, platform, plan.show_load, false);
+            top_bar_controls(ui, platform, plan.show_load, false, true);
         }
     });
     slot(ui, "navigation", navigation, |ui| {
@@ -491,6 +507,7 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         platform.draw(|backend, client, _| topbar::notice(ui, backend, client));
     });
     ui.allocate_rect(rect, Sense::hover());
+    platform.draw(|backend, client, _| crate::update::countdown(ui.ctx(), backend, client));
 }
 
 fn brand(ui: &mut egui::Ui, platform: &mut impl Platform, size: BrandSize) {
@@ -507,12 +524,20 @@ fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, size: chief::Pill
 /// The bar's actions, in the order a row shows them: `+ New`, the host's items, Project, the host's load
 /// gauge with `show_load`, and its settings. Each button is a draw of its own, so a click on one reaches the
 /// buttons drawn after it in the same frame. The view switcher stands before them, and stays in the bar when
-/// they fold into the Actions menu.
-fn top_bar_controls(ui: &mut egui::Ui, platform: &mut impl Platform, show_load: bool, in_menu: bool) {
+/// they fold into the Actions menu. `update_item` is false when an update under way stays beside that menu.
+fn top_bar_controls(
+    ui: &mut egui::Ui,
+    platform: &mut impl Platform,
+    show_load: bool,
+    in_menu: bool,
+    update_item: bool,
+) {
     platform.draw(|backend, client, _| topbar::new_button(ui, in_menu, backend, client));
     platform.draw(|backend, client, _| topbar::explorer_menu(ui, backend, client));
     platform.top_bar_items(ui, in_menu);
-    platform.draw(|backend, client, _| crate::update::top_bar_item(ui, backend, client));
+    if update_item {
+        platform.draw(|backend, client, _| crate::update::top_bar_item(ui, backend, client));
+    }
     platform.draw(|backend, client, _| crate::pull_request::menu(ui, backend, client));
     if read(platform, |backend, _| backend.management().is_some() || backend.available(&Command::PickProject)) {
         let response = ui
@@ -604,7 +629,23 @@ mod tests {
             controls: 226.0,
             controls_with_load: 445.0,
             actions_menu: 65.0,
+            update: 0.0,
         }
+    }
+
+    #[test]
+    fn an_update_under_way_stays_beside_the_folded_actions_only_where_it_fits() {
+        let with = |width, update| TopBarPlan::choose(&TopBarWidths { update, ..widths(width) });
+        // Nothing under way, and nothing to keep.
+        assert!(with(1000.0, 0.0).actions_menu && !with(1000.0, 0.0).update_beside);
+        // Folded with room for it.
+        assert!(with(1000.0, 100.0).actions_menu && with(1000.0, 100.0).update_beside);
+        // Folded without: the menu's mark says it instead, and the rest of the plan does not change for it.
+        let narrow = with(700.0, 100.0);
+        assert!(narrow.actions_menu && !narrow.update_beside);
+        assert_eq!(narrow, with(700.0, 0.0));
+        // Unfolded it is one of the controls.
+        assert!(!with(6000.0, 100.0).actions_menu && !with(6000.0, 100.0).update_beside);
     }
 
     #[test]
@@ -620,7 +661,8 @@ mod tests {
                 chief: PillSize::Full,
                 compact_switcher: false,
                 actions_menu: false,
-                show_load: true
+                show_load: true,
+                update_beside: false
             }
         );
         for width in (460..6000).rev().step_by(5).map(|w| w as f32) {
