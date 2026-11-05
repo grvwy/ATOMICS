@@ -843,6 +843,7 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
             // The phone's ⋯ menu also carries the host's usage and governor details.
             let (shown, mut clicked) = (view.place.clone(), false);
             layout_menu(ui, view, |ui| {
+                atomics_ui::update::top_bar_item(ui, backend, client);
                 atomics_ui::management::buttons(ui, backend, client);
                 if backend.management().is_some() {
                     ui.menu_button("Project", |ui| atomics_ui::topbar::project_menu(ui, backend, client));

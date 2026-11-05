@@ -18,4 +18,15 @@ fn main() {
         .filter(|version| !version.trim().is_empty())
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").expect("crate version"));
     println!("cargo:rustc-env=ATOMICS_BUILD_VERSION={}", version.trim());
+    println!("cargo:rustc-env=ATOMICS_TARGET={}", std::env::var("TARGET").expect("cargo's target"));
+    release_signing_key();
+}
+
+/// Builds the release trust anchor in when the checkout has it, and nothing otherwise: the updater then refuses
+/// to install a download. The folder is what is watched, because a missing file would rerun this every build.
+fn release_signing_key() {
+    println!("cargo:rerun-if-changed=../../assets");
+    let key = std::fs::read_to_string("../../assets/release-signing-key.pub").ok();
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("cargo's output folder")).join("release_key.rs");
+    std::fs::write(out, format!("{key:?}")).expect("writing the release key's source");
 }

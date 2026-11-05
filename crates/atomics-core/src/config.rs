@@ -540,6 +540,10 @@ forward = "cmd+alt+right"
 # url = ""                  # the service's wss:// address
 # name = ""                 # how the service lists this host; empty = this machine's name
 # pair_url = ""             # the service's pairing page, ending in #{pairing}: "Pair a device" puts the link's secret there
+
+[update]
+# check = true              # look for a new version on start and every 6 hours
+# source = ""               # a checkout to build new versions from, against its origin/main; empty = signed releases
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +573,24 @@ pub struct Config {
     pub github: crate::github::GithubConfig,
     pub remote: RemoteAccessConfig,
     pub client: ClientConfig,
+    pub update: UpdateConfig,
+}
+
+/// `[update]`: whether this host looks for new versions, and where it takes one from. `atomics update` reads
+/// `source` too, and asks whatever `check` says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Look for a new version on start and every 6 hours.
+    pub check: bool,
+    /// A checkout to build new versions from, against its origin/main. Empty: signed releases.
+    pub source: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true, source: String::new() }
+    }
 }
 
 /// `[client]`: open the window as a client of an ATOMICS host instead of running agents itself
@@ -998,6 +1020,7 @@ impl Default for Config {
             github: crate::github::GithubConfig::default(),
             remote: RemoteAccessConfig::default(),
             client: ClientConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }

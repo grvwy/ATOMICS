@@ -39,6 +39,7 @@ mod terminal;
 mod theme;
 mod ticket_signin;
 mod tickets;
+mod update;
 mod usage;
 mod vm;
 mod voice;
@@ -52,7 +53,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "atomics", version = env!("ATOMICS_BUILD_VERSION"), about = "Review-first workspace for coding agents")]
+// An update reads the version from the first word after the name: see `update::must_report`.
+#[command(
+    name = "atomics",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ATOMICS_BUILD_VERSION"), ")"),
+    about = "Review-first workspace for coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -165,6 +171,12 @@ enum Command {
     Vm {
         #[command(subcommand)]
         command: VmCommand,
+    },
+    /// Install the newest version; a running ATOMICS restarts into it when agents finish
+    Update {
+        /// Only say whether a newer version exists
+        #[arg(long)]
+        check: bool,
     },
     /// Run a heavy command, such as a full test run or a QA instance, once ATOMICS has a free slot
     Queue {
@@ -292,6 +304,7 @@ fn main() -> eframe::Result {
                 | Command::McpHost { .. }
                 | Command::Queue { .. }
                 | Command::Ctl { .. }
+                | Command::Update { .. }
         )
     );
     if !in_session {
@@ -316,6 +329,7 @@ fn main() -> eframe::Result {
                 | Command::Sandbox { .. }
                 | Command::Tickets { .. }
                 | Command::Queue { .. }
+                | Command::Update { .. }
         )
     ) {
         // SAFETY: no other thread exists yet.
@@ -417,6 +431,7 @@ fn main() -> eframe::Result {
             eprintln!("atomics mcp-host: {error:#}");
             std::process::exit(1);
         }
+        Some(Command::Update { check }) => std::process::exit(update::run_cli(check)),
         Some(Command::Queue { class, command }) => {
             let class =
                 atomics_core::governor::SlotClass::parse(&class).unwrap_or(atomics_core::governor::SlotClass::Test);

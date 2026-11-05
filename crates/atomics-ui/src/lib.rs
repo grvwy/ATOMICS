@@ -45,6 +45,7 @@ pub mod tickets;
 pub mod topbar;
 pub mod touch;
 pub mod trace_lane;
+pub mod update;
 pub mod window_keys;
 
 pub use backend::{

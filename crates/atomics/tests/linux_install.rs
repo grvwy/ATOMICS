@@ -63,6 +63,38 @@ fn fresh_install_and_update_run_installed_setup_with_stdin_and_keep_install_on_i
 }
 
 #[test]
+fn no_setup_installs_with_nobody_at_a_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin = dir.path().join("tools");
+    let target = dir.path().join("target");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(target.join("fixture-linux-native/release")).unwrap();
+    script(&bin.join("cargo"), "#!/bin/sh\nexit 0\n");
+    script(&bin.join("rustc"), "#!/bin/sh\necho 'host: fixture-linux-native'\n");
+    // Asks, as setup does, and fails with nobody to answer.
+    script(&target.join("fixture-linux-native/release/atomics"), "#!/bin/sh\nread -r answer || exit 11\n");
+    let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/linux-install.sh");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let install = |args: &[&str]| {
+        test_support::output(
+            Command::new("sh")
+                .arg(&installer)
+                .args(args)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("CARGO_TARGET_DIR", &target)
+                .env("PATH", &path)
+                .stdin(Stdio::null()),
+        )
+    };
+    assert!(!install(&[]).status.success(), "setup runs, and has nobody to ask");
+    let output = install(&["--no-setup"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(home.join(".local/bin/atomics").exists());
+}
+
+#[test]
 fn installer_reaches_real_setup_from_a_fresh_home() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");

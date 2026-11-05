@@ -370,6 +370,7 @@ impl State {
             tickets: self.ticket_ui_info(),
             management: Some(self.management_info()),
             resources: Some(self.resources.clone()),
+            update: Some(self.update_info()),
         }
     }
 

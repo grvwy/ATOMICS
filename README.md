@@ -273,7 +273,8 @@ and config overrides are preserved, and helper output goes to `restart.log` unde
 Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
 or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
-`git describe --always --tags --dirty` at compile time, falling back to the crate version. `atomics --version` prints it.
+`git describe --always --tags --dirty` at compile time, falling back to the crate version. `atomics --version` prints the
+crate version and then that build, as `atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
 
 ## Using ATOMICS on several machines
 

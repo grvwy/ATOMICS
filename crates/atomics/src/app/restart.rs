@@ -35,6 +35,9 @@ impl State {
         if self.lifecycle_jobs.iter().any(|job| !job.is_finished()) {
             blockers.push("session or plan cleanup running".into());
         }
+        if self.update.installing() {
+            blockers.push("an update is being installed".into());
+        }
         if self.startup_cleanup.as_ref().is_some_and(|job| !job.is_finished()) {
             blockers.push("startup cleanup running".into());
         }
@@ -65,7 +68,7 @@ impl State {
         self.restart_using(force, reason, move || crate::restart::Target::current(workspace.as_deref()))
     }
 
-    fn restart_using(
+    pub(super) fn restart_using(
         &mut self,
         force: bool,
         reason: Option<String>,

@@ -871,7 +871,7 @@ fn message(body: &str) -> String {
 }
 
 /// A transport error without its URL's query or any header.
-fn transport(error: &ureq::Error) -> String {
+pub(crate) fn transport(error: &ureq::Error) -> String {
     match error {
         ureq::Error::Io(error) => error.kind().to_string(),
         ureq::Error::Timeout(_) => "timed out".into(),

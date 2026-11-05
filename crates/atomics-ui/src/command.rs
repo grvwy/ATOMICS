@@ -218,6 +218,11 @@ pub enum Command {
     EditConfig,
     /// Check again whether agents can run in Docker Sandboxes.
     CheckSandbox,
+    /// Install the newer version, or, once installed, restart into it when agents finish. Only a window on the
+    /// host offers this: atomics.v1 has no operation for it.
+    Update,
+    /// Stop waiting to restart into the installed version.
+    CancelUpdate,
     /// Read the MCP servers sbx has and ATOMICS knows again.
     RefreshConnections,
     /// Import the MCP servers the agents' own configs name.

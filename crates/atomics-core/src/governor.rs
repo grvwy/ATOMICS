@@ -99,6 +99,24 @@ impl Toolchain {
     }
 }
 
+/// The Rust toolchain a repository pins, by its `rust-toolchain.toml` or `rust-toolchain`, as rustup reads them.
+#[cfg(feature = "native")]
+pub fn pinned_rust_toolchain(root: &std::path::Path) -> Option<String> {
+    let channel = |text: &str| -> Option<String> {
+        let parsed = text.parse::<toml::Table>().ok()?;
+        Some(parsed.get("toolchain")?.get("channel")?.as_str()?.to_string())
+    };
+    if let Ok(text) = std::fs::read_to_string(root.join("rust-toolchain.toml")) {
+        return channel(&text);
+    }
+    let text = std::fs::read_to_string(root.join("rust-toolchain")).ok()?;
+    // The old form is just the channel's name.
+    channel(&text).or_else(|| {
+        let name = text.trim();
+        (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
+    })
+}
+
 impl ResourceConfig {
     pub fn env(&self, toolchain: Toolchain, cores: usize) -> Vec<(String, String)> {
         match toolchain {

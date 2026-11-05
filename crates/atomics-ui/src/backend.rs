@@ -568,4 +568,9 @@ pub trait Backend {
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         None
     }
+
+    /// The host's version and any newer one, when it publishes them.
+    fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
+        None
+    }
 }

@@ -1,0 +1,388 @@
+//! Every key here is made at test time: no key, real or placeholder, is a trust anchor of any test.
+
+use super::test_support::*;
+use super::*;
+use std::os::unix::fs::MetadataExt;
+
+fn found_on(server: &Server, key: &TestKey, target: InstallTarget) -> (Feed, Found) {
+    let feed = server.feed(Ok(key.raw()), target);
+    let found = feed.latest("1.0.0").unwrap().expect("a newer release");
+    (feed, found)
+}
+
+/// What installing fails with, as the user reads it.
+fn failure(feed: &Feed, found: &Found) -> String {
+    format!("{:#}", feed.install(found, &|_| {}).unwrap_err())
+}
+
+#[test]
+fn versions_compare_as_numbers_and_a_pre_release_is_never_offered() {
+    assert!(is_newer("0.1.6", "v0.1.7"));
+    assert!(is_newer("0.1.9", "0.1.10"));
+    assert!(is_newer("0.9.9", "v1.0.0"));
+    assert!(!is_newer("0.1.7", "v0.1.7"));
+    assert!(!is_newer("0.1.7", "v0.1.6"));
+    assert!(!is_newer("0.1.6", "v0.1.7-rc1"));
+    assert!(!is_newer("0.1.6", "v0.1"));
+    assert!(!is_newer("0.1.6", "v0.1.7.1"));
+    assert!(!is_newer("a build", "v0.1.7"));
+}
+
+#[test]
+fn the_public_key_is_read_from_its_pem_and_anything_else_is_refused() {
+    let key = TestKey::new();
+    assert_eq!(parse_public_key(&key.pem()).unwrap(), key.raw());
+    for bad in [
+        String::new(),
+        "not a key".into(),
+        "-----BEGIN PUBLIC KEY-----\n!!!\n-----END PUBLIC KEY-----\n".into(),
+        // An RSA-sized body, and the right prefix on a short key.
+        format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", "QUJD"),
+        key.pem().replace("MCowBQYDK2Vw", "MCowBQYDK2Vx"),
+    ] {
+        assert!(parse_public_key(&bad).unwrap_err().contains("cannot be read"), "{bad}");
+    }
+}
+
+#[test]
+fn a_key_built_into_this_binary_is_one_it_can_use() {
+    // Absent until the maintainer provisions it; then every test run proves the file parses.
+    match BUILT_IN_KEY {
+        Some(_) => {
+            built_in_key().unwrap();
+        }
+        None => assert_eq!(built_in_key().unwrap_err(), NO_KEY),
+    }
+}
+
+#[test]
+fn verification_takes_the_checksum_and_the_signature_over_the_exact_bytes() {
+    let key = TestKey::new();
+    let archive = b"archive bytes".as_slice();
+    let checksum = sha256_line(archive, ARCHIVE_NAME);
+    let signature = key.sign(archive);
+    verify(archive, ARCHIVE_NAME, &checksum, &signature, &key.raw()).unwrap();
+
+    type Case<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a str);
+    let cases: [Case; 6] = [
+        (b"archive bytes!", &checksum, &signature, "damaged"),
+        (archive, &sha256_line(b"other", ARCHIVE_NAME), &signature, "damaged"),
+        (archive, &sha256_line(archive, "another-file.tar.gz"), &signature, "names another file"),
+        (archive, b"\xff\xfe", &signature, "cannot be read"),
+        (archive, &checksum, &signature[..63], "not signed"),
+        (archive, &checksum, &TestKey::new().sign(archive), "not signed"),
+    ];
+    for (bytes, sums, signed, expected) in cases {
+        let error = verify(bytes, ARCHIVE_NAME, sums, signed, &key.raw()).unwrap_err().to_string();
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    // The signature of a tampered archive whose checksum was fixed up, with the key this binary trusts.
+    let tampered = b"tampered".as_slice();
+    let error =
+        verify(tampered, ARCHIVE_NAME, &sha256_line(tampered, ARCHIVE_NAME), &signature, &key.raw()).unwrap_err();
+    assert!(error.to_string().contains("not signed"), "{error}");
+}
+
+#[test]
+fn a_check_finds_a_newer_release_says_nothing_otherwise_and_fails_in_plain_words() {
+    let install = Install::new();
+    let server = Server::start();
+    let feed = server.feed(Ok(TestKey::new().raw()), InstallTarget::Binary(install.target.clone()));
+
+    assert_eq!(feed.latest("1.0.0").unwrap(), None, "no release yet: a 404 is no failure");
+    server.release(b"archive", b"sum", b"sig");
+    let found = feed.latest("1.0.0").unwrap().expect("9.0.0 is newer");
+    assert_eq!(found.version, "9.0.0");
+    assert_eq!(found.notes.as_deref(), Some("https://example.com/notes/9.0.0"));
+    assert!(found.assets.is_some());
+    assert_eq!(Mode::Releases(feed.clone()).unavailable(&found), None);
+    assert_eq!(feed.latest("9.0.0").unwrap(), None);
+    assert_eq!(feed.latest("10.0.0").unwrap(), None);
+
+    server.put("/latest", 403, "");
+    assert!(format!("{:#}", feed.latest("1.0.0").unwrap_err()).contains("limiting requests"));
+    server.put("/latest", 500, "");
+    assert!(format!("{:#}", feed.latest("1.0.0").unwrap_err()).contains("answered 500"));
+    server.put("/latest", 200, "{not json");
+    assert!(format!("{:#}", feed.latest("1.0.0").unwrap_err()).contains("could not be read"));
+}
+
+#[test]
+fn a_release_without_this_platform_is_found_and_cannot_be_installed() {
+    let install = Install::new();
+    let server = Server::start();
+    let feed = server.feed(Ok(TestKey::new().raw()), InstallTarget::Binary(install.target.clone()));
+    server.put("/latest", 200, serde_json::json!({"tag_name":"v9.0.0","assets":[]}).to_string());
+    let found = feed.latest("1.0.0").unwrap().unwrap();
+    let why = Mode::Releases(feed.clone()).unavailable(&found).unwrap();
+    assert!(why.contains("no build for test-platform"), "{why}");
+    assert!(failure(&feed, &found).contains("no build for test-platform"));
+    install.untouched();
+}
+
+#[test]
+fn with_no_key_built_in_it_finds_a_release_says_so_and_downloads_nothing() {
+    let install = Install::new();
+    let server = Server::start();
+    let key = TestKey::new();
+    let archive = install.archive(&[("atomics", NEW)]);
+    server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+    let feed = server.feed(Err(NO_KEY.into()), InstallTarget::Binary(install.target.clone()));
+    let found = feed.latest("1.0.0").unwrap().expect("the check still works");
+    assert_eq!(Mode::Releases(feed.clone()).unavailable(&found).as_deref(), Some(NO_KEY));
+    // A correctly signed archive changes nothing: there is no key to check it with.
+    server.put(&format!("/{ARCHIVE_NAME}"), 500, "");
+    assert_eq!(failure(&feed, &found), NO_KEY);
+    install.untouched();
+}
+
+#[test]
+fn a_verified_release_replaces_the_program_with_a_new_file() {
+    let install = Install::new();
+    let server = Server::start();
+    let key = TestKey::new();
+    let archive = install.archive(&[("atomics", NEW)]);
+    server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+    let (feed, found) = found_on(&server, &key, InstallTarget::Binary(install.target.clone()));
+
+    let inode = std::fs::metadata(&install.target).unwrap().ino();
+    // A process that runs the old file holds it open: a rename replaces it where a write would fail with ETXTBSY.
+    let mut running = Command::new(&install.target).stdout(Stdio::null()).spawn().unwrap();
+    let steps = std::cell::RefCell::new(Vec::new());
+    feed.install(&found, &|step| steps.borrow_mut().push(step)).unwrap();
+    let _ = running.wait();
+    assert_eq!(std::fs::read_to_string(&install.target).unwrap(), NEW);
+    assert_ne!(std::fs::metadata(&install.target).unwrap().ino(), inode, "a new file, not the running one rewritten");
+    assert_eq!(*steps.borrow(), ["Downloading 9.0.0", "Verifying 9.0.0", "Installing 9.0.0"]);
+    install.no_leftovers();
+}
+
+#[test]
+fn any_verification_failure_leaves_the_old_install_and_says_why() {
+    let install = Install::new();
+    let server = Server::start();
+    let key = TestKey::new();
+    let archive = install.archive(&[("atomics", NEW)]);
+    let (checksum, signature) = (sha256_line(&archive, ARCHIVE_NAME), key.sign(&archive));
+    server.release(&archive, &checksum, &signature);
+    let (feed, found) = found_on(&server, &key, InstallTarget::Binary(install.target.clone()));
+    let path = |suffix: &str| format!("/{ARCHIVE_NAME}{suffix}");
+
+    let mut flipped = archive.clone();
+    *flipped.last_mut().unwrap() ^= 1;
+    server.put(&path(""), 200, flipped.clone());
+    assert!(failure(&feed, &found).contains("damaged"));
+    install.untouched();
+    server.put(&path(".sha256"), 200, sha256_line(&flipped, ARCHIVE_NAME));
+    assert!(failure(&feed, &found).contains("not signed"), "a checksum alone proves nothing");
+    install.untouched();
+    server.put(&path(""), 200, archive.clone());
+    server.put(&path(".sha256"), 200, checksum.clone());
+    server.put(&path(".sig"), 200, TestKey::new().sign(&archive));
+    assert!(failure(&feed, &found).contains("not signed"), "another key");
+    install.untouched();
+    server.put(&path(".sig"), 200, signature.clone());
+
+    // Each says what was kept.
+    server.put(&path(""), 404, "");
+    let error = failure(&feed, &found);
+    assert!(error.contains("Could not download the release"), "{error}");
+    assert!(error.contains("The installed version was not changed."), "{error}");
+    install.untouched();
+}
+
+#[test]
+fn a_signed_archive_that_cannot_be_installed_is_refused_before_anything_is_replaced() {
+    let install = Install::new();
+    let server = Server::start();
+    let key = TestKey::new();
+    let sign = |server: &Server, archive: &[u8]| {
+        server.release(archive, &sha256_line(archive, ARCHIVE_NAME), &key.sign(archive));
+    };
+    sign(&server, &install.archive(&[("atomics", NEW)]));
+    let (feed, found) = found_on(&server, &key, InstallTarget::Binary(install.target.clone()));
+
+    sign(&server, b"not a gzip");
+    assert!(failure(&feed, &found).contains("could not be unpacked"));
+    install.untouched();
+    sign(&server, &install.archive(&[("something-else", NEW)]));
+    assert!(failure(&feed, &found).contains("does not hold atomics"));
+    install.untouched();
+    sign(&server, &install.archive(&[("atomics", "#!/bin/sh\nexit 1\n")]));
+    assert!(failure(&feed, &found).contains("does not run on this machine"));
+    install.untouched();
+}
+
+#[test]
+fn the_version_is_the_first_word_after_the_name() {
+    assert_eq!(reported_version("atomics 0.1.7 (v0.1.7)\n"), Some("0.1.7"));
+    assert_eq!(reported_version("atomics 0.1.7 (v0.1.7-3-gabc1234-dirty)\n"), Some("0.1.7"));
+    assert_eq!(reported_version("atomics 0.1.7"), Some("0.1.7"));
+    assert_eq!(reported_version("something 0.1.7 (v0.1.7)\n"), None);
+    assert_eq!(reported_version("0.1.7\n"), None);
+    assert_eq!(reported_version("\n"), None);
+    assert_eq!(reported_version(""), None);
+}
+
+#[test]
+fn an_older_signed_build_offered_under_a_newer_tag_is_refused() {
+    let install = Install::new();
+    let bundle = install.dir.path().join("Applications/ATOMICS.app");
+    let in_bundle = bundle.join("Contents/MacOS/atomics");
+    std::fs::create_dir_all(in_bundle.parent().unwrap()).unwrap();
+    crate::test_support::write_program(&in_bundle, OLD);
+    let server = Server::start();
+    let key = TestKey::new();
+    let inside = "ATOMICS.app/Contents/MacOS/atomics";
+
+    // Each is genuinely signed with the key this binary trusts, and listed as 9.0.0.
+    for said in [
+        "echo 'atomics 1.0.0 (v1.0.0)'",
+        "echo 'atomics 9.0.01 (v9.0.01)'",
+        "echo 'atomics 9.0.0-rc1 (v9.0.0-rc1)'",
+        // As builds before this check print it.
+        "echo 'atomics v1.0.0'",
+        "echo 'atomics 61ffd46'",
+        "echo 'something else'",
+        "true",
+    ] {
+        let program = format!("#!/bin/sh\n{said}\n");
+        for (target, entry) in [
+            (InstallTarget::Binary(install.target.clone()), "atomics"),
+            (InstallTarget::Bundle(bundle.clone()), inside),
+        ] {
+            let archive = install.archive(&[(entry, &program)]);
+            server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+            let (feed, found) = found_on(&server, &key, target);
+            let error = failure(&feed, &found);
+            assert!(error.contains("not the version it claims"), "{said}: {error}");
+            assert!(error.contains("Release 9.0.0"), "{said}: {error}");
+            assert!(error.contains("The installed version was not changed."), "{said}: {error}");
+        }
+        install.untouched();
+        assert_eq!(std::fs::read_to_string(&in_bundle).unwrap(), OLD, "{said}");
+    }
+    assert_eq!(std::fs::read_dir(bundle.parent().unwrap()).unwrap().count(), 1, "nothing is left beside the bundle");
+
+    // The same keys and archive shape, with the version the release names, goes in.
+    let archive = install.archive(&[("atomics", NEW)]);
+    server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+    let (feed, found) = found_on(&server, &key, InstallTarget::Binary(install.target.clone()));
+    feed.install(&found, &|_| {}).unwrap();
+    assert_eq!(std::fs::read_to_string(&install.target).unwrap(), NEW);
+}
+
+#[test]
+fn a_swap_that_fails_keeps_what_was_there_and_says_why() {
+    let install = Install::new();
+    let server = Server::start();
+    let key = TestKey::new();
+    let archive = install.archive(&[("atomics", NEW)]);
+    server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+
+    // A rename cannot put a file over a folder that has something in it.
+    let occupied = install.dir.path().join("occupied");
+    std::fs::create_dir_all(occupied.join("atomics/kept")).unwrap();
+    let (feed, found) = found_on(&server, &key, InstallTarget::Binary(occupied.join("atomics")));
+    let error = failure(&feed, &found);
+    assert!(error.contains("Could not replace"), "{error}");
+    assert!(occupied.join("atomics/kept").is_dir());
+    assert_eq!(std::fs::read_dir(&occupied).unwrap().count(), 1, "nothing is left beside it");
+
+    // A folder this user cannot write to fails before the download is unpacked.
+    let locked = install.dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    crate::test_support::write_program(locked.join("atomics"), OLD);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        let (feed, found) = found_on(&server, &key, InstallTarget::Binary(locked.join("atomics")));
+        let error = failure(&feed, &found);
+        assert!(error.contains("Could not write to"), "{error}");
+        assert!(error.contains("not changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(locked.join("atomics")).unwrap(), OLD);
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn a_bundle_is_swapped_whole_and_kept_when_the_new_one_is_broken() {
+    let install = Install::new();
+    let bundle = install.dir.path().join("Applications/ATOMICS.app");
+    let program = bundle.join("Contents/MacOS/atomics");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    crate::test_support::write_program(&program, OLD);
+    std::fs::write(bundle.join("Contents/old-only"), "old").unwrap();
+
+    let server = Server::start();
+    let key = TestKey::new();
+    let inside = "ATOMICS.app/Contents/MacOS/atomics";
+    let broken = install.archive(&[(inside, "#!/bin/sh\nexit 1\n")]);
+    server.release(&broken, &sha256_line(&broken, ARCHIVE_NAME), &key.sign(&broken));
+    let (feed, found) = found_on(&server, &key, InstallTarget::Bundle(bundle.clone()));
+    assert!(failure(&feed, &found).contains("does not run"));
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), OLD);
+
+    let archive = install.archive(&[(inside, NEW)]);
+    server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+    feed.install(&found, &|_| {}).unwrap();
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), NEW);
+    assert!(!bundle.join("Contents/old-only").exists(), "the bundle is replaced whole");
+    assert_eq!(std::fs::read_dir(bundle.parent().unwrap()).unwrap().count(), 1, "nothing is left beside it");
+}
+
+#[test]
+fn a_bundle_swap_that_fails_at_the_second_rename_puts_the_old_one_back() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let (target, aside) = (dir.path().join("ATOMICS.app"), dir.path().join("previous.app"));
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept"), "old").unwrap();
+    assert!(swap_bundle(&dir.path().join("missing.app"), &target, &aside).is_err());
+    assert!(target.join("kept").is_file());
+    assert!(!aside.exists());
+}
+
+#[test]
+fn what_gets_replaced_is_the_installed_file_and_never_a_development_build() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let installed = root.join("bin/atomics");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(&installed, "").unwrap();
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&installed, &link).unwrap();
+    assert_eq!(InstallTarget::of(&link, false).unwrap(), InstallTarget::Binary(installed.clone()));
+
+    std::fs::write(root.join("Cargo.toml"), "").unwrap();
+    let built = root.join("target/release/atomics");
+    std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+    std::fs::write(&built, "").unwrap();
+    assert!(format!("{:#}", InstallTarget::of(&built, false).unwrap_err()).contains("development build"));
+
+    let in_bundle = root.join("ATOMICS.app/Contents/MacOS/atomics");
+    std::fs::create_dir_all(in_bundle.parent().unwrap()).unwrap();
+    std::fs::write(&in_bundle, "").unwrap();
+    assert_eq!(InstallTarget::of(&in_bundle, true).unwrap(), InstallTarget::Bundle(root.join("ATOMICS.app")));
+    assert!(format!("{:#}", InstallTarget::of(&installed, true).unwrap_err()).contains("not running from an app"));
+}
+
+#[test]
+fn a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time() {
+    let install = Install::new();
+    let stale = install.target.parent().unwrap().join(format!("{STAGING}crashed"));
+    std::fs::create_dir(&stale).unwrap();
+    let server = Server::start();
+    let key = TestKey::new();
+    let archive = install.archive(&[("atomics", NEW)]);
+    server.release(&archive, &sha256_line(&archive, ARCHIVE_NAME), &key.sign(&archive));
+    let (feed, found) = found_on(&server, &key, InstallTarget::Binary(install.target.clone()));
+    feed.install(&found, &|_| {}).unwrap();
+    install.no_leftovers();
+
+    let home = install.dir.path().join("state");
+    let held = lock(&home).unwrap();
+    assert_eq!(lock(&home).err().unwrap().to_string(), "Another update is under way.");
+    drop(held);
+    lock(&home).unwrap();
+}

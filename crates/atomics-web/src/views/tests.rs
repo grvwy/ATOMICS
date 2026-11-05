@@ -2398,6 +2398,51 @@ fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
 }
 
 #[test]
+fn a_client_shows_the_hosts_version_and_a_new_one_and_cannot_start_an_update() {
+    use atomics_core::projection::UpdateInfo;
+    let update = |latest: Option<&str>| UpdateInfo {
+        current: "0.1.6".into(),
+        latest: latest.map(str::to_string),
+        notes: latest.map(|_| "https://example.com/notes".into()),
+        ..UpdateInfo::default()
+    };
+    for size in [WIDE, PHONE] {
+        // With nothing new it still says which version the host runs, and the bar says nothing.
+        let mut host = fake_host::management();
+        host.board.host.update = Some(update(None));
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        assert!(!world.driver.remote.available(&Command::Update), "atomics.v1 has no operation for it");
+        assert!(!world.driver.remote.available(&Command::CancelUpdate));
+        let button = |shown: &[(String, Rect)]| shown.iter().any(|(text, _)| text == "Update");
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!button(&shown), "{size:?}: {shown:?}");
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(shown.iter().any(|(text, _)| text.starts_with("Updates")), "{size:?}: {shown:?}");
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Updates");
+        assert!(has(&shown, "The host runs: 0.1.6"), "{size:?}: {shown:?}");
+        client.management.settings = false;
+
+        // A new version: a hint, no button, here or in Settings.
+        let mut host = fake_host::management();
+        host.board.host.update = Some(update(Some("9.0.0")));
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        assert!(!atomics_ui::update::offered(&world.driver.remote), "a hint has no dot on Actions");
+        if size == WIDE {
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(has(&shown, "9.0.0 available"), "{shown:?}");
+            assert!(!button(&shown), "{shown:?}");
+        }
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        for line in ["The host runs: 0.1.6", "New version: 9.0.0", "Release notes"] {
+            assert!(has(&shown, line), "{size:?}: {line}: {shown:?}");
+        }
+        assert!(!button(&shown), "{size:?}: {shown:?}");
+    }
+}
+
+#[test]
 fn view_only_clients_read_settings_and_devices_but_cannot_change_them() {
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = viewing(fake_host::management());
