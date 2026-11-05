@@ -1,6 +1,6 @@
 //! The top bar's pieces: laying out a row of widgets (measuring it before drawing it, drawing into a
 //! bounded slot), the brand, the notice line, the new-session button and the Project menu. The bar's layout
-//! is [`crate::shell::top_bar`], the navigation tabs are in [`crate::tabs`], the view switcher in
+//! is [`crate::shell::top_bar`], the navigation is in [`crate::tabs`] and [`crate::boards`], the view switcher in
 //! [`crate::switcher`] and the chief's pill in [`crate::chief`]. A button whose command the backend cannot carry out is not drawn.
 
 use std::collections::HashSet;
@@ -93,7 +93,7 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
 }
 
 /// How the agents stand: "idle" only when every one of them is. It stays this narrow however they stand, because the
-/// tabs beside it need the room just as agents finish, and the notice line after them says who needs you.
+/// navigation beside it needs the room just as agents finish, and the notice line after it says who needs you.
 fn agent_count(statuses: &[AgentStatus]) -> String {
     let open = statuses.len();
     let working = statuses.iter().filter(|status| **status == AgentStatus::Working).count();

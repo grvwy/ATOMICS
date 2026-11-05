@@ -3,7 +3,8 @@
 //! an agent is found. With nothing running it takes the whole window; over running agents it is a window like Settings,
 //! so that the keys that move between agents keep working. Also the question a person's start asks when no sandbox
 //! can be had for it.
-use super::settings::{self, Mark, button, isolation, mark, note, tool};
+use super::settings::{self, button, isolation, mark, note, tool};
+use crate::status::Mark;
 use super::*;
 use crate::theme::Palette;
 use crate::touch;

@@ -9,25 +9,30 @@ keys are the last section.
 
 | Going to | How | Where it fell short |
 | --- | --- | --- |
-| A plan | Its tab in the top bar; the Tabs menu when the row is full; History for finished plans. | The CHIEF pill moved sideways as tabs came and went, so the bar never stood still. |
-| A plan's board | **Plan** in the top bar, `cmd+b`, or the tab. | Picking a plan's tab switched the panel back to the diff, whatever the user had chosen. |
+| A plan | The Boards dropdown in the top bar: boards that need you first, then the active ones. History, in the same menu, for finished plans, and **Open board** on a finished task's tile. | Every board took a tab, the CHIEF pill moved sideways as tabs came and went, and the bar never stood still. |
+| A plan's board | **Board** in the view switcher, `cmd+b`, or the board's row in the dropdown. | Picking a plan switched the panel back to the diff, whatever the user had chosen. |
 | A task | Its card on the board; `open` and `diff` buttons on the card. | A click on the card only opened or closed it. Nothing marked the card of the session on screen. |
 | A session | The sidebar's AGENTS list, a tile, the tab strip, `cmd+1…9`, `cmd+j`, the notice line. | The sidebar was one flat list; which plan a session worked for, and which ones needed the user, was only in a status word. |
 | The chief | The CHIEF pill (`cmd+o`); on the phone a Chief pane in the bottom bar. | The phone and the desktop put it in different places. |
 | A diff | **Show diff**/**Hide diff**, `cmd+d`, a tile's title, `shift+↓/↑`, the explorer. | Three buttons (Show diff, Plan, Tickets) toggled one panel in three different ways. |
 | Settings | The Settings window (desktop), ⋯ (browser and phone). | — |
-| Where am I | The selected tab, the active tile's header, the diff panel's title. | No single line said plan › task › session. |
+| Where am I | The selected tab or the name on the Boards button, the active tile's header, the diff panel's title. | No single line said plan › task › session. |
 | Back | — | No way back to the place before: opening a task's diff from the board lost the board. |
 
 ## Result
 
 - **The CHIEF pill** has a fixed width for each of three sizes, picked by the window's width alone, and always sits
-  in the middle of the top bar. The brand and the plan tabs share the half on its left, the actions the half on its
-  right; what does not fit folds into the **Tabs** and **Actions** menus. On the phone the pill sits in the middle of
+  in the middle of the top bar. The brand and the navigation share the half on its left, the actions the half on its
+  right; what does not fit folds into the **Boards** and **Actions** menus. On the phone the pill sits in the middle of
   the top bar too; a tap opens the chief's pane, a second tap goes back to the pane before it.
+- **One Boards dropdown** replaces a tab per plan. Its button names the board on screen and counts the boards that need
+  the user, plans waiting for approval among them. They come first in its menu, then the other open boards with
+  done/total and state, then History with the finished ones. A row shows its board whichever view the panel was on, and
+  the board's button approves the plan; a row's close asks first, as Close plan… does. Finished boards stay out of the bar: History reaches them, and so does
+  **Open board** on a finished task's tile. Ctrl+1 to 9 closes the menu along with picking the agent.
 - **One view switcher** (Board, Diff, Tickets) replaces Show diff, Plan and the Tickets item. The view on screen is
-  filled; picking it again hides the panel. `cmd+b`, `cmd+d` and `cmd+k` do the same as its segments. Picking a plan's
-  tab keeps the view; each window remembers its choice (the desktop in its store, a browser in `localStorage`). The
+  filled; picking it again hides the panel. `cmd+b`, `cmd+d` and `cmd+k` do the same as its segments. Going to a plan
+  from the location line or the sidebar keeps the view; each window remembers its choice (the desktop in its store, a browser in `localStorage`). The
   phone's pane bar shows Board and Diffs with the same icons and counts.
 - **The location line** over the agents and the panel says where the window is: the plan › the task the active
   session works on › the session and its status (or the worktree whose diff shows). Each part is a link: the plan
@@ -42,7 +47,7 @@ keys are the last section.
   A click on a terminal behind one types there; Escape still closes the window.
 - **A task card's click** shows its session with its diff, or a finished task's diff; its title still opens and
   closes the card. The card of the session on screen is outlined in the accent color.
-- **The sidebar** groups the sessions under the plan they work for (the heading shows the plan's tab), then those
+- **The sidebar** groups the sessions under the plan they work for (the heading shows the plan), then those
   outside plans. A session that needs the user has a warning bar and its state in the warning color, with the number
   of permission requests waiting; the active one keeps the accent fill.
 - **Each agent's row shows its number**, under its status dot: Ctrl+N goes to that row, whatever order the plan groups
@@ -61,7 +66,7 @@ never reach a terminal.
 
 | Key | Does | Terminal |
 | --- | --- | --- |
-| Ctrl+1 to 9, Command on a Mac | The Nth agent of the tab, the number on its row, with its diff against main. The keyboard stays with the diff. Past the last agent, nothing. | Never gets it, nor any other Ctrl+digit |
+| Ctrl+1 to 9, Command on a Mac | The Nth agent of the tab, the number on its row, with its diff against main. The keyboard stays with the diff, and an open menu closes. Past the last agent, nothing. | Never gets it, nor any other Ctrl+digit |
 | Shift+↓/↑ | The next and previous changed file, from anywhere but a text field or the editor. | Never gets it |
 | PageDown/PageUp | The next and previous hunk across files, while the diff has the keyboard. | Keeps them while it has the keyboard, for its programs' own scrolling |
 | ↑/↓ | Scroll the diff by lines, while it has the keyboard. | Keeps them |

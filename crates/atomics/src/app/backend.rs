@@ -35,6 +35,7 @@ impl Local<'_> {
             tab_name: super::sidebar::plan_tab_name(plan),
             status: plan.status,
             state: self.0.plan_state(index),
+            approved: plan.approved,
             changed: self.0.changed_plans.contains(&plan.id),
             done: plan.count(TaskStatus::Done),
             total: plan.tasks.len(),

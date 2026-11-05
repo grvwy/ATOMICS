@@ -178,38 +178,53 @@ mod tests {
         click_at(app, ctx, pos);
     }
 
-    fn close_tab(app: &mut Desktop<'_>, ctx: &egui::Context, index: usize) {
-        let label = app.runtime.plan_state(index).label(&app.runtime.plans[index].goal);
-        click(app, ctx, &label);
+    /// Opens the Boards dropdown.
+    fn open_boards(app: &mut Desktop<'_>, ctx: &egui::Context) {
         render(app, ctx, vec![]).drop_without_applying_deltas();
-        let id = egui::Id::NULL.with(("plan-close", app.runtime.plans[index].id.as_str()));
-        let rect = ctx.data(|data| data.get_temp::<Rect>(id)).expect("selected plan must have a close button");
+        let items = ctx.data(|data| data.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items"))).unwrap();
+        let button = items.iter().find(|(name, _)| name == "Boards").expect("the Boards dropdown").1;
+        click_at(app, ctx, button.center());
+        render(app, ctx, vec![]).drop_without_applying_deltas();
+    }
+
+    /// The close button of an open board's row.
+    fn close_board(app: &mut Desktop<'_>, ctx: &egui::Context, index: usize) {
+        open_boards(app, ctx);
+        let id = egui::Id::NULL.with(("plan-close", app.runtime.plans[index].id.as_str(), ""));
+        let rect = ctx.data(|data| data.get_temp::<Rect>(id)).expect("an open board's row has a close button");
         click_at(app, ctx, rect.center());
     }
 
-    fn history_action(app: &mut Desktop<'_>, ctx: &egui::Context, plan: &str, action: &str) {
+    /// Opens History in the dropdown.
+    fn open_history(app: &mut Desktop<'_>, ctx: &egui::Context) {
+        open_boards(app, ctx);
         click(app, ctx, "History");
         render(app, ctx, vec![]).drop_without_applying_deltas();
+    }
+
+    fn history_action(app: &mut Desktop<'_>, ctx: &egui::Context, plan: &str, action: &str) {
+        open_history(app, ctx);
         let id = egui::Id::NULL.with(("plan-history", plan, action));
         let rect = ctx.data(|data| data.get_temp::<Rect>(id)).expect("History action must be reachable");
         click_at(app, ctx, rect.center());
     }
 
     #[test]
-    fn completed_tabs_archive_open_tabs_confirm_and_history_views_and_reopens() {
+    fn history_views_archives_and_reopens_and_an_open_boards_close_confirms() {
         with_app(
-            "app::plan_view::tests::completed_tabs_archive_open_tabs_confirm_and_history_views_and_reopens",
+            "app::plan_view::tests::history_views_archives_and_reopens_and_an_open_boards_close_confirms",
             |app, ctx| {
                 fixture(app);
                 let sessions = app.runtime.sessions.len();
-                click(app, ctx, "✓ Completed one");
+                history_action(app, ctx, "one", "view");
                 assert!(app.runtime.panel == PanelMode::Plan && app.runtime.plan_view);
+                assert_eq!(app.runtime.selected_plan, 3);
                 assert!(app.runtime.creating.is_empty());
                 assert_eq!(app.runtime.sessions.len(), sessions);
-                close_tab(app, ctx, 3);
+                history_action(app, ctx, "one", "archive");
                 assert_eq!(app.runtime.plans[3].status, PlanStatus::Archived);
                 assert!(app.client.confirm_plan_close.is_none());
-                close_tab(app, ctx, 2);
+                close_board(app, ctx, 2);
                 assert!(app.client.confirm_plan_close.is_some());
                 let output = render(app, ctx, vec![]);
                 let labels = text(&output).iter().map(|shape| shape.galley.text()).collect::<Vec<_>>();
@@ -219,14 +234,14 @@ mod tests {
                 output.drop_without_applying_deltas();
                 click(app, ctx, "Cancel");
                 assert_eq!(app.runtime.plans[2].status, PlanStatus::Open);
-                close_tab(app, ctx, 2);
+                close_board(app, ctx, 2);
                 click(app, ctx, "Complete plan");
                 assert_eq!(app.runtime.plans[2].status, PlanStatus::Completed);
-                close_tab(app, ctx, 1);
+                close_board(app, ctx, 1);
                 click(app, ctx, "Archive plan");
                 assert_eq!(app.runtime.plans[1].status, PlanStatus::Archived);
                 assert!(app.runtime.find("c").is_none(), "archiving closes the plan's task session");
-                click(app, ctx, "History");
+                open_history(app, ctx);
                 let output = render(app, ctx, vec![]);
                 let labels = text(&output).iter().map(|shape| shape.galley.text()).collect::<Vec<_>>();
                 for name in ["Completed one", "Completed two", "Archived"] {
@@ -248,6 +263,56 @@ mod tests {
                 assert_eq!(Plan::load(&paths::atomics_home().join("plans/one.json")).unwrap().status, PlanStatus::Open);
             },
         );
+    }
+
+    #[test]
+    fn a_finished_tasks_tile_leads_back_to_its_finished_board() {
+        with_app("app::plan_view::tests::a_finished_tasks_tile_leads_back_to_its_finished_board", |app, ctx| {
+            fixture(app);
+            let root = PathBuf::from("/project/P");
+            app.runtime.sessions.clear();
+            app.runtime.plans[3].project = Some(root.clone());
+            app.runtime.plans[3].tasks[0].finished_at = Some(1);
+            app.runtime.plans[3].tasks[0].worktree = Some("/tmp".into());
+            app.runtime.plan_view = false;
+            app.runtime.view = Some(root);
+            let paint = |app: &mut Desktop<'_>, ctx: &egui::Context, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.paint(ui),
+                )
+            };
+            paint(app, ctx, vec![]).drop_without_applying_deltas();
+            let output = paint(app, ctx, vec![]);
+            let button = text(&output)
+                .into_iter()
+                .find(|shape| shape.galley.text() == "Open board")
+                .map(|shape| shape.visual_bounding_rect().center());
+            let shown: Vec<String> = text(&output).iter().map(|shape| shape.galley.text().to_string()).collect();
+            output.drop_without_applying_deltas();
+            let button = button.unwrap_or_else(|| panic!("the tile's Open board: {shown:?}"));
+            assert!(
+                !shown.iter().any(|text| text == "Completed one"),
+                "the finished board is out of the bar: {shown:?}"
+            );
+            for pressed in [true, false] {
+                let event = egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                paint(app, ctx, vec![egui::Event::PointerMoved(button), event]).drop_without_applying_deltas();
+                app.runtime.drain_actions();
+            }
+            assert_eq!(app.runtime.selected_plan, 3);
+            assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Plan && app.runtime.diff_open);
+            assert_eq!(app.runtime.plans[3].status, PlanStatus::Completed, "looking changes nothing");
+        });
     }
 
     #[test]
@@ -281,8 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_activity_colors_and_fill_are_independent_of_selection() {
-        with_app("app::plan_view::tests::plan_activity_colors_and_fill_are_independent_of_selection", |app, ctx| {
+    fn boards_show_their_state_in_their_rows_whatever_is_selected() {
+        with_app("app::plan_view::tests::boards_show_their_state_in_their_rows_whatever_is_selected", |app, ctx| {
             fixture(app);
             assert_eq!(
                 (0..6).map(|index| app.runtime.plan_state(index)).collect::<Vec<_>>(),
@@ -295,52 +360,80 @@ mod tests {
                     PlanState::Archived
                 ]
             );
+            open_boards(app, ctx);
             let output = render(app, ctx, vec![]);
             let labels = text(&output);
-            for index in 0..5 {
-                let state = app.runtime.plan_state(index);
-                let expected = state.label(&app.runtime.plans[index].goal);
-                let label = labels.iter().find(|shape| shape.galley.text() == expected).unwrap();
+            let shown: Vec<&str> = labels.iter().map(|shape| shape.galley.text()).collect();
+            // The menu is drawn last, after the bar's and the board's own text.
+            let index_of = |label: &str| shown.iter().rposition(|text| *text == label);
+            // The boards that wait come first, then the others; finished ones are behind History.
+            let order = ["NEEDS YOU · 1", "Needs", "ACTIVE · 2", "Running", "Idle", "History"]
+                .map(|label| index_of(label).unwrap_or_else(|| panic!("{label}: {shown:?}")));
+            assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}: {shown:?}");
+            for finished in ["Completed one", "Completed two", "Archived"] {
+                assert!(index_of(finished).is_none(), "{finished}: {shown:?}");
+            }
+            for label in ["2 running", "needs you", "idle"] {
+                assert!(index_of(label).is_some(), "{label}: {shown:?}");
+            }
+            for (index, goal) in [(0, "Running"), (1, "Needs"), (2, "Idle")] {
+                let color = app.runtime.plan_state(index).color(&app.palette());
+                let name = labels.iter().rfind(|shape| shape.galley.text() == goal).unwrap();
                 assert!(
-                    label.galley.job.sections.iter().any(|section| section.format.color == state.color(&app.palette())),
-                    "{expected}: wrong state color"
+                    name.galley.job.sections.iter().any(|section| section.format.color == color),
+                    "{goal}: wrong state color"
                 );
             }
+            // A board on screen is the button's name, outlined; every open board's row can close it.
             let items =
                 ctx.data(|data| data.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items"))).unwrap();
-            let idle = items.iter().find(|(name, _)| name == "Idle · idle").unwrap().1;
-            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.rect.center().distance(idle.center())<1.0&&rect.stroke.color==app.palette().accent&&rect.fill==Color32::TRANSPARENT)),"selection should be an outline");
-            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==app.palette().accent.gamma_multiply(0.35))),"running should be filled");
-            let running_tab = items.iter().find(|(name, _)| name == "● Running · 2 running").unwrap().1;
-            let close_id = egui::Id::NULL.with(("plan-close", "running"));
+            let boards = items.iter().find(|(name, _)| name == "Boards").unwrap().1;
             assert!(
-                ctx.data(|data| data.get_temp::<Rect>(close_id)).is_none(),
-                "unselected close button stays hidden until hover"
+                output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.rect.center().distance(boards.center()) < 1.0
+                        && rect.stroke.color == app.palette().accent)),
+                "selection should be an outline"
             );
-            let running = text(&output)
-                .into_iter()
-                .find(|shape| shape.galley.text() == "● Running · 2 running")
-                .unwrap()
-                .galley
-                .job
-                .sections[0]
-                .format
-                .color;
+            assert!(
+                labels.iter().any(
+                    |shape| shape.galley.text() == "Idle" && boards.contains(shape.visual_bounding_rect().center())
+                ),
+                "the button names the selected board: {shown:?}"
+            );
+            for id in ["running", "needs", "idle"] {
+                let close = egui::Id::NULL.with(("plan-close", id, ""));
+                assert!(ctx.data(|data| data.get_temp::<Rect>(close)).is_some(), "{id}'s close");
+            }
+            // A running board's mark pulses, while the menu shows it.
+            let mark = |output: &egui::FullOutput| {
+                let name = text(output).into_iter().rfind(|shape| shape.galley.text() == "Running").unwrap();
+                let bounds = name.visual_bounding_rect();
+                output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Circle(circle)
+                        if (circle.center.y - bounds.center().y).abs() < 2.0 && circle.center.x < bounds.left() =>
+                    {
+                        Some(circle.fill)
+                    }
+                    _ => None,
+                })
+            };
+            let before = mark(&output).expect("the running mark");
             output.drop_without_applying_deltas();
             let later = render(app, ctx, vec![]);
-            let animated = text(&later)
-                .into_iter()
-                .find(|shape| shape.galley.text() == "● Running · 2 running")
-                .unwrap()
-                .galley
-                .job
-                .sections[0]
-                .format
-                .color;
-            assert_ne!(running, animated, "running dot should animate");
+            assert_ne!(before, mark(&later).expect("the running mark"), "running mark should pulse");
             later.drop_without_applying_deltas();
-            render(app, ctx, vec![egui::Event::PointerMoved(running_tab.center())]).drop_without_applying_deltas();
-            assert!(ctx.data(|data| data.get_temp::<Rect>(close_id)).is_some(), "hover reveals the close button");
+            render(
+                app,
+                ctx,
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            )
+            .drop_without_applying_deltas();
             app.runtime.plans[1].tasks[0].status = TaskStatus::Running;
             app.runtime.plans[1].tasks[0].report =
                 Some(Report { status: "question".into(), summary: "Question".into(), at: 0 });
@@ -354,17 +447,11 @@ mod tests {
             for index in 0..6 {
                 app.runtime.selected_plan = index;
                 let output = render(app, ctx, vec![]);
-                let title = text(&output)
-                    .into_iter()
-                    .find(|shape| shape.galley.text() == app.runtime.plans[index].goal)
-                    .unwrap();
+                let color = app.runtime.plan_state(index).color(&app.palette());
                 assert!(
-                    title
-                        .galley
-                        .job
-                        .sections
-                        .iter()
-                        .any(|section| section.format.color == app.runtime.plan_state(index).color(&app.palette()))
+                    text(&output).into_iter().any(|shape| shape.galley.text() == app.runtime.plans[index].goal
+                        && shape.galley.job.sections.iter().any(|section| section.format.color == color)),
+                    "the board's goal in its state's color"
                 );
                 output.drop_without_applying_deltas();
             }

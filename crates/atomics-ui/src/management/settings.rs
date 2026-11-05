@@ -2,6 +2,7 @@
 //! what can be undone acts at once, and only what cannot asks first. The raw configuration is under Advanced.
 use super::*;
 use crate::keys::shortcut_label;
+use crate::status::{Mark, paint_mark};
 use crate::theme::{Palette, lerp, parse_hex};
 use crate::touch;
 use atomics_core::ops::SettingsTool;
@@ -28,37 +29,6 @@ pub(super) enum Confirm {
 
 /// The section that says where agents run and what sandboxes need.
 pub(super) const AGENTS: &str = "Agents";
-
-/// What state a row is in. Painted, not typed: a browser has only egui's own fonts, and they draw none of these.
-#[derive(Clone, Copy)]
-pub(super) enum Mark {
-    Check,
-    Cross,
-    Dot,
-    Ring,
-}
-
-fn paint_mark(painter: &egui::Painter, center: egui::Pos2, mark: Mark, color: Color32) {
-    let line = Stroke::new(1.6, color);
-    match mark {
-        Mark::Check => {
-            let points = [Vec2::new(-4.0, 0.0), Vec2::new(-1.0, 3.0), Vec2::new(4.5, -3.5)];
-            painter.line(points.map(|point| center + point).into(), line);
-        }
-        Mark::Cross => {
-            let arm = Vec2::splat(3.5);
-            painter.line_segment([center - arm, center + arm], line);
-            let arm = Vec2::new(3.5, -3.5);
-            painter.line_segment([center - arm, center + arm], line);
-        }
-        Mark::Dot => {
-            painter.circle_filled(center, 3.5, color);
-        }
-        Mark::Ring => {
-            painter.circle_stroke(center, 3.5, Stroke::new(1.0, color));
-        }
-    }
-}
 
 /// A mark in the flow of a row, as tall as a line of text.
 pub(super) fn mark(ui: &mut egui::Ui, mark: Mark, color: Color32) {

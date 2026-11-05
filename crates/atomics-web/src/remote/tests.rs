@@ -929,7 +929,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
         "ATOMICS",
         "CHIEF",
         "Ungrouped · 0",
-        "◆ Parse faster",
+        "Parse faster",
         "Diff",
         "Board 0/2",
         "AGENTS",

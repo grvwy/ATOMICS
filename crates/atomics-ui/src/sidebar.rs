@@ -101,7 +101,7 @@ fn session_row(
 }
 
 /// A group's heading in the AGENTS list: the plan its sessions work for, in the plan's color; a click shows
-/// the plan's tab where the backend can.
+/// the plan where the backend can.
 fn group_heading(ui: &mut egui::Ui, p: &Palette, text: &str, color: egui::Color32, hover: &str) -> egui::Response {
     ui.add_space(4.0);
     let label =

@@ -298,7 +298,7 @@ pub enum Command {
     /// A task brief on the board has the keyboard this frame: the desktop's host holds off a restart until
     /// the edit is done.
     EditingPlan,
-    /// Close a plan's tab: an open plan asks to be closed first, a finished one is archived
+    /// The close of a board's row: an open plan asks to be closed first, a finished one is archived
     /// ([`Command::ArchiveFinished`]).
     ClosePlanTab(usize),
     /// Open the new-session dialog.

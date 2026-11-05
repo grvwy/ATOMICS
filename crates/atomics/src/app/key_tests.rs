@@ -89,6 +89,21 @@ fn click_on(app: &mut Desktop<'_>, ctx: &egui::Context, label: &str) {
     run(app, ctx, vec![]);
 }
 
+/// The text of the next frame.
+fn frame_text(app: &mut Desktop<'_>, ctx: &egui::Context) -> Vec<String> {
+    let output = frame(app, ctx, vec![]);
+    let text = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    text
+}
+
 /// The active agent has the keyboard, as after a click on its terminal.
 fn at_the_terminal(app: &mut Desktop<'_>, ctx: &egui::Context) {
     app.client.focus_terminal = app.runtime.active.clone();
@@ -728,6 +743,57 @@ fn an_agent_chord_from_a_terminal_shows_the_nth_agents_diff_and_holds_the_keys_t
             }
         },
     );
+}
+
+#[test]
+fn an_agent_chord_works_with_the_boards_dropdown_open_and_after_using_it() {
+    with_app("app::key_tests::an_agent_chord_works_with_the_boards_dropdown_open_and_after_using_it", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        let (first, second) = two_agents(app, dir.path());
+        app.runtime.plans = ["Atlas", "Beacon"]
+            .into_iter()
+            .map(|goal| Plan {
+                id: goal.to_lowercase(),
+                goal: goal.into(),
+                approved: true,
+                tasks: vec![Task { id: "t".into(), title: "A task".into(), ..Task::default() }],
+                ..Plan::default()
+            })
+            .collect();
+        app.runtime.selected_plan = 0;
+        at_the_terminal(app, ctx);
+
+        // Open: the chord picks the agent, the menu goes, and the diff has the keyboard.
+        click_on(app, ctx, "Boards");
+        assert!(egui::Popup::is_any_open(ctx), "the menu is open");
+        assert!(frame_text(app, ctx).iter().any(|text| text == "ACTIVE · 2"));
+        press(app, ctx, Key::Num2, agent_chord());
+        assert!(!egui::Popup::is_any_open(ctx), "the chord's diff is not left under a menu");
+        shows_the_diff_of(app, ctx, "second", &second);
+        untouched(app, &[("first", &first), ("second", &second)], "chord");
+
+        // Past the last agent nothing happens, and the menu stays.
+        click_on(app, ctx, "Boards");
+        press(app, ctx, Key::Num9, agent_chord());
+        assert_eq!(app.runtime.active.as_deref(), Some("second"));
+        assert!(egui::Popup::is_any_open(ctx), "no agent, nothing moved");
+        press(app, ctx, Key::Escape, NONE);
+
+        // After using it: a board picked from the menu, then the chord counts that board's agents, here none.
+        click_on(app, ctx, "Boards");
+        click_on(app, ctx, "Beacon");
+        assert_eq!(app.runtime.selected_plan, 1);
+        assert!(app.runtime.plan_view && !egui::Popup::is_any_open(ctx));
+        assert!(app.runtime.panel == PanelMode::Plan && app.runtime.diff_open, "a row shows its board");
+        press(app, ctx, Key::Num1, agent_chord());
+        assert_eq!(app.runtime.active, None, "Beacon has no agents, so the chord has none to pick");
+
+        // And back on All, the first agent.
+        app.send(Command::SetView(None));
+        run(app, ctx, vec![]);
+        press(app, ctx, Key::Num1, agent_chord());
+        shows_the_diff_of(app, ctx, "first", &first);
+    });
 }
 
 #[test]

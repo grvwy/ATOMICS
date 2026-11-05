@@ -65,9 +65,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clicking_plan_tabs_and_approving_boards_targets_only_the_selected_plan() {
+    fn picking_boards_and_approving_them_targets_only_the_selected_plan() {
         with_app(
-            "app::sidebar::tests::clicking_plan_tabs_and_approving_boards_targets_only_the_selected_plan",
+            "app::sidebar::tests::picking_boards_and_approving_them_targets_only_the_selected_plan",
             |app, ctx| {
                 app.runtime.repos = (0..8).map(|i| PathBuf::from(format!("/project/repo-{i}"))).collect();
                 for goal in ["Atlas", "Beacon"] {
@@ -106,6 +106,7 @@ mod tests {
                 let mut time = 0.0;
                 let mut frame = |app: &mut Desktop<'_>, width, events| {
                     time += 0.05;
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("topbar-items"), Vec::<(String, Rect)>::new()));
                     let output = ctx.run_ui(
                         egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1000.0))),
@@ -143,12 +144,20 @@ mod tests {
                     pressed,
                     modifiers: egui::Modifiers::NONE,
                 };
-                // The working/open count can move completed tabs into History at this width.
-                // The plan remains completed and reachable through History; its agents keep working.
+                let boards = || {
+                    let items = ctx.data(|d| d.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items")));
+                    items.unwrap().iter().find(|(name, _)| name == "Boards").expect("the Boards dropdown").1.center()
+                };
+                // A finished plan is behind History; its agents keep working.
+                frame(app, 2400.0, vec![]);
+                let open = boards();
+                frame(app, 2400.0, vec![egui::Event::PointerMoved(open), button(open, true)]);
+                frame(app, 2400.0, vec![button(open, false)]);
                 let text = frame(app, 2400.0, vec![]);
                 let history = text.iter().find(|(t, _)| t == "History").expect("plan history stays reachable").1;
                 frame(app, 2400.0, vec![egui::Event::PointerMoved(history), button(history, true)]);
                 frame(app, 2400.0, vec![button(history, false)]);
+                frame(app, 2400.0, vec![]);
                 let text = frame(app, 2400.0, vec![]);
                 assert!(text.iter().any(|(t, _)| t == "Completed"));
                 assert!(
@@ -179,8 +188,16 @@ mod tests {
                     assert!(text.iter().any(|(t, _)| t == "Repos · 0"));
                     assert!(!text.iter().any(|(t, _)| t.starts_with("repo-")));
                     assert!(!text.iter().any(|(t, _)| t.contains("Archived")));
-                    assert!(text.iter().any(|(t, _)| t.starts_with("✓ Completed")));
-                    let pos = text.iter().find(|(t, _)| t.starts_with(&format!("● {goal} ·"))).unwrap().1;
+                    assert!(!text.iter().any(|(t, _)| t.contains("Completed")), "a finished board leaves the bar");
+                    let open = boards();
+                    frame(app, width, vec![egui::Event::PointerMoved(open), button(open, true)]);
+                    frame(app, width, vec![button(open, false)]);
+                    frame(app, width, vec![]);
+                    let text = frame(app, width, vec![]);
+                    let waiting = if goal == "Atlas" { "NEEDS YOU · 2" } else { "NEEDS YOU · 1" };
+                    assert!(text.iter().any(|(t, _)| t == waiting), "unapproved boards wait: {text:?}");
+                    // The menu is drawn last, over the bar's own name of the selected board.
+                    let pos = text.iter().rfind(|(t, _)| t == goal).unwrap().1;
                     frame(app, width, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
                     frame(app, width, vec![button(pos, false)]);
                     assert_eq!(app.runtime.selected_plan, index);
