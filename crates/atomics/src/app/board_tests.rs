@@ -127,14 +127,15 @@ fn cards_wrap_words_with_normal_spacing_at_narrow_and_wide_sizes() {
         "app::board_tests::cards_wrap_words_with_normal_spacing_at_narrow_and_wide_sizes",
         |app, ctx| {
             populate(app);
-            for width in [480.0, 740.0, 1600.0, 5120.0] {
+            // Narrow boards keep 240-point columns; wider boards have room to expand them.
+            for (width, min_card_width) in [(480.0, 239.0), (740.0, 239.0), (1600.0, 279.0), (5120.0, 279.0)] {
                 for i in 0..3 {
                     frame(app, ctx, width, width as f64 + i as f64, vec![]);
                 }
                 let rendered = frame(app, ctx, width, width as f64 + 3.0, vec![]);
                 assert!(!rendered.cards.is_empty());
                 for card in &rendered.cards {
-                    assert!(card.width() >= 279.0, "{width}: card width {}", card.width());
+                    assert!(card.width() >= min_card_width, "{width}: card width {}", card.width());
                 }
                 let titles: Vec<_> =
                     rendered.text.iter().filter(|t| t.galley.text().starts_with("Readable ")).collect();
@@ -212,9 +213,9 @@ fn branch_names_are_single_line_elided_and_show_the_full_name_on_hover() {
 }
 
 #[test]
-fn a_narrow_board_stacks_its_statuses_and_keeps_card_buttons() {
+fn a_narrow_board_scrolls_sideways_and_keeps_card_buttons() {
     super::tests::with_app(
-        "app::board_tests::a_narrow_board_stacks_its_statuses_and_keeps_card_buttons",
+        "app::board_tests::a_narrow_board_scrolls_sideways_and_keeps_card_buttons",
         |app, ctx| {
             populate(app);
             for i in 0..3 {
@@ -222,8 +223,14 @@ fn a_narrow_board_stacks_its_statuses_and_keeps_card_buttons() {
             }
             let rendered = frame(app, ctx, 740.0, 3.0, vec![]);
             let first = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 0 ")).unwrap();
-            // Too narrow for five columns: the statuses stack, each card the panel's width, none cut at its edge.
+            // Too narrow for five columns: they keep their width and sit side by side in a horizontal scroll.
+            for card in &rendered.cards {
+                assert!((card.width() - 240.0).abs() < 1.0, "card width {}", card.width());
+            }
             assert!(first.pos.x < 60.0, "the first card starts at the panel's left: {:?}", first.pos);
+            let second = rendered.text.iter().find(|t| t.galley.text().starts_with("Readable 1 ")).unwrap();
+            assert!(second.pos.x >= first.pos.x + 240.0, "the columns keep their width");
+            assert!((second.pos.y - first.pos.y).abs() < 1.0, "the statuses share a row");
             let pointer = first.pos + vec2(30.0, 8.0);
             frame(
                 app,
@@ -236,7 +243,7 @@ fn a_narrow_board_stacks_its_statuses_and_keeps_card_buttons() {
                         unit: egui::MouseWheelUnit::Point,
                         phase: egui::TouchPhase::Move,
                         source: egui::MouseWheelSource::Unknown,
-                        delta: vec2(0.0, -2000.0),
+                        delta: vec2(-2000.0, 0.0),
                         modifiers: egui::Modifiers::NONE,
                     },
                 ],
@@ -250,7 +257,10 @@ fn a_narrow_board_stacks_its_statuses_and_keeps_card_buttons() {
                 .iter()
                 .find(|t| t.galley.text().starts_with("Readable 4 "))
                 .expect("the last status must be reachable");
-            assert!(last.pos.x > 0.0 && last.pos.x < 60.0 && last.pos.y < 1000.0, "{:?}", last.pos);
+            assert!(last.pos.x > 0.0 && last.pos.x < 740.0, "{:?}", last.pos);
+            assert!((last.pos.y - first.pos.y).abs() < 1.0, "scrolling keeps the statuses in their row");
+            let card = rendered.cards.iter().find(|card| card.contains(last.pos)).expect("the last card is visible");
+            assert!(card.left() >= 0.0 && card.right() <= 740.0, "the last card fits in the panel: {card:?}");
             for label in ["reopen", "integrate"] {
                 assert!(rendered.text.iter().any(|t| t.galley.text() == label), "missing {label} button");
             }
