@@ -104,12 +104,11 @@ mod tests {
                     ));
                 }
                 let mut time = 0.0;
-                let mut frame = |app: &mut Desktop<'_>, events| {
+                let mut frame = |app: &mut Desktop<'_>, width, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {
-                            // Wide enough for every tab beside the centered pill.
-                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(2400.0, 1000.0))),
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1000.0))),
                             time: Some(time),
                             events,
                             ..Default::default()
@@ -144,32 +143,63 @@ mod tests {
                     pressed,
                     modifiers: egui::Modifiers::NONE,
                 };
+                // The working/open count can move completed tabs into History at this width.
+                // The plan remains completed and reachable through History; its agents keep working.
+                let text = frame(app, 2400.0, vec![]);
+                let history = text.iter().find(|(t, _)| t == "History").expect("plan history stays reachable").1;
+                frame(app, 2400.0, vec![egui::Event::PointerMoved(history), button(history, true)]);
+                frame(app, 2400.0, vec![button(history, false)]);
+                let text = frame(app, 2400.0, vec![]);
+                assert!(text.iter().any(|(t, _)| t == "Completed"));
+                assert!(
+                    ctx.data(|data| data.get_temp::<Rect>(egui::Id::NULL.with(("plan-history", "completed", "view"))))
+                        .is_some()
+                );
+                assert_eq!(app.runtime.plans.last().unwrap().status, PlanStatus::Completed);
+                assert_eq!(app.runtime.selected_plan, two);
+                assert_eq!(
+                    app.runtime.sessions.iter().map(|s| s.status).collect::<Vec<_>>(),
+                    [AgentStatus::Working; 2]
+                );
+                frame(
+                    app,
+                    2400.0,
+                    vec![egui::Event::Key {
+                        key: Key::Escape,
+                        physical_key: Some(Key::Escape),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                // Give this board-routing fixture enough room for every tab and the wider count.
+                let width = 3200.0;
                 for (goal, index, visible) in [("Atlas", one, 0), ("Beacon", two, 1)] {
-                    let text = frame(app, vec![]);
+                    let text = frame(app, width, vec![]);
                     assert!(text.iter().any(|(t, _)| t == "Repos · 0"));
                     assert!(!text.iter().any(|(t, _)| t.starts_with("repo-")));
                     assert!(!text.iter().any(|(t, _)| t.contains("Archived")));
                     assert!(text.iter().any(|(t, _)| t.starts_with("✓ Completed")));
                     let pos = text.iter().find(|(t, _)| t.starts_with(&format!("● {goal} ·"))).unwrap().1;
-                    frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
-                    frame(app, vec![button(pos, false)]);
+                    frame(app, width, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+                    frame(app, width, vec![button(pos, false)]);
                     assert_eq!(app.runtime.selected_plan, index);
                     assert!(app.runtime.plan_view);
                     assert_eq!(app.runtime.visible_sessions(), [visible]);
                     app.runtime.toggle_plan();
-                    let text = frame(app, vec![]);
+                    let text = frame(app, width, vec![]);
                     assert!(text.iter().any(|(t, _)| t == &format!("{goal} task")));
                     let other = if goal == "Atlas" { "Beacon task" } else { "Atlas task" };
                     assert!(!text.iter().any(|(t, _)| t == other));
                     assert!(!text.iter().any(|(t, _)| t == &format!("{goal} instructions")));
                     let task_pos = text.iter().find(|(t, _)| t == &format!("{goal} task")).unwrap().1;
-                    frame(app, vec![egui::Event::PointerMoved(task_pos), button(task_pos, true)]);
-                    frame(app, vec![button(task_pos, false)]);
-                    let text = frame(app, vec![]);
+                    frame(app, width, vec![egui::Event::PointerMoved(task_pos), button(task_pos, true)]);
+                    frame(app, width, vec![button(task_pos, false)]);
+                    let text = frame(app, width, vec![]);
                     assert!(text.iter().any(|(t, _)| t == &format!("{goal} instructions")));
                     let approve = text.iter().find(|(t, _)| t == "Approve plan").unwrap().1;
-                    frame(app, vec![egui::Event::PointerMoved(approve), button(approve, true)]);
-                    frame(app, vec![button(approve, false)]);
+                    frame(app, width, vec![egui::Event::PointerMoved(approve), button(approve, true)]);
+                    frame(app, width, vec![button(approve, false)]);
                     assert!(app.runtime.plans[index].approved);
                     if index == one {
                         assert!(!app.runtime.plans[two].approved);
