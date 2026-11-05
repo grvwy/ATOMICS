@@ -69,7 +69,7 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
             egui::Frame::new()
                 .fill(p.raised)
                 .stroke(egui::Stroke::new(1.0, p.border))
-                .corner_radius(3)
+                .corner_radius(crate::theme::RADIUS)
                 .inner_margin(egui::Margin::symmetric(6, 4))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());

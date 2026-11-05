@@ -961,7 +961,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     viewer.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&viewer);
     assert!(text.iter().any(|t| t == "PLAN"), "a viewer sees the board: {text:?}");
-    for action in ["Approve plan", "Allow", "×", "Close plan…", "Dispatch", "Send", "+ New", "start", "accept"] {
+    for action in ["Approve plan", "Allow", "×", "Close plan…", "Dispatch", "Send", "+ New", "Start", "Accept"] {
         assert!(!text.iter().any(|t| t.starts_with(action)), "{action}: a viewer cannot change it: {text:?}");
     }
     assert!(!text.iter().any(|t| t.starts_with("Steer")), "{text:?}");

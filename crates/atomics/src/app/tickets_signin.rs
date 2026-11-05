@@ -333,7 +333,7 @@ impl Desktop<'_> {
         if !config.server.uses_oauth() {
             ui.label(RichText::new(format!("{} is not signed in", config.system)).strong().color(p.warning));
             ui.label("Set oauth = true under [tickets.server] to sign in with the browser from here.");
-            if ui.small_button("Try again").clicked() {
+            if ui.button("Try again").clicked() {
                 self.runtime.tickets.panel.signin = false;
             }
             return;
@@ -342,11 +342,11 @@ impl Desktop<'_> {
         // what it does cover keeps working, so the banner may be put away, and its tokens signed out.
         let partial = self.runtime.tickets.sign.state() == Some(&SignState::Partial);
         let drew = self.draw(|backend, client| atomics_ui::signin::banner(ui, backend, client));
-        if (!drew || partial) && ui.small_button("Try again").clicked() {
+        if (!drew || partial) && ui.button("Try again").clicked() {
             self.runtime.tickets.panel.signin = false;
         }
         // The chip is for a sign-in that covers everything; this one still holds tokens to forget.
-        if partial && ui.small_button("Sign out").clicked() {
+        if partial && ui.button("Sign out").clicked() {
             self.runtime.start_sign_out();
         }
     }
@@ -354,7 +354,7 @@ impl Desktop<'_> {
     /// The header chip: signed in, with the way out.
     pub(super) fn signed_in_chip(&mut self, ui: &mut egui::Ui, p: &Palette, system: &str) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Sign out").clicked() {
+            if ui.button("Sign out").clicked() {
                 self.runtime.start_sign_out();
             }
             ui.label(

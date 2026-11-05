@@ -507,9 +507,13 @@ impl Desktop<'_> {
         ui.separator();
         ui.label("Add a remote server");
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.client.connection_name).hint_text("name").desired_width(110.0));
             ui.add(
-                egui::TextEdit::singleline(&mut self.client.connection_url)
+                atomics_ui::controls::single_line(&mut self.client.connection_name)
+                    .hint_text("name")
+                    .desired_width(110.0),
+            );
+            ui.add(
+                atomics_ui::controls::single_line(&mut self.client.connection_url)
                     .hint_text("https://mcp.example.com/mcp")
                     .desired_width(300.0),
             );

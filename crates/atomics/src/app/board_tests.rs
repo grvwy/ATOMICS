@@ -12,7 +12,7 @@ fn accepted_tasks_show_the_integration_count_and_action() {
         }];
         let rendered = frame(app, ctx, 1400.0, 0.0, vec![]);
         let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
-        assert!(labels.contains(&"1 accepted tasks not integrated yet"), "{labels:?}");
+        assert!(labels.contains(&"1 accepted task not integrated yet"), "{labels:?}");
         assert!(labels.contains(&"Integrate"));
     });
 }
@@ -169,14 +169,14 @@ fn cards_wrap_words_with_normal_spacing_at_narrow_and_wide_sizes() {
                     "progress:",
                     "Keep the original task note",
                     "Detailed instructions",
-                    "✓ Keep the original acceptance checks",
-                    "open",
+                    "Keep the original acceptance checks",
+                    "Open",
                 ] {
                     assert!(rendered.text.iter().any(|t| t.galley.text().contains(content)), "missing {content}");
                 }
                 if width == 5120.0 {
                     assert!(rendered.text.iter().any(|t| t.galley.text() == "after task-0"));
-                    for label in ["start", "unblock", "accept", "send back", "reopen", "integrate"] {
+                    for label in ["Start", "Unblock", "Accept", "Send back", "Reopen", "Integrate"] {
                         assert!(rendered.text.iter().any(|t| t.galley.text() == label), "missing {label} button");
                     }
                 }
@@ -259,10 +259,10 @@ fn a_narrow_board_scrolls_sideways_and_keeps_card_buttons() {
         assert!((last.pos.y - first.pos.y).abs() < 1.0, "scrolling keeps the statuses in their row");
         let card = rendered.cards.iter().find(|card| card.contains(last.pos)).expect("the last card is visible");
         assert!(card.left() >= 0.0 && card.right() <= 740.0, "the last card fits in the panel: {card:?}");
-        for label in ["reopen", "integrate"] {
+        for label in ["Reopen", "Integrate"] {
             assert!(rendered.text.iter().any(|t| t.galley.text() == label), "missing {label} button");
         }
-        let reopen = rendered.text.iter().find(|t| t.galley.text() == "reopen").unwrap();
+        let reopen = rendered.text.iter().find(|t| t.galley.text() == "Reopen").unwrap();
         let pos = reopen.pos + reopen.galley.rect.center().to_vec2();
         frame(app, ctx, 740.0, 11.0, vec![egui::Event::PointerMoved(pos)]);
         for (time, pressed) in [(12.0, true), (12.05, false)] {
@@ -393,7 +393,7 @@ fn completed_and_archived_boards_are_read_only_even_with_ready_tasks() {
                     assert!(labels.contains(&"Reopen plan"));
                     assert!(labels.iter().any(|text| text.contains("read-only")));
                     for forbidden in
-                        ["start", "accept", "send back", "unblock", "reopen", "integrate", "resume", "Approve plan"]
+                        ["Start", "Accept", "Send back", "Unblock", "Reopen", "Integrate", "Resume", "Approve plan"]
                     {
                         assert!(!labels.contains(&forbidden), "{status:?} offers {forbidden}: {labels:?}");
                     }

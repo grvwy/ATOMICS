@@ -540,12 +540,12 @@ fn connections(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
         subheading(ui, &p, "Add a remote server");
         let state = &mut client.management;
         ui.add(
-            egui::TextEdit::singleline(&mut state.connection_name)
+            crate::controls::single_line(&mut state.connection_name)
                 .hint_text("Server name")
                 .desired_width(ui.available_width()),
         );
         ui.add(
-            egui::TextEdit::singleline(&mut state.connection_url)
+            crate::controls::single_line(&mut state.connection_url)
                 .hint_text("https://mcp.example.com/mcp")
                 .desired_width(ui.available_width()),
         );
@@ -802,11 +802,13 @@ fn credential_form(ui: &mut egui::Ui, client: &mut Client, info: &ManagementInfo
     };
     if let Some(hint) = hint {
         ui.add(
-            egui::TextEdit::singleline(&mut state.credential_host).hint_text(hint).desired_width(ui.available_width()),
+            crate::controls::single_line(&mut state.credential_host)
+                .hint_text(hint)
+                .desired_width(ui.available_width()),
         );
     }
     let value = ui.add(
-        egui::TextEdit::singleline(&mut state.credential_value)
+        crate::controls::single_line(&mut state.credential_value)
             .id(egui::Id::NULL.with("credential-value"))
             .password(true)
             .hint_text("New value (hidden)")
@@ -884,7 +886,7 @@ fn advanced(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
     ui.separator();
     subheading(ui, &p, "Effective configuration");
     ui.add(
-        egui::TextEdit::singleline(&mut client.management.filter)
+        crate::controls::single_line(&mut client.management.filter)
             .hint_text("Find a setting")
             .desired_width(ui.available_width()),
     );
@@ -916,7 +918,7 @@ fn advanced(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
         state.scope = Some(scope);
         if scope == Scope::Theme {
             ui.add(
-                egui::TextEdit::singleline(&mut state.theme)
+                crate::controls::single_line(&mut state.theme)
                     .hint_text("Theme name")
                     .desired_width(ui.available_width()),
             );
@@ -929,12 +931,12 @@ fn advanced(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
                 .hint_text("[layout]\nmin_tile_width = 400.0"),
         );
         ui.add(
-            egui::TextEdit::singleline(&mut state.remove)
+            crate::controls::single_line(&mut state.remove)
                 .hint_text("Keys to remove, separated by commas")
                 .desired_width(ui.available_width()),
         );
         ui.add(
-            egui::TextEdit::singleline(&mut state.reason)
+            crate::controls::single_line(&mut state.reason)
                 .hint_text("Reason (optional)")
                 .desired_width(ui.available_width()),
         );

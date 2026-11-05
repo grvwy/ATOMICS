@@ -140,7 +140,7 @@ impl Desktop<'_> {
                 }
                 let before = dialog.query.clone();
                 let response = ui.add(
-                    egui::TextEdit::singleline(&mut dialog.query)
+                    atomics_ui::controls::single_line(&mut dialog.query)
                         .hint_text("Go to file · ↑↓ to pick · Enter opens · Esc closes")
                         .desired_width(f32::INFINITY)
                         .font(p.ui(15.0)),

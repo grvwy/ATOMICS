@@ -615,7 +615,7 @@ impl TermPane {
         };
         ui.label(RichText::new(text).color(color).size(12.5));
         let touch = self.touch;
-        let button = |ui: &mut egui::Ui, text: &str| touch::small_button(ui, touch, text);
+        let button = |ui: &mut egui::Ui, text: &str| touch::button(ui, touch, text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if self.top.is_some() && button(ui, "↓ Live").on_hover_text("Back to the live screen").clicked() {
                 actions.live = true;

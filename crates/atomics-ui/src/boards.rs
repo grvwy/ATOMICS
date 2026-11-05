@@ -9,7 +9,7 @@ use egui::{Atom, AtomExt as _, Atoms, Color32, Rect, RichText, Sense, Stroke, St
 use crate::status::{Mark, PULSE_STEP, paint_mark, pulse};
 use crate::theme::{Palette, lerp};
 use crate::topbar::{measure, record_item};
-use crate::{Backend, Client, Command, PanelMode, PlanRow, PlanState};
+use crate::{Backend, Client, Command, PanelMode, PlanRow, PlanState, controls};
 
 /// The size of the text on the button and in the rows.
 const FONT: f32 = 13.0;
@@ -52,16 +52,9 @@ fn row_color(row: &PlanRow, p: &Palette) -> Color32 {
     if row.needs_user() { p.warning } else { row.state.color(p) }
 }
 
-/// The down-pointing mark of a dropdown, in `rect`.
-pub(crate) fn chevron(painter: &egui::Painter, rect: Rect, color: Color32) {
-    let c = rect.center();
-    let points = vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)];
-    painter.add(egui::Shape::line(points, Stroke::new(1.3, color)));
-}
-
 /// The button: the marker with its count, `label` and the chevron. Only the label gives way in a narrow slot.
 fn button<'a>(label: &str, waiting: usize, selected: bool, p: &Palette) -> egui::Button<'a> {
-    let (foreground, warning, accent, muted) = (p.foreground, p.warning, p.accent, p.muted);
+    let (foreground, warning, muted) = (p.foreground, p.warning, p.muted);
     let font = p.ui(FONT);
     let mut atoms = Atoms::default();
     if waiting > 0 {
@@ -71,11 +64,8 @@ fn button<'a>(label: &str, waiting: usize, selected: bool, p: &Palette) -> egui:
         atoms.push_right(RichText::new(waiting.to_string()).font(font.clone()).color(warning).strong());
     }
     atoms.push_right(RichText::new(label.to_string()).font(font).color(foreground).atom_shrink(true));
-    atoms.push_right(Atom::paint(vec2(9.0, 9.0), move |ui: &egui::Ui, args: egui::AtomPaintArgs| {
-        chevron(ui.painter(), args.rect, muted);
-    }));
-    let button = egui::Button::new(atoms).truncate();
-    if selected { button.stroke(Stroke::new(1.0, accent)) } else { button }
+    atoms.push_right(controls::chevron_atom(muted));
+    controls::flat(egui::Button::new(atoms).truncate(), selected, p)
 }
 
 /// One draw's view of the plans.

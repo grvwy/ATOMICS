@@ -1002,7 +1002,7 @@ impl Desktop<'_> {
                 ui.add_space(4.0);
                 ui.label("Extra instructions for the chief (optional)");
                 let edit = ui.add(
-                    egui::TextEdit::singleline(&mut dialog.extra)
+                    atomics_ui::controls::single_line(&mut dialog.extra)
                         .char_limit(atomics_core::tickets::PLAN_EXTRA_MAX)
                         .desired_width(f32::INFINITY),
                 );
@@ -1088,7 +1088,7 @@ impl Desktop<'_> {
                 0.0
             };
             let response = ui.add(
-                egui::TextEdit::singleline(&mut panel.query)
+                atomics_ui::controls::single_line(&mut panel.query)
                     .id(query_id)
                     .hint_text("Search tickets…")
                     .desired_width((ui.available_width() - toggle - tabs).max(60.0)),
@@ -1134,7 +1134,7 @@ impl Desktop<'_> {
                     let on = panel.chips.contains(&i);
                     let applies = config.filter_applies(filter, name);
                     let chip = ui
-                        .add_enabled(applies, egui::Button::selectable(on, filter.label.as_str()).small())
+                        .add_enabled(applies, egui::Button::selectable(on, filter.label.as_str()))
                         .on_hover_text(format!("Alt+{}", i + 1))
                         .on_disabled_hover_text("This search does not take this filter");
                     if chip.clicked() {
@@ -1165,9 +1165,7 @@ impl Desktop<'_> {
         ui.horizontal(|ui| {
             if find.more {
                 ui.label(RichText::new("loading more…").size(11.0).color(p.muted));
-            } else if find.next.is_some()
-                && !find.busy
-                && ui.small_button("More").on_hover_text("↓ on the last").clicked()
+            } else if find.next.is_some() && !find.busy && ui.button("More").on_hover_text("↓ on the last").clicked()
             {
                 acts.push(Act::More);
             }
@@ -1299,7 +1297,7 @@ impl Desktop<'_> {
                     .flatten()
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let response = ui.small_button(text);
+                let response = ui.button(text);
                 if response.clicked()
                     && let Some(url) = &link.url
                 {

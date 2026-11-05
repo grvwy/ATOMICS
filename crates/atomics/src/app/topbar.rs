@@ -661,6 +661,32 @@ mod tests {
     }
 
     #[test]
+    fn every_button_in_the_bar_has_one_height() {
+        with_app("app::topbar::tests::every_button_in_the_bar_has_one_height", |app, ctx| {
+            fixture(app, 3);
+            for width in [700.0, 2400.0] {
+                render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                let (items, output) = render(app, ctx, width, vec![]);
+                output.drop_without_applying_deltas();
+                let controls: Vec<_> = items
+                    .iter()
+                    .filter(|(name, _)| {
+                        ["Boards", "+ New", "Project", "Settings", "Remote", "Actions"].contains(&name.as_str())
+                            || name.starts_with("All ·")
+                            || name.starts_with("Ungrouped ·")
+                            || name.starts_with("Repos ·")
+                            || name.starts_with("view:")
+                    })
+                    .collect();
+                assert!(controls.len() >= 3, "width={width}: {items:?}");
+                for (name, rect) in controls {
+                    assert_eq!(rect.height(), atomics_ui::theme::CONTROL_HEIGHT, "width={width}: {name}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn the_button_names_the_board_on_screen_and_gives_it_up_in_a_narrow_bar() {
         with_app(
             "app::topbar::tests::the_button_names_the_board_on_screen_and_gives_it_up_in_a_narrow_bar",

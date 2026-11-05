@@ -331,13 +331,17 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
                 ui.add_space(gutter);
             }
             if backend.available(&Command::HideChief)
-                && shortcut_tip(touch::small_button(ui, touch, "minimize"), backend, |keys| &keys.toggle_chief)
-                    .clicked()
+                && shortcut_tip(touch::button(ui, touch, "Minimize"), backend, |keys| &keys.toggle_chief).clicked()
             {
                 client.send(Command::HideChief);
             }
-            let label = if chief.dock == ChiefDock::Floating { "dock" } else { "float" };
-            if backend.available(&Command::SetChiefDock(chief.dock)) && touch::small_button(ui, touch, label).clicked()
+            let (label, hover) = if chief.dock == ChiefDock::Floating {
+                ("Dock", "Keep the chief in a column beside the agents")
+            } else {
+                ("Float", "Float the chief in a window over the agents")
+            };
+            if backend.available(&Command::SetChiefDock(chief.dock))
+                && touch::button(ui, touch, label).on_hover_text(hover).clicked()
             {
                 client.send(Command::SetChiefDock(if chief.dock == ChiefDock::Floating {
                     ChiefDock::Docked
@@ -408,13 +412,13 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         let active_title = active
             .and_then(|id| sessions.iter().find(|s| s.id == id))
             .map(|s| s.title.clone())
-            .unwrap_or_else(|| "none".into());
+            .unwrap_or_else(|| "no agent".into());
         let agents = sessions.iter().filter(|s| s.kind != AgentKind::Shell && s.can_receive).count();
         let selected = client.selected.len();
         let label = match client.steer_target {
-            SteerTarget::Active => format!("→ {active_title}"),
-            SteerTarget::Agents => format!("→ all agents ({agents})"),
-            SteerTarget::Selected => format!("→ selected ({selected})"),
+            SteerTarget::Active => format!("To: {active_title}"),
+            SteerTarget::Agents => format!("To: all agents ({agents})"),
+            SteerTarget::Selected => format!("To: selected ({selected})"),
         };
         egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).truncate().show_ui(ui, |ui| {
             ui.selectable_value(&mut client.steer_target, SteerTarget::Active, format!("Active: {active_title}"));
@@ -448,17 +452,17 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
             .desired_width(width)
             .hint_text(hint)
             .font(p.ui(13.0));
-        let response = ui.add(edit);
+        let response = ui.add(crate::controls::field(edit));
         if std::mem::take(&mut client.focus_steer) {
             response.request_focus();
         }
         // Filled only with something to send, as Send review is: with nothing typed it does nothing.
-        let button = if client.steer_text.trim().is_empty() {
-            egui::Button::new("Send")
+        let response = if client.steer_text.trim().is_empty() {
+            touch::button(ui, client.touch, "Send")
         } else {
-            egui::Button::new(RichText::new("Send").color(p.on_accent)).fill(p.accent)
+            crate::controls::primary(ui, "Send", client.touch, &p)
         };
-        if ui.add(touch::sized(button, client.touch)).clicked() {
+        if response.on_hover_text("Send this to the agents under To").clicked() {
             send = true;
         }
         if send {

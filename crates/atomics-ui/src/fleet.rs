@@ -68,11 +68,13 @@ pub fn tab_strip(
                     p.muted
                 };
                 let text = RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.0);
-                let response = ui.add(
-                    egui::Button::new(text)
-                        .fill(if active { lerp(p.panel, p.accent, 0.25) } else { Color32::TRANSPARENT })
-                        .stroke(Stroke::NONE),
-                );
+                let button = egui::Button::new(text);
+                let button = if active {
+                    button.fill(lerp(p.panel, p.accent, 0.25)).stroke(Stroke::NONE)
+                } else {
+                    button.frame_when_inactive(false)
+                };
+                let response = ui.add(button);
                 if response.clicked() {
                     clicked = Some(s.id.clone());
                 }
@@ -215,7 +217,7 @@ pub fn tiles(
                                     ui.close();
                                 }
                                 if backend.preview_active(preview.port)
-                                    && ui.small_button(format!("Stop port {}", preview.port)).clicked()
+                                    && ui.button(format!("Stop port {}", preview.port)).clicked()
                                 {
                                     client.send(Command::StopPreview { port: preview.port });
                                     ui.close();
@@ -334,7 +336,7 @@ pub fn tiles(
                         "This agent needs an MCP server that is not connected. Connecting it opens its sign-in \
                          page in your browser, and every sandboxed session then gets it.",
                     );
-                    if line == 0 && can_dismiss && ui.small_button("×").on_hover_text("Dismiss").clicked() {
+                    if line == 0 && can_dismiss && ui.button("×").on_hover_text("Dismiss").clicked() {
                         dismiss = Some(row.id.clone());
                     }
                 });
@@ -433,7 +435,7 @@ pub fn tiles(
         // Finished boards have left the top bar: the work they did leads back to them.
         let show = plans.get(done.plan).map(|row| boards::show_command(row, done.plan));
         if let Some(show) = show.filter(|show| backend.available(show))
-            && child.small_button("Open board").on_hover_text("The board of the plan this task belongs to").clicked()
+            && child.button("Open board").on_hover_text("The board of the plan this task belongs to").clicked()
         {
             show_board = Some(show);
         }

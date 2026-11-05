@@ -383,12 +383,17 @@ pub fn show(
 
     if touch.is_none() {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(header.title).strong().size(14.0).color(palette.foreground));
-            if let Some(branch) = header.branch {
-                ui.label(egui::RichText::new(branch).color(palette.muted).monospace());
-            }
+            // The buttons first: the title and the branch shorten into what they leave, and never run under them.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 header_buttons(ui, state, &header, palette, &mut action);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let title = egui::RichText::new(header.title).strong().size(14.0).color(palette.foreground);
+                    ui.add(egui::Label::new(title).truncate());
+                    if let Some(branch) = header.branch {
+                        let branch = egui::RichText::new(branch).color(palette.muted).monospace();
+                        ui.add(egui::Label::new(branch).truncate());
+                    }
+                });
             });
         });
     } else {
@@ -815,15 +820,14 @@ fn header_buttons(
     if touch.is_none() {
         close_button(ui, touch, action);
     }
-    if header.refresh && touch::small_button(ui, touch, "⟳").on_hover_text("Refresh").clicked() {
+    if header.refresh && touch::button(ui, touch, "Refresh").on_hover_text("Read the changes again").clicked() {
         *action = DiffAction::Refresh;
     }
-    if state.viewing.is_some() && touch::small_button(ui, touch, "← diff").on_hover_text("Back to the diff").clicked()
-    {
+    if state.viewing.is_some() && touch::button(ui, touch, "Back to diff").clicked() {
         state.viewing = None;
     }
     if header.edit
-        && touch::small_button(ui, touch, "editor")
+        && touch::button(ui, touch, "Edit")
             .on_hover_text(format!(
                 "Edit in the editor ({}) · double-click a line to edit there",
                 shortcut_label(ui.ctx(), header.editor_shortcut)
@@ -837,23 +841,28 @@ fn header_buttons(
         return;
     }
     let n = state.comments.len();
-    let (text, fill) = if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
-    let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(text)).fill(fill);
-    if ui
-        .add_enabled(n > 0 && header.can_send, touch::sized(send, touch))
+    let label = format!("Send review ({n})");
+    let response = if n > 0 && header.can_send {
+        crate::controls::primary(ui, label, touch, palette)
+    } else {
+        ui.add_enabled(false, touch::sized(egui::Button::new(label), touch))
+    };
+    if response
         .on_hover_text("Send every comment to the agent as one message")
         .on_disabled_hover_text(if header.can_send { "Click a line to comment" } else { "No agent in this worktree" })
         .clicked()
     {
         *action = DiffAction::SendReview;
     }
-    if !state.comments.is_empty() && touch::small_button(ui, touch, "discard").clicked() {
+    if !state.comments.is_empty()
+        && touch::button(ui, touch, "Discard").on_hover_text("Drop every comment, unsent").clicked()
+    {
         state.comments.clear();
     }
 }
 
 fn close_button(ui: &mut egui::Ui, touch: Option<Touch>, action: &mut DiffAction) {
-    if touch::small_button(ui, touch, "×").on_hover_text("Close diff").clicked() {
+    if touch::button(ui, touch, "×").on_hover_text("Close diff").clicked() {
         *action = DiffAction::Close;
     }
 }
@@ -881,7 +890,7 @@ fn diff_buttons(
     touch: Option<Touch>,
     action: &mut DiffAction,
 ) {
-    ui.menu_button("files ▾", |ui| {
+    crate::controls::menu_button(ui, "Files", |ui| {
         egui::ScrollArea::vertical().id_salt("diff-files").max_height(420.0).show(ui, |ui| {
             for (i, file) in diff.files.iter().enumerate() {
                 let label = format!("{}  +{} −{}", file.path(), file.additions(), file.deletions());
@@ -895,7 +904,7 @@ fn diff_buttons(
     });
     if !diff.files.is_empty() {
         let all = state.collapsed.len() == diff.files.len();
-        if touch::small_button(ui, touch, if all { "expand all" } else { "collapse all" }).clicked() {
+        if touch::button(ui, touch, if all { "Expand all" } else { "Collapse all" }).clicked() {
             if all {
                 state.collapsed.clear();
             } else {
@@ -904,12 +913,12 @@ fn diff_buttons(
         }
     }
     if touch.is_some() {
-        let wrap = egui::Button::selectable(!state.unwrapped, "wrap");
+        let wrap = egui::Button::selectable(!state.unwrapped, "Wrap");
         if ui.add(touch::sized(wrap, touch)).on_hover_text("Wrap long lines to the screen").clicked() {
             state.unwrapped = !state.unwrapped;
         }
     } else if ui
-        .toggle_value(split, "split")
+        .toggle_value(split, "Side by side")
         .on_hover_text("Old and new side by side until ATOMICS quits (diff_split in the config sets the default)")
         .changed()
     {
@@ -1098,7 +1107,7 @@ fn editor_row(
 ) -> (bool, bool) {
     let field = rect.with_min_x(rect.left() + gutter - char_w);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("comment-editor").max_rect(field));
-    let edit = egui::TextEdit::singleline(&mut editor.text)
+    let edit = crate::controls::single_line(&mut editor.text)
         .id(child.scope_id().with("comment-box"))
         .hint_text("Comment for the agent · Enter adds · Esc cancels")
         .font(font.clone())
@@ -1155,8 +1164,8 @@ pub fn files_panel(
 ) -> Option<String> {
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 74.0).max(60.0);
-        ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter files").desired_width(width));
-        ui.toggle_value(&mut state.changed_only, "changed").on_hover_text("Only files in the diff");
+        ui.add(crate::controls::single_line(&mut state.filter).hint_text("Filter files").desired_width(width));
+        ui.toggle_value(&mut state.changed_only, "Changed").on_hover_text("Only files in the diff");
     });
     let tree = state.tree(main, target);
     let prepared = target.clone();

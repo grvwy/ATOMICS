@@ -23,6 +23,7 @@ pub mod boards;
 pub mod chief;
 mod client;
 mod command;
+pub mod controls;
 pub mod diff_panel;
 pub mod diff_view;
 pub mod fleet;

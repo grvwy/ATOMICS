@@ -22,10 +22,7 @@ pub fn sized(button: Button<'_>, touch: Option<Touch>) -> Button<'_> {
     }
 }
 
-/// [`Ui::small_button`], or a button a finger can hit under `touch`.
-pub fn small_button<'a>(ui: &mut Ui, touch: Option<Touch>, atoms: impl IntoAtoms<'a>) -> Response {
-    match touch {
-        Some(_) => ui.add(sized(Button::new(atoms), touch)),
-        None => ui.small_button(atoms),
-    }
+/// A button, one a finger can hit under `touch`.
+pub fn button<'a>(ui: &mut Ui, touch: Option<Touch>, atoms: impl IntoAtoms<'a>) -> Response {
+    ui.add(sized(Button::new(atoms), touch))
 }

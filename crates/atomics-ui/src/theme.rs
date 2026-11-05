@@ -54,6 +54,10 @@ const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
+/// The height every button, tab and menu button has, whatever the theme's font, and their corners' radius.
+pub const CONTROL_HEIGHT: f32 = 22.0;
+pub const RADIUS: u8 = 4;
+
 /// The UI text size the built-in themes are drawn at; `ui_size` scales the UI from it. The rest of the type scale:
 /// 10.5 for headings in capitals and the smallest notes, 11 for secondary text, 12 for small body text; names and
 /// titles above that.
@@ -147,8 +151,8 @@ impl Palette {
         visuals.panel_fill = p.panel;
         visuals.window_fill = p.overlay;
         visuals.window_stroke = Stroke::new(1.0, p.border);
-        visuals.window_corner_radius = egui::CornerRadius::same(4);
-        visuals.menu_corner_radius = egui::CornerRadius::same(3);
+        visuals.window_corner_radius = egui::CornerRadius::same(6);
+        visuals.menu_corner_radius = egui::CornerRadius::same(6);
         visuals.extreme_bg_color = p.background;
         visuals.text_edit_bg_color = Some(p.background);
         visuals.faint_bg_color = p.raised;
@@ -168,7 +172,7 @@ impl Palette {
             &mut widgets.active,
             &mut widgets.open,
         ] {
-            state.corner_radius = egui::CornerRadius::same(2);
+            state.corner_radius = egui::CornerRadius::same(RADIUS);
             state.expansion = 0.0;
             state.fg_stroke = Stroke::new(1.0, p.foreground);
         }
@@ -196,6 +200,7 @@ impl Palette {
             }
         }
         style.spacing.button_padding = vec2(7.0, 2.0);
+        style.spacing.interact_size.y = CONTROL_HEIGHT;
         style.spacing.item_spacing = vec2(7.0, 4.0);
         style
     }
@@ -366,21 +371,28 @@ pub fn parse_hex(text: &str) -> Option<Color32> {
     atomics_core::theme::parse_color(text).map(|[r, g, b]| Color32::from_rgb(r, g, b))
 }
 
+/// What a test of the look needs of a theme.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// Fonts the host never found; the style and scale tests need none.
+    pub struct NoFonts;
+
+    impl FontHook for NoFonts {
+        fn apply(&self, _: &egui::Context, _: &Fonts) {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::tests_support::NoFonts;
     use super::*;
     use atomics_core::config::ThemeConfig;
 
     fn builtin(name: &str) -> Palette {
         let config = ThemeConfig { name: name.into(), ..ThemeConfig::default() };
         Palette::new(&atomics_core::theme::resolve(&config, |_| None).tokens, Fonts::default())
-    }
-
-    /// Fonts the host never found; the style and scale tests need none.
-    struct NoFonts;
-
-    impl FontHook for NoFonts {
-        fn apply(&self, _: &egui::Context, _: &Fonts) {}
     }
 
     #[test]

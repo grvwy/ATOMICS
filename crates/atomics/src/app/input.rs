@@ -378,7 +378,7 @@ impl Desktop<'_> {
                     } else {
                         ui.label("Folder");
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut dialog.folder).hint_text("~/repos/app"));
+                            ui.add(atomics_ui::controls::single_line(&mut dialog.folder).hint_text("~/repos/app"));
                             ui.menu_button("▾", |ui| {
                                 let mut known: Vec<PathBuf> =
                                     self.runtime.worktrees.iter().map(|w| w.path.clone()).collect();
@@ -391,7 +391,9 @@ impl Desktop<'_> {
                                         ui.close();
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text("The folders of your worktrees and agents");
                         });
                         ui.end_row();
                     }
@@ -421,7 +423,7 @@ impl Desktop<'_> {
                     }
                     ui.label("Prompt");
                     let prompt = ui.add(
-                        egui::TextEdit::singleline(&mut dialog.prompt)
+                        atomics_ui::controls::single_line(&mut dialog.prompt)
                             .hint_text("optional first prompt; it names a scratch session")
                             .desired_width(320.0),
                     );
@@ -469,7 +471,7 @@ impl Desktop<'_> {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                let field = ui.add(egui::TextEdit::singleline(&mut rename.title).desired_width(280.0));
+                let field = ui.add(atomics_ui::controls::single_line(&mut rename.title).desired_width(280.0));
                 if std::mem::take(&mut rename.focus) {
                     field.request_focus();
                 }

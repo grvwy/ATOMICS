@@ -708,7 +708,7 @@ fn github_controls_take_focus_immediately_and_restore_the_previous_pane() {
                 if response.has_focus() {
                     received = ui.input(|input| input.events.clone());
                 }
-                ui.add(egui::TextEdit::singleline(&mut draft).id(agent));
+                ui.add(atomics_ui::controls::single_line(&mut draft).id(agent));
                 app.github_modal(ui.ctx());
             })
             .drop_without_applying_deltas();

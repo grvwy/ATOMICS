@@ -221,12 +221,12 @@ pub fn draw(ui: &mut egui::Ui, compact: bool, backend: &dyn Backend, client: &mu
         return;
     }
     let shown = active(&backend.view_hints());
-    let height = ui.spacing().interact_size.y.max(22.0);
+    let height = ui.spacing().interact_size.y;
     let painter = ui.painter().clone();
     let laid: Vec<_> = segments.iter().map(|segment| layout(&painter, segment, compact, &p)).collect();
     let total: f32 = laid.iter().map(|(_, width)| width).sum();
     let (outline, _) = ui.allocate_exact_size(vec2(total, height), Sense::hover());
-    let radius = 5.0;
+    let radius = f32::from(crate::theme::RADIUS);
     painter.rect(outline, radius, p.raised, Stroke::NONE, StrokeKind::Inside);
     let mut left = outline.left();
     for (index, (segment, (label, width))) in segments.iter().zip(laid).enumerate() {

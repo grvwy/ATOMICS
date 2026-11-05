@@ -273,7 +273,7 @@ build](../README.md#restart-onto-a-new-build).
 
 ## 11. Verify cleanup
 
-ATOMICS removes what it makes. Completing a plan, **Clean up plan…** and the **clean up…** dialog remove
+ATOMICS removes what it makes. Completing a plan, **Clean up plan…** and the **Clean up…** dialog remove
 worktrees together with their sandboxes, MCP registrations and relay rules. Closing a scratch session
 removes its folder and sandbox. The next start sweeps whatever a crash left. To check by hand, once the
 work you started is closed:
@@ -288,7 +288,7 @@ atomics doctor                              # "cleanup leftover (warning)" names
 ```
 
 - A stopped `atomics-<session id>` sandbox is kept on purpose while its worktree exists, so the session
-  can resume. Removing the worktree (plan cleanup or **clean up…**) removes it.
+  can resume. Removing the worktree (plan cleanup or **Clean up…**) removes it.
 - `atomics-template-…`, `atomics-relay-check-…` and `atomics-azure-check-…` exist only while those commands run.
   The two checks leave an empty `relay-check/` folder in the state folder.
 - Scratch folders go when their session closes; quitting ends scratch sessions, and the next start

@@ -95,7 +95,7 @@ fn session_row(
     let state_color = if needs { p.warning } else { status_color(s.status, p) };
     let state = clip.text(detail.right_top(), egui::Align2::LEFT_TOP, state, p.ui(11.0), state_color);
     if selected {
-        clip.text(state.right_top(), egui::Align2::LEFT_TOP, " · ✔ selected", p.ui(11.0), p.accent);
+        clip.text(state.right_top(), egui::Align2::LEFT_TOP, " · selected", p.ui(11.0), p.accent);
     }
     response
 }
@@ -252,7 +252,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     ui.horizontal(|ui| {
         section(ui, p, "EXPLORER");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if can_pick && ui.small_button("+").on_hover_text("Open project…").clicked() {
+            if can_pick && ui.button("+").on_hover_text("Open project…").clicked() {
                 client.send(Command::PickProject);
             }
         });
@@ -346,10 +346,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             explorer.show_worktrees = !explorer.show_worktrees;
         }
         if can_clean_up
-            && ui
-                .small_button("clean up…")
-                .on_hover_text("Find merged or abandoned worktrees and remove them")
-                .clicked()
+            && ui.button("Clean up…").on_hover_text("Find merged or abandoned worktrees and remove them").clicked()
         {
             open_cleanup = true;
         }
@@ -461,13 +458,15 @@ fn folder_panel(
     let touch = client.touch;
     let explorer = client.explorers.entry(project.to_path_buf()).or_default();
     ui.horizontal_wrapped(|ui| {
-        if !explorer.folder.is_empty() && crate::touch::small_button(ui, touch, "↑ Parent folder").clicked() {
+        if !explorer.folder.is_empty() && crate::touch::button(ui, touch, "↑ Parent folder").clicked() {
             explorer.folder = explorer.folder.rsplit_once('/').map_or(String::new(), |(parent, _)| parent.into());
         }
         ui.label(if explorer.folder.is_empty() { "/" } else { &explorer.folder });
     });
     ui.add(
-        egui::TextEdit::singleline(&mut explorer.filter).hint_text("Filter files").desired_width(ui.available_width()),
+        crate::controls::single_line(&mut explorer.filter)
+            .hint_text("Filter files")
+            .desired_width(ui.available_width()),
     );
     let path = explorer.folder.clone();
     let snapshot = backend.folder(root, &path);
@@ -502,10 +501,10 @@ fn folder_panel(
         if let Some(error) = &snapshot.error {
             ui.label(RichText::new(error).color(p.warning));
         }
-        if !snapshot.first && crate::touch::small_button(ui, touch, "First page").clicked() {
+        if !snapshot.first && crate::touch::button(ui, touch, "First page").clicked() {
             backend.first_folder(root, &path);
         }
-        if snapshot.more && !snapshot.loading && crate::touch::small_button(ui, touch, "Next files").clicked() {
+        if snapshot.more && !snapshot.loading && crate::touch::button(ui, touch, "Next files").clicked() {
             backend.more_folder(root, &path);
         }
         if snapshot.entries.is_empty() && !snapshot.loading && snapshot.error.is_none() {
