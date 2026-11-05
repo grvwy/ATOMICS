@@ -4,8 +4,8 @@
 //! so that the keys that move between agents keep working. Also the question a person's start asks when no sandbox
 //! can be had for it.
 use super::settings::{self, button, isolation, mark, note, tool};
-use crate::status::Mark;
 use super::*;
+use crate::status::Mark;
 use crate::theme::Palette;
 use crate::touch;
 use atomics_core::isolation::IsolationMode;
