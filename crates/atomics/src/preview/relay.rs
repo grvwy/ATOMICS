@@ -146,11 +146,8 @@ impl Relay {
         if self.connections.len() >= MAX_TUNNELS || self.contains(&id) {
             return Err("too many tunnels or duplicate tunnel id".into());
         }
-        if self
-            .connecting
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_TUNNELS).then_some(n + 1))
-            .is_err()
-        {
+        if self.connecting.fetch_add(1, Ordering::AcqRel) >= MAX_TUNNELS {
+            self.connecting.fetch_sub(1, Ordering::AcqRel);
             return Err("too many preview connects under way".into());
         }
         let connecting = self.connecting.clone();
