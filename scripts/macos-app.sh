@@ -8,8 +8,11 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest=${1:-"$HOME/Applications"}
 app="$dest/ATOMICS.app"
+target_dir=${CARGO_TARGET_DIR:-"$root/target"}
+target=${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
 
-cargo build --release --manifest-path "$root/Cargo.toml" -p atomics
+cargo build --release --locked --manifest-path "$root/Cargo.toml" -p atomics \
+  --target "$target" --target-dir "$target_dir"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)
 
 work=$(mktemp -d)
@@ -30,7 +33,7 @@ done
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$root/target/release/atomics" "$app/Contents/MacOS/atomics"
+cp "$target_dir/$target/release/atomics" "$app/Contents/MacOS/atomics"
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/ATOMICS.icns"
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
