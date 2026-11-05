@@ -3848,7 +3848,7 @@ mod tests {
                 "cards board",
                 "b1",
                 "3 tickets · 1 without a task",
-                "sync",
+                "Sync",
                 "CARD-1 · Doing",
                 "CARD-2 · Todo",
                 "⚠ setting the state to Stuck failed: card_move is broken today",
@@ -3900,7 +3900,7 @@ mod tests {
             // The sync button reads the tickets again.
             let reads = count(&state, "card_list");
             let output = board_frame(app, ctx, vec![]);
-            let sync = texts(&output).into_iter().find(|(text, _)| text == "sync").unwrap().1;
+            let sync = texts(&output).into_iter().find(|(text, _)| text == "Sync").unwrap().1;
             output.drop_without_applying_deltas();
             for pressed in [true, false] {
                 let event = egui::Event::PointerButton {

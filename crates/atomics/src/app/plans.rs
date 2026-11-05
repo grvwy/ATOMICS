@@ -1739,7 +1739,7 @@ mod tests {
                     app.runtime.drain_actions();
                     assert_eq!(
                         output.shapes.iter().any(|shape| {
-                            matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "integrate")
+                            matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "Integrate")
                         }),
                         can_integrate
                     );
