@@ -37,7 +37,8 @@ keys are the last section.
   is in no terminal, text field, menu or dialog, so it never takes an Escape meant for an agent. Each window keeps
   its own history (client state, `atomics_ui::nav`).
 - **Settings, Remote and the project picker** take the keyboard when they open, so nothing typed at them reaches a
-  terminal. **Escape** closes the one on top (a menu inside it first), and the keyboard returns to the active terminal.
+  terminal, including after an agent chord selects another agent. **Escape** closes the one on top (a menu inside it
+  first), and the keyboard returns to the active terminal.
   A click on a terminal behind one types there; Escape still closes the window.
 - **A task card's click** shows its session with its diff, or a finished task's diff; its title still opens and
   closes the card. The card of the session on screen is outlined in the accent color.
@@ -46,6 +47,7 @@ keys are the last section.
   of permission requests waiting; the active one keeps the accent fill.
 - **Each agent's row shows its number**, under its status dot: Ctrl+N goes to that row, whatever order the plan groups
   put it in. The tile strip lists the agents in that order too.
+- **An agent started through control tools or another client** leaves this window's active agent and keyboard alone.
 - **Keyboard focus is visible** on the custom controls: the pill, the switcher's segments, the location's arrows and
   links, the sidebar's rows and the task cards draw a focus ring in the theme's selection color.
 

@@ -571,6 +571,9 @@ impl State {
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
             }
             ControlRequest::Start { agent, folder, repo, branch, prompt, args, isolation } => {
+                // Control and remote requests start work on the host; they do not navigate the desktop.
+                // A desktop start selects its own result when its reply comes back to that window.
+                let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
                 let started = match (folder, repo, branch) {
                     (_, Some(repo), Some(branch)) => {
                         // Checking out a big repository takes a while: do it off the UI thread
@@ -591,6 +594,7 @@ impl State {
                     }
                     (None, None, None) => self.start_scratch(&agent, args, prompt, isolation),
                 };
+                (self.active, self.diff_root, self.focus_terminal) = selection;
                 match started {
                     Ok(id) => {
                         let index = self.find(&id).expect("just started");

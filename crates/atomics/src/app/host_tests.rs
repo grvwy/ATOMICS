@@ -1072,6 +1072,88 @@ fn remote_client(host: &Host) -> crate::protocol::tests::TestClient {
     client
 }
 
+#[test]
+fn control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard() {
+    with_state(
+        "app::host_tests::control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard",
+        |mut state, ctx| {
+            use atomics_core::ops::{Outcome, SessionAction, SessionCommand};
+            use atomics_core::wire::{Envelope, Message};
+            let (dir, repo) = repository();
+            state.config.remote.enabled = true;
+            state.config.base_ref = "main".into();
+            state.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+            state.sessions = vec![session("foreground", AgentKind::Generic, AgentStatus::Working, &repo)];
+            state.active = Some("foreground".into());
+            state.diff_root = Some(repo.clone());
+            state.focus_terminal = None;
+            let field = egui::Id::NULL.with("settings field");
+            ctx.memory_mut(|m| m.request_focus(field));
+            let host = state.into_host();
+            let mut client = remote_client(&host);
+            for remote in [false, true] {
+                for place in ["folder", "scratch", "worktree"] {
+                    let branch = format!("start-{}-{place}", if remote { "remote" } else { "control" });
+                    let folder = (place == "folder").then(|| repo.display().to_string());
+                    let new_repo = (place == "worktree").then(|| repo.display().to_string());
+                    let new_branch = (place == "worktree").then(|| branch.clone());
+                    let result = if remote {
+                        client.send(&Envelope::new(Message::SessionCommand(SessionCommand {
+                            op: branch.clone(),
+                            action: SessionAction::Start {
+                                agent: "shell".into(),
+                                folder,
+                                repo: new_repo,
+                                branch: new_branch,
+                                prompt: None,
+                            },
+                        })));
+                        let outcome = outcome_of(&mut client, &branch);
+                        let Outcome::Done { result } = outcome else { panic!("{outcome:?}") };
+                        result
+                    } else {
+                        command(&host, json!({"cmd":"start", "agent":"shell", "folder":folder, "repo":new_repo, "branch":new_branch})).result
+                    };
+                    let id = result["id"].as_str().expect("the started agent");
+                    eventually(&host, |state| state.sessions.iter().any(|s| s.id == id && s.terminal.is_some()));
+                    let state = host.state();
+                    assert_eq!(state.active.as_deref(), Some("foreground"), "{branch}");
+                    assert_eq!(state.diff_root.as_ref(), Some(&repo), "{branch}");
+                    assert!(state.focus_terminal.is_none(), "{branch}");
+                    assert!(ctx.memory(|m| m.has_focus(field)), "{branch}");
+                }
+            }
+        },
+    );
+}
+
+#[test]
+fn the_desktop_selects_its_own_new_agent_when_its_start_reply_arrives() {
+    with_state(
+        "app::host_tests::the_desktop_selects_its_own_new_agent_when_its_start_reply_arrives",
+        |mut state, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            state.sessions = vec![session("foreground", AgentKind::Generic, AgentStatus::Working, dir.path())];
+            state.active = Some("foreground".into());
+            let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+            let mut app = App { client, host: state.into_host(), replies: Vec::new() };
+            let request = serde_json::from_value(json!({"cmd":"start", "agent":"shell", "folder":dir.path()})).unwrap();
+            app.replies.push((true, app.host.command(request)));
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+            let mut frame = eframe::Frame::_new_kittest();
+            while !app.replies.is_empty() {
+                assert!(Instant::now() < deadline, "desktop did not receive its start reply");
+                eframe::App::logic(&mut app, ctx, &mut frame);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let state = app.host.state();
+            let started = state.sessions.iter().find(|s| s.id != "foreground").unwrap();
+            assert_eq!(state.active.as_deref(), Some(started.id.as_str()));
+            assert_eq!(app.client.focus_terminal.as_deref(), Some(started.id.as_str()));
+        },
+    );
+}
+
 /// The final outcome of `op`, applying the board frames that come first. A failure names the
 /// caller's line, which says whose read it was.
 #[track_caller]

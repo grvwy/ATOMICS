@@ -122,7 +122,10 @@ pub fn tiles(
     let can_resume = backend.available(&Command::ResumeSession(String::new()));
     let can_connect = backend.available(&Command::Connect { name: String::new(), store_env: false, url: None });
     let can_dismiss = backend.available(&Command::DismissMcp(String::new()));
-    let focus_request = client.focus_terminal.take();
+    let focus_request = client
+        .focus_terminal
+        .take()
+        .filter(|_| !crate::management::window_open(client) && !client.tickets.dialog && !ui.ctx().text_edit_focused());
     let (inset, header_height, close_size) = match client.touch {
         Some(touch) => (0.0, touch.target, touch.target),
         None => (3.0, TILE_HEADER, 18.0),

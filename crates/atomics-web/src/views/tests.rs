@@ -3672,3 +3672,51 @@ fn closing_settings_gives_the_keyboard_back_to_the_terminal() {
     assert!(client.focus_terminal.is_none());
     assert!(view.term.overlay.focus, "the input takes it back");
 }
+
+#[test]
+fn agent_chords_with_a_management_window_open_keep_typed_and_pasted_text_out_of_terminals() {
+    for window in ["settings", "remote", "project"] {
+        let (ctx, mut world, mut client, mut view) = at_a_terminal(fake_host::management(), WIDE);
+        match window {
+            "settings" => client.management.settings = true,
+            "remote" => client.management.remote = true,
+            "project" => client.management.project = true,
+            _ => unreachable!(),
+        }
+        settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num1, CHORD));
+        assert_eq!(view.desk.active.as_deref(), Some("s1"));
+        sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("private text".into())]);
+        sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Paste("private paste".into())]);
+        // Even a panel that already has focus cannot hand the keyboard to a terminal behind a window.
+        ctx.memory_mut(|m| m.request_focus(atomics_ui::panel_nav::focus_id()));
+        sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Paste("still private".into())]);
+        settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        no_bytes(&world);
+        assert!(!view.term.typing(), "{window}");
+        assert!(client.focus_terminal.is_none(), "{window}");
+    }
+}
+
+#[test]
+fn selecting_the_active_agent_with_a_chord_replaces_a_pull_request_with_its_diff_against_main() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::panels_host());
+    client.send(Command::SetView(None));
+    client.send(Command::Activate { session: "s1".into(), open_diff: true });
+    client.send(Command::SetPanel(PanelMode::Diff));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    client.pr_view = Some(("pull:example/repo#7".into(), Default::default()));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.pr_view.as_ref().unwrap().1.prepared.is_some());
+    assert!(client.pr_target.is_some());
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Num1, CHORD));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.pr_view.is_none());
+    assert!(client.pr_target.is_none());
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+    assert_eq!(view.desk.diff_target(&world.driver.remote).as_deref(), Some(Path::new(WORKTREE)));
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert!(diff_asked(&world, WORKTREE));
+    assert!(panel_has_the_keys(&ctx));
+    no_bytes(&world);
+}

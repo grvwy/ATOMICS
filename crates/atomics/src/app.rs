@@ -806,7 +806,7 @@ impl std::ops::DerefMut for Desktop<'_> {
 pub struct App {
     client: Client,
     host: crate::host::Host,
-    replies: Vec<Receiver<ControlOutcome>>,
+    replies: Vec<(bool, Receiver<ControlOutcome>)>,
 }
 
 impl App {
@@ -822,7 +822,8 @@ impl App {
         let actions = state.action_tx.clone();
         drop(state);
         for command in commands {
-            self.replies.push(self.host.command(command));
+            let start = matches!(command, ControlRequest::Start { .. });
+            self.replies.push((start, self.host.command(command)));
         }
         if ui.input(|input| !input.events.is_empty()) {
             self.host.wake();
@@ -848,10 +849,12 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut state = self.host.state();
-        self.replies.retain(|reply| match reply.try_recv() {
+        self.replies.retain(|(start, reply)| match reply.try_recv() {
             Ok(ControlOutcome::Done(response)) => {
                 if let Some(error) = response.error {
                     state.toast(error);
+                } else if *start && let Some(id) = response.result.get("id").and_then(|id| id.as_str()) {
+                    Desktop { runtime: &mut state, client: &mut self.client }.activate(id, false);
                 }
                 false
             }

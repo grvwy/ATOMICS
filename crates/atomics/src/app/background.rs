@@ -152,10 +152,12 @@ impl State {
                 self.cleanup_closed_plan(index);
                 continue;
             }
-            let background = launch
-                .task
-                .as_ref()
-                .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
+            // A control start belongs to its caller; the desktop selects only replies to its own starts.
+            let background = launch.reply.is_some()
+                || launch
+                    .task
+                    .as_ref()
+                    .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
                 let role = Role::Agent(launch.isolation);
