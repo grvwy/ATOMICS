@@ -42,6 +42,8 @@ const QUOTA_RETRY_MS: u64 = 60_000;
 const STEADY_MS: u64 = 30_000;
 /// How long to wait for a fresh ticket before asking again.
 const TICKET_WAIT_MS: u64 = 15_000;
+/// How long the page must be hidden before a live socket is treated as potentially stale.
+const LIVE_SOCKET_STALE_AFTER_MS: u64 = 30_000;
 
 /// What the frame shows about its connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +70,12 @@ pub enum Status {
 pub enum Stop {
     /// No parent origin is configured, so nothing may boot the frame.
     NoParent,
-    /// This browser has no key for the host: it never paired here.
+    /// This storage context has no device record for the host (first use, cleared or evicted).
     NotHere,
+    /// Storage could not be read. This is never permission to pair or overwrite a key.
+    DeviceReadFailed,
+    /// The broker refused the hosting page's sign-in or connect ticket; the key is kept.
+    SignIn,
     /// The host said, inside the encrypted channel, that it does not know this browser's key.
     NotPaired,
     /// The channel was closed as not paired, but the host did not say so itself: the key is kept.
@@ -101,11 +107,17 @@ impl Stop {
             Stop::NotHere => {
                 "This browser is not paired with this computer yet. In ATOMICS on the computer, open Remote devices and pair it."
             }
+            Stop::DeviceReadFailed => {
+                "This browser could not read its saved pairing. Try again to read it; your key has not been replaced."
+            }
+            Stop::SignIn => {
+                "Sign in again on the page that hosts ATOMICS, then try again. This browser keeps its pairing."
+            }
             Stop::NotPaired => {
                 "The computer no longer knows this browser. Pair it again from Remote devices in ATOMICS on the computer."
             }
             Stop::NotPairedUnconfirmed => {
-                "The connection was closed as not paired, but the computer did not confirm it, so this browser keeps its key. Reload the page to try again; if this keeps happening, pair again from Remote devices."
+                "The connection was closed as not paired, but the computer did not confirm it. This browser keeps its key. Try again to reconnect with the saved pairing."
             }
             Stop::NoPairing => "This pairing link was used or has expired. Show a new code on the computer.",
             Stop::PairRefused => "The computer refused this browser: the codes did not match.",
@@ -114,13 +126,17 @@ impl Stop {
             Stop::Revoked => "This computer's registration with the rendezvous service was revoked.",
             Stop::KeyMismatch => "The computer's key does not match the one this browser paired with. Pair again.",
             Stop::Failed => "This browser could not start the connection. Reload the page to try again.",
-            Stop::Unauthorised => "The host did not accept this window's token. Pair this window with the host again.",
+            Stop::Unauthorised => "The host did not accept this window's token. Try again to read the current token.",
             Stop::Version => {
                 "The host speaks another version of the ATOMICS protocol. Update ATOMICS here or on the host."
             }
         }
     }
 }
+
+/// A failed storage read, distinct from a successful read that found no device.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceReadError;
 
 /// What the browser glue does for the driver.
 pub enum Output {
@@ -191,8 +207,10 @@ pub struct Driver {
     pub remote: RemoteBackend,
     device_name: String,
     device: Option<Device>,
-    /// A pairing boot's link and the key this browser pairs with, until the host accepts it.
-    pairing: Option<(Pairing, Secret)>,
+    /// The last successful read found a device, so a requested pairing can reuse its key.
+    had_device: bool,
+    /// A pairing boot's link. Read storage before choosing the device key to pair with.
+    pairing: Option<Pairing>,
     /// When a pairing boot's link has surely expired: its lifetime after the hosting page got it
     /// ([`Boot::pairing_age_ms`] before the boot). Until then a host busy pairing another device is
     /// asked again.
@@ -237,6 +255,7 @@ impl Driver {
             remote: RemoteBackend::new(op_prefix),
             device_name: device_name.to_string(),
             device: None,
+            had_device: false,
             pairing: None,
             pair_until_ms: 0,
             pair_busy: false,
@@ -272,12 +291,82 @@ impl Driver {
 
     /// Dial again now rather than at the next wait's end: the user asked, or what the host needs is back.
     pub fn retry_now(&mut self) {
+        if self.status == Status::Stopped(Stop::DeviceReadFailed) {
+            if let Some(host) = self.boot.as_ref().map(|b| b.host_id.clone()) {
+                self.status = Status::Connecting;
+                self.load(host);
+            }
+            return;
+        }
         if self.socket.is_none() && self.direct {
             if matches!(self.status, Status::Stopped(_)) {
                 self.status = Status::Connecting;
                 self.retry = Retry::default();
             }
             self.dial();
+        } else if self.socket.is_none()
+            && !self.direct
+            && matches!(
+                self.status,
+                Status::Reconnecting { .. } | Status::Stopped(Stop::SignIn | Stop::NotPairedUnconfirmed)
+            )
+        {
+            self.status = if self.pairing.is_some() {
+                Status::Pairing { code: None }
+            } else {
+                Status::Reconnecting { attempt: self.retry.attempt }
+            };
+            self.retry.due_ms = None;
+            self.ask_ticket();
+        }
+    }
+
+    /// Returning from the background may leave a socket that looks open but can no longer deliver.
+    /// Keep a live session through short tab switches, preserving its screen and typing lease.
+    /// Replace only an ordinary session, never interrupt code comparison or retry a security refusal.
+    pub fn resumed(&mut self, hidden_ms: u64) {
+        if self.status == Status::Live && hidden_ms < LIVE_SOCKET_STALE_AFTER_MS {
+            return;
+        }
+        if self.direct || self.loading || self.pairing.is_some() || self.device.is_none() {
+            return;
+        }
+        if !matches!(
+            self.status,
+            Status::Live | Status::Connecting | Status::Reconnecting { .. } | Status::Stopped(Stop::SignIn)
+        ) {
+            return;
+        }
+        if let Some(socket) = self.socket.take() {
+            self.outputs.push(Output::Close { socket: socket.id, code: close::NORMAL });
+            self.remote.disconnected();
+        }
+        self.ticket = None;
+        self.status = Status::Reconnecting { attempt: self.retry.attempt };
+        self.retry.due_ms = None;
+        self.ask_ticket();
+    }
+
+    /// One safe diagnostic line for the pairing and recovery screens. Never contains key material.
+    pub fn pairing_reason(&self) -> Option<&'static str> {
+        match self.status {
+            Status::Pairing { .. } if self.device.is_some() && self.known.is_some() => {
+                Some("Reason: host key changed; pairing was requested.")
+            }
+            Status::Pairing { .. } if self.had_device => {
+                Some("Reason: pairing was requested; reusing the stored device key.")
+            }
+            Status::Pairing { .. } | Status::Stopped(Stop::NotHere) => Some("Reason: no key stored for this host."),
+            Status::ConfirmRepair | Status::Stopped(Stop::KeyMismatch) => Some("Reason: host key changed."),
+            Status::Stopped(Stop::DeviceReadFailed) => Some("Reason: could not read the stored key."),
+            Status::Stopped(Stop::NotPaired) => Some("Reason: host refused this key inside the encrypted connection."),
+            Status::Stopped(Stop::NotPairedUnconfirmed) => {
+                Some("Reason: connection refused pairing without host confirmation; key kept.")
+            }
+            Status::Stopped(Stop::NoPairing | Stop::PairRefused | Stop::PairFailed | Stop::PairInterrupted) => {
+                Some("Reason: the requested pairing did not complete; any stored key is kept.")
+            }
+            _ => None,
         }
     }
 
@@ -306,22 +395,10 @@ impl Driver {
                 let pairing = boot.pairing.clone();
                 let lifetime_ms = (PAIRING_LIFETIME_SECS * 1000).saturating_sub(boot.pairing_age_ms);
                 self.boot = Some(boot);
-                match pairing {
-                    // Pairing: first, whether this browser already holds a key for the host.
-                    Some(pairing) => match Secret::generate() {
-                        Ok(secret) => {
-                            self.pairing = Some((pairing, secret));
-                            self.pair_until_ms = self.now_ms + lifetime_ms;
-                            self.status = Status::Pairing { code: None };
-                            self.load(host_id);
-                        }
-                        Err(_) => self.status = Status::Stopped(Stop::Failed),
-                    },
-                    None => {
-                        self.status = Status::Connecting;
-                        self.load(host_id);
-                    }
-                }
+                self.pairing = pairing;
+                self.pair_until_ms = self.now_ms + lifetime_ms;
+                self.status = Status::Connecting;
+                self.load(host_id);
             }
             FromParent::Ticket { host_id, ticket } => {
                 let ours = self.boot.as_ref().is_some_and(|b| b.host_id == host_id);
@@ -340,20 +417,43 @@ impl Driver {
     }
 
     /// The stored device for the booted host, as [`Output::LoadDevice`] asked.
-    pub fn device_loaded(&mut self, device: Option<Device>) {
+    pub fn device_loaded(&mut self, device: Result<Option<Device>, DeviceReadError>) {
         if !std::mem::take(&mut self.loading) {
             return;
         }
+        let Ok(device) = device else {
+            self.status = Status::Stopped(Stop::DeviceReadFailed);
+            return;
+        };
         let host = self.boot.as_ref().map(|b| b.host_id.clone());
-        let device = device.filter(|d| Some(&d.host_id) == host.as_ref());
+        if device.as_ref().is_some_and(|d| Some(&d.host_id) != host.as_ref()) {
+            self.status = Status::Stopped(Stop::DeviceReadFailed);
+            return;
+        }
+        self.had_device = device.is_some();
         match (&self.pairing, device) {
             // Pairing would replace the host key this browser trusts for that host: ask first. The
             // same key needs no question, since only that host can answer the pairing.
-            (Some((pairing, _)), Some(known)) if known.host_key != pairing.host_key => {
+            (Some(pairing), Some(known)) if known.host_key != pairing.host_key => {
                 self.known = Some(known);
                 self.status = Status::ConfirmRepair;
             }
-            (Some(_), _) => self.dial(),
+            (Some(pairing), device) => {
+                self.device = match device {
+                    Some(device) => Some(device),
+                    None => match Secret::generate() {
+                        Ok(secret) => {
+                            Some(Device { host_id: pairing.host_id.clone(), host_key: pairing.host_key, secret })
+                        }
+                        Err(_) => {
+                            self.status = Status::Stopped(Stop::Failed);
+                            return;
+                        }
+                    },
+                };
+                self.status = Status::Pairing { code: None };
+                self.dial();
+            }
             (None, Some(device)) => {
                 self.device = Some(device);
                 self.dial();
@@ -368,12 +468,12 @@ impl Driver {
         if self.status != Status::ConfirmRepair {
             return;
         }
-        let known = self.known.take();
         if pair {
+            self.device = self.known.clone();
             self.status = Status::Pairing { code: None };
         } else {
             self.pairing = None;
-            self.device = known;
+            self.device = self.known.take();
             self.status = Status::Connecting;
         }
         self.dial();
@@ -399,9 +499,9 @@ impl Driver {
         let Some(boot) = &self.boot else { return };
         let Some(ticket) = self.ticket.take() else { return self.ask_ticket() };
         let connection = match (&self.pairing, &self.device) {
-            (Some((pairing, secret)), _) => Connection::pair(pairing, secret, &self.device_name),
+            (Some(pairing), Some(device)) => Connection::pair(pairing, &device.secret, &self.device_name),
             (None, Some(device)) => Connection::session(&device.host_id, &device.host_key, &device.secret),
-            (None, None) => return,
+            (_, None) => return,
         };
         let Ok(connection) = connection else {
             self.status = Status::Stopped(Stop::Failed);
@@ -460,8 +560,10 @@ impl Driver {
                     self.status = Status::Pairing { code: Some(code) };
                 }
                 Event::Paired(_) => {
-                    let Some((pairing, secret)) = self.pairing.take() else { continue };
-                    let device = Device { host_id: pairing.host_id.clone(), host_key: pairing.host_key, secret };
+                    let Some(pairing) = self.pairing.take() else { continue };
+                    let Some(mut device) = self.device.take() else { continue };
+                    device.host_key = pairing.host_key;
+                    self.known = None;
                     self.outputs.push(Output::SaveDevice(device.clone()));
                     self.outputs.push(Output::Post(boot::PAIRED));
                     self.device = Some(device);
@@ -580,6 +682,7 @@ impl Driver {
             End::Version => Some(Stop::Version),
             // A direct link's upgrade carries the token; nothing between can forge a refusal of it.
             End::Code(close::UNAUTHORISED) if self.direct => Some(Stop::Unauthorised),
+            End::Code(close::UNAUTHORISED) => Some(Stop::SignIn),
             // Sealed by the host itself: the one sign to forget the key on.
             End::HostRefused => {
                 if let Some(device) = self.device.take() {
@@ -600,7 +703,9 @@ impl Driver {
             _ => None,
         };
         if let Some(stop) = stop {
-            self.pairing = None;
+            if stop != Stop::SignIn {
+                self.pairing = None;
+            }
             self.retry = Retry::default();
             self.status = Status::Stopped(stop);
             return;

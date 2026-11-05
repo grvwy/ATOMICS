@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 use crate::boot::{self, ParentOrigin};
 use crate::desk;
 use crate::device::{self, Device};
-use crate::driver::{Driver, Output};
+use crate::driver::{DeviceReadError, Driver, Output};
 use crate::layout::{self, LayoutMode};
 use crate::page::{self, PageEvent};
 use crate::term_pane::{self, Overlay};
@@ -45,6 +45,8 @@ extern "C" {
     async fn save_device(host_id: &str, host_key: &str, secret: &[u8]) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch, js_name = forgetDevice)]
     async fn forget_device(host_id: &str) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = requestPersistence)]
+    async fn request_persistence() -> JsValue;
 }
 
 #[wasm_bindgen(module = "/web/terminal.js")]
@@ -104,7 +106,8 @@ enum Input {
     Open { socket: u64, protocol: String },
     Data { socket: u64, bytes: Vec<u8> },
     Closed { socket: u64, code: u16 },
-    Device(Option<Device>),
+    Device(Result<Option<Device>, DeviceReadError>),
+    Resumed { hidden_ms: u64 },
     Note(&'static str),
     Page(PageEvent),
 }
@@ -155,6 +158,7 @@ struct App {
     themed: bool,
     _listener: Closure<dyn FnMut(MessageEvent)>,
     _page: Closure<dyn FnMut(JsValue)>,
+    _visibility: Closure<dyn FnMut()>,
     /// What the overlay was last set to.
     applied: Overlay,
     /// The layout last kept in the page's storage.
@@ -223,6 +227,26 @@ impl App {
         client.palette.apply(&ctx, &BundledFonts);
         client.icon = load_icon(&ctx);
         let inbox: Inbox = Rc::default();
+        // Keep asking at boot, but a repeated denial should not produce a note on every visit.
+        wasm_bindgen_futures::spawn_local(async {
+            let _ = request_persistence().await;
+        });
+        let visibility = {
+            let (inbox, ctx) = (inbox.clone(), ctx.clone());
+            let document = window.document().expect("a document");
+            let visible = document.clone();
+            let mut hidden_at = visible.hidden().then(|| js_sys::Date::now() as u64);
+            let listener = Closure::<dyn FnMut()>::new(move || {
+                if visible.hidden() {
+                    hidden_at.get_or_insert_with(|| js_sys::Date::now() as u64);
+                } else {
+                    let hidden_ms = hidden_at.take().map_or(0, |at| (js_sys::Date::now() as u64).saturating_sub(at));
+                    push(&inbox, &ctx, Input::Resumed { hidden_ms });
+                }
+            });
+            let _ = document.add_event_listener_with_callback("visibilitychange", listener.as_ref().unchecked_ref());
+            listener
+        };
         let listener = {
             let (inbox, ctx, parent) = (inbox.clone(), ctx.clone(), parent.clone());
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -276,6 +300,7 @@ impl App {
             themed: false,
             _listener: listener,
             _page: page,
+            _visibility: visibility,
             applied: Overlay::default(),
             saved_layout: layout,
             saved_view,
@@ -377,7 +402,10 @@ impl App {
             Output::LoadDevice(host) => {
                 let (inbox, ctx) = (self.inbox.clone(), self.ctx.clone());
                 wasm_bindgen_futures::spawn_local(async move {
-                    let device = load_device(&host).await.ok().and_then(|stored| stored_device(&host, &stored));
+                    let device = match load_device(&host).await {
+                        Ok(stored) => stored_device(&host, &stored),
+                        Err(_) => Err(DeviceReadError),
+                    };
                     push(&inbox, &ctx, Input::Device(device));
                 });
             }
@@ -386,8 +414,11 @@ impl App {
                 wasm_bindgen_futures::spawn_local(async move {
                     let key = device.host_key.text();
                     if save_device(&device.host_id, &key, device.secret.as_bytes()).await.is_err() {
-                        let note = "This browser could not keep its key, so it will need pairing again next time.";
+                        let note =
+                            "This browser could not save its pairing. Reopening this page may require pairing again.";
                         push(&inbox, &ctx, Input::Note(note));
+                    } else {
+                        persistence_note(&inbox, &ctx).await;
                     }
                 });
             }
@@ -413,20 +444,39 @@ impl App {
 }
 
 /// A stored device as `device-store.js` hands it back: `{hostKey, secret}`, or null.
-fn stored_device(host_id: &str, stored: &JsValue) -> Option<Device> {
-    if stored.is_null() || stored.is_undefined() {
-        return None;
+fn stored_device(host_id: &str, stored: &JsValue) -> Result<Option<Device>, DeviceReadError> {
+    if stored.is_null() {
+        return Ok(None);
     }
-    let host_key = Reflect::get(stored, &JsValue::from_str("hostKey")).ok()?.as_string()?;
-    let secret = Reflect::get(stored, &JsValue::from_str("secret")).ok()?.dyn_into::<Uint8Array>().ok()?;
+    let host_key = Reflect::get(stored, &JsValue::from_str("hostKey")).ok().and_then(|v| v.as_string());
+    let secret = Reflect::get(stored, &JsValue::from_str("secret"))
+        .ok()
+        .and_then(|v| v.dyn_into::<Uint8Array>().ok())
+        .ok_or(DeviceReadError)?;
     let mut bytes = Zeroizing::new([0u8; KEY_BYTES]);
     let read = secret.length() as usize == KEY_BYTES;
     if read {
         secret.copy_to(&mut bytes[..]);
     }
     secret.fill(0, 0, secret.length());
-    let host_key = PublicKey::parse(&host_key)?;
-    read.then(|| Device { host_id: host_id.to_string(), host_key, secret: Secret::from_bytes(&bytes) })
+    let host_key = host_key.as_deref().and_then(PublicKey::parse).ok_or(DeviceReadError)?;
+    if !read {
+        return Err(DeviceReadError);
+    }
+    Ok(Some(Device { host_id: host_id.to_string(), host_key, secret: Secret::from_bytes(&bytes) }))
+}
+
+/// Request persistence after a pairing saves its key; boot-time requests remain silent.
+async fn persistence_note(inbox: &Inbox, ctx: &egui::Context) {
+    if request_persistence().await.as_bool() == Some(false) {
+        push(
+            inbox,
+            ctx,
+            Input::Note(
+                "This browser has not protected this site's storage from automatic cleanup. Your saved pairing can still be used.",
+            ),
+        );
+    }
 }
 
 impl eframe::App for App {
@@ -447,6 +497,7 @@ impl eframe::App for App {
                     self.driver.socket_closed(socket, code);
                 }
                 Input::Device(device) => self.driver.device_loaded(device),
+                Input::Resumed { hidden_ms } => self.driver.resumed(hidden_ms),
                 Input::Note(note) => self.driver.remote.say(note),
                 Input::Page(PageEvent::Term(input)) => self.view.term.inputs.push(input),
                 Input::Page(PageEvent::Viewport(viewport)) => self.view.viewport = viewport,

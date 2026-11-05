@@ -1112,6 +1112,9 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
         Status::Pairing { code } => padded(ui, gutter, |ui| {
             centred(ui, |ui| {
                 ui.label(RichText::new("Pairing this browser with your computer").size(18.0));
+                if let Some(reason) = driver.pairing_reason() {
+                    ui.label(RichText::new(reason).small().color(p.muted));
+                }
                 ui.add_space(16.0);
                 match code {
                     Some(code) => {
@@ -1132,6 +1135,9 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
         Status::ConfirmRepair => padded(ui, gutter, |ui| {
             centred(ui, |ui| {
                 ui.label(RichText::new("Pair this browser again?").size(18.0));
+                if let Some(reason) = driver.pairing_reason() {
+                    ui.label(RichText::new(reason).small().color(p.muted));
+                }
                 ui.add_space(16.0);
                 ui.label(
                     "This browser is already paired with this computer, under another key. Pairing again \
@@ -1153,6 +1159,18 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
         Status::Stopped(stop) => padded(ui, gutter, |ui| {
             centred(ui, |ui| {
                 ui.label(stop.message());
+                if let Some(reason) = driver.pairing_reason() {
+                    ui.label(RichText::new(reason).small().color(p.muted));
+                }
+                if matches!(
+                    stop,
+                    crate::driver::Stop::DeviceReadFailed
+                        | crate::driver::Stop::SignIn
+                        | crate::driver::Stop::NotPairedUnconfirmed
+                ) && ui.button("Try again").clicked()
+                {
+                    driver.retry_now();
+                }
             })
         }),
         _ => padded(ui, gutter, |ui| {

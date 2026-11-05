@@ -162,7 +162,7 @@ impl World {
                     }
                     Output::LoadDevice(host) => {
                         let device = self.store.get(&host).cloned();
-                        self.driver.device_loaded(device);
+                        self.driver.device_loaded(Ok(device));
                     }
                     Output::SaveDevice(device) => {
                         self.store.insert(device.host_id.clone(), device);

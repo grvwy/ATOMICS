@@ -1558,7 +1558,8 @@ pub fn management() -> FakeHost {
                 name: "A phone".into(),
                 controls: true,
                 connected: false,
-                seen_ms: 0,
+                paired_ms: 1_793_836_800_000,
+                seen_ms: 1_793_880_000_000,
             }],
             ..Default::default()
         },

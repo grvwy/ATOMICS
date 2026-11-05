@@ -13,71 +13,126 @@ const KEYS = 'keys';
 const DEVICES = 'devices';
 const SEAL = 'seal';
 
-const done = request => new Promise((resolve, reject) => {
-  request.onsuccess = () => resolve(request.result);
-  request.onerror = () => reject(request.error);
-});
-
 let opened;
+function discard(connection) {
+  if (opened === connection) opened = undefined;
+}
+
 function open() {
-  opened ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB, 1);
-    request.onupgradeneeded = () => {
-      request.result.createObjectStore(KEYS);
-      request.result.createObjectStore(DEVICES);
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
+  if (!opened) {
+    const connection = new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB, 1);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore(KEYS);
+        request.result.createObjectStore(DEVICES);
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        // A backgrounded browser may close the connection. A schema change must also let it go.
+        db.onclose = () => discard(connection);
+        db.onversionchange = () => { db.close(); discard(connection); };
+        resolve(db);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    opened = connection;
+    // An unsuccessful open must not poison every later attempt, including Try again.
+    connection.catch(() => discard(connection));
+  }
   return opened;
 }
 
-const store = (db, name, mode) => db.transaction(name, mode).objectStore(name);
-const aad = (hostId, hostKey) => new TextEncoder().encode(`atomics-device-v1\n${hostId}\n${hostKey}`);
-
-async function sealingKey(db) {
-  const kept = await done(store(db, KEYS, 'readonly').get(SEAL));
-  if (kept) return kept;
-  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-  try {
-    await done(store(db, KEYS, 'readwrite').add(key, SEAL));
-    return key;
-  } catch {
-    // Another tab made one first: use that.
-    return await done(store(db, KEYS, 'readonly').get(SEAL));
+async function withDatabase(action) {
+  for (let attempt = 0; ; attempt++) {
+    const connection = open();
+    let db;
+    try {
+      db = await connection;
+      return await action(db);
+    } catch (error) {
+      // A close can precede its event, or interrupt a transaction. Retry once with a new connection.
+      // Quota, permission, malformed records and decrypt errors stay errors, never "no device".
+      const lost = ['InvalidStateError', 'TransactionInactiveError', 'AbortError', 'UnknownError'].includes(error?.name);
+      if (!lost) throw error;
+      db?.close();
+      discard(connection);
+      if (attempt) throw error;
+    }
   }
 }
 
-// Replaces what was kept for the host. The frame calls it once the host accepted a pairing, and asks the
-// user first when that pairing names another host key than the one kept (driver.rs, ConfirmRepair).
+function transact(db, name, mode, action) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(name, mode);
+    const request = action(tx.objectStore(name));
+    let result;
+    request.onsuccess = () => { result = request.result; };
+    request.onerror = () => reject(request.error);
+    // A request's success is not a committed write: an interrupted transaction may still abort.
+    tx.oncomplete = () => resolve(result);
+    tx.onabort = () => reject(tx.error ?? new DOMException('Storage transaction interrupted', 'AbortError'));
+  });
+}
+
+const aad = (hostId, hostKey) => new TextEncoder().encode(`atomics-device-v1\n${hostId}\n${hostKey}`);
+
+async function sealingKey(db) {
+  const kept = await transact(db, KEYS, 'readonly', s => s.get(SEAL));
+  if (kept) return kept;
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  try {
+    await transact(db, KEYS, 'readwrite', s => s.add(key, SEAL));
+    return key;
+  } catch (error) {
+    if (error?.name !== 'ConstraintError') throw error;
+    // Another tab made one first: use that.
+    const kept = await transact(db, KEYS, 'readonly', s => s.get(SEAL));
+    if (!kept) throw new Error('The storage sealing key could not be read');
+    return kept;
+  }
+}
+
+// Best effort, at every boot as well as after saving. A denied request is shown to the user; it must
+// neither block a stored key's use nor turn a committed save into a failure. null means unsupported.
+export async function requestPersistence() {
+  try {
+    if (!navigator.storage?.persist) return null;
+    return await navigator.storage.persist();
+  } catch {
+    return false;
+  }
+}
+
+// Replaces what was kept for the host only once the host accepted a pairing. The driver reuses an
+// existing device key and asks first when the pairing names a different host key (ConfirmRepair).
 export async function saveDevice(hostId, hostKey, secret) {
   // The caller's bytes are a view of wasm memory: copy them before anything waits.
   const plain = Uint8Array.from(secret);
   try {
-    const db = await open();
-    const key = await sealingKey(db);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const sealed = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad(hostId, hostKey) }, key, plain);
-    await done(store(db, DEVICES, 'readwrite').put({ v: 1, hostKey, iv, sealed, pairedAt: Date.now() }, hostId));
-    // Ask the browser to keep this origin's storage when it clears unused sites' storage.
-    await navigator.storage?.persist?.();
+    await withDatabase(async db => {
+      const key = await sealingKey(db);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const sealed = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad(hostId, hostKey) }, key, plain);
+      await transact(db, DEVICES, 'readwrite', s => s.put({ v: 1, hostKey, iv, sealed, pairedAt: Date.now() }, hostId));
+    });
   } finally {
     plain.fill(0);
   }
 }
 
 export async function loadDevice(hostId) {
-  const db = await open();
-  const record = await done(store(db, DEVICES, 'readonly').get(hostId));
-  if (!record || record.v !== 1) return null;
-  const key = await done(store(db, KEYS, 'readonly').get(SEAL));
-  if (!key) return null;
-  const plain = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: record.iv, additionalData: aad(hostId, record.hostKey) }, key, record.sealed);
-  return { hostKey: record.hostKey, secret: new Uint8Array(plain) };
+  return withDatabase(async db => {
+    const record = await transact(db, DEVICES, 'readonly', s => s.get(hostId));
+    if (record === undefined) return null;
+    if (record?.v !== 1) throw new Error('The stored device could not be read');
+    const key = await transact(db, KEYS, 'readonly', s => s.get(SEAL));
+    if (!key) throw new Error('The storage sealing key could not be read');
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: record.iv, additionalData: aad(hostId, record.hostKey) }, key, record.sealed);
+    return { hostKey: record.hostKey, secret: new Uint8Array(plain) };
+  });
 }
 
 export async function forgetDevice(hostId) {
-  const db = await open();
-  await done(store(db, DEVICES, 'readwrite').delete(hostId));
+  await withDatabase(db => transact(db, DEVICES, 'readwrite', s => s.delete(hostId)));
 }

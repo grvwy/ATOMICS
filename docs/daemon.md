@@ -805,8 +805,8 @@ a launcher).
 - **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop
   reading, and the host then treats it as the slow client it is (a fresh snapshot, or a drop and a reconnect),
   rather than the window holding an unbounded backlog.
-- **When waiting cannot help, it stops and says why**: a refused token ("pair this window again"; the VM's window
-  asks whether to, with **Pair again**), or a host of another major version (a frame it cannot decode as such, or
+- **When waiting cannot help, it stops and says why**: a refused token (Try again reads the current token; the
+  VM's window also asks whether to pair anew, with **Pair again**), or a host of another major version (a frame it cannot decode as such, or
   the host's `unsupported_version` refusal of the `hello`). Anything else, a host that is not there included, is a
   drop it dials again after.
 - **Tests.** `app::client_tests` runs the real host in process with its protocol server and the client's own
@@ -936,8 +936,9 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   channel with `refused`. The prologue is `atomics-noise-v1`, `atomics.v1`, the protocol major and the host id, one
   per line.
 - **The allowlist** is `devices.json` in the ATOMICS home (0600, written atomically): each device's public key,
-  name, access, and when it paired and was last seen. Remote devices lists them, with "connected" while a session
-  is open; "Revoke…" asks once, removes the device and ends its sessions at once with the sealed refusal and
+  name, access, and when it paired and was last seen. Remote devices lists both dates in UTC, with "connected"
+  while a session is open; an older host that omits the paired date shows "unknown". "Revoke…" asks once,
+  removes the device and ends its sessions at once with the sealed refusal and
   `not_paired`. A host the service revoked (4403) stops, and withdraws an open pairing link. `atomics ctl '{"cmd":"remote"}'` adds `paired`:
   the pairing's stage and the devices (no keys, links or secrets).
 - **The browser's half** is `atomics_core::noise` (wasm32-safe, `getrandom`'s `wasm_js` backend): `Pairing::read`,
@@ -1067,22 +1068,71 @@ the frame did not ask for is dropped.
 
 **Dialing.** `new WebSocket(broker, ['atomics.rendezvous.v1', 'atomics.ticket.<ticket>'])`, binary messages, each a
 bare tunnel body; the broker must answer `atomics.rendezvous.v1` or the frame closes the socket. Each ticket is
-used once. Then the Noise channel (H5b): on a pairing boot the frame makes a fresh device key, pairs with
+used once. Then the Noise channel (H5b): on a pairing boot the frame first reads storage and reuses the device
+key it holds for this host, making a fresh key only after a successful read finds none. It pairs with
 `Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the six-digit code until the host
 answers, and on `paired` keeps the key and posts `atomics.paired`; the channel goes on as the session. When the
 boot names a host this browser already holds another host key for, the frame first asks "Pair this browser
 again?": pairing replaces that key once the host accepts the device, and "Keep the current pairing" connects with
-the key it holds. The same host key needs no question, since only that host can answer the link. Otherwise it
+the key it holds. Confirming the changed host key also reuses the device key; only the trusted host key is
+replaced after acceptance. The same host key needs no question, since only that host can answer the link. Otherwise it
 loads the key it holds for `host_id` and dials `Noise_IK`; with none it asks to pair from the host's Remote devices.
 
 **The device key** is kept per host in the client origin's IndexedDB (`web/device-store.js`): the host's key and
-the device key sealed with AES-GCM under a WebCrypto key made non-extractable, with `navigator.storage.persist()`
-asked for. A copy of the database is ciphertext, but script on the client's origin can use the sealing key, which
-is why the client gets an origin of its own (design §4.2, §6.2).
+the device key sealed with AES-GCM under a WebCrypto key made non-extractable. `navigator.storage.persist()` is
+asked for at every boot and after saving; refusal is reported only just after a pairing saves its key, without
+blocking use of the saved key. Boot-time requests remain silent. This is a
+best-effort request, not a guarantee against eviction, private browsing, or the user clearing site data. A copy
+of the database is ciphertext, but script on the client's origin can use the sealing key, which is why the
+client gets an origin of its own (design §4.2, §6.2). Nothing stores the raw device key in localStorage or sends
+it to the hosting page or a server.
+
+A closed or interrupted IndexedDB connection is discarded and the operation retried once on a new connection;
+failed opens are not cached, and writes wait for transaction completion. Only an absent device record means
+"no key". A failed read, malformed record, missing sealing key or failed decryption says "could not read the
+stored key" and offers **Try again**. It never starts pairing or replaces or deletes the record. A retry reads
+storage again, including when the frame was booted with a pairing link.
+
+**Why pairing or recovery appears.** The frame shows a short reason without key material:
+
+The hosting page can also show its pairing route without consulting the device store: an explicit Pair this
+device action, opening a pairing link, returning through history, or reloading that route. A consumed link's
+fragment is gone after reload. A sign-in redirect can return to the pairing route without its fragment too;
+password/code sign-in that stays on the document can retain the link in memory. These are navigation or link
+recovery paths, not evidence that a saved device key was lost. Opening a system Camera link can select a
+different browser storage context from the installed app; scan or paste inside the intended app. Launching
+the installed app's home page or opening the ordinary hosts page does not itself request pairing. The hosting
+page must label an expired session as a sign-in problem; the frame cannot diagnose a session response it never
+receives.
+
+| Path | Meaning and retained state |
+| --- | --- |
+| Successful read finds no record for this host | No key stored in this origin and browser storage context. First use, cleared or evicted storage, a different profile, origin or storage partition can look alike; the client cannot infer which happened. |
+| Storage open, read or decryption fails | A false loss: storage is unreadable, not evidence of an absent key. Try again; no pairing or replacement. |
+| The hosting page explicitly boots a pairing link | A requested pairing, not evidence of a lost key. Reuse a readable device key; the host still compares the codes. |
+| A pairing link names a different host key | Ask before replacing the trusted host key. Keep the existing device key and record until acceptance. |
+| A session handshake answer does not authenticate | Host-key mismatch warning; keep the saved pairing. |
+| The host's encrypted `not_paired` refusal | The host no longer trusts this key. This alone deletes the stored device and asks for pairing again. |
+| A bare `not_paired` close | Unconfirmed refusal through the broker; keep the key and offer Try again. |
+| `no_pairing`, refused or failed pairing, or disconnect during code comparison | The requested pairing failed or its link expired. This does not remove a previously saved key. |
+| `unauthorised` (4401) from the broker | Sign in again on the hosting page, then Try again for a fresh ticket. Keep the device key; this is not a pairing loss. |
+| `revoked` (4403) | The host registration was revoked, not the browser pairing. Keep the device key. |
+| Missing parent configuration, unavailable randomness, or incompatible protocol version | Setup/start/version error; keep any saved key. |
+| Ordinary disconnect, host offline, expired pass/ticket without a typed refusal, quota or failed transport decryption | Reconnect with a fresh ticket; keep the key. No pairing screen. |
+
+If storage really is gone on a phone, recommend a hosting-page shortcut to its existing scanner, keeping the
+selected host and returning directly to its pairing page after sign-in. It should use a fresh, short-lived link
+from Remote devices and retain host-side code comparison. This is a recommendation only; no shortcut or
+alternative authentication mechanism is implemented here. An installed app and a browser may have separate
+storage contexts, so recovery should return to the same one.
 
 **Reconnecting.** A drop waits 1 s, doubling to 30 s with jitter (60 s after `quota`), and starts over once a
 channel stayed up 30 s; each try asks the parent for a fresh ticket, then says `hello` with the epoch and cursor
-the board holds, so the host replays what was missed or sends a snapshot. A gap in the events asks for one
+the board holds, so the host replays what was missed or sends a snapshot. When `visibilitychange` says the page
+is visible again, a live session keeps its socket, screen and typing lease if it was hidden for less than 30 s.
+After at least 30 s hidden it closes the potentially stale socket and requests a fresh ticket. An ordinary
+session already disconnected still retries at once, even after a short tab switch.
+It does not interrupt code comparison or restart after a host-key mismatch or host refusal. A gap in the events asks for one
 `resync`. Operations still unanswered are sent again with the same IDs while younger than `op_ttl_secs`; older
 ones say to check the board. At most 64 wait (`max_pending_ops`); past that the browser refuses new ones until
 some are answered. A transport message that fails to decrypt ends the channel, and the frame dials again. While
@@ -1090,7 +1140,7 @@ pairing, `pairing_busy` (another device is pairing) is tried again with the same
 five minutes are up, counted from when the page got it (`pair.age_ms`). It stops for good on `no_pairing` at once
 ("This pairing link was used or has expired. Show a new code on the computer."), on `pairing_busy` once the link's
 time is up, on the host's sealed refusal (and forgets the key), a bare `not_paired` close (it keeps the key),
-`revoked`, a refused or failed pairing, a drop while the codes are being compared, or a handshake answer that does
+`revoked`, `unauthorised` (asking to sign in, with Try again), a refused or failed pairing, a drop while the codes are being compared, or a handshake answer that does
 not authenticate (the host's key is not the one this browser paired with).
 
 **What it offers.** What the desktop offers wherever `atomics.v1` can carry it, asked for in `hello` with `board`,
@@ -1249,6 +1299,12 @@ button takes the keyboard off it, and without the renew the host ended the lease
 (`src/fake_host.rs`, whose terminals echo under leases): pairing, the channel and reconnecting; each command as a
 controller, a viewer and offline, with what it sends and what comes of it; leases, typing and gestures; and the views
 drawn headless in both layouts.
+
+The quick `device_store_recovers_connections_and_preserves_unreadable_keys` browser test needs Chrome but no
+built bundle: `cargo test -p atomics-web --test browser device_store -- --ignored`. It uses the source module,
+real IndexedDB and WebCrypto, and injected connection, transaction, read and persistence failures. Native
+driver and view tests also check that an unreadable key offers Try again without pairing, and that a requested
+pairing reuses the stored device key.
 
 `tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker, in a desktop
 window and as an iPhone used by touch alone. Its header says what each test drives. The tests click and tap where the
