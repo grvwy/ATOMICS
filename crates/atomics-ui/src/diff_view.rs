@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use atomics_core::diff::{DiffLine, FileStatus, LineKind, SplitRow, split_rows};
+use atomics_core::diff::{DiffLine, FileDiff, FileStatus, LineKind, SplitRow, split_rows};
 use atomics_core::diff_data::Span;
 use atomics_core::files::{self, Dir};
 use atomics_core::layout::DiffSplit;
@@ -32,6 +32,8 @@ pub struct DiffState {
     /// The line at the top of the diff and whether it was side by side, to keep the place
     /// when that changes.
     top: Option<((usize, usize, usize), bool)>,
+    /// The row at the top of the diff, to hold it there when the diff changes.
+    place: Option<Place>,
     /// A whole file shown instead of the diff.
     pub viewing: Option<String>,
     pub file: Option<Arc<FileView>>,
@@ -40,6 +42,53 @@ pub struct DiffState {
     pub focused: Option<String>,
     /// Long lines run on to the right, to scroll to, where a phone would wrap them.
     pub unwrapped: bool,
+}
+
+/// Where the view stands in the diff, by file path and line: rows come and go above it as the worktree changes.
+struct Place {
+    path: String,
+    /// Which file that was, for when it is gone: the one that took its place stands in for it.
+    file: usize,
+    /// The nearest row at or above the top that belongs to the file itself ([`Row::key`]).
+    key: (usize, usize),
+    /// The rows from that one to the top, which hang under its line.
+    past: usize,
+    /// Points of the top row scrolled past.
+    within: f32,
+    /// The rows of the whole diff.
+    rows: usize,
+}
+
+impl Place {
+    /// The place at scroll `offset`.
+    fn at(offset: f32, top: usize, files: &[FileDiff], file_rows: &[usize], rows: &[Row], row_h: f32) -> Self {
+        let file = file_rows.partition_point(|&row| row <= top) - 1;
+        let first = file_rows[file];
+        let own = rows[first..=top].iter().rposition(|row| row.key().is_some()).unwrap_or(0);
+        Place {
+            path: files[file].path().to_string(),
+            file,
+            key: rows[first + own].key().unwrap_or_default(),
+            past: top - first - own,
+            within: offset - top as f32 * row_h,
+            rows: rows.len(),
+        }
+    }
+
+    /// The scroll offset that shows this place in a diff of `rows`, whose files start at `file_rows`.
+    fn offset(&self, files: &[FileDiff], file_rows: &[usize], rows: &[Row], row_h: f32) -> f32 {
+        let Some(file) = files.iter().position(|file| file.path() == self.path) else {
+            return file_rows[self.file.min(file_rows.len() - 1)] as f32 * row_h;
+        };
+        let first = file_rows[file];
+        let own = &rows[first..file_rows.get(file + 1).copied().unwrap_or(rows.len())];
+        // That line, or in a file that changed the nearest one before it.
+        let at = own
+            .iter()
+            .position(|row| row.key() == Some(self.key))
+            .unwrap_or_else(|| own.iter().rposition(|row| row.key().is_some_and(|key| key <= self.key)).unwrap_or(0));
+        ((first + (at + self.past).min(own.len() - 1)) as f32 * row_h + self.within).max(0.0)
+    }
 }
 
 /// The explorer of one project: the main checkout's files, with the changes of the
@@ -105,6 +154,18 @@ struct Editor {
     anchor: Anchor,
     text: String,
     focus: bool,
+    /// A press elsewhere took the focus of this empty box: it closes when the press is over.
+    leaving: bool,
+}
+
+/// Closes the box after `cancel`. Not while a press goes on, or the rows would move under it: what is released on
+/// has to be what was pressed.
+fn close_editor(ui: &egui::Ui, state: &mut DiffState, cancel: bool) {
+    let Some(editor) = state.editor.as_mut() else { return };
+    editor.leaving |= cancel;
+    if editor.leaving && !ui.input(|i| i.pointer.any_down()) {
+        state.editor = None;
+    }
 }
 
 pub enum DiffAction {
@@ -140,7 +201,7 @@ impl DiffState {
             hunks.filter_map(move |(hi, hunk)| hunk.lines.iter().position(on_it).map(|li| Anchor::Diff(fi, hi, li)))
         });
         let Some(anchor) = anchors.next() else { return false };
-        self.editor = Some(Editor { anchor, text: comment.body.clone(), focus });
+        self.editor = Some(Editor { anchor, text: comment.body.clone(), focus, leaving: false });
         true
     }
 
@@ -255,6 +316,18 @@ impl Row {
         match *self {
             Row::Line(fi, hi, li) | Row::Wrap(fi, hi, li, _) => Some((fi, hi, li)),
             Row::Pair(fi, hi, pair) => pair.new.or(pair.old).map(|li| (fi, hi, li)),
+            _ => None,
+        }
+    }
+
+    /// Where a row of the file's own stands in it: its hunk and line, each from 1, with 0 for what comes before
+    /// the first. `None` for what hangs under a line.
+    fn key(&self) -> Option<(usize, usize)> {
+        match *self {
+            Row::File(_) => Some((0, 0)),
+            Row::Hunk(_, hi) => Some((hi + 1, 0)),
+            Row::Line(_, hi, li) => Some((hi + 1, li + 1)),
+            Row::Pair(_, hi, pair) => pair.new.or(pair.old).map(|li| (hi + 1, li + 1)),
             _ => None,
         }
     }
@@ -475,9 +548,13 @@ pub fn show(
     };
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("diff-rows", header.title)));
     let before = egui::scroll_area::State::load(ui.ctx(), scroll_id).map(|s| s.clamped_offset().y).unwrap_or_default();
-    if let Some(offset) =
-        keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump.map(|row| row as f32 * row_h))
-    {
+    // Unless asked to go elsewhere, the view stays with its rows, wherever the diff has moved them to.
+    let jump = jump.map(|row| row as f32 * row_h).or_else(|| {
+        let held = state.place.as_ref()?.offset(&diff.files, &file_rows, &rows, row_h);
+        ((held - before).abs() >= 0.5).then_some(held)
+    });
+    let resized = state.place.as_ref().is_some_and(|place| place.rows != rows.len());
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump) {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
@@ -642,7 +719,12 @@ pub fn show(
                                 let removed = diff.files[fi].hunks[hi].lines[li].kind == LineKind::Removed;
                                 (side(!removed), side_gutter)
                             }
-                            _ => (rect, gutter),
+                            // On screen however far the code is scrolled, or typing would scroll it back.
+                            _ => (
+                                rect.with_min_x(rect.left().max(view.left() + char_w - gutter))
+                                    .with_max_x(view.right()),
+                                gutter,
+                            ),
                         };
                         let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font, can_review);
                         commit_editor |= commit;
@@ -658,18 +740,24 @@ pub fn show(
         top
     });
     state.top = shown.inner.map(|line| (line, split));
-    if jump.is_none() && shown.state.clamped_offset().y != before {
-        // Use the viewport's top row, rather than the virtualizer's extra visible lines.
-        let top = (shown.state.clamped_offset().y / row_h) as usize;
-        if let Some((fi, hi)) = rows[..=top.min(rows.len() - 1)].iter().rev().find_map(|row| match *row {
+    let offset = shown.state.clamped_offset().y;
+    // Use the viewport's top row, rather than the virtualizer's extra visible lines. A jump lands right on a row, which
+    // rounding must not make the row before it: that could be another file's.
+    let top = (((offset + 0.01) / row_h) as usize).min(rows.len() - 1);
+    // A diff that shrank under the view moves it too; only the user's own scrolling changes the file in focus.
+    if jump.is_none()
+        && !resized
+        && offset != before
+        && let Some((fi, hi)) = rows[..=top].iter().rev().find_map(|row| match *row {
             Row::File(fi) => Some((fi, None)),
             Row::Hunk(fi, hi) => Some((fi, Some(hi))),
             _ => row.line().map(|(fi, hi, _)| (fi, Some(hi))),
-        }) {
-            state.focused = Some(diff.files[fi].path().to_string());
-            state.hunk = hi;
-        }
+        })
+    {
+        state.focused = Some(diff.files[fi].path().to_string());
+        state.hunk = hi;
     }
+    state.place = Some(Place::at(offset, top, &diff.files, &file_rows, &rows, row_h));
 
     if let Some(path) = toggle
         && !state.collapsed.remove(&path)
@@ -695,15 +783,20 @@ pub fn show(
                 body: editor.text.trim().to_string(),
             });
         }
-    } else if cancel_editor {
-        state.editor = None;
+    } else {
+        close_editor(ui, state, cancel_editor);
     }
     if let Some((path, line)) = edit_line {
         state.editor = None;
         return DiffAction::Edit { path: Some(path), line };
     }
     if let Some((fi, hi, li)) = clicked_line {
-        state.editor = Some(Editor { anchor: Anchor::Diff(fi, hi, li), text: String::new(), focus: true });
+        state.editor =
+            Some(Editor { anchor: Anchor::Diff(fi, hi, li), text: String::new(), focus: true, leaving: false });
+        // The line stays under the pointer, whichever box above it this one replaces.
+        if let Some(row) = rows.iter().position(|row| row.shows((fi, hi, li))) {
+            state.place = Some(Place::at(offset, row, &diff.files, &file_rows, &rows, row_h));
+        }
     }
     action
 }
@@ -951,15 +1044,15 @@ fn show_file(
             excerpt: file.lines[i].clone(),
             body: editor.text.trim().to_string(),
         });
-    } else if cancel {
-        state.editor = None;
+    } else {
+        close_editor(ui, state, cancel);
     }
     if let Some(i) = double_clicked {
         state.editor = None;
         return Some(i as u32 + 1);
     }
     if let Some(i) = clicked {
-        state.editor = Some(Editor { anchor: Anchor::File(i), text: String::new(), focus: true });
+        state.editor = Some(Editor { anchor: Anchor::File(i), text: String::new(), focus: true, leaving: false });
     }
     None
 }
@@ -1457,10 +1550,37 @@ mod tests {
     }
 
     #[test]
+    fn a_place_finds_its_own_row_again_side_by_side_too() {
+        let line = |kind, old_no, new_no| DiffLine { kind, old_no, new_no, text: "x".into(), emphasis: Vec::new() };
+        let lines = vec![
+            line(LineKind::Context, Some(1), Some(1)),
+            line(LineKind::Removed, Some(2), None),
+            line(LineKind::Removed, Some(3), None),
+            line(LineKind::Removed, Some(4), None),
+            line(LineKind::Added, None, Some(2)),
+            line(LineKind::Added, None, Some(3)),
+            line(LineKind::Context, Some(5), Some(4)),
+        ];
+        let files = [FileDiff::untracked("a.rs".to_string(), "a\n")];
+        let unified = (0..lines.len()).map(|li| Row::Line(0, 0, li));
+        let split = split_rows(&lines).into_iter().map(|pair| Row::Pair(0, 0, pair));
+        let head = [Row::File(0), Row::Hunk(0, 0)];
+        let layouts = [head.into_iter().chain(unified).collect::<Vec<_>>(), head.into_iter().chain(split).collect()];
+        for rows in layouts {
+            for top in 0..rows.len() {
+                let offset = top as f32 * 10.0;
+                let place = Place::at(offset, top, &files, &[0], &rows, 10.0);
+                assert_eq!(place.offset(&files, &[0], &rows, 10.0), offset, "row {top} of {} holds still", rows.len());
+            }
+        }
+    }
+
+    #[test]
     fn a_comment_box_keeps_the_keyboard_and_its_draft_until_the_comment_can_go() {
         let ctx = egui::Context::default();
         let mut state = state_with(&["a.rs"]);
-        state.editor = Some(Editor { anchor: Anchor::Diff(0, 0, 0), text: "draft".into(), focus: true });
+        state.editor =
+            Some(Editor { anchor: Anchor::Diff(0, 0, 0), text: "draft".into(), focus: true, leaving: false });
         let palette = crate::Client::default().palette;
         let font = palette.mono(13.0);
         let enter = egui::Event::Key {

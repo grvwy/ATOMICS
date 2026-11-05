@@ -72,6 +72,9 @@
 //! plain Ctrl+D still reaches the terminal. `shift_arrows_and_page_keys_walk_the_diff`: from a terminal, Shift+↓ walks
 //! the changed files, and PageDown the hunks once the diff has the keyboard. DevTools' keys skip the browser's own
 //! shortcuts, so whether a tab would have switched was checked by hand with real X11 keys (docs/navigation.md).
+//! `an_update_and_a_click_leave_the_diff_where_it_is`: at the Nth file, a new revision swaps the bodies with nothing
+//! moving, Shift+↓ goes on from that file, a click opens the comment box under the line clicked, and Ctrl+N still
+//! reaches the Nth agent from there.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -1533,6 +1536,8 @@ struct Opened {
     /// What the client draws with.
     palette: Palette,
     line: Arc<Line>,
+    /// What the broker sends the browser next: what the host publishes on its own.
+    pending: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
@@ -1560,7 +1565,8 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
     let line = Arc::new(Line::default());
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), line.clone(), Arc::default());
+    let pending = Arc::default();
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), line.clone(), Arc::clone(&pending));
 
     let scale = if touch { PHONE_SCALE } else { 1.0 };
     let mut flags = vec![
@@ -1601,7 +1607,7 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
     let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
     let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
     let palette = Palette::new(&booted.theme_tokens(), Fonts::default());
-    Opened { host, log, _browser: browser, page, frame, palette, line }
+    Opened { host, log, _browser: browser, page, frame, palette, line, pending }
 }
 
 /// The input is on the terminal, and has the focus.
@@ -2859,4 +2865,147 @@ fn a_phone_acts_by_touch() {
     keep(&mut page, "phone-history-plan");
     assert_eq!(host.lock().unwrap().received.len(), before, "nothing went to the host");
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
+}
+
+/// The height of a row of the diff in the bundle's font, in CSS pixels.
+const DIFF_ROW: f32 = 17.53;
+
+/// A worktree of eight files short enough that several show at once, each of its own length to tell them apart.
+fn eight_files(board: &mut FakeHost) {
+    let template = board.board.diffs[0].files[0].clone();
+    let name = |i: usize| format!("src/f{i}.rs");
+    board.board.diffs[0].files = (0..8)
+        .map(|i| atomics_core::projection::DiffFileSummary {
+            old_path: Some(name(i)),
+            new_path: Some(name(i)),
+            ..template.clone()
+        })
+        .collect();
+    for i in 0..8 {
+        let file = fake_host::file_diff(&name(i), 12 + 2 * i as u32);
+        board.files.insert((fake_host::WORKTREE.into(), name(i)), file);
+    }
+}
+
+/// Which of [`eight_files`] shows at the top, by how far its added lines are from the next file's: its own, its next
+/// file's header, hunk header and context line.
+fn top_file(bands: &[i32]) -> i32 {
+    let rows = (bands[1] - bands[0]) as f32 / DIFF_ROW;
+    ((rows.round() as i32) - 3 - 12) / 2
+}
+
+/// The tops of the added lines' bands on the diff's half of the screen, from the top. A hovered line is a gap in one.
+fn band_tops(page: &mut DevTools, palette: &Palette) -> Vec<i32> {
+    let region = Rect::from_min_max(pos2(WIDE.0 / 2.0, 90.0), pos2(WIDE.0, WIDE.1 - 40.0));
+    let (tops, _) = until_on(page, WIDE, &actions_dir(), "the added diff lines", |page| {
+        let mut bands: Vec<_> = boxes(page, palette.added, 2, region, 1000.0)
+            .into_iter()
+            .filter(|r| r.width() > 200.0 && r.height() > 10.0)
+            .collect();
+        bands.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        (!bands.is_empty()).then(|| bands.iter().map(|band| band.top().round() as i32).collect::<Vec<_>>())
+    });
+    tops
+}
+
+/// The bands stand where they stood. egui rounds the top of what scrolls to a whole pixel, so a row whose index changed
+/// can stand a pixel off.
+#[track_caller]
+fn same_bands(now: &[i32], then: &[i32], when: &str) {
+    let same = now.len() == then.len() && now.iter().zip(then).all(|(a, b)| (a - b).abs() <= 1);
+    assert!(same, "{when}: {now:?}, {then:?} before");
+}
+
+/// A press and a release some frames apart, as a person's.
+fn slow_click(page: &mut DevTools, at: (f64, f64)) {
+    page.mouse("mouseMoved", at);
+    thread::sleep(Duration::from_millis(100));
+    page.mouse("mousePressed", at);
+    thread::sleep(Duration::from_millis(150));
+    page.mouse("mouseReleased", at);
+    thread::sleep(Duration::from_millis(300));
+}
+
+/// How many diff requests the host got for `file`.
+fn diff_asks(host: &FakeHost, file: &str) -> usize {
+    host.received.iter().filter(|m| matches!(m, Message::DiffGet { path, .. } if path == file)).count()
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn an_update_and_a_click_leave_the_diff_where_it_is() {
+    let mut board = fake_host::working();
+    eight_files(&mut board);
+    agent_with_a_diff(&mut board, "s2", "Agent two", "src/two.rs");
+    let Opened { host, log, _browser, mut page, mut frame, palette, pending, .. } = open(board, WIDE, false);
+    log.wait("hello new", 1);
+    at_the_first_terminal(&mut frame, &mut page, &log);
+
+    // Shift+↓ brings the diff up, and a few more walk it down.
+    page.chord(8, "ArrowDown", "ArrowDown", 40);
+    frame.wait("the keyboard on the canvas", ON_THE_CANVAS);
+    wait_host(&host, "every file asked for", |h| (0..8).all(|i| diff_asks(h, &format!("src/f{i}.rs")) >= 1));
+    thread::sleep(Duration::from_millis(600));
+    for _ in 0..4 {
+        page.chord(8, "ArrowDown", "ArrowDown", 40);
+        thread::sleep(Duration::from_millis(250));
+    }
+    let bands = band_tops(&mut page, &palette);
+    let file = top_file(&bands);
+    keep(&mut page, "place-after-walking");
+    assert!(file >= 2, "well into the diff: {bands:?}");
+
+    // The file right above it grows on the host and the others stay the same: the refresh moves nothing on screen.
+    {
+        let mut host = host.lock().unwrap();
+        let above = format!("src/f{}.rs", file - 1);
+        let grown = fake_host::file_diff(&above, 60);
+        host.files.insert((fake_host::WORKTREE.into(), above), grown);
+        let at = host.board.diffs.iter().position(|d| d.worktree == fake_host::WORKTREE).expect("the diff");
+        let mut summary = host.board.diffs[at].clone();
+        summary.revision += 1;
+        let frames = host.event(|cursor| Message::DiffSummary { cursor, summary });
+        pending.lock().unwrap().extend(frames);
+    }
+    for frame in 0..10 {
+        same_bands(&band_tops(&mut page, &palette), &bands, &format!("while the files are read again, shot {frame}"));
+    }
+    wait_host(&host, "every file asked for again", |h| (0..8).all(|i| diff_asks(h, &format!("src/f{i}.rs")) >= 2));
+    thread::sleep(Duration::from_millis(400));
+    same_bands(&band_tops(&mut page, &palette), &bands, "with the new bodies in");
+    keep(&mut page, "place-after-the-update");
+
+    // Shift+↓ goes on from that file, not from the first.
+    page.chord(8, "ArrowDown", "ArrowDown", 40);
+    thread::sleep(Duration::from_millis(300));
+    let bands = band_tops(&mut page, &palette);
+    assert_eq!(top_file(&bands), file + 1, "the next file: {bands:?}");
+
+    // A click on a line: what is above it stays, and the comment box opens under it.
+    let row = f64::from(DIFF_ROW);
+    let line = f64::from(bands[0]) + row * 2.5;
+    slow_click(&mut page, (1300.0, line));
+    let clicked = band_tops(&mut page, &palette);
+    keep(&mut page, "place-after-a-click");
+    assert_eq!(clicked[0], bands[0], "nothing above the line moves: {clicked:?}");
+    let under = |tops: &[i32], line: f64| tops.iter().find(|&&top| f64::from(top) > line).copied().map(f64::from);
+    let box_under = line - row / 2.0 + row * 2.0;
+    assert!(under(&clicked, line).is_some_and(|top| (top - box_under).abs() < 3.0), "{clicked:?}, clicked at {line}");
+
+    // A click on a line below the empty box: it gets the box, and it is the line still under the pointer.
+    let line = under(&clicked, line).expect("the lines under the box") + row * 2.5;
+    slow_click(&mut page, (1300.0, line));
+    let moved = band_tops(&mut page, &palette);
+    keep(&mut page, "place-after-a-second-click");
+    let box_under = line - row / 2.0 + row * 2.0;
+    assert!(under(&moved, line).is_some_and(|top| (top - box_under).abs() < 3.0), "{moved:?}, clicked at {line}");
+
+    // Ctrl+N from the box: the Nth agent's diff, the keyboard with it, and no byte in a terminal.
+    page.chord(2, "2", "Digit2", 50);
+    wait_host(&host, "the second agent's diff", |h| diff_asked(h, "/w/s2"));
+    frame.wait("the keyboard on the canvas", ON_THE_CANVAS);
+    keep(&mut page, "place-ctrl-2");
+    for session in ["s1", "s2"] {
+        assert_eq!(typed(&host, session), "", "{session}: no byte");
+    }
 }

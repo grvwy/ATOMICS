@@ -1330,3 +1330,172 @@ fn machine_follows_the_open_panel_and_resubscribes_after_reconnect() {
     assert!(!viewer.machine_available());
     assert!(viewer.take_outgoing().is_empty());
 }
+
+/// The worktree's diff moves on to `revision`, with `files` in it.
+fn new_revision(remote: &RemoteBackend, cursor: u64, revision: u64, files: &[&str]) {
+    let mut summary = fake_host::board().diffs.remove(0);
+    let file = summary.files[0].clone();
+    summary.revision = revision;
+    summary.files = files
+        .iter()
+        .map(|path| DiffFileSummary {
+            old_path: Some(path.to_string()),
+            new_path: Some(path.to_string()),
+            ..file.clone()
+        })
+        .collect();
+    remote.receive(Envelope::host(EPOCH, Message::DiffSummary { cursor: Seq(cursor), summary }));
+}
+
+/// The diff requests `remote` has for the host: each one's request, path, revision and offset.
+fn diff_asks(remote: &RemoteBackend) -> Vec<(Option<String>, String, u64, Option<u32>)> {
+    let sent = remote.take_outgoing();
+    sent.into_iter()
+        .filter_map(|envelope| match envelope.message {
+            Message::DiffGet { path, revision, offset, .. } => {
+                Some((envelope.request_id, path, revision.unwrap().0, offset))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The host answers a request with `lines` lines of `path`, with more to come from `next_offset`.
+fn answer(
+    remote: &RemoteBackend,
+    request: &Option<String>,
+    path: &str,
+    revision: u64,
+    lines: u32,
+    next_offset: Option<u32>,
+) {
+    let body = DiffFileBody { worktree: WORKTREE.into(), revision, file: fake_host::file_diff(path, lines) };
+    let message = Message::DiffFile { body, truncated: next_offset.is_some(), next_offset };
+    remote.receive(Envelope::host(EPOCH, message).reply_to(request.clone()));
+}
+
+/// The lines the diff shows of `path`, and whether it shows that file at all.
+fn lines_shown(remote: &RemoteBackend, path: &str) -> Option<usize> {
+    let snapshot = remote.diff(Path::new(WORKTREE)).expect("the diff");
+    let prepared = snapshot.prepared.expect("the diff's rows");
+    let file = prepared.diff.files.iter().find(|file| file.path() == path)?;
+    Some(file.hunks.iter().map(|hunk| hunk.lines.len()).sum())
+}
+
+/// The fake board's worktree with its files read: a.rs of 6 lines and a context line, b.rs of 40.
+fn diff_read() -> RemoteBackend {
+    let remote = connected(Role::Controller);
+    remote.want_diff(Path::new(WORKTREE));
+    for (request, path, revision, _) in diff_asks(&remote) {
+        answer(&remote, &request, &path, revision, if path == "src/a.rs" { 6 } else { 40 }, None);
+    }
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7));
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(41));
+    remote.take_outgoing();
+    remote
+}
+
+#[test]
+fn a_new_revision_keeps_each_file_on_screen_until_its_new_body_is_whole() {
+    let remote = diff_read();
+    new_revision(&remote, 4, 5, &["src/a.rs", "src/b.rs"]);
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7), "the diff does not empty");
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(41));
+    let asks = diff_asks(&remote);
+    assert_eq!(
+        asks.iter().map(|(_, path, revision, _)| (path.as_str(), *revision)).collect::<Vec<_>>(),
+        [("src/a.rs", 5), ("src/b.rs", 5)]
+    );
+
+    // One file swaps, the other still shows what it did.
+    answer(&remote, &asks[0].0, "src/a.rs", 5, 9, None);
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(10));
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(41));
+
+    // Page by page, the old body stays whole until the last page is in.
+    answer(&remote, &asks[1].0, "src/b.rs", 5, 3, Some(4));
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(41), "not the first page as if it were the file");
+    let next = diff_asks(&remote);
+    assert_eq!(next.len(), 1);
+    assert_eq!((next[0].1.as_str(), next[0].3), ("src/b.rs", Some(4)));
+    answer(&remote, &next[0].0, "src/b.rs", 5, 3, None);
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(8), "both pages, one hunk");
+}
+
+#[test]
+fn a_new_revision_drops_files_it_no_longer_lists() {
+    let remote = diff_read();
+    new_revision(&remote, 4, 5, &["src/a.rs"]);
+    assert_eq!(lines_shown(&remote, "src/b.rs"), None);
+    let asks = diff_asks(&remote);
+    assert_eq!(asks.len(), 1);
+    answer(&remote, &asks[0].0, "src/a.rs", 5, 6, None);
+    new_revision(&remote, 5, 6, &["src/a.rs", "src/b.rs"]);
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(0), "back, with nothing old to show");
+}
+
+#[test]
+fn a_refresh_reads_a_few_files_at_a_time_the_empty_ones_first() {
+    let remote = diff_read();
+    let many: Vec<String> = (0..MAX_IN_FLIGHT + 2).map(|i| format!("src/n{i}.rs")).collect();
+    let mut files = vec!["src/a.rs", "src/b.rs"];
+    files.extend(many.iter().map(String::as_str));
+    new_revision(&remote, 4, 5, &files);
+    let asks = diff_asks(&remote);
+    assert_eq!(asks.len(), MAX_IN_FLIGHT);
+    assert!(asks.iter().all(|(_, path, _, _)| path.starts_with("src/n")), "{asks:?}");
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7), "an old body waits its turn on screen");
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(41));
+}
+
+#[test]
+fn a_body_that_did_not_change_leaves_the_diff_as_it_is() {
+    let remote = diff_read();
+    new_revision(&remote, 4, 5, &["src/a.rs", "src/b.rs"]);
+    let asks = diff_asks(&remote);
+    let before = remote.diff(Path::new(WORKTREE)).unwrap().prepared.unwrap();
+    answer(&remote, &asks[0].0, "src/a.rs", 5, 6, None);
+    answer(&remote, &asks[1].0, "src/b.rs", 5, 40, None);
+    let after = remote.diff(Path::new(WORKTREE)).unwrap();
+    assert!(!after.loading);
+    assert!(Arc::ptr_eq(&before, &after.prepared.unwrap()), "nothing to redraw");
+}
+
+#[test]
+fn a_refresh_that_fails_keeps_the_body_and_says_so() {
+    let remote = diff_read();
+    remote.send(Command::RefreshDiff(WORKTREE.into()));
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7), "the refresh button does not empty the diff");
+    let asks = diff_asks(&remote);
+    let refusal = WireError::new(ErrorCode::Internal, "the disk is gone").into_envelope(asks[0].0.clone(), None);
+    remote.receive(refusal);
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7));
+    assert!(remote.diff(Path::new(WORKTREE)).unwrap().error.is_some());
+}
+
+#[test]
+fn answers_to_an_earlier_read_do_not_touch_the_new_one() {
+    let remote = diff_read();
+    new_revision(&remote, 4, 5, &["src/a.rs", "src/b.rs"]);
+    let old = diff_asks(&remote);
+    new_revision(&remote, 5, 6, &["src/a.rs", "src/b.rs"]);
+    let new = diff_asks(&remote);
+    assert_eq!(new.len(), 2);
+
+    // The host refuses the old revision's request: the new read goes on, and nothing is asked twice.
+    let stale = WireError::new(ErrorCode::StaleRevision, "the diff moved on").into_envelope(old[1].0.clone(), None);
+    remote.receive(stale);
+    assert!(diff_asks(&remote).is_empty(), "b.rs is already being read");
+    answer(&remote, &new[1].0, "src/b.rs", 6, 3, Some(4));
+    let next = diff_asks(&remote);
+    answer(&remote, &next[0].0, "src/b.rs", 6, 3, None);
+    assert_eq!(lines_shown(&remote, "src/b.rs"), Some(8));
+
+    // Refresh forgets what was in flight: a late page of the read it replaced is not one of the new read's.
+    remote.send(Command::RefreshDiff(WORKTREE.into()));
+    let refreshed = diff_asks(&remote);
+    answer(&remote, &new[0].0, "src/a.rs", 6, 2, None);
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7), "the late answer is dropped");
+    answer(&remote, &refreshed[0].0, "src/a.rs", 6, 9, None);
+    assert_eq!(lines_shown(&remote, "src/a.rs"), Some(10));
+}
