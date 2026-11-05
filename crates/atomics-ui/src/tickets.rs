@@ -310,7 +310,7 @@ pub fn sidebar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     }
     let p = client.palette.clone();
     crate::sidebar::section(ui, &p, "TICKETS");
-    if touch::small_button(ui, client.touch, "Find tickets…").clicked() {
+    if touch::button(ui, client.touch, "Find tickets…").clicked() {
         client.tickets.show_find(true);
         client.send(Command::SetPanel(PanelMode::Tickets));
         client.send(Command::OpenDiff);
@@ -367,10 +367,10 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
         ui.horizontal_wrapped(|ui| {
             ui.heading("Tickets");
             ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).small().color(p.muted));
-            if touch::small_button(ui, client.touch, "Find").clicked() {
+            if touch::button(ui, client.touch, "Find").clicked() {
                 panel.show_find(true);
             }
-            if touch::small_button(ui, client.touch, "×").clicked() {
+            if touch::button(ui, client.touch, "×").on_hover_text("Close the panel").clicked() {
                 client.send(Command::CloseDiff);
             }
         });
@@ -418,7 +418,7 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
     }
     ui.horizontal(|ui| {
         let response = ui.add(
-            egui::TextEdit::singleline(&mut panel.query)
+            crate::controls::single_line(&mut panel.query)
                 .id(query_id)
                 .hint_text("Search tickets…")
                 .desired_width((ui.available_width() - 84.0).max(40.0)),
@@ -448,9 +448,7 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
         }
         for (index, label) in info.views.iter().enumerate() {
             let selected = panel.query.trim().is_empty() && panel.view.unwrap_or(info.default_view) == index;
-            if touch::small_button(ui, client.touch, if selected { format!("● {label}") } else { label.clone() })
-                .clicked()
-            {
+            if ui.add(touch::sized(egui::Button::selectable(selected, label.as_str()), client.touch)).clicked() {
                 panel.view = Some(index);
                 panel.query.clear();
                 search = true;
@@ -648,7 +646,7 @@ fn read(
     let mut open = None;
     let mut back = false;
     ui.horizontal_wrapped(|ui| {
-        back |= touch::small_button(ui, client.touch, "← Back").clicked();
+        back |= touch::button(ui, client.touch, "← Back").clicked();
         if let Some(url) = &card.link.url {
             web_link(ui, "Open in browser", url);
         }
@@ -676,7 +674,7 @@ fn read(
                 }
             }
         });
-        if touch::small_button(ui, client.touch, "Refresh").clicked() && active {
+        if touch::button(ui, client.touch, "Refresh").clicked() && active {
             open = Some((card.link.clone(), false));
         }
     });
@@ -724,7 +722,7 @@ fn read(
                 .collect::<Vec<_>>()
                 .join(" · ");
             let url = link.url.as_deref().filter(|url| markdown::web_url(url).is_some());
-            let button = ui.add_enabled_ui(url.is_some(), |ui| touch::small_button(ui, client.touch, text)).inner;
+            let button = ui.add_enabled_ui(url.is_some(), |ui| touch::button(ui, client.touch, text)).inner;
             if let Some(url) = url
                 && button.on_hover_text(url).clicked()
             {
@@ -942,7 +940,7 @@ fn plan_dialog(
             }
             ui.label("Extra instructions for the chief (optional)");
             let extra = ui.add(
-                egui::TextEdit::singleline(&mut panel.extra)
+                crate::controls::single_line(&mut panel.extra)
                     .id(plan_extra_id())
                     .char_limit(atomics_core::tickets::PLAN_EXTRA_MAX)
                     .desired_width(f32::INFINITY),
@@ -959,7 +957,7 @@ fn plan_dialog(
             ui.horizontal_wrapped(|ui| {
                 go |=
                     ui.add_enabled(ready, touch::sized(egui::Button::new("Plan with chief ⏎"), client.touch)).clicked();
-                cancel |= touch::small_button(ui, client.touch, "Cancel").clicked();
+                cancel |= touch::button(ui, client.touch, "Cancel").clicked();
             });
         });
     if cancel {

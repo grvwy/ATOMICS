@@ -466,8 +466,8 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "⋯",
         "◆ CHIEF AGENT",
         "TRACE",
-        "float",
-        "minimize",
+        "Float",
+        "Minimize",
         "Fix the parser",
         "Permission requested",
         "Allow",
@@ -959,11 +959,11 @@ fn a_viewer_and_a_page_offline_have_nothing_to_press_and_nothing_to_type_in() {
         "+ New",
         "Send",
         "Steer",
-        "start",
-        "accept",
-        "send back",
-        "unblock",
-        "integrate",
+        "Start",
+        "Accept",
+        "Send back",
+        "Unblock",
+        "Integrate",
         "Integrate",
         "×",
     ];
@@ -1004,7 +1004,7 @@ fn a_viewer_and_a_page_offline_have_nothing_to_press_and_nothing_to_type_in() {
 fn a_steer_from_the_bar_reaches_the_host_and_one_refused_comes_back() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "→ Fix the parser"), "to the active session: {shown:?}");
+    assert!(has(&shown, "To: Fix the parser"), "to the active session: {shown:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Steer · Enter sends")));
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("go on".into())]);
@@ -1033,12 +1033,12 @@ fn a_steer_from_the_bar_reaches_the_host_and_one_refused_comes_back() {
     assert!(has(&shown, "The host refused: message not delivered: session exited"), "whole: {shown:?}");
 
     // The note lies over the frame, moves nothing, and goes after a while.
-    let bar = on(&shown, "→ Fix the parser");
-    assert_eq!(on(&settled(&ctx, &mut world, &mut client, &mut view, WIDE), "→ Fix the parser"), bar);
+    let bar = on(&shown, "To: Fix the parser");
+    assert_eq!(on(&settled(&ctx, &mut world, &mut client, &mut view, WIDE), "To: Fix the parser"), bar);
     view.now_ms += NOTICE_MS + 1.0;
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(!has(&shown, "The host refused"), "{shown:?}");
-    assert_eq!(on(&shown, "→ Fix the parser"), bar);
+    assert_eq!(on(&shown, "To: Fix the parser"), bar);
 }
 
 #[test]
@@ -1162,10 +1162,10 @@ fn a_closed_plans_history_stays_read_only() {
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.send(Command::ViewPlanHistory(0));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Completed ✓ · read-only"), "{shown:?}");
+    assert!(has(&shown, "Completed · read-only"), "{shown:?}");
     assert!(has(&shown, "Archive"), "a finished plan's own Archive: {shown:?}");
     for action in
-        ["Dispatch ready", "Close plan…", "start", "accept", "send back", "unblock", "integrate", "Integrate", "Reopen"]
+        ["Dispatch ready", "Close plan…", "Start", "Accept", "Send back", "Unblock", "Integrate", "Integrate", "Reopen"]
     {
         assert!(!has(&shown, action), "{action} on a read-only board: {shown:?}");
     }
@@ -1190,21 +1190,21 @@ fn a_boards_buttons_change_the_plan_and_a_merge_shows_while_it_runs() {
     // The right panel dragged wide enough for every column.
     client.split = Some(1800.0);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
-    for button in ["Dispatch ready (1)", "start", "accept", "send back", "unblock", "integrate", "Integrate"] {
+    for button in ["Dispatch ready (1)", "Start", "Accept", "Send back", "Unblock", "Integrate", "Integrate"] {
         assert!(has(&shown, button), "{button} is missing: {:?}", shown.iter().map(|s| &s.0).collect::<Vec<_>>());
     }
-    assert!(has(&shown, "1 accepted tasks not integrated yet"), "{shown:?}");
+    assert!(has(&shown, "1 accepted task not integrated yet"), "{shown:?}");
 
-    click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "start");
+    click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "Start");
     assert_eq!(task(&world, "t3").status, TaskStatus::Running);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
-    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(exactly(&shown, "integrate")));
+    drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(exactly(&shown, "Integrate")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
     let integrated = |world: &World, id: &str| task(world, id).integrated.is_some();
     assert!(integrated(&world, "t4") ^ integrated(&world, "t5"), "the first card's: {shown:?}");
-    click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "accept");
+    click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "Accept");
     assert_eq!(task(&world, "t4").status, TaskStatus::Done);
-    click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "unblock");
+    click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "Unblock");
     assert_eq!(task(&world, "t6").status, TaskStatus::Running);
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, BOARD, "Integrate");
     assert!(task(&world, "t4").integrated.is_some() && task(&world, "t5").integrated.is_some());
@@ -1230,7 +1230,7 @@ fn a_boards_buttons_change_the_plan_and_a_merge_shows_while_it_runs() {
     client.split = Some(1800.0);
     client.send(Command::IntegrateTask { plan: 0, task: "t4".into() });
     let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
-    assert!(has(&shown, "integrating…"), "{shown:?}");
+    assert!(has(&shown, "Integrating…"), "{shown:?}");
     assert_eq!(world.driver.remote.notice(), None);
 }
 
@@ -1296,7 +1296,7 @@ fn a_comment_and_a_review_reach_the_host_from_the_diff() {
             body: "second".into(),
         }],
     });
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "discard");
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Discard");
     assert!(world.host.board.diffs[0].comments.is_empty(), "{shown:?}");
 }
 
@@ -1532,7 +1532,7 @@ fn a_draft_outlasts_the_host_sending_the_whole_board_again() {
 #[test]
 fn the_steer_bar_names_no_all_agents_and_shift_enter_makes_a_new_line() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
-    let list = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "→ Fix the parser");
+    let list = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "To: Fix the parser");
     assert!(has(&list, "Active: Fix the parser") && has(&list, "Selected (0)"), "{list:?}");
     assert!(!has(&list, "All agents"), "a shell can run under any name: {list:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&list, "Active: Fix the parser")));
@@ -1736,8 +1736,11 @@ fn the_picker_starts_an_agent_on_the_ungrouped_tab() {
     assert!(!has(&shown, "New session"), "{shown:?}");
     assert_eq!(world.host.board.sessions.len(), 2);
 
-    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "+ New");
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start");
+    let picker = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "+ New");
+    // The picker's Start, drawn over the board's cards and their own.
+    let start = picker.iter().rfind(|(text, _)| text == "Start").expect("the picker's Start").1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(start));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     let started = world.host.board.sessions.iter().find(|s| s.id.starts_with("new-")).expect("a new session");
     assert_eq!((started.agent.as_str(), started.cwd.as_str()), ("claude", "/scratch/new"), "a scratch folder");
     assert!(view.desk.ungrouped && !view.desk.plan_view, "it lands on the Ungrouped tab");
@@ -1767,7 +1770,7 @@ fn a_hosts_empty_frame_offers_what_the_browser_does() {
     host.board.plans.clear();
     let (ctx, mut world, mut client, mut view) = live_with(host);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "CHIEF") && has(&shown, "start"), "{shown:?}");
+    assert!(has(&shown, "CHIEF") && has(&shown, "start"), "the pill says it can start: {shown:?}");
     assert!(!has(&shown, "+ New") && !has(&shown, "Start "), "the mirror names no agent: {shown:?}");
     assert!(has(&shown, "AGENTS") && !has(&shown, "EXPLORER"), "no projects, no way to open one: {shown:?}");
     let text: String = shown.iter().map(|(text, _)| text.as_str()).collect();
@@ -3192,7 +3195,7 @@ fn host_panels_draw_in_both_layouts_and_editor_input_uses_its_own_terminal() {
                 "{size:?}: {shown:?}"
             );
             assert!(client.pr_view.as_ref().unwrap().1.prepared.is_some());
-            assert!(!has(&shown, "Send review") && !has(&shown, "editor"), "a PR is read-only: {shown:?}");
+            assert!(!has(&shown, "Send review") && !has(&shown, "Edit"), "a PR is read-only: {shown:?}");
         }
         client.pr_view = None;
         if view.compact {
@@ -3203,7 +3206,7 @@ fn host_panels_draw_in_both_layouts_and_editor_input_uses_its_own_terminal() {
         if !view.compact {
             client.send(Command::SetChiefDock(atomics_core::config::ChiefDock::Floating));
             let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
-            assert!(has(&shown, "TRACE") && has(&shown, "dock"), "the floating chief: {shown:?}");
+            assert!(has(&shown, "TRACE") && has(&shown, "Dock"), "the floating chief: {shown:?}");
         }
     }
 }

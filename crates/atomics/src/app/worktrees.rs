@@ -254,20 +254,20 @@ impl Desktop<'_> {
                 ui.horizontal(|ui| {
                     let idle = cleanup.busy.is_none();
                     if ui
-                        .add_enabled(idle, egui::Button::new("fetch --prune"))
+                        .add_enabled(idle, egui::Button::new("Fetch and prune"))
                         .on_hover_text("Refresh which remote branches are gone (completed PRs)")
                         .clicked()
                     {
                         action = Some(Command::CleanupFetch);
                     }
                     if ui
-                        .add_enabled(idle, egui::Button::new("prune missing"))
+                        .add_enabled(idle, egui::Button::new("Prune missing"))
                         .on_hover_text("Forget worktrees whose folder no longer exists")
                         .clicked()
                     {
                         action = Some(Command::CleanupPrune);
                     }
-                    if ui.add_enabled(idle, egui::Button::new("reload")).clicked() {
+                    if ui.add_enabled(idle, egui::Button::new("Reload")).clicked() {
                         action = Some(Command::CleanupReload);
                     }
                     if let Some(busy) = &cleanup.busy {
@@ -396,7 +396,7 @@ impl Desktop<'_> {
                     .count();
                 ui.horizontal(|ui| {
                     if ui
-                        .button("select safe")
+                        .button("Select safe")
                         .on_hover_text("Clean, and merged or with its remote branch deleted")
                         .clicked()
                     {
@@ -406,7 +406,7 @@ impl Desktop<'_> {
                             .map(|h| h.path.clone())
                             .collect();
                     }
-                    if ui.button("select none").clicked() {
+                    if ui.button("Select none").clicked() {
                         self.client.cleanup_selected.clear();
                         self.client.cleanup_sandboxes.clear();
                     }

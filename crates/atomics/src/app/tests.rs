@@ -360,7 +360,7 @@ fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
         };
         frame(app, Vec::new());
         let shown = frame(app, Vec::new());
-        let target = shown.iter().find(|(text, _)| text.starts_with("→ ")).expect("the target").1.center();
+        let target = shown.iter().find(|(text, _)| text.starts_with("To: ")).expect("the target").1.center();
         let button = |pressed| egui::Event::PointerButton {
             pos: target,
             button: egui::PointerButton::Primary,

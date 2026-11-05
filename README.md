@@ -47,7 +47,7 @@ says what to take along and what to set up again.
   updates live, with syntax highlighting and word-level emphasis.
 - **Side by side when there is room.** A diff area at least 1100 points wide shows the old version left and the new one
   right, each edited line beside what it replaced. `diff_split` under `[layout]` picks `auto`, `always` or `never`; the
-  **split** toggle in the diff header overrides it until ATOMICS quits. Comments and double-click-to-edit work the same in
+  **Side by side** toggle in the diff header overrides it until ATOMICS quits. Comments and double-click-to-edit work the same in
   both views.
 - **Ungrouped sessions for everything else.** Research and small tasks need no project or board. **+ New** (`cmd+t`)
   starts a session in a scratch folder of its own under the state directory (`<state>/scratch/<id>`), in the
@@ -72,7 +72,7 @@ says what to take along and what to set up again.
   When the configured program is `hx` and only `helix` is on PATH, editor launch and doctor use `helix`.
   Helix's gutter compares tracked files with HEAD; ATOMICS reviews against the merge-base. Committed branch
   changes and untracked files can therefore have no Helix marker. See [Helix diff gutters](docs/helix-diff-gutter.md).
-- **Worktree clean-up.** **clean up…** in the explorer checks every worktree for uncommitted work, merged branches
+- **Worktree clean-up.** **Clean up…** in the explorer checks every worktree for uncommitted work, merged branches
   and deleted remote branches (completed PRs). **select safe** picks the ones that can go. Removal never forces, so
   worktrees with uncommitted work are kept, and branches are deleted only when git considers them merged.
 - **Files.** `cmd+p` searches every file of the project. A changed file jumps to its hunks; any other file opens
@@ -595,7 +595,7 @@ repository's stash.
 Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: Claude in a large window in the middle of the
 screen, started in the project's main checkout with every ATOMICS tool and a built-in way of working (plan, wait for your
 approval, dispatch, verify, end with a fresh reviewer, never push without asking). Close the window to minimize it to
-the pill. The **dock** / **float** button in its header switches between the floating window and a full-height column
+the pill. The **Dock** / **Float** button in its header switches between the floating window and a full-height column
 beside the agents; the pill's context menu offers both modes too. Drag the dock's right edge to resize it, or double-click
 to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"docked"`) sets the initial mode.
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
@@ -696,7 +696,7 @@ worktrees used by agent sessions are kept with a reason. Removal rechecks the pr
 branches without worktrees can be removed too. The saved plan history stays available.
 
 Tasks come together on the plan's **integration branch** (`atomics/plan-<plan-id>` unless the plan names one; the board
-shows it). `atomics_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
+shows it). `atomics_plan_integrate` (or **Integrate** on a review or done card) commits whatever the task left uncommitted
 on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
 branch into the integration branch. The merge happens in a worktree of its own next to the repository, created on
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
@@ -723,10 +723,10 @@ sessions.
 
 Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.
 Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **Open board**,
-**diff** and **resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
+**Diff** and **Resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
 When every task is accepted, its board offers **Archive plan**; closed as completed, the plan leaves the dropdown's open
 boards for **History**. The chief stays running and
-worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
+worktrees remain for the existing **Clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
 
 ## Tickets
 

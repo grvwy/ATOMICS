@@ -191,7 +191,7 @@ fn preview_button(
     {
         client.send(Command::OpenPreview { session, preview: preview.clone() });
     }
-    if backend.preview_active(preview.port) && ui.small_button("Stop").clicked() {
+    if backend.preview_active(preview.port) && ui.button("Stop").clicked() {
         client.send(Command::StopPreview { port: preview.port });
     }
 }

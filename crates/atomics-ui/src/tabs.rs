@@ -4,20 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{RichText, Stroke, vec2};
+use egui::RichText;
 
 use crate::boards;
-use crate::theme::Palette;
 use crate::topbar::{measure, record_item};
-use crate::{Backend, Client, Command, SessionRow, ViewHints};
+use crate::{Backend, Client, Command, SessionRow, ViewHints, controls};
 
 /// The size of a tab's text, as the bar's other buttons have it.
 const TEXT: f32 = 13.0;
-
-/// A tab's look: flat, and outlined while it is the one selected.
-fn tab_button<'a>(button: egui::Button<'a>, selected: bool, p: &Palette) -> egui::Button<'a> {
-    button.fill(egui::Color32::TRANSPARENT).stroke(if selected { Stroke::new(1.0, p.accent) } else { Stroke::NONE })
-}
 
 #[derive(Clone)]
 enum ViewTab {
@@ -164,11 +158,9 @@ impl Nav<'_> {
             ui.menu_button(text, |ui| projects(self, ui));
             return;
         }
-        let muted = self.client.palette.muted;
-        let arrow = egui::Atom::paint(vec2(9.0, 9.0), move |ui: &egui::Ui, args: egui::AtomPaintArgs| {
-            boards::chevron(ui.painter(), args.rect, muted);
-        });
-        let button = tab_button(egui::Button::new((text, arrow)), selected, &self.client.palette);
+        let palette = self.client.palette.clone();
+        let arrow = controls::chevron_atom(palette.muted);
+        let button = controls::flat(egui::Button::new((text, arrow)), selected, &palette);
         let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| projects(self, ui));
         record_item(ui, &label, &response);
     }
@@ -199,7 +191,7 @@ impl Nav<'_> {
             ViewTab::Repos => unreachable!(),
         };
         let text = RichText::new(&label).font(p.ui(TEXT)).color(p.foreground);
-        let response = ui.add(tab_button(egui::Button::new(text), selected, &p)).on_hover_text(hover);
+        let response = ui.add(controls::flat(egui::Button::new(text), selected, &p)).on_hover_text(hover);
         if !in_menu {
             record_item(ui, &label, &response);
         }

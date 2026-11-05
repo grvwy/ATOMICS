@@ -175,14 +175,14 @@ impl CredentialUi {
             });
             let hosted = matches!(KINDS[self.selected].0, "registry" | crate::credentials::GITHUB_APP);
             if KINDS[self.selected].0 == "registry" {
-                ui.add(egui::TextEdit::singleline(&mut self.host).hint_text("registry.example.com (host only)"));
+                ui.add(atomics_ui::controls::single_line(&mut self.host).hint_text("registry.example.com (host only)"));
             } else if hosted {
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.host)
+                    atomics_ui::controls::single_line(&mut self.host)
                         .hint_text("GitHub Enterprise host; empty for github.com (Connect GitHub is simpler)"),
                 );
             }
-            ui.add(egui::TextEdit::singleline(&mut self.value).password(true).hint_text("New value (hidden)"));
+            ui.add(atomics_ui::controls::single_line(&mut self.value).password(true).hint_text("New value (hidden)"));
             ui.label("Stored values are never displayed. Replace/remove revokes existing session placeholders; restart those sessions.");
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.value.is_empty(), egui::Button::new("Add / replace credential")).clicked() {

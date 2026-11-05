@@ -159,7 +159,9 @@ pub fn explorer_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clie
         ui.set_max_width(360.0);
         ui.set_max_height(600.0);
         crate::sidebar::explorer(ui, backend, client);
-    });
+    })
+    .response
+    .on_hover_text("The open projects, their worktrees and files");
 }
 
 /// The Project menu: open a project, a recent project or a workspace, or save the open projects as one.
@@ -203,7 +205,7 @@ pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
         return;
     }
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut client.workspace_input).hint_text("name").desired_width(120.0));
+        ui.add(crate::controls::single_line(&mut client.workspace_input).hint_text("name").desired_width(120.0));
         let name = client.workspace_input.trim().to_string();
         if ui.add_enabled(!name.is_empty() && menu.can_save, egui::Button::new("Save workspace")).clicked() {
             client.send(Command::SaveWorkspace(name));

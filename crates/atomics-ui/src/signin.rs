@@ -159,13 +159,12 @@ pub fn banner(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> 
             return;
         }
         let label = button_label(info);
-        let button = egui::Button::new(RichText::new(&label).color(p.on_accent)).fill(p.accent);
         let hover = if info.state == SignInState::Expired {
             format!("Sign in to {} again; the tickets connect with the new sign-in", info.system)
         } else {
             format!("Search, read and plan from {}'s tickets", info.system)
         };
-        let response = ui.add(touch::sized(button, touch)).on_hover_text(hover);
+        let response = crate::controls::primary(ui, &label, touch, &p).on_hover_text(hover);
         crate::topbar::record_item(ui, "sign-in", &response);
         if response.clicked() {
             client.sign_in_paste.clear();
@@ -195,7 +194,7 @@ fn signing_in(ui: &mut egui::Ui, view: &SignInView, can: bool, client: &mut Clie
     ui.horizontal_wrapped(|ui| {
         let waiting = if manual { "Waiting for the sign-in…" } else { "Waiting for the browser…" };
         ui.label(RichText::new(waiting).strong());
-        if can && touch::small_button(ui, touch, "Cancel").clicked() {
+        if can && touch::button(ui, touch, "Cancel").clicked() {
             client.send(Command::CancelSignIn);
         }
         if let Some(left) = view.seconds_left {
@@ -203,7 +202,7 @@ fn signing_in(ui: &mut egui::Ui, view: &SignInView, can: bool, client: &mut Clie
         }
     });
     if !manual {
-        if can && touch::small_button(ui, touch, "No browser here?").clicked() {
+        if can && touch::button(ui, touch, "No browser here?").clicked() {
             client.sign_in_manual = true;
         }
         return;
@@ -216,10 +215,10 @@ fn signing_in(ui: &mut egui::Ui, view: &SignInView, can: bool, client: &mut Clie
         Some(url) => {
             ui.horizontal_wrapped(|ui| {
                 ui.add(egui::Label::new(RichText::new(url).monospace().size(11.0)).truncate());
-                if touch::small_button(ui, touch, "Open link").clicked() {
+                if touch::button(ui, touch, "Open link").clicked() {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
-                if touch::small_button(ui, touch, "Copy link").clicked() {
+                if touch::button(ui, touch, "Copy link").clicked() {
                     ui.ctx().copy_text(url.clone());
                 }
             });
@@ -235,12 +234,12 @@ fn signing_in(ui: &mut egui::Ui, view: &SignInView, can: bool, client: &mut Clie
     let mut use_it = false;
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 80.0).max(120.0);
-        let edit = egui::TextEdit::singleline(&mut client.sign_in_paste)
+        let edit = crate::controls::single_line(&mut client.sign_in_paste)
             .hint_text("http://127.0.0.1:…/callback?code=…&state=…")
             .desired_width(width);
         let response = ui.add(edit);
         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        use_it = touch::small_button(ui, touch, "Use it").clicked() || enter;
+        use_it = touch::button(ui, touch, "Use it").clicked() || enter;
     });
     if use_it && !client.sign_in_paste.trim().is_empty() {
         let text = std::mem::take(&mut client.sign_in_paste);

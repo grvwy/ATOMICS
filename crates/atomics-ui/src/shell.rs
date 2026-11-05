@@ -547,6 +547,7 @@ fn top_bar_controls(
             .menu_button("Project", |ui| platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client)))
             .response;
         record_item(ui, "Project", &response);
+        response.on_hover_text("Open a project or a workspace");
     }
     if show_load || in_menu {
         platform.draw(|backend, client, _| {

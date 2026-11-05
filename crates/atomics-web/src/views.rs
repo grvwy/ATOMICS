@@ -854,8 +854,7 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
                 }
                 topbar::new_button(ui, true, backend, client);
                 atomics_ui::topbar::workspace_menu(ui, backend, client);
-                if backend.tickets().is_some() && atomics_ui::touch::small_button(ui, client.touch, "Tickets").clicked()
-                {
+                if backend.tickets().is_some() && atomics_ui::touch::button(ui, client.touch, "Tickets").clicked() {
                     client.send(Command::ToggleView(PanelMode::Tickets));
                     ui.close();
                 }
@@ -1033,7 +1032,7 @@ fn notice(ui: &mut egui::Ui, driver: &Driver, touch: Option<Touch>) {
     if let Some(notice) = remote.notice() {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(notice).small());
-            if touch::small_button(ui, touch, "×").on_hover_text("Dismiss").clicked() {
+            if touch::button(ui, touch, "×").on_hover_text("Dismiss").clicked() {
                 remote.dismiss_notice();
             }
         });

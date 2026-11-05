@@ -34,10 +34,10 @@ pub fn draw(
     let editor_running = editor.as_ref().is_some_and(|e| e.running);
     let mut action = None;
     child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if crate::touch::small_button(ui, touch, "×").on_hover_text("Close the panel").clicked() {
+        if crate::touch::button(ui, touch, "×").on_hover_text("Close the panel").clicked() {
             action = Some("close");
         }
-        if crate::touch::small_button(ui, touch, "diff")
+        if crate::touch::button(ui, touch, "Back to diff")
             .on_hover_text(format!(
                 "Back to the diff ({})",
                 shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_editor)
@@ -49,7 +49,7 @@ pub fn draw(
         if editor_running
             && editor.as_ref().is_some_and(|e| e.inlay_hints)
             && backend.available(&Command::EditorHints(root.to_path_buf()))
-            && crate::touch::small_button(ui, touch, "inlay hints")
+            && crate::touch::button(ui, touch, "Inlay hints")
                 .on_hover_text("Toggle the language server's inlay hints")
                 .clicked()
         {

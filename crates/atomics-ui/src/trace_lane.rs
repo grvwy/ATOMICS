@@ -387,13 +387,13 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
         ui.label(RichText::new(label).size(10.5).strong().color(color));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .small_button(if lane.collapsed { "▴" } else { "▾" })
-                .on_hover_text("Collapse or expand the trace")
+                .button(if lane.collapsed { "Show" } else { "Hide" })
+                .on_hover_text("Show or hide the trace's calls")
                 .clicked()
             {
                 acts.push(Act::Collapse);
             }
-            if ui.small_button("clear").clicked() {
+            if ui.button("Clear").on_hover_text("Forget the calls shown here").clicked() {
                 acts.push(Act::Clear);
             }
             let calls = entries.len();

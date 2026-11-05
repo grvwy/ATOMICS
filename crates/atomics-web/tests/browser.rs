@@ -1270,7 +1270,7 @@ fn the_bundle_works_on_a_phone_by_touch() {
     });
     wait_host(&host, "the plan approved", |h| h.board.plans[0].approved);
     screens.save(&mut page, "plan-approved", |page| {
-        // "approved ✓", wherever the header's rows put it.
+        // "Approved", wherever the header's rows put it.
         approve(page).is_none() && amount(page, p.success, 24, header) >= 10.0
     });
     let corner = Rect::from_min_max(pos2(screen.center().x, top.top()), top.max);
@@ -1630,7 +1630,7 @@ fn the_input_gives_way_to_a_floating_window() {
     log.wait("subscribe chief", 1);
     frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
 
-    // The docked chief's "float": its window lies over the active agent's terminal, under the input.
+    // The docked chief's "Float": its window lies over the active agent's terminal, under the input.
     page.click((409.0, 50.0));
     frame.wait("the window cut out of the input", &format!("{CLIP}.startsWith('path(')"));
     let input = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.left, r.right, r.top, r.bottom]; })()");
@@ -1834,7 +1834,7 @@ fn panel_button(page: &mut DevTools, palette: &Palette, board: bool) -> (f64, f6
 }
 
 /// Find a button by its drawn outline and the size egui gives its label in this look.
-fn button(page: &mut DevTools, palette: &Palette, size: (f32, f32), region: Rect, label: &str, small: bool) -> Pos2 {
+fn button(page: &mut DevTools, palette: &Palette, size: (f32, f32), region: Rect, label: &str) -> Pos2 {
     let phone = size.0 < 600.0;
     let zoom = if phone { layout::ZOOM } else { 1.0 };
     let ctx = egui::Context::default();
@@ -1847,7 +1847,7 @@ fn button(page: &mut DevTools, palette: &Palette, size: (f32, f32), region: Rect
     ctx.all_styles_mut(|s| *s = style.clone());
     let mut expected = egui::Vec2::ZERO;
     let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-        let response = if small && !phone { ui.small_button(label) } else { ui.button(label) };
+        let response = ui.button(label);
         expected = response.rect.size() * zoom;
     });
     output.textures_delta.clear();
@@ -1865,8 +1865,8 @@ fn button(page: &mut DevTools, palette: &Palette, size: (f32, f32), region: Rect
     rect.center()
 }
 
-fn click_button(page: &mut DevTools, palette: &Palette, region: Rect, label: &str, small: bool) {
-    let at = button(page, palette, WIDE, region, label, small);
+fn click_button(page: &mut DevTools, palette: &Palette, region: Rect, label: &str) {
+    let at = button(page, palette, WIDE, region, label);
     page.click((f64::from(at.x), f64::from(at.y)));
 }
 
@@ -2000,8 +2000,12 @@ fn text_boxes_take_the_keyboard_from_a_terminal() {
     keep(&mut page, "wide-comment");
 
     // Send review sends it to the agent, as one review, and it leaves the diff.
+    // The panel's one filled button, found by its fill: a button's rounded corners cut a filled outline short.
     let header = Rect::from_min_max(pos2(WIDE.0 / 2.0, 34.0), pos2(WIDE.0, 120.0));
-    click_button(&mut page, &palette, header, "Send review (1)", false);
+    let (send, _) = until_on(&mut page, WIDE, &actions_dir(), "Send review (1)", |page| {
+        boxes(page, palette.accent, 6, header, 150.0).into_iter().find(|b| b.width() >= 60.0)
+    });
+    page.click((f64::from(send.center().x), f64::from(send.center().y)));
     wait_host(&host, "the review", |h| h.reviews.len() == 1 && h.reviews[0].1[0].body == "Why this step?");
     wait_host(&host, "the comment gone from the diff", |h| h.board.diffs[0].comments.is_empty());
     keep(&mut page, "wide-review-sent");
@@ -2066,7 +2070,7 @@ fn the_keyboard_in_a_text_box_lets_go_of_the_terminals_lease() {
 
     // A card's open types in its agent, as picking it from the sidebar does.
     let board = Rect::from_min_max(pos2(input_rect(&mut frame).right(), 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
-    click_button(&mut page, &palette, board, "open", true);
+    click_button(&mut page, &palette, board, "Open");
     log.wait("acquire s1", 1);
     frame.wait("the focus on the input", FOCUSED);
     page.call("Input.insertText", json!({ "text": "a" }));
@@ -2450,11 +2454,11 @@ fn a_board_and_a_tile_act_in_a_wide_window() {
 
     // A card's start starts that task; Dispatch ready, then, the other one that is ready.
     let board = Rect::from_min_max(pos2(input_rect(&mut frame).right(), 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
-    click_button(&mut page, &palette, board, "start", true);
+    click_button(&mut page, &palette, board, "Start");
     wait_host(&host, "t3 started", |h| task(h, "t3").status == TaskStatus::Running);
     assert_eq!(task(&host.lock().unwrap(), "t7").status, TaskStatus::Planned);
     thread::sleep(Duration::from_millis(300));
-    click_button(&mut page, &palette, board, "Dispatch ready (1)", false);
+    click_button(&mut page, &palette, board, "Dispatch ready (1)");
     wait_host(&host, "t7 dispatched", |h| task(h, "t7").status == TaskStatus::Running);
     keep(&mut page, "wide-board-dispatched");
 
@@ -2464,14 +2468,14 @@ fn a_board_and_a_tile_act_in_a_wide_window() {
     frame.wait("the dialog cut out of the input", &format!("{CLIP}.startsWith('path(')"));
     keep(&mut page, "wide-close-session");
     assert!(has_agent(&host.lock().unwrap()), "not yet");
-    click_button(&mut page, &palette, dialog_region(WIDE), "Cancel", false);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Cancel");
     frame.wait("the dialog gone", &format!("{CLIP} === ''"));
     assert!(has_agent(&host.lock().unwrap()));
 
     // The dialog's Close session closes it, and the input goes with its terminal.
     page.click(close);
     frame.wait("the dialog again", &format!("{CLIP}.startsWith('path(')"));
-    click_button(&mut page, &palette, dialog_region(WIDE), "Close session", false);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Close session");
     wait_host(&host, "the agent closed", |h| !has_agent(h));
     frame.wait("the input gone with its terminal", "document.getElementById('atomics-input').hidden");
     keep(&mut page, "wide-session-closed");
@@ -2525,14 +2529,14 @@ fn a_plan_closes_and_a_new_session_starts() {
     page.click((f64::from(row.center().x), f64::from(row.center().y)));
     thread::sleep(Duration::from_millis(300));
     let board = Rect::from_min_max(pos2(WIDE.0 / 2.0, 34.0), pos2(WIDE.0, WIDE.1 - 40.0));
-    click_button(&mut page, &palette, board, "Close plan…", true);
+    click_button(&mut page, &palette, board, "Close plan…");
     keep(&mut page, "wide-close-plan");
-    click_button(&mut page, &palette, dialog_region(WIDE), "Cancel", false);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Cancel");
     thread::sleep(Duration::from_millis(300));
     assert_eq!(host.lock().unwrap().board.plans[0].status, PlanStatus::Open);
-    click_button(&mut page, &palette, board, "Close plan…", true);
+    click_button(&mut page, &palette, board, "Close plan…");
     thread::sleep(Duration::from_millis(400));
-    click_button(&mut page, &palette, dialog_region(WIDE), "Archive plan", false);
+    click_button(&mut page, &palette, dialog_region(WIDE), "Archive plan");
     wait_host(&host, "the plan archived", |h| h.board.plans[0].status == PlanStatus::Archived);
     keep(&mut page, "wide-plan-archived");
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
@@ -2578,22 +2582,22 @@ fn a_row_steers_and_a_review_column_acts() {
     let board = Rect::from_min_max(pos2(left, 180.0), pos2(SIZE.0, SIZE.1 - 40.0));
     let review =
         Rect::from_min_max(pos2(left + board.width() * 0.6, 180.0), pos2(left + board.width() * 0.8, board.bottom()));
-    let click = |page: &mut DevTools, region: Rect, label: &str, small: bool| {
-        let at = button(page, &palette, SIZE, region, label, small);
+    let click = |page: &mut DevTools, region: Rect, label: &str| {
+        let at = button(page, &palette, SIZE, region, label);
         page.click((f64::from(at.x), f64::from(at.y)));
     };
-    click(&mut page, board, "unblock", true);
+    click(&mut page, board, "Unblock");
     wait_host(&host, "t6 unblocked", |h| task(h, "t6").status == TaskStatus::Running);
     thread::sleep(Duration::from_millis(300));
-    // "send back" has the same monospace width; integrate is the row's last button.
-    click(&mut page, review.with_min_x(review.center().x), "integrate", true);
+    // "Send back" has the same monospace width; integrate is the row's last button.
+    click(&mut page, review.with_min_x(review.center().x), "Integrate");
     wait_host(&host, "t4 integrated", |h| task(h, "t4").integrated.is_some());
     thread::sleep(Duration::from_millis(300));
-    click(&mut page, review, "accept", true);
+    click(&mut page, review, "Accept");
     wait_host(&host, "t4 accepted", |h| task(h, "t4").status == TaskStatus::Done);
     thread::sleep(Duration::from_millis(300));
     let header = board.with_min_y(34.0).with_max_y(180.0);
-    click(&mut page, header, "Integrate", false);
+    click(&mut page, header, "Integrate");
     wait_host(&host, "t5 integrated", |h| task(h, "t5").integrated.is_some());
     keep(&mut page, "wide-board-integrated");
 
@@ -2781,7 +2785,7 @@ fn a_phone_acts_by_touch() {
     // Close plan… offers its choices at a finger's size, and Cancel keeps it open.
     page.tap(at(58.4, 191.1));
     keep(&mut page, "phone-close-plan");
-    let cancel = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Cancel", false);
+    let cancel = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Cancel");
     page.tap(cancel);
     thread::sleep(Duration::from_millis(400));
     assert_eq!(host.lock().unwrap().board.plans[0].status, PlanStatus::Open);
@@ -2821,7 +2825,7 @@ fn a_phone_acts_by_touch() {
     assert_eq!(typed(&host, "s1"), "ls", "none of it reached the terminal");
     keep(&mut page, "phone-comment");
     let header = Rect::from_min_max(Pos2::ZERO, pos2(SIZE.0, 300.0));
-    let send = button(&mut page, &palette, SIZE, header, "Send review (1)", false);
+    let send = button(&mut page, &palette, SIZE, header, "Send review (1)");
     page.tap(send);
     wait_host(&host, "the review", |h| h.reviews.len() == 1 && h.reviews[0].1[0].body == "Why this step?");
     keep(&mut page, "phone-review-sent");
@@ -2835,13 +2839,13 @@ fn a_phone_acts_by_touch() {
     frame.wait("the dialog cut out of the input", &format!("{CLIP}.startsWith('path(')"));
     keep(&mut page, "phone-close-session");
     assert!(has_agent(&host.lock().unwrap()), "not yet");
-    let cancel = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Cancel", false);
+    let cancel = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Cancel");
     page.tap(cancel);
     frame.wait("the dialog gone", &format!("{CLIP} === ''"));
     assert!(has_agent(&host.lock().unwrap()));
     page.tap(close);
     frame.wait("the dialog again", &format!("{CLIP}.startsWith('path(')"));
-    let confirm = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Close session", false);
+    let confirm = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Close session");
     page.tap(confirm);
     wait_host(&host, "the agent closed", |h| !has_agent(h));
     keep(&mut page, "phone-session-closed");
@@ -2851,7 +2855,7 @@ fn a_phone_acts_by_touch() {
     thread::sleep(Duration::from_millis(400));
     page.tap(at(58.4, 191.1));
     keep(&mut page, "phone-close-plan-again");
-    let archive = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Archive plan", false);
+    let archive = button(&mut page, &palette, SIZE, dialog_region(SIZE), "Archive plan");
     page.tap(archive);
     wait_host(&host, "the plan archived", |h| h.board.plans[0].status == PlanStatus::Archived);
     keep(&mut page, "phone-plan-archived");

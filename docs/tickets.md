@@ -867,7 +867,7 @@ short cleaned error. Floating, a card shows three rows and `+ N more`; docked, a
 it and press `Enter`, to expand it. A ticket row, or **open ↗**, opens the ticket in the Tickets panel's Read view.
 Click the lane to focus it: `Shift+↓` / `Shift+↑` step card by card (as they step hunks and results), `PageUp` /
 `PageDown` scroll a page, `↑` `↓` a line, `Home` / `End`, `Esc` returns to the terminal. Drag the edge above the lane
-to resize it (double-click resets), **▾** collapses it and **clear** hides the cards so far (the trace itself is kept).
+to resize it (double-click resets), **Hide** collapses it and **Clear** hides the cards so far (the trace itself is kept).
 The Tickets panel's footer echoes the newest card (`chief · read KEY ✓`); click it to open the chief.
 
 ## What happens when
@@ -991,7 +991,7 @@ read it, with no `[tickets]` set up or for a ticket of another system, the click
 browser instead. Hovering shows its title, system, last update and when ATOMICS last read it. A failed operation shows in
 red beneath the chip until an operation on that ticket succeeds. Failed state updates are retried; a
 failed comment is not, and neither is a comment still queued when ATOMICS quits or restarts. The plan header shows the linked board or ticket. In board mode it adds how many
-of the board's tickets have no task yet, plus a **sync** button that reads everything again and retries
+of the board's tickets have no task yet, plus a **Sync** button that reads everything again and retries
 failed updates.
 
 ## Chief tools

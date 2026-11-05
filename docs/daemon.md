@@ -1239,7 +1239,7 @@ CSS size), with proportional UI text and monospace only for code, terminals and 
 with full-width cards under its header and buttons; a tile fills the pane to its sides with a finger-sized header;
 the diff header stacks the title, then the branch and counts, then its buttons in a row that wraps with Close last,
 and the diff shows one side, numbers each line once and wraps long lines under their indent, measured by the
-glyphs they are drawn with, so wide characters never run past the screen (**wrap** turns that off); approval
+glyphs they are drawn with, so wide characters never run past the screen (**Wrap** turns that off); approval
 banners span the screen.
 
 **Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and

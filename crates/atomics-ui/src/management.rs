@@ -329,7 +329,7 @@ fn proposal(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client, inf
                 }
             });
             ui.add(
-                egui::TextEdit::singleline(&mut client.management.proposal_note)
+                crate::controls::single_line(&mut client.management.proposal_note)
                     .hint_text("Note for the chief (optional)"),
             );
         });

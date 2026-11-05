@@ -75,7 +75,7 @@ publishing it, and plan the rest again on the new machine.
 
 On the old machine:
 
-1. Integrate every task whose work you want to keep (`atomics_plan_integrate`, or **integrate** on its card).
+1. Integrate every task whose work you want to keep (`atomics_plan_integrate`, or **Integrate** on its card).
    Integration commits what a task left uncommitted, so the integration branch then holds all of it. Work
    you do not integrate stays behind.
 2. Keep a copy of what is left to do: `atomics_plan_get {plan}` shows the goal and every task's status, and
