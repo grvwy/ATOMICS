@@ -311,7 +311,7 @@ mod tests {
                         let collapsed = items.iter().any(|(name, _)| name == "Actions");
                         // The view switcher stays in the bar when the actions fold; it drops its names.
                         let required: &[&str] = if collapsed {
-                            &["chief", "Actions", "Tabs", "view:Board", "view:Diff"]
+                            &["chief", "Actions", "view:Board", "view:Diff"]
                         } else {
                             &["chief", "Settings", "Project", "+ New", "view:Board", "view:Diff"]
                         };
@@ -323,6 +323,10 @@ mod tests {
                                 assert!((width - *natural).abs() < 0.5, "{case}: {name} shrank");
                             }
                         }
+                        assert!(
+                            items.iter().any(|(name, _)| name == "Tabs" || name.starts_with("Repos ·")),
+                            "{case}: repository navigation must stay reachable"
+                        );
                         // Check the rendered text too: distinct labels cannot paint
                         // across each other, even inside compound items such as CHIEF.
                         let mut text_rects = Vec::new();
@@ -365,6 +369,49 @@ mod tests {
                         }
                         output.drop_without_applying_deltas();
                     }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn agent_counts_separate_working_and_open_and_collapse_together() {
+        with_app("app::topbar::tests::agent_counts_separate_working_and_open_and_collapse_together", |app, ctx| {
+            fixture(app, 3);
+            app.runtime.sessions[0].status = AgentStatus::Working;
+            let root = Path::new("/project/ATOMICS");
+            for i in 0..12 {
+                app.runtime.sessions.push(session(
+                    &format!("agent-{i}"),
+                    AgentKind::Generic,
+                    if i < 2 { AgentStatus::Working } else { AgentStatus::Done },
+                    root,
+                ));
+            }
+            app.runtime.sessions.push(session("shell", AgentKind::Shell, AgentStatus::Working, root));
+            for working in [true, false] {
+                if !working {
+                    for session in app.runtime.sessions.iter_mut().filter(|s| !s.chief) {
+                        session.status = AgentStatus::Idle;
+                    }
+                }
+                let expected = if working { "2 working · 12 open" } else { "12 idle" };
+                for width in [480.0, 550.0, 700.0, 900.0, 1200.0, 1500.0, 2400.0, 5120.0] {
+                    let (items, output) = render(app, ctx, width, vec![]);
+                    let counts_shown = items.iter().any(|(name, _)| name == "agents");
+                    assert_eq!(
+                        output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Text(text) if text.galley.text() == expected)),
+                        counts_shown,
+                        "width={width}"
+                    );
+                    if width == 5120.0 {
+                        assert!(counts_shown);
+                    }
+                    if width == 480.0 {
+                        assert!(!counts_shown);
+                    }
+                    output.drop_without_applying_deltas();
                 }
             }
         });

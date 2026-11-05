@@ -41,6 +41,7 @@ use atomics_ui::text::truncate;
 use atomics_ui::{Backend, Command, PanelMode};
 use serde_json::json;
 
+mod agent_cleanup;
 mod approvals;
 mod backend;
 mod background;
@@ -570,6 +571,7 @@ pub(crate) struct State {
     last_status: HashMap<String, AgentStatus>,
     waiters: Vec<Waiter>,
     heartbeat: heartbeat::Heartbeat,
+    agent_cleanup: agent_cleanup::Checks,
     /// Events already summarized in the last automatic chief wake.
     chief_wake_cursor: u64,
     tickets: tickets::Tickets,
@@ -1083,6 +1085,7 @@ impl State {
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
             chief_wake_cursor: 0,
+            agent_cleanup: agent_cleanup::Checks::default(),
             tickets,
             plans,
             selected_plan,

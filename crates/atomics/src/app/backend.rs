@@ -128,7 +128,11 @@ impl Backend for Local<'_> {
             .tasks
             .iter()
             .filter_map(|task| {
-                let note = state.integration_check_note(index, task)?;
+                let note = match (state.agent_cleanup_note(task), state.integration_check_note(index, task)) {
+                    (Some(cleanup), Some(integration)) => format!("{cleanup}; {integration}"),
+                    (Some(note), None) | (None, Some(note)) => note,
+                    (None, None) => return None,
+                };
                 let checking = state.integration_checks.contains_key(&(plan.id.clone(), task.id.clone()));
                 Some((task.id.clone(), (note, checking)))
             })
@@ -719,7 +723,10 @@ mod tests {
             assert_eq!(board.ready, ["b"]);
             assert_eq!(board.sessions["asking"], ("Asking".to_string(), AgentStatus::NeedsInput));
             assert_eq!(board.sessions.len(), 2);
-            let note = format!("checking whether it is in {}", app.runtime.plans[1].integration_branch());
+            let note = format!(
+                "Agent kept open: waiting for its turn and pending messages to finish; checking whether it is in {}",
+                app.runtime.plans[1].integration_branch()
+            );
             assert_eq!(board.integration_notes.len(), 1);
             assert_eq!(board.integration_notes["a"], (note, true));
             assert!(board.checking);

@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use atomics_core::config::{AgentKind, KeyConfig};
+use atomics_core::session::AgentStatus;
 use egui::{Rect, RichText, Sense, vec2};
 
 use crate::keys::shortcut_label;
@@ -63,10 +64,13 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
     }
     if size == BrandSize::Full {
         let sessions = backend.session_list();
-        let agents = sessions.iter().filter(|s| s.kind != AgentKind::Shell).count();
-        let response = ui.label(
-            RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" })).color(client.palette.muted),
-        );
+        let agents = sessions.iter().filter(|s| !s.chief && s.kind != AgentKind::Shell).count();
+        let working = sessions
+            .iter()
+            .filter(|s| !s.chief && s.kind != AgentKind::Shell && s.status == AgentStatus::Working)
+            .count();
+        let label = if working == 0 { format!("{agents} idle") } else { format!("{working} working · {agents} open") };
+        let response = ui.label(RichText::new(label).color(client.palette.muted));
         record_item(ui, "agents", &response);
         let names: HashSet<_> = sessions.iter().filter_map(|s| s.sandbox.as_ref()).collect();
         if !names.is_empty() {
