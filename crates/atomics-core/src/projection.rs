@@ -304,6 +304,80 @@ pub struct SetupInfo {
     pub project: Option<String>,
     pub connections: Vec<SetupConnection>,
     pub start_choice: Option<StartChoice>,
+    /// What sandboxes need on this machine, once the host has looked. It says what they would need while agents run
+    /// on the machine too, so that someone can get ready before switching.
+    pub sandbox_steps: Vec<SetupStep>,
+    /// The step under way, one at a time.
+    pub job: Option<SetupJob>,
+    /// Why the last one did not finish. Its words hold no credential.
+    pub failure: Option<SetupFailure>,
+}
+
+/// What a click on a setup step does on the host. `atomics setup` runs the same work from a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupAction {
+    InstallClaude,
+    InstallCodex,
+    InstallGit,
+    InstallSbx,
+    AzureLogin,
+    DockerLogin,
+    NetworkPolicy,
+    /// Takes the value pasted beside it.
+    ClaudeCredential,
+    OpenAiLogin,
+    /// Takes the value pasted beside it.
+    OpenAiKey,
+    LinearConnect,
+    RemoveGithubSecret,
+    SshForwardingOff,
+    SshAgentOff,
+}
+
+/// A button on a setup step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupClick {
+    pub action: SetupAction,
+    pub label: String,
+    /// It takes a pasted value, which never comes back from the host. This names the field.
+    #[serde(default)]
+    pub paste: Option<String>,
+    /// It cannot be undone, so this is asked first.
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+impl SetupClick {
+    pub fn new(action: SetupAction, label: &str) -> SetupClick {
+        SetupClick { action, label: label.into(), paste: None, confirm: None }
+    }
+}
+
+/// Something sandboxes need, and what can be done about it from here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupStep {
+    pub name: String,
+    pub done: bool,
+    /// What it is, or what it still needs.
+    pub note: String,
+    pub clicks: Vec<SetupClick>,
+    /// The exact command, where this takes a terminal or sudo.
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupJob {
+    pub action: SetupAction,
+    /// What it is doing now, for the person watching.
+    pub progress: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupFailure {
+    pub action: SetupAction,
+    pub why: String,
 }
 
 /// A program setup looks for.
@@ -318,6 +392,8 @@ pub struct SetupProgram {
     pub found: Option<String>,
     /// What to run to get it.
     pub install: String,
+    /// The click that runs that, where no terminal or sudo is needed.
+    pub click: Option<SetupClick>,
 }
 
 /// Something ATOMICS can connect to, which can always wait.
@@ -333,6 +409,8 @@ pub struct SetupConnection {
     pub note: String,
     /// What to run in a terminal, where it takes one.
     pub command: Option<String>,
+    /// The click that connects it, where one can.
+    pub click: Option<SetupClick>,
 }
 
 /// A person's start that could not get a sandbox, waiting for them to say what to do. ATOMICS never runs a sandboxed

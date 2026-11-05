@@ -1,6 +1,8 @@
 # Fresh start on Linux
 
-This page takes a clean Ubuntu desktop to a running chief with sandboxed agents. Each step ends with a
+This page takes a clean Ubuntu desktop to a running chief with sandboxed agents. You do not need all of it to try
+ATOMICS: after step 2 its first run opens a setup screen, and agents run on this machine under your own login until
+you choose sandboxes. Steps 3 onward are for sandboxes and for a machine you depend on. Each step ends with a
 check. [How ATOMICS works](how-it-works.md) explains the pieces; if you are bringing an existing setup from
 another machine, read [Moving to a new machine](moving-machines.md) on the old one first.
 
@@ -33,7 +35,7 @@ sudo usermod -aG kvm "$USER"   # then log out and back in
 id -Gn                         # must list kvm
 ```
 
-`atomics setup` (step 3) checks the rest and prints the install command for anything missing:
+Settings → Agents, or `atomics setup` (step 3), checks the rest and gives the install command for anything missing:
 `curl -fsSL https://claude.ai/install.sh | bash` for Claude Code, Node.js/npm and then
 `npm install -g @openai/codex` for Codex, and for sbx:
 
@@ -63,21 +65,31 @@ atomics --version
 ```
 
 The installer builds a release binary for the native target and atomically replaces `~/.local/bin/atomics`,
-even while ATOMICS runs. It installs a desktop entry and icon under `~/.local/share`, then runs
-`atomics setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so. Started from the desktop entry,
-ATOMICS adds your login shell's `PATH` to the bare one the launcher gives, so set `PATH` in your shell's startup
-files as usual; `atomics doctor` says where `PATH` came from.
+even while ATOMICS runs. It installs a desktop entry and icon under `~/.local/share`, and asks nothing: open ATOMICS
+from your applications menu, and its first run opens the setup screen ([First run](how-it-works.md#first-run)). To run
+`atomics` from a terminal too, add `~/.local/bin` to `PATH`; it prints the exact line if it is missing. Started from the
+desktop entry, ATOMICS adds your login shell's `PATH` to the bare one the launcher gives, so set `PATH` in your shell's
+startup files as usual; `atomics doctor` says where `PATH` came from.
 `scripts/linux-install.sh --uninstall` removes the binary, desktop entry and icon, and keeps config and state.
 
-## 3. Run `atomics setup`
+## 3. Set up sandboxes
+
+Open **Settings → Agents** in ATOMICS: it lists what sandboxes need, with a button for each step that can be one, and
+the exact command with a copy button for each step that takes sudo or a terminal. [Fresh machine: clicks, or one guided
+command](isolation.md#fresh-machine-clicks-or-one-guided-command) lists them all. Then choose **Docker Sandboxes** under
+**Where agents run**.
+
+The same from a terminal:
 
 ```sh
-atomics setup                  # or: atomics setup --workspace daily
+atomics sandbox setup          # atomics setup does this when agents already run in sandboxes
+atomics setup --workspace daily
 ```
 
 Setup creates a missing config, then works through the machine in order. It shows each missing tool
-(git, claude, codex, secret-tool, sbx) and each failed KVM check (KVM, `kvm` group) with what to do, and
-waits: fix it in another terminal, then press Enter to check again, or `q` to stop. It goes on only when
+(git, your agents, secret-tool, sbx) and each failed KVM check (KVM, `kvm` group) with what to do, and
+waits: fix it in another terminal, then press Enter to check again, or `q` to stop, which leaves ATOMICS as it is and
+exits 0. One agent is enough; another one missing only says how to get it. It goes on only when
 all of them pass. A distribution other than Ubuntu 24.04+ is only a warning. After that it asks before each change:
 
 1. Docker sign-in (`sbx login`, in the browser).
@@ -95,8 +107,8 @@ all of them pass. A distribution other than Ubuntu 24.04+ is only a warning. Aft
 
 It then rechecks everything and runs `atomics doctor`. Values travel over stdin, hidden on a terminal, and
 never appear in arguments, output, logs or config. Ctrl-C, EOF or declining another step stops setup, and
-running it again resumes where it stopped. [Fresh machine: one guided
-command](isolation.md#fresh-machine-one-guided-command) has the details.
+running it again resumes where it stopped. [Fresh machine: clicks, or one guided
+command](isolation.md#fresh-machine-clicks-or-one-guided-command) has the details.
 
 To store or replace one credential without the rest of setup, use `--credential`. The value is read from
 stdin only; there is no flag or argument that takes it:

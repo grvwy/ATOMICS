@@ -3,13 +3,33 @@
 use super::*;
 use std::io::{BufRead, IsTerminal, Write};
 
-pub fn run(workspace: Option<&str>) -> Result<()> {
+/// A person stopped setup, or a step they asked for, which nothing failed at.
+#[derive(Debug)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("setup stopped; rerun `atomics setup` to resume")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// What `atomics setup` says when someone stops it: ATOMICS itself is fine.
+pub const STOPPED: &str = "Setup stopped. ATOMICS is installed and ready to open; `atomics setup` carries on from here \
+                           whenever you want, and so does Settings in ATOMICS.";
+
+/// `atomics setup`: what this configuration uses, and no more. `sandboxes` asks for sandboxes even while agents run on
+/// this machine, as `atomics sandbox setup` does.
+pub fn run(workspace: Option<&str>, sandboxes: bool) -> Result<()> {
     use atomics_core::config::Config;
     let main = Config::load_or_create(&paths::config_file())
         .map_err(|_| anyhow::anyhow!("cannot load ATOMICS config; fix it before running setup"))?;
     let claude = checks::claude_sandboxed(&main, workspace);
     let config = checks::setup_config(&main, workspace)
         .map_err(|_| anyhow::anyhow!("cannot load workspace isolation/ticket config; fix it before running setup"))?;
+    let mut using = checks::in_use(&main, workspace);
+    using.sandboxes |= sandboxes;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut output = std::io::stdout();
@@ -17,17 +37,30 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
         output,
         "ATOMICS fresh-machine setup. Completed steps are reused; Ctrl-C or EOF stops safely. Rerun this command to resume."
     )?;
-    writeln!(output, "{}", crate::relay::azure::doctor_line(config.azure.enabled))?;
+    if using.sandboxes {
+        writeln!(output, "{}", crate::relay::azure::doctor_line(config.azure.enabled))?;
+    }
     // Installation, privilege elevation and group/session changes belong to the
     // user. Keep checking after they run the displayed OS-specific commands.
     let program = loop {
         // Installers often add ~/.local/bin or Homebrew to shell startup files.
         // Re-read that PATH instead of using the app's cached launch-time PATH.
-        let path = crate::setup::login_shell_var("PATH").or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
-        let missing: Vec<_> = checks::host_lines_with(|name| crate::setup::find_on_path(name, &path).is_some())
-            .into_iter()
-            .filter(|line| checks::blocks_setup(line))
-            .collect();
+        let path = crate::setup::refresh_login_path();
+        let lines = checks::setup_lines(&using, cfg!(target_os = "macos"), |name| {
+            crate::setup::find_on_path(name, &path).is_some()
+        });
+        let missing: Vec<_> = lines.iter().filter(|line| checks::blocks_setup(line)).collect();
+        if missing.is_empty() && !using.sandboxes {
+            for line in lines.iter().filter(|line| !line.starts_with('✓')) {
+                writeln!(output, "{line}")?;
+            }
+            writeln!(
+                output,
+                "Agents run on this machine under your own login, so sandboxes are not needed. Setup is complete; \
+                 `atomics sandbox setup` or Settings in ATOMICS sets sandboxes up if you want them."
+            )?;
+            return Ok(());
+        }
         if missing.is_empty() {
             let program = crate::setup::find_on_path("sbx", &path).map(|p| p.to_string_lossy().into_owned());
             if let Some(program) = program
@@ -85,7 +118,7 @@ fn retry(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
     )?;
     output.flush()?;
     if answer(input)?.eq_ignore_ascii_case("q") {
-        bail!("setup stopped; rerun `atomics setup` to resume")
+        return Err(Stopped.into());
     }
     Ok(())
 }
@@ -100,7 +133,7 @@ fn consent(input: &mut impl BufRead, output: &mut impl Write, message: &str) -> 
     write!(output, "{message} [y/N] ")?;
     output.flush()?;
     if !answer(input)?.eq_ignore_ascii_case("y") {
-        bail!("setup stopped; rerun `atomics setup` to resume")
+        return Err(Stopped.into());
     }
     Ok(())
 }
@@ -127,18 +160,14 @@ fn guided(
     // diagnose exits nonzero for unrelated failures; its JSON is still valid.
     if !diagnosis()?.signed_in() {
         consent(input, output, "Sign in to Docker with sbx login? Complete the browser sign-in.")?;
-        private_command(program, &["login"], "")?;
+        docker_login(program, None)?;
         if !diagnosis()?.signed_in() {
             bail!("Docker sign-in incomplete; run `sbx login` in a host terminal and retry setup")
         }
     }
     if !diagnosis()?.policy_initialized() {
         consent(input, output, &format!("Initialize sbx's global network policy to {}?", config.network.name()))?;
-        safe_sbx(
-            program,
-            &["policy", "init", config.network.name()],
-            "network policy initialization failed; retry setup",
-        )?;
+        network_policy(program, config)?;
     }
     let secrets =
         checks::secrets(program).ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?;
@@ -160,13 +189,7 @@ fn guided(
             "Run `claude setup-token` in a trusted host terminal and paste the token below; an Anthropic API key goes to sbx's anthropic secret instead. Input is hidden on a terminal."
         )?;
         let mut token = credential(input, output, "Claude setup-token or Anthropic API key: ", terminal)?;
-        let result = if token.is_empty() {
-            Err(anyhow::anyhow!("the token is empty; rerun setup to resume"))
-        } else if token.starts_with("sk-ant-oat") {
-            store_subscription(keychain, &token)
-        } else {
-            private_command(program, &["secret", "set", "anthropic"], &format!("{token}\n"))
-        };
+        let result = store_claude_credential(program, keychain, &token);
         token.clear();
         result?;
     }
@@ -177,15 +200,7 @@ fn guided(
             output,
             "Sign in to OpenAI with your ChatGPT account for sandboxed Codex (sbx secret set openai --oauth)?",
         )? {
-            private_command(program, &["secret", "set", "openai", "--oauth"], "")?;
-            if !checks::secrets(program)
-                .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
-                .openai
-            {
-                bail!(
-                    "OpenAI sign-in incomplete; run `sbx secret set openai --oauth` in a host terminal and retry setup"
-                )
-            }
+            openai_login(program, None)?;
         } else {
             let store = crate::credentials::Store::new(keychain.clone());
             let token = match store.token("openai")? {
@@ -205,7 +220,7 @@ fn guided(
                 }
             };
             if let Some(token) = token {
-                private_command(program, &["secret", "set", "openai"], &format!("{token}\n"))?;
+                store_openai_key(program, &token)?;
                 writeln!(
                     output,
                     "OpenAI: OS keychain for ATOMICS relay; sandbox Codex uses sbx's OpenAI credential proxy."
@@ -228,20 +243,16 @@ fn guided(
         let linear = servers.as_array().unwrap().iter().find(|server| server["name"] == "linear");
         if linear.is_none() {
             consent(input, output, "Register the Linear MCP server with sbx?")?;
-            safe_sbx(
-                program,
-                &["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"],
-                "Linear registration failed; retry setup",
-            )?;
+            register_linear(program)?;
         }
         if linear.is_none_or(|server| server["status"] != "ready") {
             consent(input, output, "Authorize sbx's Linear MCP server? Complete the browser authorization.")?;
-            private_command(program, &["mcp", "auth", "linear"], "y\n")?;
+            authorize_linear(program, None)?;
         }
     }
     if secrets.github {
         consent(input, output, "Remove sbx's github secret so sandbox agents cannot push as you?")?;
-        safe_sbx(program, &["secret", "rm", "github", "--force"], "could not remove github secret; retry setup")?;
+        remove_github_secret(program)?;
     }
     // Setup never removes these itself: `sbx secret rm <name>` would put a pasted credential in argv.
     loop {
@@ -271,12 +282,7 @@ fn guided(
         || checks::setting(program, "ssh.agentSocketPath").as_deref() != Some("")
     {
         consent(input, output, "Disable global sbx SSH agent forwarding?")?;
-        safe_sbx(
-            program,
-            &["settings", "set", "ssh.agentForwardingEnabled", "false"],
-            "could not disable SSH forwarding; retry setup",
-        )?;
-        safe_sbx(program, &["settings", "unset", "ssh.agentSocketPath"], "could not clear SSH socket; retry setup")?;
+        ssh_forwarding_off(program)?;
     }
     let lines = checks::sandbox_lines(program, config, route);
     for line in &lines {
@@ -286,6 +292,68 @@ fn guided(
         bail!("sandbox checks still need attention; follow the hints and rerun `atomics setup`")
     }
     Ok(())
+}
+
+// ── The work of each step, which `atomics setup` asks about and Settings runs on a click ─────────────
+
+pub(super) fn docker_login(program: &str, stop: Option<&AtomicBool>) -> Result<()> {
+    private_command_until(program, &["login"], "", stop)
+}
+
+pub(super) fn network_policy(program: &str, config: &SandboxConfig) -> Result<()> {
+    safe_sbx(program, &["policy", "init", config.network.name()], "network policy initialization failed; retry setup")
+}
+
+/// A subscription token goes to the OS keychain for ATOMICS's relay, and anything else to sbx's anthropic secret.
+pub(super) fn store_claude_credential(program: &str, keychain: &crate::relay::Keychain, token: &str) -> Result<()> {
+    if token.is_empty() {
+        bail!("the token is empty; rerun setup to resume")
+    }
+    if token.starts_with("sk-ant-oat") {
+        store_subscription(keychain, token)
+    } else {
+        private_command(program, &["secret", "set", "anthropic"], &format!("{token}\n"))
+    }
+}
+
+pub(super) fn openai_login(program: &str, stop: Option<&AtomicBool>) -> Result<()> {
+    private_command_until(program, &["secret", "set", "openai", "--oauth"], "", stop)?;
+    if !checks::secrets(program)
+        .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
+        .openai
+    {
+        bail!("OpenAI sign-in incomplete; run `sbx secret set openai --oauth` in a host terminal and retry setup")
+    }
+    Ok(())
+}
+
+pub(super) fn store_openai_key(program: &str, token: &str) -> Result<()> {
+    private_command(program, &["secret", "set", "openai"], &format!("{token}\n"))
+}
+
+pub(super) fn register_linear(program: &str) -> Result<()> {
+    safe_sbx(
+        program,
+        &["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"],
+        "Linear registration failed; retry setup",
+    )
+}
+
+pub(super) fn authorize_linear(program: &str, stop: Option<&AtomicBool>) -> Result<()> {
+    private_command_until(program, &["mcp", "auth", "linear"], "y\n", stop)
+}
+
+pub(super) fn remove_github_secret(program: &str) -> Result<()> {
+    safe_sbx(program, &["secret", "rm", "github", "--force"], "could not remove github secret; retry setup")
+}
+
+pub(super) fn ssh_forwarding_off(program: &str) -> Result<()> {
+    safe_sbx(
+        program,
+        &["settings", "set", "ssh.agentForwardingEnabled", "false"],
+        "could not disable SSH forwarding; retry setup",
+    )?;
+    safe_sbx(program, &["settings", "unset", "ssh.agentSocketPath"], "could not clear SSH socket; retry setup")
 }
 
 /// Keeps the Claude subscription token in the OS keychain, where ATOMICS's relay reads it.
@@ -334,6 +402,7 @@ pub(crate) enum OutputError {
     Read,
     Timeout,
     TooLarge,
+    Stopped,
 }
 
 /// Read credential helpers through bounded, nonblocking pipes only. Neither stream ever goes
@@ -341,6 +410,15 @@ pub(crate) enum OutputError {
 pub(crate) fn private_output(
     command: &mut Command,
     timeout: Duration,
+) -> std::result::Result<std::process::Output, OutputError> {
+    private_output_until(command, timeout, None)
+}
+
+/// [`private_output`], stopped once `stop` is set.
+pub(crate) fn private_output_until(
+    command: &mut Command,
+    timeout: Duration,
+    stop: Option<&AtomicBool>,
 ) -> std::result::Result<std::process::Output, OutputError> {
     use std::io::{ErrorKind, Read};
     use std::os::fd::AsRawFd;
@@ -397,6 +475,9 @@ pub(crate) fn private_output(
             {
                 return Ok(std::process::Output { status, stdout: out, stderr: err });
             }
+            if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+                return Err(OutputError::Stopped);
+            }
             if Instant::now() >= deadline {
                 return Err(OutputError::Timeout);
             }
@@ -414,6 +495,16 @@ pub(crate) fn private_output(
 /// Child output is discarded: a failed credential writer may echo its input.
 /// Browser auth can take several minutes, but a stuck helper remains bounded.
 pub(crate) fn private_command(program: &str, args: &[&str], input: &str) -> Result<()> {
+    private_command_until(program, args, input, None)
+}
+
+/// [`private_command`], stopped once `stop` is set: nobody has to wait out a sign-in they walked away from.
+pub(crate) fn private_command_until(
+    program: &str,
+    args: &[&str],
+    input: &str,
+    stop: Option<&AtomicBool>,
+) -> Result<()> {
     use std::os::fd::OwnedFd;
     let (mut writer, reader) =
         std::os::unix::net::UnixStream::pair().map_err(|_| anyhow::anyhow!("could not open setup input"))?;
@@ -430,13 +521,17 @@ pub(crate) fn private_command(program: &str, args: &[&str], input: &str) -> Resu
     drop(writer);
     let deadline = Instant::now() + CREATE_TIMEOUT;
     loop {
+        let stopped = stop.is_some_and(|stop| stop.load(Ordering::Relaxed));
         match child.try_wait() {
             Ok(Some(status)) if status.success() && result.is_ok() => return Ok(()),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if !stopped && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 // SAFETY: the setup helper owns this process group, including its children.
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
+                if stopped {
+                    return Err(Stopped.into());
+                }
                 bail!("setup helper failed or timed out; complete browser sign-in and retry `atomics setup`")
             }
         }

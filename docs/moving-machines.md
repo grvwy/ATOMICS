@@ -36,7 +36,7 @@ would load the old machine's sessions and plans.
 
 ## Set up again
 
-- **ATOMICS.** Follow [Fresh start on Linux](fresh-start-linux.md): `atomics setup` signs in to Docker,
+- **ATOMICS.** Follow [Fresh start on Linux](fresh-start-linux.md): Settings → Agents or `atomics setup` signs in to Docker,
   sets sbx's network policy and secrets, registers sbx's Linear server when a ticket profile uses Linear,
   and stores the Claude token in the OS keychain. Store the other credentials you used with `atomics setup
   --credential <kind>`. The keychain and sbx's secrets never leave a machine.

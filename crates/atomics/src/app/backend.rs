@@ -94,8 +94,9 @@ impl Backend for Local<'_> {
         !matches!(command, atomics_ui::Command::OpenTicket(_)) || self.0.ticket_config().is_some()
     }
 
+    /// Only a project: from an app menu this is the home folder, which no agent should start in unasked.
     fn launch_dir(&self) -> Option<PathBuf> {
-        Some(self.0.launch_dir.clone())
+        self.0.launch_project.then(|| self.0.launch_dir.clone())
     }
 
     fn session_ticket(&self, session: &str) -> Option<atomics_core::tickets::TicketLink> {

@@ -326,6 +326,15 @@ pub enum SettingsTool {
     AnswerStart {
         run_here: bool,
     },
+    /// Run one setup step on the host, off its window's thread; [`crate::projection::SetupInfo`] says how it goes.
+    RunSetup {
+        action: crate::projection::SetupAction,
+        /// What was pasted for it, over this connection only: it reaches no argument, log or reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    /// Stop the setup step under way.
+    CancelSetup,
 }
 
 /// What became of an operation.
@@ -645,6 +654,9 @@ impl HostCommand {
                 }
                 SettingsTool::InitProject { path } => {
                     bounds.id("path", Some(path));
+                }
+                SettingsTool::RunSetup { value, .. } => {
+                    bounds.text("value", value.as_deref());
                 }
                 _ => {}
             },

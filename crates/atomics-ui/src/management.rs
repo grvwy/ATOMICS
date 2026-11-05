@@ -24,6 +24,10 @@ pub struct State {
     later: Vec<String>,
     /// The Settings section that opens as Settings next draws.
     open_section: Option<String>,
+    /// What was pasted for a setup step and not sent yet. It goes as Settings closes.
+    setup_values: std::collections::HashMap<atomics_core::projection::SetupAction, String>,
+    /// The setup step waiting for a yes, because it cannot be undone.
+    setup_confirm: Option<atomics_core::projection::SetupAction>,
     pub folder: Option<String>,
     pub folder_page: u32,
     pub filter: String,
@@ -57,6 +61,8 @@ impl State {
     /// What lives as long as Settings is open goes when it closes: above all a value typed and never saved.
     fn forget_settings(&mut self) {
         self.credential_value.clear();
+        self.setup_values.clear();
+        self.setup_confirm = None;
         self.confirm = None;
         self.loaded.clear();
         self.focus_credential = false;

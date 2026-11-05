@@ -23,6 +23,7 @@ pub(crate) mod checks;
 pub mod exec;
 pub mod relay_check;
 pub mod setup;
+pub(crate) mod steps;
 pub use checks::doctor_lines;
 
 /// Most sbx commands answer within a second; this bounds a stuck daemon.
@@ -1379,10 +1380,10 @@ mod tests {
             error
         };
         let missing = bin.path().join("missing").display().to_string();
-        refusal(&missing, &["not installed", checks::install_hint("sbx", cfg!(target_os = "macos"))]);
+        refusal(&missing, &["not installed", &checks::install_hint("sbx", cfg!(target_os = "macos"))]);
         refusal("sbx-not-on-this-path", &["not installed"]);
         std::fs::write(bin.path().join("version"), "v0.49.9").unwrap();
-        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", checks::install_hint("sbx", cfg!(target_os = "macos"))]);
+        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", &checks::install_hint("sbx", cfg!(target_os = "macos"))]);
         std::fs::write(bin.path().join("version"), "dev").unwrap();
         refusal(&sbx, &["no version ATOMICS can read"]);
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();

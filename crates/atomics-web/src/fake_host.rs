@@ -1513,18 +1513,24 @@ pub fn management() -> FakeHost {
                     agent: None,
                     found: Some("/usr/bin/git".into()),
                     install: "sudo apt-get install git".into(),
+                    click: None,
                 },
                 SetupProgram {
                     name: "Claude Code".into(),
                     agent: Some("claude".into()),
                     found: Some("~/.local/bin/claude".into()),
                     install: "curl -fsSL https://claude.ai/install.sh | bash".into(),
+                    click: None,
                 },
                 SetupProgram {
                     name: "Codex".into(),
                     agent: Some("codex".into()),
                     found: None,
                     install: "npm install -g @openai/codex".into(),
+                    click: Some(atomics_core::projection::SetupClick::new(
+                        atomics_core::projection::SetupAction::InstallCodex,
+                        "Install",
+                    )),
                 },
             ],
             connections: [
@@ -1539,6 +1545,7 @@ pub fn management() -> FakeHost {
                 connected: None,
                 note: note.into(),
                 command: command.map(str::to_string),
+                click: None,
             })
             .into(),
             ..SetupInfo::default()

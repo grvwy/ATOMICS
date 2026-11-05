@@ -33,6 +33,9 @@ impl State {
         for ticket in &waiting {
             blockers.push(format!("queued work waiting: {} ({})", ticket.label, ticket.id));
         }
+        if let Some(job) = &self.setup_job {
+            blockers.push(format!("setup step running: {}", job.progress()));
+        }
         if !self.creating.is_empty() || !self.pending_codex.is_empty() || !self.pending_sandbox.is_empty() {
             blockers.push(format!(
                 "worktree or agent launch running: {}",

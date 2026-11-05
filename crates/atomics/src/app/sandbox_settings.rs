@@ -16,12 +16,14 @@ impl State {
         };
         let (main, workspace) = (self.config.clone(), self.workspace.clone());
         let keychain = self.relay.keychain().clone();
+        let machine = self.sandbox_machine(config.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         self.sandbox_check = Some(rx);
         let wake = self.wake.clone();
         std::thread::spawn(move || {
             let claude = crate::sandbox::checks::claude_route(&main, workspace.as_deref(), &keychain);
-            let _ = tx.send(crate::sandbox::doctor_lines(&program, &config, claude));
+            let lines = crate::sandbox::doctor_lines(&program, &config, claude);
+            let _ = tx.send((lines, crate::sandbox::steps::status(&machine)));
             wake.notify();
         });
     }
@@ -31,7 +33,10 @@ impl State {
             return false;
         };
         match rx.try_recv() {
-            Ok(lines) => self.sandbox_lines = lines,
+            Ok((lines, steps)) => {
+                self.sandbox_lines = lines;
+                self.sandbox_steps = steps;
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.sandbox_lines = vec!["✗ Sandbox check stopped; refresh to retry".into()]

@@ -11,6 +11,8 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
     std::fs::create_dir(&bin).unwrap();
     let shell = dir.path().join("shell");
     test_support::write_program(&shell, "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n");
+    // Linux's commands name the package manager this machine has.
+    test_support::write_program(bin.join("apt-get"), "#!/bin/sh\nexit 0\n");
     let config = dir.path().join("config.toml");
     let output = test_support::output(
         Command::new(env!("CARGO_BIN_EXE_atomics"))
@@ -27,7 +29,7 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
     assert!(config.exists());
     let stdout = String::from_utf8(output.stdout).unwrap();
     for tool in ["git", "claude", "codex"] {
-        assert!(stdout.contains(&format!("✗ sandbox prerequisite: {tool}")), "{stdout}");
+        assert!(stdout.contains(&format!("✗ prerequisite: {tool}")), "{stdout}");
     }
     assert!(stdout.contains(if cfg!(target_os = "macos") {
         "xcode-select --install"
@@ -38,7 +40,7 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
     if cfg!(target_os = "macos") {
         assert!(!stdout.contains("secret-tool") && !stdout.contains("libsecret"), "{stdout}");
     } else {
-        assert!(stdout.contains("✗ sandbox prerequisite: secret-tool"), "{stdout}");
+        assert!(stdout.contains("✗ prerequisite: secret-tool"), "{stdout}");
         assert!(stdout.contains("sudo apt-get install libsecret-tools gnome-keyring"), "{stdout}");
     }
     assert!(String::from_utf8(output.stderr).unwrap().contains("rerun `atomics setup` to resume"));

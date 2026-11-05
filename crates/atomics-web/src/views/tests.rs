@@ -2032,6 +2032,110 @@ fn a_first_run_opens_the_setup_screen_once_and_skipping_it_tells_the_host() {
     }
 }
 
+/// Settings on any client: what sandboxes need, with a click, a pasted value, a question or an exact command for each,
+/// and what the step under way or the last failure says.
+#[test]
+fn settings_lists_what_sandboxes_need_and_each_step_goes_to_the_host() {
+    use atomics_core::ops::SettingsTool;
+    use atomics_core::projection::{SetupAction, SetupClick, SetupFailure, SetupJob, SetupStep};
+    let steps = || {
+        vec![
+            SetupStep {
+                name: "Docker account".into(),
+                clicks: vec![SetupClick::new(SetupAction::DockerLogin, "Sign in")],
+                ..SetupStep::default()
+            },
+            SetupStep {
+                name: "Claude in sandboxes".into(),
+                clicks: vec![SetupClick {
+                    paste: Some("Anthropic API key or token".into()),
+                    ..SetupClick::new(SetupAction::ClaudeCredential, "Save")
+                }],
+                ..SetupStep::default()
+            },
+            SetupStep {
+                name: "A github secret in sbx".into(),
+                clicks: vec![SetupClick {
+                    confirm: Some("Remove sbx's github secret?".into()),
+                    ..SetupClick::new(SetupAction::RemoveGithubSecret, "Remove")
+                }],
+                ..SetupStep::default()
+            },
+            SetupStep {
+                name: "The kvm group".into(),
+                command: Some("sudo usermod -aG kvm \"$USER\"".into()),
+                ..SetupStep::default()
+            },
+        ]
+    };
+    let host = |setup: &dyn Fn(&mut atomics_core::projection::SetupInfo)| {
+        let mut host = fake_host::management();
+        let info = &mut host.board.host.management.as_mut().unwrap().setup;
+        info.sandbox_steps = steps();
+        setup(info);
+        host
+    };
+    let (ctx, mut world, mut client, mut view) = live_with(host(&|_| {}));
+    client.management.settings = true;
+    section(&ctx, &mut world, &mut client, &mut view, WIDE, "Theme");
+    let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Agents");
+    for label in ["What they need", "Docker Sandboxes", "Docker account", "Copy: sudo usermod", "Every check"] {
+        assert!(has(&shown, label), "{label}: {shown:?}");
+    }
+    assert!(!has(&shown, "KVM is not available"), "the detail stays behind its row: {shown:?}");
+
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Sign in");
+    assert_eq!(
+        tools_sent(&world).last(),
+        Some(&SettingsTool::RunSetup { action: SetupAction::DockerLogin, value: None }),
+        "{shown:?}"
+    );
+    // What cannot be undone asks first, and Keep leaves it alone.
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Remove");
+    assert!(has(&shown, "Remove sbx's github secret?"), "{shown:?}");
+    let before = tools_sent(&world).len();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Keep");
+    assert!(!has(&shown, "Remove sbx's github secret?"), "{shown:?}");
+    assert_eq!(tools_sent(&world).len(), before);
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Remove");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let yes = shown.iter().rfind(|(text, _)| text == "Remove").unwrap().1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(yes));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(
+        tools_sent(&world).last(),
+        Some(&SettingsTool::RunSetup { action: SetupAction::RemoveGithubSecret, value: None })
+    );
+
+    // While a step runs it says so, and offers a way out; nothing else can start.
+    let (ctx, mut world, mut client, mut view) = live_with(host(&|info| {
+        info.job = Some(SetupJob { action: SetupAction::DockerLogin, progress: "Finish in your browser…".into() });
+    }));
+    client.management.settings = true;
+    section(&ctx, &mut world, &mut client, &mut view, WIDE, "Theme");
+    let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Agents");
+    assert!(has(&shown, "Finish in your browser") && has(&shown, "Cancel"), "{shown:?}");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Cancel");
+    assert_eq!(tools_sent(&world).last(), Some(&SettingsTool::CancelSetup));
+
+    // A failure says why, beside its step.
+    let (ctx, mut world, mut client, mut view) = live_with(host(&|info| {
+        info.failure = Some(SetupFailure { action: SetupAction::DockerLogin, why: "the sign-in timed out".into() });
+    }));
+    client.management.settings = true;
+    section(&ctx, &mut world, &mut client, &mut view, WIDE, "Theme");
+    let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Agents");
+    assert!(has(&shown, "the sign-in timed out"), "{shown:?}");
+
+    // A client that may not change the host reads it all and starts nothing.
+    let (ctx, mut world, mut client, mut view) = viewing(host(&|_| {}));
+    client.management.settings = true;
+    section(&ctx, &mut world, &mut client, &mut view, WIDE, "Theme");
+    section(&ctx, &mut world, &mut client, &mut view, WIDE, "Agents");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Sign in");
+    assert!(!tools_sent(&world).iter().any(|tool| matches!(tool, SettingsTool::RunSetup { .. })));
+}
+
 /// The setup screen as a first run sees it. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where it goes.
 #[test]
 #[ignore]
@@ -2668,11 +2772,11 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
         assert!(tools_sent(&world).is_empty(), "nothing is read before it is opened");
 
         for (label, expected, content) in [
-            ("Agents", Some(SettingsTool::CheckSandbox), "Docker Sandboxes"),
-            ("Connections", Some(SettingsTool::RefreshConnections), "linear"),
-            ("Credentials", Some(SettingsTool::RefreshCredentials), "Claude subscription"),
-            ("Remote devices", None, "Paired devices"),
-            ("Advanced", None, "Effective configuration"),
+            ("Agents", vec![SettingsTool::CheckSandbox, SettingsTool::CheckPrograms], "Docker Sandboxes"),
+            ("Connections", vec![SettingsTool::RefreshConnections], "linear"),
+            ("Credentials", vec![SettingsTool::RefreshCredentials], "Claude subscription"),
+            ("Remote devices", vec![], "Paired devices"),
+            ("Advanced", vec![], "Effective configuration"),
         ] {
             let before = tools_sent(&world).len();
             let shown = section(&ctx, &mut world, &mut client, &mut view, size, label);

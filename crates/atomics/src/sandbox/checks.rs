@@ -34,12 +34,7 @@ pub(crate) fn claude_route(
     if claude_sandboxed(config, workspace) {
         ClaudeRoute::Sandboxed { subscription: keychain.claude_token().is_some() }
     } else {
-        let isolation = workspace
-            .and_then(|name| workspace::Workspace::load(name).ok())
-            .and_then(|workspace| workspace.isolation().ok().flatten())
-            .and_then(|overrides| config.isolation.with_overrides(&overrides).ok())
-            .unwrap_or_else(|| config.isolation.clone());
-        if isolation.bare_relay {
+        if effective_isolation(config, workspace).bare_relay {
             ClaudeRoute::BareRelay { subscription: keychain.claude_token().is_some() }
         } else {
             ClaudeRoute::Bare
@@ -50,12 +45,7 @@ pub(crate) fn claude_route(
 /// Whether a Claude agent runs sandboxed: its own `isolation`, else the workspace's or main `mode`.
 /// A repository can still require sandboxes for its own agents.
 pub(crate) fn claude_sandboxed(config: &atomics_core::config::Config, workspace: Option<&str>) -> bool {
-    let overrides = workspace
-        .and_then(|name| workspace::Workspace::load(name).ok())
-        .and_then(|workspace| workspace.isolation().ok().flatten());
-    let isolation = overrides
-        .and_then(|overrides| config.isolation.with_overrides(&overrides).ok())
-        .unwrap_or_else(|| config.isolation.clone());
+    let isolation = effective_isolation(config, workspace);
     config
         .agents
         .iter()
@@ -412,45 +402,135 @@ fn prerequisite_lines(mac: bool, installed: impl Fn(&str) -> bool) -> Vec<String
     ["git", "claude", "codex"]
         .into_iter()
         .chain(keychain)
-        .map(|name| check_line(installed(name), &format!("sandbox prerequisite: {name}"), install_hint(name, mac)))
+        .map(|name| {
+            let hint = hint_with(name, mac, &installed);
+            check_line(installed(name), &format!("sandbox prerequisite: {name}"), &hint)
+        })
         .collect()
 }
 
-/// What to run to get `program`, for a person to copy.
-pub(crate) fn install_command(program: &str, mac: bool) -> String {
+/// What to run to get `program`, for a person to copy, with what `has` finds on this machine. Linux has several package
+/// managers. Where none is known this is words, starting "install", and not a command that would not run.
+pub(crate) fn install_command(program: &str, mac: bool, has: &dyn Fn(&str) -> bool) -> String {
+    let packages = |apt: &str, other: &str| {
+        if has("apt-get") {
+            format!("sudo apt-get install {apt}")
+        } else if has("dnf") {
+            format!("sudo dnf install {other}")
+        } else if has("pacman") {
+            format!("sudo pacman -S {other}")
+        } else if has("zypper") {
+            format!("sudo zypper install {apt}")
+        } else {
+            format!("install {apt} with your package manager")
+        }
+    };
     match (program, mac) {
         ("git", true) => "xcode-select --install".into(),
-        ("git", false) => "sudo apt-get install git".into(),
+        ("git", false) => packages("git", "git"),
         ("claude", _) => "curl -fsSL https://claude.ai/install.sh | bash".into(),
         ("codex", true) => "brew install --cask codex".into(),
-        ("codex", false) => "npm install -g @openai/codex".into(),
+        ("codex", false) if has("npm") => "npm install -g @openai/codex".into(),
+        ("codex", false) => {
+            let node = packages("nodejs npm", "nodejs npm");
+            if node.starts_with("install ") {
+                format!("{node}, then run: npm install -g @openai/codex")
+            } else {
+                format!("{node} && sudo npm install -g @openai/codex")
+            }
+        }
+        ("secret-tool", _) => packages("libsecret-tools gnome-keyring", "libsecret gnome-keyring"),
+        ("sbx", true) => "brew trust docker/tap && brew install docker/tap/sbx".into(),
+        ("sbx", false) if has("apt-get") => {
+            "curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh && sudo apt install docker-sbx".into()
+        }
+        ("sbx", false) => "install sbx from https://github.com/docker/sbx-releases".into(),
+        ("az", true) => "brew install azure-cli".into(),
+        ("az", false) if has("apt-get") => "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash".into(),
+        ("az", false) => "install az from https://learn.microsoft.com/cli/azure/install-azure-cli".into(),
         (other, _) => format!("install {other}"),
     }
 }
 
-pub(super) fn install_hint(name: &str, mac: bool) -> &'static str {
-    match (name, mac) {
-        ("git", true) => "install with `xcode-select --install` (or `brew install git`)",
-        ("git", false) => "install with `sudo apt-get install git`",
-        ("claude", _) => "install with `curl -fsSL https://claude.ai/install.sh | bash`",
-        ("codex", true) => "install with `brew install --cask codex`",
-        ("codex", false) => "install Node.js/npm, then `npm install -g @openai/codex`",
-        ("secret-tool", _) => {
-            "install with `sudo apt-get install libsecret-tools gnome-keyring` and unlock the desktop keyring: ATOMICS's \
-             relay reads the Claude subscription with it"
+/// What doctor and setup say about a missing program, with what is on this machine now. Blocks while the login shell
+/// is first read: call it off the window's thread.
+pub(super) fn install_hint(name: &str, mac: bool) -> String {
+    hint_with(name, mac, &|program| crate::setup::find_program(program).is_some())
+}
+
+fn hint_with(name: &str, mac: bool, has: &dyn Fn(&str) -> bool) -> String {
+    let command = install_command(name, mac, has);
+    let how = if command.starts_with("install ") { command } else { format!("install with `{command}`") };
+    match name {
+        "secret-tool" => {
+            format!("{how} and unlock the desktop keyring: ATOMICS's relay reads the Claude subscription with it")
         }
-        (_, true) => {
-            "install with `brew trust docker/tap` then `brew install docker/tap/sbx` (upgrade: `brew upgrade sbx`)"
-        }
-        (_, false) => {
-            "install with `curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh` then `sudo apt install docker-sbx`"
-        }
+        _ => how,
     }
 }
 
+/// What a configuration uses, which is all `atomics setup` asks for.
+pub(super) struct InUse {
+    /// The program of each agent it runs.
+    pub(super) agents: Vec<String>,
+    pub(super) sandboxes: bool,
+    /// Something reads the Claude subscription from the OS keychain.
+    pub(super) keychain: bool,
+}
+
+fn effective_isolation(config: &atomics_core::config::Config, workspace: Option<&str>) -> isolation::IsolationConfig {
+    workspace
+        .and_then(|name| workspace::Workspace::load(name).ok())
+        .and_then(|workspace| workspace.isolation().ok().flatten())
+        .and_then(|overrides| config.isolation.with_overrides(&overrides).ok())
+        .unwrap_or_else(|| config.isolation.clone())
+}
+
+pub(super) fn in_use(config: &atomics_core::config::Config, workspace: Option<&str>) -> InUse {
+    use atomics_core::config::AgentKind;
+    let isolation = effective_isolation(config, workspace);
+    let sandboxed = |agent: &&atomics_core::config::AgentConfig| {
+        isolation.mode_for(agent, None) == isolation::IsolationMode::Sandbox
+    };
+    InUse {
+        agents: config
+            .agents
+            .iter()
+            .filter(|agent| agent.kind != AgentKind::Shell)
+            .filter_map(|agent| agent.command.first().cloned())
+            .collect(),
+        sandboxes: config.agents.iter().any(|agent| sandboxed(&agent)),
+        keychain: isolation.bare_relay
+            || config.agents.iter().filter(sandboxed).any(|agent| agent.kind == AgentKind::Claude),
+    }
+}
+
+/// What `atomics setup` checks. One agent is enough to start with, so another one missing only says how to get it: of
+/// these lines, only the ones [`blocks_setup`] picks hold setup up.
+pub(super) fn setup_lines(using: &InUse, mac: bool, installed: impl Fn(&str) -> bool) -> Vec<String> {
+    let has = |program: &str| installed(program);
+    let line = |name: &str| check_line(installed(name), &format!("prerequisite: {name}"), &hint_with(name, mac, &has));
+    let mut lines = vec![line("git")];
+    let any_agent = using.agents.iter().any(|agent| installed(agent));
+    for agent in &using.agents {
+        if any_agent && !installed(agent) {
+            lines.push(format!("{agent} is not installed; {}", hint_with(agent, mac, &has)));
+        } else {
+            lines.push(line(agent));
+        }
+    }
+    if using.keychain && !mac {
+        lines.push(line("secret-tool"));
+    }
+    if using.sandboxes {
+        lines.extend(linux_checks());
+    }
+    lines
+}
+
+/// KVM on this machine: whether it is there for this session, and whether the session is in its group.
 #[cfg(target_os = "linux")]
-fn linux_checks() -> Vec<String> {
-    let os = std::fs::read_to_string("/etc/os-release").ok();
+pub(super) fn kvm_state() -> (bool, bool) {
     let kvm = File::options().read(true).write(true).open("/dev/kvm").ok();
     let kvm = kvm.is_some_and(|file| {
         use std::os::fd::AsRawFd;
@@ -458,7 +538,18 @@ fn linux_checks() -> Vec<String> {
         unsafe { libc::ioctl(file.as_raw_fd(), 0xae00) == 12 }
     });
     let groups = Command::new("id").arg("-Gn").output().ok().filter(|o| o.status.success());
-    linux_lines(os.as_deref(), kvm, groups.as_ref().and_then(|o| std::str::from_utf8(&o.stdout).ok()))
+    let in_group = groups
+        .as_ref()
+        .and_then(|o| std::str::from_utf8(&o.stdout).ok())
+        .is_some_and(|groups| groups.split_whitespace().any(|group| group == "kvm"));
+    (kvm, in_group)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_checks() -> Vec<String> {
+    let os = std::fs::read_to_string("/etc/os-release").ok();
+    let (kvm, in_group) = kvm_state();
+    linux_lines(os.as_deref(), kvm, in_group.then_some("kvm"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -716,6 +807,71 @@ mod tests {
     }
 
     #[test]
+    fn install_commands_name_this_machines_package_manager_and_no_command_where_none_is_known() {
+        let on = |tool: &'static str| move |name: &str| name == tool;
+        for (tool, git) in [
+            ("apt-get", "sudo apt-get install git"),
+            ("dnf", "sudo dnf install git"),
+            ("pacman", "sudo pacman -S git"),
+            ("zypper", "sudo zypper install git"),
+            ("none-here", "install git with your package manager"),
+        ] {
+            assert_eq!(install_command("git", false, &on(tool)), git);
+        }
+        assert_eq!(hint_with("git", false, &on("none-here")), "install git with your package manager");
+        assert!(hint_with("git", false, &on("dnf")).contains("`sudo dnf install git`"));
+        // Claude Code's own installer takes no package manager, and sbx's Debian package is no use elsewhere.
+        assert_eq!(
+            install_command("claude", false, &on("none-here")),
+            install_command("claude", true, &on("none-here"))
+        );
+        assert!(install_command("sbx", false, &on("pacman")).contains("github.com/docker/sbx-releases"));
+        assert!(install_command("sbx", false, &on("apt-get")).contains("docker-sbx"));
+        // Codex needs Node.js first where npm is not here.
+        assert_eq!(install_command("codex", false, &on("npm")), "npm install -g @openai/codex");
+        assert!(install_command("codex", false, &on("apt-get")).starts_with("sudo apt-get install nodejs npm && "));
+        assert!(install_command("codex", false, &on("none-here")).starts_with("install nodejs npm"));
+    }
+
+    #[test]
+    fn setup_asks_only_for_what_this_configuration_uses() {
+        let bare = InUse { agents: vec!["claude".into(), "codex".into()], sandboxes: false, keychain: false };
+        let blocking = |using: &InUse, found: &[&str]| -> Vec<String> {
+            setup_lines(using, false, |name| found.contains(&name))
+                .into_iter()
+                .filter(|line| blocks_setup(line))
+                .collect()
+        };
+        assert!(blocking(&bare, &["git", "claude"]).is_empty(), "one agent is enough, whichever");
+        assert!(blocking(&bare, &["git", "codex"]).is_empty());
+        let shown = setup_lines(&bare, false, |name| name == "git" || name == "claude").join("\n");
+        assert!(shown.contains("codex is not installed"), "it still says how to get the other: {shown}");
+        assert!(!shown.contains("secret-tool") && !shown.contains("KVM") && !shown.contains("sbx"), "{shown}");
+        let none = blocking(&bare, &["git"]);
+        assert_eq!(none.len(), 2, "with no agent at all, either will do: {none:?}");
+        assert_eq!(blocking(&bare, &["claude"]).len(), 1, "git is needed by every agent");
+
+        let relay =
+            InUse { keychain: true, ..InUse { agents: vec!["claude".into()], sandboxes: false, keychain: false } };
+        assert_eq!(blocking(&relay, &["git", "claude"]).len(), 1, "what reads the keychain needs its tool");
+        assert!(blocking(&relay, &["git", "claude", "secret-tool"]).is_empty());
+        let sandboxes =
+            InUse { sandboxes: true, ..InUse { agents: vec!["claude".into()], sandboxes: false, keychain: false } };
+        #[cfg(target_os = "linux")]
+        assert!(setup_lines(&sandboxes, false, |_| true).join("\n").contains("KVM"));
+        let _ = sandboxes;
+
+        let mut config: atomics_core::config::Config = Default::default();
+        config.isolation.mode = isolation::IsolationMode::Bare;
+        let using = in_use(&config, None);
+        assert!(!using.sandboxes && !using.keychain);
+        assert!(using.agents.iter().any(|agent| agent == "claude"));
+        assert!(!using.agents.iter().any(|agent| agent.is_empty()), "a shell is no agent to install");
+        config.isolation.mode = isolation::IsolationMode::Sandbox;
+        assert!(in_use(&config, None).sandboxes && in_use(&config, None).keychain);
+    }
+
+    #[test]
     fn setup_waits_for_prerequisites_and_kvm_but_not_the_distribution() {
         let other = linux_lines(Some("ID=cachyos\nID_LIKE=arch"), true, Some("users kvm"));
         assert!(other[0].starts_with('✗') && !blocks_setup(&other[0]));
@@ -729,11 +885,12 @@ mod tests {
     fn fresh_machine_prerequisites_have_os_specific_install_commands() {
         for mac in [true, false] {
             assert!(prerequisite_lines(mac, |_| true).iter().all(|line| line.starts_with('✓')));
-            let missing = prerequisite_lines(mac, |_| false).join("\n");
+            let apt = |name: &str| name == "apt-get";
+            let missing = prerequisite_lines(mac, apt).join("\n");
             assert!(missing.lines().all(|line| line.starts_with('✗')));
             assert!(missing.contains("git") && missing.contains("claude") && missing.contains("codex"));
             assert!(missing.contains(if mac { "xcode-select --install" } else { "sudo apt-get install git" }));
-            assert!(install_hint("sbx", mac).contains(if mac {
+            assert!(hint_with("sbx", mac, &apt).contains(if mac {
                 "brew install docker/tap/sbx"
             } else {
                 "sudo apt install docker-sbx"

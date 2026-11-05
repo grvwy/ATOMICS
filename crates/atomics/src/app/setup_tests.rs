@@ -199,7 +199,11 @@ fn an_agent_installed_while_the_screen_shows_is_found_and_starts_without_a_resta
             look_for_programs(app, ctx);
             let shown = settle(app, ctx);
             assert!(has(&shown, "Claude Code") && !has(&shown, "Start Claude Code"), "{shown:?}");
-            assert!(shown.iter().any(|(text, _)| text.starts_with("Copy: curl")), "how to get it: {shown:?}");
+            // A click where its installer's tools are here, and the command where they are not.
+            assert!(
+                has(&shown, "Install") || shown.iter().any(|(text, _)| text.starts_with("Copy: curl")),
+                "how to get it: {shown:?}"
+            );
 
             crate::test_support::write_program(home.join("login-tools/claude"), "#!/bin/sh\nexec cat\n");
             click_beside(app, ctx, "Your agents", "Check again");
@@ -209,6 +213,191 @@ fn an_agent_installed_while_the_screen_shows_is_found_and_starts_without_a_resta
             let session = &app.runtime.sessions[0];
             assert_ne!(session.status, AgentStatus::Exited, "{:?}", session.last_message);
             assert!(crate::setup::find_program("claude").is_some(), "what starts from now on finds it too");
+        },
+    );
+}
+
+/// As Claude Code's installer leaves it, with what a stand-in for `curl` prints for `bash` to run.
+fn stand_in_installer(home: &Path, script: &str) {
+    let tools = home.join("login-tools");
+    crate::test_support::write_program(tools.join("curl"), format!("#!/bin/sh\ncat <<'SCRIPT'\n{script}\nSCRIPT\n"));
+    crate::test_support::write_program(tools.join("bash"), "#!/bin/sh\nexec /bin/sh\n");
+}
+
+const INSTALLS_CLAUDE: &str = "mkdir -p \"$HOME/.local/bin\"\nprintf '#!/bin/sh\\nexec cat\\n' > \"$HOME/.local/bin/claude\"\nchmod +x \"$HOME/.local/bin/claude\"";
+
+#[test]
+fn claude_code_installs_with_a_click_and_starts_without_a_terminal_or_a_restart() {
+    with_fresh_app(
+        "app::setup_tests::claude_code_installs_with_a_click_and_starts_without_a_terminal_or_a_restart",
+        &[],
+        |app, ctx, home| {
+            // Before it looks, so that this look offers the click; it goes in a folder the login shell does not list.
+            stand_in_installer(home, INSTALLS_CLAUDE);
+            look_for_programs(app, ctx);
+            let shown = click_beside(app, ctx, "Claude Code", "Install");
+            assert!(
+                app.runtime.setup_job.is_some() || home.join(".local/bin/claude").exists(),
+                "the click started it: {shown:?}"
+            );
+            tick_until(app, ctx, "the install", |app| app.runtime.setup_job.is_none());
+            tick_until(app, ctx, "the look after it", |app| {
+                !app.runtime.setup_look_again && app.runtime.programs_check.is_none()
+            });
+            assert!(app.runtime.setup_failure.is_none(), "{:?}", app.runtime.setup_failure);
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Start Claude Code"), "{shown:?}");
+            click(app, ctx, "Start Claude Code");
+            run_requests(app);
+            let session = &app.runtime.sessions[0];
+            assert_ne!(session.status, AgentStatus::Exited, "{:?}", session.last_message);
+        },
+    );
+}
+
+#[test]
+fn a_step_shows_its_progress_can_be_stopped_and_a_failure_says_why_with_the_command_in_reach() {
+    with_fresh_app(
+        "app::setup_tests::a_step_shows_its_progress_can_be_stopped_and_a_failure_says_why_with_the_command_in_reach",
+        &[],
+        |app, ctx, home| {
+            let marker = home.join("installer-started");
+            stand_in_installer(home, &format!("touch '{}'\nexec sleep 30", marker.display()));
+            look_for_programs(app, ctx);
+            click_beside(app, ctx, "Claude Code", "Install");
+            tick_until(app, ctx, "the installer to start", |_| marker.exists());
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Installing Claude Code…") && has(&shown, "Cancel"), "{shown:?}");
+            let blockers = app.runtime.restart_blockers();
+            assert!(blockers.iter().any(|blocker| blocker.contains("setup step")), "{blockers:?}");
+            // One at a time.
+            let another = HostAction::SettingsTool {
+                tool: SettingsTool::RunSetup {
+                    action: atomics_core::projection::SetupAction::InstallCodex,
+                    value: None,
+                },
+            };
+            assert!(app.runtime.manage(another).is_err());
+
+            click(app, ctx, "Cancel");
+            tick_until(app, ctx, "it to stop", |app| app.runtime.setup_job.is_none());
+            assert!(app.runtime.setup_failure.is_none(), "stopping it is no failure");
+
+            stand_in_installer(home, "echo 'no space left on device' >&2\nexit 7");
+            tick_until(app, ctx, "the look after it", |app| {
+                !app.runtime.setup_look_again && app.runtime.programs_check.is_none()
+            });
+            let shown = click_beside(app, ctx, "Claude Code", "Install");
+            tick_until(app, ctx, "the failure", |app| app.runtime.setup_job.is_none());
+            let failure = app.runtime.setup_failure.clone().expect("it failed");
+            assert!(failure.why.contains("no space left on device"), "{failure:?} {shown:?}");
+            let shown = settle(app, ctx);
+            assert!(shown.iter().any(|(text, _)| text.contains("no space left")), "{shown:?}");
+            assert!(
+                shown.iter().any(|(text, _)| text.starts_with("Copy: curl")),
+                "what it ran stays in reach: {shown:?}"
+            );
+
+            // A download that fails says nothing to `bash`, and is no success.
+            stand_in_installer(home, "exit 0");
+            click_beside(app, ctx, "Claude Code", "Install");
+            tick_until(app, ctx, "the second failure", |app| app.runtime.setup_job.is_none());
+            let failure = app.runtime.setup_failure.clone().expect("nothing was installed");
+            assert!(failure.why.contains("not on your PATH"), "{failure:?}");
+        },
+    );
+}
+
+#[test]
+fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
+    with_app(
+        "app::setup_tests::settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left",
+        |app, ctx| {
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = crate::sandbox::fake::install(bin.path()).display().to_string();
+            for marker in ["signed-out", "no-policy", "removed-anthropic", "no-openai"] {
+                std::fs::write(bin.path().join(marker), "").unwrap();
+            }
+            let wait = |app: &mut Desktop<'_>| {
+                frame(app, ctx, vec![]);
+                tick_until(app, ctx, "the step and the look after it", |app| {
+                    app.runtime.setup_job.is_none()
+                        && !app.runtime.setup_look_again
+                        && app.runtime.sandbox_check.is_none()
+                        && app.runtime.programs_check.is_none()
+                });
+                settle(app, ctx)
+            };
+            app.client.ui.management.settings = true;
+            settle(app, ctx);
+            click(app, ctx, "Theme  ·  claude");
+            let shown = settle(app, ctx);
+            let row = shown.iter().find(|(text, _)| text.starts_with("Agents  ·")).expect("the section");
+            let pos = row.1;
+            click_at(app, ctx, pos);
+            wait(app);
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Docker account") && has(&shown, "Network policy"), "{shown:?}");
+            assert!(has(&shown, "What they need"), "{shown:?}");
+            assert!(has(&shown, "Docker Sandboxes"), "{shown:?}");
+
+            click_beside(app, ctx, "Docker account", "Sign in");
+            let shown = wait(app);
+            assert!(!shown.iter().any(|(text, _)| text == "Sign in"), "signed in: {shown:?}");
+            assert_eq!(crate::sandbox::fake::calls_to(bin.path(), &["login"]).len(), 1);
+
+            click_beside(app, ctx, "Network policy", "Use balanced");
+            let shown = wait(app);
+            assert!(!has(&shown, "Use balanced"), "{shown:?}");
+            assert_eq!(crate::sandbox::fake::calls_to(bin.path(), &["policy", "init"]).len(), 1);
+
+            // A pasted value leaves the field as it is sent, reaches no argument, and shows nowhere.
+            const FIELD: &str = "Anthropic API key or token";
+            let paste = |app: &mut Desktop<'_>, value: &str| {
+                click_beside(app, ctx, "Claude in sandboxes", FIELD);
+                frame(app, ctx, vec![egui::Event::Text(value.into())]);
+            };
+            paste(app, "sk-ant-api03-PRIVATE-not-sent");
+            let shown = settle(app, ctx);
+            assert!(!has(&shown, FIELD), "the field holds it, where the hint was: {shown:?}");
+            assert!(!format!("{shown:?}").contains("PRIVATE"), "and it is masked: {shown:?}");
+            // What was not sent goes when Settings closes, and comes back to nobody.
+            app.client.ui.management.settings = false;
+            settle(app, ctx);
+            app.client.ui.management.settings = true;
+            let shown = settle(app, ctx);
+            assert!(has(&shown, FIELD), "{shown:?}");
+
+            paste(app, "sk-ant-api03-PRIVATE-pasted");
+            click_beside(app, ctx, "Claude in sandboxes", "Save");
+            let shown = wait(app);
+            assert!(!format!("{shown:?}").contains("PRIVATE"), "{shown:?}");
+            assert!(!format!("{:?}", crate::sandbox::fake::calls(bin.path())).contains("PRIVATE"));
+            assert!(!format!("{:?}", app.runtime.management_info().setup).contains("PRIVATE"));
+            assert_eq!(
+                std::fs::read_to_string(bin.path().join("secret-stdin")).unwrap().trim(),
+                "sk-ant-api03-PRIVATE-pasted"
+            );
+            assert!(!has(&shown, FIELD), "stored, so there is no field to fill: {shown:?}");
+        },
+    );
+}
+
+#[test]
+fn the_welcome_starts_agents_in_a_project_and_never_in_a_folder_that_is_not_one() {
+    with_app(
+        "app::setup_tests::the_welcome_starts_agents_in_a_project_and_never_in_a_folder_that_is_not_one",
+        |app, ctx| {
+            assert!(!app.runtime.launch_project, "this test's folder is no repository");
+            assert_eq!(app.runtime.backend().launch_dir(), None);
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Start claude"), "{shown:?}");
+            assert!(shown.iter().any(|(text, _)| text.starts_with("each in a scratch folder")), "{shown:?}");
+            app.runtime.launch_project = true;
+            let launch = app.runtime.launch_dir.clone();
+            assert_eq!(app.runtime.backend().launch_dir(), Some(launch.clone()));
+            let shown = settle(app, ctx);
+            assert!(shown.iter().any(|(text, _)| text.starts_with("in ")), "{shown:?}");
         },
     );
 }

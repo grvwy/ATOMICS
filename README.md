@@ -84,10 +84,9 @@ says what to take along and what to set up again.
 
 The first start of ATOMICS opens a setup screen: which agents it found, where they run, a first project and
 connections, every one of which can wait. See [First run](docs/how-it-works.md#first-run). Agents run on this machine
-under your own login until you choose sandboxes; `atomics setup` guides those from a terminal, with tool installation,
-Docker sign-in, network policy, credentials (over stdin, the Claude subscription into the OS keychain) and Linear
-authorization, and resumes completed steps on rerun. See
-[fresh-machine setup](docs/isolation.md#fresh-machine-one-guided-command).
+under your own login until you choose sandboxes. **Settings → Agents** sets those up with clicks, and says the exact
+command for what takes sudo. `atomics setup` does the same from a terminal, for what your configuration uses, and
+resumes completed steps on rerun. See [fresh-machine setup](docs/isolation.md#fresh-machine-clicks-or-one-guided-command).
 
 ```sh
 cargo install --path crates/atomics     # or: cargo run --release -p atomics
@@ -131,10 +130,9 @@ atomics --workspace daily
 scripts/linux-install.sh --uninstall  # removes the binary, desktop entry and icon; keeps config/state
 ```
 
-The installer builds a release binary for the native Linux target, atomically replaces `~/.local/bin/atomics`,
-including while ATOMICS is running, and runs the installed `atomics setup` with your terminal attached.
-Setup guides missing tools, KVM access, Docker sign-in and credentials; updates reuse completed steps.
-If setup is interrupted, rerun `atomics setup` to resume. Add `~/.local/bin` to PATH for terminal use. The desktop entry and icon go under
+The installer builds a release binary for the native Linux target and atomically replaces `~/.local/bin/atomics`,
+including while ATOMICS is running. It asks nothing: open ATOMICS from your applications menu, and its first run opens a
+setup screen. It prints the line to add `~/.local/bin` to PATH for terminal use if that is missing. The desktop entry and icon go under
 `${XDG_DATA_HOME:-~/.local/share}`; rerunning updates the same files. Both Wayland and X11 are enabled. eframe supplies
 embedded fallback fonts, so the UI and terminal do not require macOS fonts; system fonts can also be used. A working
 Vulkan driver (for example Mesa's `mesa-vulkan-drivers`) supports the default wgpu renderer. File dialogs use the desktop
