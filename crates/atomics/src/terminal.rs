@@ -15,10 +15,11 @@ pub use runtime::Terminal;
 
 use crate::theme::{Palette, Theme, is_app_chord};
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Row, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::vte::ansi::Rgb;
 use atomics_core::screen::{CursorShape, Screen};
 use atomics_core::theme::{parse_color, xterm_color};
@@ -33,6 +34,9 @@ pub struct TerminalView {
     scroll_remainder: f32,
     selection: Option<Selection>,
     selection_revision: u64,
+    selection_rows: Option<SelectedRows>,
+    /// A copy consumes the whole key press, including repeats, until C or Ctrl is released.
+    copying: bool,
     /// What has been typed since the last Enter.
     line: String,
     /// The cells last painted; kept so a frame reuses its buffers.
@@ -55,6 +59,12 @@ struct Copied {
     rows: usize,
 }
 
+struct SelectedRows {
+    start: Line,
+    rows: Vec<Row<Cell>>,
+    size: (usize, usize),
+}
+
 impl Default for TerminalView {
     fn default() -> Self {
         Self {
@@ -63,6 +73,8 @@ impl Default for TerminalView {
             scroll_remainder: 0.0,
             selection: None,
             selection_revision: 0,
+            selection_rows: None,
+            copying: false,
             line: String::new(),
             screen: Screen::blank(0, 0),
             copied: None,
@@ -87,6 +99,8 @@ impl TerminalView {
             self.terminal = Some(instance);
             self.grid = (0, 0);
             self.selection = None;
+            self.selection_rows = None;
+            self.copying = false;
             self.scroll_remainder = 0.0;
             self.line.clear();
             self.copied = None;
@@ -172,6 +186,7 @@ impl TerminalView {
         }
         self.grid = (cols, rows);
         self.selection = None;
+        self.selection_rows = None;
         let size = WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
@@ -181,14 +196,31 @@ impl TerminalView {
         terminal.resize(size);
     }
 
-    // Client anchors are grid coordinates. Output can scroll or rewrite the
-    // cells beneath them, so discard them before any locked query or paint.
-    fn sync_selection(&mut self, terminal: &Terminal) {
+    // Client anchors are grid coordinates. Unrelated output leaves them alone; a rewrite,
+    // scroll or resize that changes their rows invalidates them. The caller holds the emulator lock.
+    fn sync_selection(&mut self, terminal: &Terminal, term: &alacritty_terminal::Term<runtime::Listener>) {
         let revision = terminal.revision();
         if self.selection_revision != revision {
-            self.selection = None;
+            if let Some(SelectedRows { start, rows, size }) = &self.selection_rows {
+                let grid = term.grid();
+                if *size != (grid.columns(), grid.screen_lines())
+                    || *start < grid.topmost_line()
+                    || rows.iter().enumerate().any(|(n, row)| grid[*start + n] != *row)
+                {
+                    self.selection = None;
+                    self.selection_rows = None;
+                }
+            }
             self.selection_revision = revision;
         }
+    }
+
+    fn remember_selection(&mut self, term: &alacritty_terminal::Term<runtime::Listener>) {
+        self.selection_rows = self.selection.as_ref().and_then(|s| s.to_range(term)).map(|range| {
+            let grid = term.grid();
+            let rows = (range.start.line.0..=range.end.line.0).map(|line| grid[Line(line)].clone()).collect();
+            SelectedRows { start: range.start.line, rows, size: (grid.columns(), grid.screen_lines()) }
+        });
     }
 
     fn point_at(&self, pos: Pos2, rect: Rect, metrics: &Metrics, offset: usize) -> (Point, Side) {
@@ -208,7 +240,7 @@ impl TerminalView {
         metrics: &Metrics,
     ) {
         let mut term = terminal.term.lock();
-        self.sync_selection(terminal);
+        self.sync_selection(terminal, &term);
         let offset = term.grid().display_offset();
 
         if let Some(pos) = response.interact_pointer_pos() {
@@ -225,6 +257,9 @@ impl TerminalView {
         }
         if response.clicked() {
             self.selection = None;
+        }
+        if response.drag_started() || response.dragged() || response.clicked() {
+            self.remember_selection(&term);
         }
 
         if !response.hovered() {
@@ -262,6 +297,9 @@ impl TerminalView {
 
     fn handle_keys(&mut self, terminal: &Terminal, ui: &egui::Ui) {
         let events = ui.input(|i| i.events.clone());
+        if !ui.input(|i| i.modifiers.ctrl) {
+            self.copying = false;
+        }
         let modes = screen::modes(*terminal.term.lock().mode());
         let mut out: Vec<u8> = Vec::new();
         for event in events {
@@ -285,7 +323,7 @@ impl TerminalView {
                 }
                 egui::Event::Copy => {
                     let mut term = terminal.term.lock();
-                    self.sync_selection(terminal);
+                    self.sync_selection(terminal, &term);
                     // alacritty's copy helper reads its selection field. Install the
                     // client's selection only for this locked query, then restore it.
                     let previous = std::mem::replace(&mut term.selection, self.selection.clone());
@@ -294,7 +332,9 @@ impl TerminalView {
                     if let Some(text) = text.filter(|text| !text.is_empty()) {
                         ui.ctx().copy_text(text);
                         self.selection = None;
-                    } else if !cfg!(target_os = "macos") {
+                        self.selection_rows = None;
+                        self.copying = true;
+                    } else if !cfg!(target_os = "macos") && ui.input(|i| i.modifiers.ctrl) && !self.copying {
                         out.push(0x03);
                         terminal.record_input(std::time::Instant::now(), false);
                     }
@@ -305,6 +345,7 @@ impl TerminalView {
                         terminal.record_input(std::time::Instant::now(), false);
                     }
                 }
+                egui::Event::Key { key: Key::C, pressed: false, .. } => self.copying = false,
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
                     if let Some(bytes) = encode::key(key, modifiers, &modes) {
                         out.extend(bytes);
@@ -326,6 +367,7 @@ impl TerminalView {
             let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
             self.selection = None;
+            self.selection_rows = None;
             drop(term);
             terminal.write(out);
         }
@@ -343,7 +385,7 @@ impl TerminalView {
         // Copy under the emulator lock; lay out and paint after releasing it.
         let selection = {
             let term = terminal.term.lock();
-            self.sync_selection(terminal);
+            self.sync_selection(terminal, &term);
             self.copy_view(&term, palette, Some(terminal.revision()))
         };
         painter::paint(
@@ -721,7 +763,7 @@ mod tests {
         // The status query is a PTY barrier: the shell sees the terminal's four-byte
         // response only after the initial output has been parsed and its Wakeup sent.
         // Seeing "reviewed" alone can race the newline arriving in a later PTY read,
-        // whose revision would discard the selection before the test's first copy.
+        // before the selected row's final contents have arrived.
         let terminal = Terminal::spawn(crate::host::Wake::default(), theme.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo -icanon min 1 time 0; printf 'reviewed\\r\\n\\033[5n'; dd bs=1 count=4 of=/dev/null 2>/dev/null; stty icanon; : > ready; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
         let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
         while !dir.path().join("ready").exists() {
@@ -733,11 +775,12 @@ mod tests {
         let mut view = TerminalView::default();
         view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(160.0, 64.0)), &metrics);
         {
-            let _guard = terminal.term.lock();
-            view.sync_selection(&terminal);
+            let term = terminal.term.lock();
+            view.sync_selection(&terminal, &term);
             let mut selection = Selection::new(SelectionType::Simple, Point::new(Line(0), Column(0)), Side::Left);
             selection.update(Point::new(Line(0), Column(7)), Side::Right);
             view.selection = Some(selection);
+            view.remember_selection(&term);
         }
         (terminal, view, metrics, dir)
     }
@@ -752,9 +795,13 @@ mod tests {
 
     fn copy_selection(terminal: &Terminal, view: &mut TerminalView) -> Option<String> {
         let ctx = egui::Context::default();
-        let output = ctx.run_ui(egui::RawInput { events: vec![egui::Event::Copy], ..Default::default() }, |ui| {
-            view.handle_keys(terminal, ui)
-        });
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::ModifiersChanged(Modifiers::CTRL), egui::Event::Copy],
+                ..Default::default()
+            },
+            |ui| view.handle_keys(terminal, ui),
+        );
         let copied = output.platform_output.commands.iter().find_map(|command| match command {
             egui::OutputCommand::CopyText(text) => Some(text.clone()),
             _ => None,
@@ -764,16 +811,22 @@ mod tests {
     }
 
     fn raw_input_terminal() -> (Terminal, crate::test_support::TempDir) {
+        raw_input_terminal_with_output("")
+    }
+
+    fn raw_input_terminal_with_output(output: &str) -> (Terminal, crate::test_support::TempDir) {
         let dir = crate::test_support::tempdir().unwrap();
         // The status response is a barrier for the initial output and its revision. Raw mode
         // lets the file capture control bytes without the line discipline consuming them.
-        let script = "stty raw -echo; printf 'alpha beta gamma\\r\\n\\033[5n'; \
-                      dd bs=1 count=4 of=/dev/null 2>/dev/null; exec cat > input";
+        let script = format!(
+            "stty raw -echo; printf 'alpha beta gamma\\r\\n\\033[5n'; \
+                      dd bs=1 count=4 of=/dev/null 2>/dev/null; {output}exec cat > input"
+        );
         let terminal = Terminal::spawn(
             crate::host::Wake::default(),
             Vec::new(),
             "/bin/sh".into(),
-            vec!["-c".into(), script.into()],
+            vec!["-c".into(), script],
             dir.path(),
             HashMap::new(),
             100,
@@ -804,11 +857,12 @@ mod tests {
     }
 
     fn select_input_text(terminal: &Terminal, view: &mut TerminalView) {
-        let _guard = terminal.term.lock();
-        view.sync_selection(terminal);
+        let term = terminal.term.lock();
+        view.sync_selection(terminal, &term);
         let mut selection = Selection::new(SelectionType::Simple, Point::new(Line(0), Column(0)), Side::Left);
         selection.update(Point::new(Line(0), Column(15)), Side::Right);
         view.selection = Some(selection);
+        view.remember_selection(&term);
     }
 
     #[test]
@@ -830,14 +884,78 @@ mod tests {
     }
 
     #[test]
-    fn copy_clears_the_selection_and_the_next_copy_interrupts_off_macos() {
+    fn copy_keeps_selected_text_while_the_terminal_keeps_printing_and_sends_no_interrupt() {
+        let (terminal, dir) = raw_input_terminal_with_output(
+            "(while [ ! -e print ]; do sleep 0.01; done; \
+             i=0; while [ ! -e stop ]; do i=$((i + 1)); printf '\\rprint %s' \"$i\"; sleep 0.01; done) & ",
+        );
+        let mut view = TerminalView::default();
+        select_input_text(&terminal, &mut view);
+        std::fs::write(dir.path().join("print"), "").unwrap();
+        wait_for_text(&terminal, "print");
+        // Synchronize the selection across several output revisions, as mouse handling and painting do.
+        for _ in 0..3 {
+            let before = terminal.revision();
+            let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+            while terminal.revision() == before {
+                assert!(std::time::Instant::now() < deadline, "terminal stopped printing");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let term = terminal.term.lock();
+            view.sync_selection(&terminal, &term);
+            assert!(view.selection.is_some(), "output below the selected row keeps the selection");
+        }
+        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("alpha beta gamma"));
+        assert_eq!(copy_selection(&terminal, &mut view), None, "a held copy key may repeat");
+        std::fs::write(dir.path().join("stop"), "").unwrap();
+        assert!(captured_input(&terminal, &dir).is_empty(), "copy and its repeats send no bytes");
+        assert!(terminal.last_typed().is_none());
+    }
+
+    #[test]
+    fn a_dedicated_copy_key_without_a_selection_sends_no_interrupt() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        egui::Context::default()
+            .run_ui(egui::RawInput { events: vec![egui::Event::Copy], ..Default::default() }, |ui| {
+                view.handle_keys(&terminal, ui)
+            })
+            .drop_without_applying_deltas();
+        assert!(captured_input(&terminal, &dir).is_empty());
+        assert!(terminal.last_typed().is_none());
+    }
+
+    #[test]
+    fn copy_repeats_never_interrupt_and_a_fresh_press_interrupts_off_macos() {
         let (terminal, dir) = raw_input_terminal();
         let mut view = TerminalView::default();
         select_input_text(&terminal, &mut view);
         assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("alpha beta gamma"));
         assert!(view.selection.is_none());
         assert!(terminal.last_typed().is_none(), "copying text is not terminal input");
-        // The marker separates the two copies: only the second may send an interrupt.
+        for _ in 0..3 {
+            assert_eq!(copy_selection(&terminal, &mut view), None);
+        }
+        assert!(terminal.last_typed().is_none(), "repeating a copy is not terminal input");
+        let ctx = egui::Context::default();
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(Modifiers::CTRL),
+                    egui::Event::Key {
+                        key: Key::C,
+                        physical_key: Some(Key::C),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::CTRL,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| view.handle_keys(&terminal, ui),
+        )
+        .drop_without_applying_deltas();
+        // Only a fresh press may send an interrupt.
         terminal.write(b"!".to_vec());
         assert_eq!(copy_selection(&terminal, &mut view), None);
         let bytes = captured_input(&terminal, &dir);
@@ -918,7 +1036,7 @@ mod tests {
     #[test]
     fn selection_is_discarded_after_output_scrolls_without_a_frame() {
         let (terminal, mut view, _, _dir) = selected_terminal();
-        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("reviewed"));
+        assert!(view.selection.is_some());
         terminal.write(b"\r".to_vec());
         // Output scrolls on the PTY thread while the client consumes no frames.
         wait_for_text(&terminal, "five");
@@ -930,7 +1048,7 @@ mod tests {
     #[test]
     fn selection_is_discarded_when_geometry_changes() {
         let (terminal, mut view, metrics, _dir) = selected_terminal();
-        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("reviewed"));
+        assert!(view.selection.is_some());
         view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(64.0, 48.0)), &metrics);
         assert_eq!(copy_selection(&terminal, &mut view), None);
         assert!(view.selection.is_none());

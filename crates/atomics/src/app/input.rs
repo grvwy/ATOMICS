@@ -7,6 +7,22 @@ impl State {
 }
 
 impl Desktop<'_> {
+    pub(super) fn dialog_open(&self) -> bool {
+        let client = &self.client;
+        client.project_picker.is_some()
+            || client.cleanup_open
+            || client.plan_cleanup_open
+            || client.new_dialog.is_some()
+            || client.rename.is_some()
+            || client.quick_open.is_some()
+            || atomics_ui::management::window_open(&client.ui)
+            || client.ui.confirm_close.is_some()
+            || client.ui.confirm_plan_close.is_some()
+            || self.runtime.github.modal
+            || self.runtime.tickets.panel.dialog.is_some()
+            || client.ui.tickets.dialog
+    }
+
     /// Takes an Escape pressed while nothing had the keyboard at the end of the last frame and no menu or
     /// dialog is open.
     fn escape_goes_back(&self, ctx: &egui::Context) -> bool {
@@ -14,20 +30,7 @@ impl Desktop<'_> {
         let idle = client.keyboard_idle
             && ctx.memory(|m| m.focused().is_none())
             && !egui::Popup::is_any_open(ctx)
-            && client.project_picker.is_none()
-            && !client.cleanup_open
-            && !client.plan_cleanup_open
-            && client.new_dialog.is_none()
-            && client.rename.is_none()
-            && client.quick_open.is_none()
-            && !client.ui.management.remote
-            && !client.ui.management.project
-            && !client.ui.management.settings
-            && client.ui.confirm_close.is_none()
-            && client.ui.confirm_plan_close.is_none()
-            && !self.runtime.github.modal
-            && self.runtime.tickets.panel.dialog.is_none()
-            && !client.ui.tickets.dialog
+            && !self.dialog_open()
             && matches!(client.voice, Voice::Idle)
             && client.ui.history.can_go(-1);
         idle && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
@@ -209,12 +212,19 @@ impl Desktop<'_> {
                 if picked.tickets_open && !self.client.ui.tickets.active() {
                     self.runtime.tickets_retarget(&picked.session);
                 }
-                picked.keyboard.settle(ctx, &mut self.client.ui);
+                if self.dialog_open() {
+                    self.client.focus_terminal = None;
+                    self.client.ui.focus_editor = false;
+                } else {
+                    picked.keyboard.settle(ctx, &mut self.client.ui);
+                }
             }
         }
         // At the smallest window size the diff covers the terminal entirely.
         let diff_fills = self.runtime.last_layout.is_some_and(|l| l.diff == DiffPlacement::Full);
-        self.draw(|backend, client| window_keys::hand_back(ctx, backend, client, diff_fills));
+        if !self.dialog_open() {
+            self.draw(|backend, client| window_keys::hand_back(ctx, backend, client, diff_fills));
+        }
     }
 
     /// Opens the New session dialog. A new session works in a scratch folder of its own unless
@@ -914,6 +924,88 @@ mod tests {
                 assert_diff_keys(app, ctx, &second);
                 assert_received(&first, b"");
             }
+        });
+    }
+
+    #[test]
+    fn agent_chords_keep_settings_and_desktop_dialogs_from_typing_into_terminals() {
+        with_app(
+            "app::input::tests::agent_chords_keep_settings_and_desktop_dialogs_from_typing_into_terminals",
+            |app, ctx| {
+                for window in ["settings", "remote", "project", "new", "rename", "quick", "github"] {
+                    app.runtime.sessions.clear();
+                    let dir = crate::test_support::tempdir().unwrap();
+                    let first = dir.path().join("first");
+                    let second = dir.path().join("second");
+                    diff_agent(app, &first, "first");
+                    diff_agent(app, &second, "second");
+                    app.runtime.active = Some("first".into());
+                    app.runtime.panel = PanelMode::Diff;
+                    app.runtime.diff_open = true;
+                    app.client.focus_terminal = Some("first".into());
+                    diff_frame(app, ctx, vec![]);
+                    match window {
+                        "settings" => app.client.ui.management.settings = true,
+                        "remote" => app.client.ui.management.remote = true,
+                        "project" => app.client.ui.management.project = true,
+                        "new" => app.open_new_dialog(None),
+                        "rename" => app.begin_rename("first"),
+                        "quick" => {
+                            app.client.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true })
+                        }
+                        "github" => app.runtime.github.modal = true,
+                        _ => unreachable!(),
+                    }
+                    diff_frame(app, ctx, vec![]);
+                    // A field in the window already owns the keyboard when the shortcut arrives.
+                    let field = egui::Id::NULL.with(("dialog field", window));
+                    let modifiers =
+                        if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+                    route(app, ctx, field, vec![key(Key::Num2, Key::Num2, modifiers)]);
+                    assert_eq!(app.runtime.active.as_deref(), Some("second"), "{window}");
+                    assert!(app.client.focus_terminal.is_none(), "{window}");
+                    if window != "github" {
+                        assert!(ctx.memory(|m| m.has_focus(field)), "{window} keeps its field's keyboard");
+                    }
+                    diff_frame(
+                        app,
+                        ctx,
+                        vec![egui::Event::Text("private text".into()), egui::Event::Paste("private paste".into())],
+                    );
+                    for root in [&first, &second] {
+                        let id = if root == &first { "first" } else { "second" };
+                        app.runtime.sessions[app.runtime.find(id).unwrap()].terminal.as_ref().unwrap().write(vec![0]);
+                        assert_received(root, b"\0");
+                    }
+                    app.client.ui.management.settings = false;
+                    app.client.ui.management.remote = false;
+                    app.client.ui.management.project = false;
+                    app.client.new_dialog = None;
+                    app.client.rename = None;
+                    app.client.quick_open = None;
+                    app.runtime.github.modal = false;
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn an_agent_chord_clears_a_pull_request_even_for_the_active_agent() {
+        with_app("app::input::tests::an_agent_chord_clears_a_pull_request_even_for_the_active_agent", |app, ctx| {
+            let root = PathBuf::from("/project");
+            app.runtime.sessions = vec![session("agent", AgentKind::Generic, AgentStatus::Working, &root)];
+            app.runtime.active = Some("agent".into());
+            app.runtime.panel = PanelMode::Diff;
+            app.runtime.diff_open = true;
+            app.client.ui.pr_view = Some(("pull:example/repo#7".into(), Default::default()));
+            app.client.ui.pr_target = Some((Some("agent".into()), Some(root.clone())));
+            let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+            route(app, ctx, diff_view::focus_id(), vec![key(Key::Num1, Key::Num1, modifiers)]);
+            assert!(app.client.ui.pr_view.is_none());
+            assert!(app.client.ui.pr_target.is_none());
+            assert_eq!(app.runtime.diff_target(), Some(root));
+            assert_eq!(app.runtime.active.as_deref(), Some("agent"));
+            assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
         });
     }
 

@@ -145,7 +145,7 @@ fn show_legacy(
     view.resize(terminal, inner, metrics);
     view.handle_mouse(terminal, ui, &response, inner, metrics);
     let term = terminal.term.lock();
-    view.sync_selection(terminal);
+    view.sync_selection(terminal, &term);
     super::legacy_paint::paint(&term, view.selection.as_ref(), view.grid.1, ui, (rect, inner), metrics, palette, false);
 }
 

@@ -122,6 +122,10 @@ impl Keyboard {
     /// Moves the keyboard, once the platform carried out what the key recorded.
     pub fn settle(self, ctx: &Context, client: &mut Client) {
         client.focus_terminal = None;
+        client.focus_editor = false;
+        if crate::management::window_open(client) || client.tickets.dialog {
+            return;
+        }
         client.focus_editor = self == Keyboard::Editor;
         ctx.memory_mut(|m| match self {
             Keyboard::Panel => m.request_focus(focus_id()),
@@ -148,6 +152,8 @@ pub fn pick_agent(ctx: &Context, backend: &dyn Backend, client: &mut Client, n: 
     let hints = backend.view_hints();
     // Only an open Tickets panel keeps its place; activating opens the panel, so ask first.
     let tickets_open = hints.panel == PanelMode::Tickets && hints.diff_open;
+    client.pr_view = None;
+    client.pr_target = None;
     client.send(Command::Activate { session: session.id.clone(), open_diff: true });
     let keyboard = if hints.panel == PanelMode::Editor {
         if !backend.editors().iter().any(|e| Path::new(&e.root) == session.root && e.running) {
@@ -211,12 +217,12 @@ pub fn walk(ctx: &Context, backend: &dyn Backend, client: &mut Client, step: Wal
 
 /// While the panel has the keyboard: typing or Escape, or the panel going away, hands it back to the active terminal
 /// (`client.focus_terminal`). A typed key stays in the input for the terminal, and true says the keyboard moved. The
-/// reader's dialog holds the keyboard, and the reader takes Escape in a ticket itself. Where the diff fills the
+/// open windows hold the keyboard, and the reader takes Escape in a ticket itself. Where the diff fills the
 /// window (`diff_fills`), it closes, or the terminal would not show.
 pub fn hand_back(ctx: &Context, backend: &dyn Backend, client: &mut Client, diff_fills: bool) -> bool {
     let hints = backend.view_hints();
     let reader = hints.panel == PanelMode::Tickets && hints.diff_open && client.tickets.active();
-    if !ctx.memory(|m| m.has_focus(focus_id())) || (reader && client.tickets.dialog) {
+    if crate::management::window_open(client) || !ctx.memory(|m| m.has_focus(focus_id())) || client.tickets.dialog {
         return false;
     }
     let escape =

@@ -56,7 +56,7 @@ impl State {
 }
 
 /// Whether Settings, Remote or the project picker is open.
-fn window_open(client: &Client) -> bool {
+pub fn window_open(client: &Client) -> bool {
     client.management.settings || client.management.remote || client.management.project
 }
 
