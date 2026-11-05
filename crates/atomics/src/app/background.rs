@@ -585,6 +585,7 @@ impl State {
             self.toast.as_ref().map(|(_, at)| *at),
             self.integration_revision,
             self.integration_checks.len(),
+            self.agent_cleanup.revision,
             self.sessions
                 .iter()
                 .map(|s| {
@@ -825,7 +826,7 @@ impl State {
         let mut wanted: Vec<PathBuf> = self
             .sessions
             .iter()
-            .filter(|s| s.worktree.is_some())
+            .filter(|s| s.worktree.is_some() || s.scratch.is_some())
             .map(Session::root)
             .chain(target.map(Path::to_path_buf))
             .collect();
@@ -846,8 +847,12 @@ impl State {
         if self.watcher.is_none() {
             let (tx, integration_dirty, wake) =
                 (self.watch_tx.clone(), self.integration_dirty.clone(), self.wake.clone());
+            let cleanup_files = self.agent_cleanup.files.clone();
             let on_change = move |change| match change {
-                Change::Files(root) => drop(tx.send(root)),
+                Change::Files(root) => {
+                    *cleanup_files.lock().unwrap().entry(root.clone()).or_default() += 1;
+                    drop(tx.send(root));
+                }
                 Change::Refs => {
                     integration_dirty.store(true, Ordering::Relaxed);
                     wake.notify();

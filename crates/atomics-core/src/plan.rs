@@ -319,8 +319,19 @@ impl Plan {
         }
     }
 
-    /// Accepted work keeps its agent until integration; final review closes on acceptance.
+    /// Marks accepted integrated tasks and final reviews finished.
     pub fn finish_tasks(&mut self, now: u64, workflow: &crate::workflow::Workflow) -> bool {
+        self.finish_tasks_with(now, workflow, |_| false)
+    }
+
+    /// The host can also verify that accepted work has landed or made no changes. Keep that
+    /// transition here so finishing the last such task runs the usual plan completion gate.
+    pub fn finish_tasks_with(
+        &mut self,
+        now: u64,
+        workflow: &crate::workflow::Workflow,
+        checked: impl Fn(&Task) -> bool,
+    ) -> bool {
         let integration = self.integration_branch();
         let stage_sequence = self.stage_sequence();
         let new_stage = stage_sequence != self.finished_stage_sequence;
@@ -336,6 +347,7 @@ impl Plan {
             if task.status == TaskStatus::Done
                 && (task.id == REVIEW_TASK
                     || task.branch.is_none()
+                    || checked(task)
                     || (task.integrated.as_deref() == Some(&integration) && task.integration_verified))
                 && task.finished_at.is_none()
             {
@@ -954,6 +966,34 @@ mod tests {
         assert!(plan.finish_tasks(2, &workflow));
         assert_eq!(plan.status, PlanStatus::Completed);
         assert_eq!(plan.tasks[0].status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn checked_landed_work_obeys_acceptance_and_completion_gate() {
+        use crate::workflow::{Stage, Workflow};
+        let workflow = Workflow { done: "ci_passed".into(), ..Default::default() };
+        let mut plan = Plan {
+            id: "landed".into(),
+            tasks: vec![Task {
+                id: "code".into(),
+                branch: Some("feature".into()),
+                status: TaskStatus::Review,
+                ..Task::default()
+            }],
+            ..Plan::default()
+        };
+        assert!(!plan.finish_tasks_with(1, &workflow, |_| true));
+        assert!(plan.tasks[0].finished_at.is_none(), "checked work still needs acceptance");
+        plan.tasks[0].set_status(TaskStatus::Done);
+        assert!(plan.finish_tasks_with(2, &workflow, |_| true));
+        assert_eq!(plan.tasks[0].finished_at, Some(2));
+        assert_eq!(plan.status, PlanStatus::Open, "the workflow gate still applies");
+        plan.stages.push(Stage { stage: "ci_passed".into(), sequence: 1, ..Default::default() });
+        assert!(plan.finish_tasks_with(3, &workflow, |_| true));
+        assert_eq!(plan.status, PlanStatus::Completed);
+        plan.reopen();
+        assert!(!plan.finish_tasks_with(4, &workflow, |_| true));
+        assert_eq!(plan.status, PlanStatus::Open, "reopening needs fresh progress to complete again");
     }
 
     #[test]

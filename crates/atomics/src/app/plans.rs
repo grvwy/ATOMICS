@@ -43,6 +43,7 @@ impl State {
     }
 
     pub(super) fn finish_plan_agents(&mut self) {
+        self.refresh_agent_cleanup();
         let now = atomics_core::store::now();
         for index in 0..self.plans.len() {
             if self.plans[index].status == plan::PlanStatus::Archived {
@@ -50,7 +51,17 @@ impl State {
             }
             let workflow = self.plan_workflow(&self.plans[index]);
             let was_open = self.plans[index].is_open();
-            let mut changed = self.plans[index].finish_tasks(now, &workflow);
+            let closable: HashSet<_> = self.plans[index]
+                .tasks
+                .iter()
+                .filter_map(|task| {
+                    let session = self.sessions.iter().find(|s| task.session.as_deref() == Some(&s.id))?;
+                    self.accepted_agent_finished(session, task, &self.plans[index]).then(|| session.id.clone())
+                })
+                .collect();
+            let mut changed = self.plans[index].finish_tasks_with(now, &workflow, |task| {
+                task.session.as_ref().is_some_and(|id| closable.contains(id))
+            });
             if was_open && self.plans[index].status == PlanStatus::Completed {
                 self.ticket_plan_completed(index);
             }
@@ -75,7 +86,7 @@ impl State {
                     self.diffs.entry(root).or_default().mark_dirty();
                     changed = true;
                 }
-                if self.config.plan.close_done_agents {
+                if self.config.plan.close_done_agents && closable.contains(&session.id) {
                     close.push(session.id.clone());
                 }
             }
@@ -193,6 +204,13 @@ impl State {
         for id in &ids {
             if self.sessions.iter().any(|session| session.id == *id && session.chief)
                 || (plan.status == PlanStatus::Completed && !self.config.plan.close_done_agents)
+                || (plan.status == PlanStatus::Completed
+                    && self.sessions.iter().any(|session| {
+                        session.id == *id
+                            && !plan.tasks.iter().any(|task| {
+                                task.session.as_ref() == Some(id) && self.accepted_agent_finished(session, task, &plan)
+                            })
+                    }))
             {
                 continue;
             }
@@ -1734,6 +1752,7 @@ mod tests {
                     )
                     .ok
                 );
+                super::super::agent_cleanup::finish_checks(app.runtime);
                 assert!(app.runtime.find("reviewer").is_none());
                 assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
                 assert!(app.runtime.plans[0].tasks[0].integrated.is_none());
@@ -1753,8 +1772,13 @@ mod tests {
         with_app(
             "app::plans::tests::accepted_agents_exit_keep_results_and_complete_without_closing_chief",
             |app, _ctx| {
-                let dir = crate::test_support::tempdir().unwrap();
-                let root = dir.path();
+                let (_dir, repo) = repository();
+                let root = repo.as_path();
+                git::git(root, &["checkout", "-qb", "code"]).unwrap();
+                std::fs::write(root.join("feature"), "completed work").unwrap();
+                git::git(root, &["add", "."]).unwrap();
+                git::git(root, &["commit", "-qm", "feature"]).unwrap();
+                app.runtime.config.base_ref = "main".into();
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
@@ -1841,6 +1865,7 @@ mod tests {
                     result: Ok(Integration { committed: false, merge: Merge::Merged, worktree: root.into() }),
                     reply: None,
                 });
+                super::super::agent_cleanup::finish_checks(app.runtime);
                 assert!(app.runtime.find("worker").is_none());
                 assert_eq!(app.runtime.report(Some("worker"), "done", "Final late report"), Some("code".into()));
                 assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Done);
@@ -1879,9 +1904,12 @@ mod tests {
                 app.runtime.sync_plan();
                 assert!(app.runtime.find("reviewer").is_some(), "the reviewer report must also wait for acceptance");
                 assert!(app.runtime.plans[index].tasks[1].finished_at.is_none());
+                // The real integration has already brought this commit into the review's base.
+                git::git(root, &["branch", &app.runtime.plans[index].integration_branch(), "code"]).unwrap();
                 assert!(
                     request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"review", "status":"done"})).ok
                 );
+                super::super::agent_cleanup::finish_checks(app.runtime);
                 assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Completed);
                 assert!(app.runtime.find("reviewer").is_none());
                 assert!(app.runtime.find("chief").is_some());
@@ -1918,7 +1946,8 @@ mod tests {
     fn disabling_automatic_closing_keeps_agents_and_completed_plans() {
         with_app("app::plans::tests::disabling_automatic_closing_keeps_agents_and_completed_plans", |app, _| {
             app.runtime.config.plan.close_done_agents = false;
-            app.runtime.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Idle, Path::new("/work"))];
+            let dir = crate::test_support::tempdir().unwrap();
+            app.runtime.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Idle, dir.path())];
             app.runtime.plans[app.runtime.selected_plan] = Plan {
                 id: "disabled".into(),
                 tasks: vec![Task { status: TaskStatus::Done, session: Some("worker".into()), ..Task::default() }],
@@ -1929,7 +1958,7 @@ mod tests {
             assert_eq!(app.runtime.plans[app.runtime.selected_plan].status, plan::PlanStatus::Completed);
             assert!(app.runtime.completed_tasks().is_empty());
             app.runtime.config.plan.close_done_agents = true;
-            app.runtime.finish_plan_agents();
+            super::super::agent_cleanup::finish_checks(app.runtime);
             assert!(app.runtime.find("worker").is_none());
             assert!(app.runtime.completed_tasks().is_empty());
             app.runtime.plan_view = true;

@@ -73,6 +73,10 @@ The single line is `ATOMICS wake: <n> new events, <m> heartbeat findings (<short
 Events are counted since the previous wake; findings and their short kinds come from the latest fleet check
 (`none` when empty). `[chief] heartbeat_secs` separately controls that check (default 300 seconds), delivered
 through `atomics_wait`.
+When finished agents can be cleaned up, the wake appends a short list (up to five session ids and reasons).
+Only idle agents with no turn or pending messages and a clean worktree qualify: their task is accepted,
+their branch is merged, or they have no task and no changes. The chief should close each listed session
+with `atomics_close` or say why it should stay open; listing one does not close it.
 
 Where and how the chief starts: `[chief] cwd` is its folder (`~/` allowed; unset, the main checkout of the
 project on screen), `resume` names a Claude session id it continues instead of starting a new conversation,

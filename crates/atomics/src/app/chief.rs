@@ -23,7 +23,7 @@ impl WakeConditions {
     }
 }
 
-fn wake_message(events: usize, findings: &[Finding]) -> String {
+fn wake_message(events: usize, findings: &[Finding], cleanup: &[String]) -> String {
     let kinds: Vec<_> = [
         (Kind::AgentGone, "agent_gone"),
         (Kind::Unreported, "unreported"),
@@ -35,10 +35,18 @@ fn wake_message(events: usize, findings: &[Finding]) -> String {
     .filter_map(|(kind, label)| findings.iter().any(|finding| finding.kind == kind).then_some(label))
     .collect();
     let kinds = if kinds.is_empty() { "none".into() } else { kinds.join(", ") };
-    format!(
+    let mut message = format!(
         "ATOMICS wake: {events} new events, {} heartbeat findings ({kinds}). Call atomics_wait and act; if nothing changed, post one short line.",
         findings.len()
-    )
+    );
+    if !cleanup.is_empty() {
+        let listed = cleanup.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = if cleanup.len() > 5 { format!(" (+{} more)", cleanup.len() - 5) } else { String::new() };
+        message.push_str(&format!(
+            " Cleanup: {listed}{more}. Close each listed agent with atomics_close or say why it should stay open."
+        ));
+    }
+    message
 }
 
 fn chief_work_open(plans: &[Plan], sessions: &[Session]) -> bool {
@@ -81,7 +89,7 @@ impl State {
         let events =
             self.events.iter().filter(|event| event.seq > self.chief_wake_cursor && event.session != chief.id).count();
         let findings = self.heartbeat.last.as_ref().map_or(&[][..], |(_, findings)| findings.as_slice());
-        let message = wake_message(events, findings);
+        let message = wake_message(events, findings, &self.agent_cleanup_candidates());
         if matches!(self.deliver(index, &message), Delivery::Sent | Delivery::Pending) {
             self.sessions[index].activity.wake_since = Some(Instant::now());
             self.chief_wake_cursor = self.event_seq;
@@ -327,7 +335,7 @@ mod tests {
     #[test]
     fn wake_line_is_exact_and_summarizes_unique_short_kinds() {
         assert_eq!(
-            wake_message(0, &[]),
+            wake_message(0, &[], &[]),
             "ATOMICS wake: 0 new events, 0 heartbeat findings (none). Call atomics_wait and act; if nothing changed, post one short line."
         );
         let findings: Vec<_> = [
@@ -342,9 +350,20 @@ mod tests {
         .map(|kind| Finding { plan: "plan".into(), task: "task".into(), session: None, kind })
         .collect();
         assert_eq!(
-            wake_message(3, &findings),
+            wake_message(3, &findings, &[]),
             "ATOMICS wake: 3 new events, 6 heartbeat findings (agent_gone, unreported, approval, held_messages, stuck_working). Call atomics_wait and act; if nothing changed, post one short line."
         );
+    }
+
+    #[test]
+    fn wake_names_cleanup_candidates_and_asks_for_a_decision_on_each() {
+        let cleanup: Vec<_> = (0..7).map(|i| format!("agent-{i} (merged branch)")).collect();
+        let message = wake_message(0, &[], &cleanup);
+        assert!(message.contains("Cleanup: agent-0 (merged branch), agent-1 (merged branch)"));
+        assert!(message.contains("agent-4 (merged branch) (+2 more)."));
+        assert!(!message.contains("agent-5"));
+        assert!(message.ends_with("Close each listed agent with atomics_close or say why it should stay open."));
+        assert_eq!(message.lines().count(), 1);
     }
 
     #[test]

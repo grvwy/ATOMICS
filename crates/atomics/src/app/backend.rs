@@ -128,7 +128,11 @@ impl Backend for Local<'_> {
             .tasks
             .iter()
             .filter_map(|task| {
-                let note = state.integration_check_note(index, task)?;
+                let note = match (state.agent_cleanup_note(task), state.integration_check_note(index, task)) {
+                    (Some(cleanup), Some(integration)) => format!("{cleanup}; {integration}"),
+                    (Some(note), None) | (None, Some(note)) => note,
+                    (None, None) => return None,
+                };
                 let checking = state.integration_checks.contains_key(&(plan.id.clone(), task.id.clone()));
                 Some((task.id.clone(), (note, checking)))
             })
