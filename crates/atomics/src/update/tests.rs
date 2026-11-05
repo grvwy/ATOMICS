@@ -365,6 +365,38 @@ fn what_gets_replaced_is_the_installed_file_and_never_a_development_build() {
     std::fs::write(&in_bundle, "").unwrap();
     assert_eq!(InstallTarget::of(&in_bundle, true).unwrap(), InstallTarget::Bundle(root.join("ATOMICS.app")));
     assert!(format!("{:#}", InstallTarget::of(&installed, true).unwrap_err()).contains("not running from an app"));
+
+    // A folder that only happens to end in `.app` is not a bundle, and an update must not swap it away.
+    std::fs::create_dir_all(root.join("work.app/target/debug")).unwrap();
+    for program in [
+        "work.app/target/debug/atomics",
+        "work.app/atomics",
+        "ATOMICS.app/Contents/MacOS/something-else",
+        "ATOMICS.app/Contents/atomics",
+    ] {
+        let program = root.join(program);
+        std::fs::write(&program, "").unwrap();
+        let error = format!("{:#}", InstallTarget::of(&program, true).unwrap_err());
+        assert!(error.contains("not running from an app"), "{}: {error}", program.display());
+    }
+}
+
+#[test]
+fn what_goes_under_the_real_name_is_on_the_disk_first() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let bundle = dir.path().join("ATOMICS.app");
+    std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+    std::fs::write(bundle.join("Contents/MacOS/atomics"), "program").unwrap();
+    std::os::unix::fs::symlink("nowhere", bundle.join("Contents/link")).unwrap();
+    on_disk(&bundle).unwrap();
+    on_disk(&bundle.join("Contents/MacOS/atomics")).unwrap();
+    assert!(on_disk(&dir.path().join("missing")).is_err(), "what is not there is not on the disk");
+}
+
+#[test]
+fn unpacking_gives_the_archives_owner_no_say() {
+    let tar = unpack_command(Path::new("archive"), Path::new("folder"));
+    assert!(tar.get_args().any(|arg| arg == "--no-same-owner"), "{tar:?}");
 }
 
 #[test]

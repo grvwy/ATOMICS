@@ -319,8 +319,7 @@ impl InstallTarget {
                 && dir.parent().is_some_and(|parent| parent.join("Cargo.toml").is_file())
         });
         if macos {
-            let bundle = resolved.ancestors().find(|path| path.extension().is_some_and(|ext| ext == "app"));
-            return match bundle {
+            return match crate::restart::bundle_of(&resolved) {
                 Some(bundle) => Ok(Self::Bundle(bundle.to_path_buf())),
                 None => bail!("ATOMICS is not running from an app bundle, so there is nothing to swap."),
             };
@@ -359,6 +358,7 @@ impl InstallTarget {
                 let new = unpacked.join("atomics");
                 must_run(&new)?;
                 must_report(&new, version)?;
+                on_disk(&new).with_context(|| format!("Could not write to {}", parent.display()))?;
                 std::fs::rename(&new, target)
             }
             Self::Bundle(target) => {
@@ -366,11 +366,33 @@ impl InstallTarget {
                 let program = new.join("Contents/MacOS/atomics");
                 must_run(&program)?;
                 must_report(&program, version)?;
+                on_disk(&new).with_context(|| format!("Could not write to {}", parent.display()))?;
                 swap_bundle(&new, target, &staging.path().join("previous.app"))
             }
         }
-        .with_context(|| format!("Could not replace {}", target.display()))
+        .with_context(|| format!("Could not replace {}", target.display()))?;
+        // The swap is done and stands; this only makes it last through a power cut, where a folder can sync at all.
+        let _ = std::fs::File::open(parent).and_then(|folder| folder.sync_all());
+        Ok(())
     }
+}
+
+/// Puts `path` on the disk, all of it where it is a folder, so that a power cut after the rename finds the new program
+/// and not an empty file under its name. A link's target is inside what gets synced, and a folder that cannot sync
+/// only risks its own names.
+fn on_disk(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_symlink() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            on_disk(&entry?.path())?;
+        }
+        let _ = std::fs::File::open(path).and_then(|folder| folder.sync_all());
+        return Ok(());
+    }
+    std::fs::File::open(path)?.sync_all()
 }
 
 /// With the update's lock held, whatever an earlier one left is a crash's.
@@ -382,15 +404,16 @@ fn remove_stale_staging(parent: &Path) {
     }
 }
 
+/// The archive's owner is the build's, and means nothing here: with `sudo atomics update`, tar would otherwise give the
+/// installed program to whoever has that number on this machine.
+fn unpack_command(archive: &Path, folder: &Path) -> Command {
+    let mut tar = Command::new("tar");
+    tar.arg("--no-same-owner").arg("-xzf").arg(archive).arg("-C").arg(folder);
+    tar
+}
+
 fn unpack(archive: &Path, folder: &Path) -> Result<()> {
-    let output = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(folder)
-        .stdin(Stdio::null())
-        .output()
-        .context("Could not run tar")?;
+    let output = unpack_command(archive, folder).stdin(Stdio::null()).output().context("Could not run tar")?;
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr);
         bail!("The release could not be unpacked: {}", why.lines().next().unwrap_or("tar failed"));

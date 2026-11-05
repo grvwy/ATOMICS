@@ -37,6 +37,8 @@ pub struct TerminalView {
     selection_rows: Option<SelectedRows>,
     /// A copy consumes the whole key press, including repeats, until C or Ctrl is released.
     copying: bool,
+    /// Whether Ctrl was down when the last frame ended, which this frame's events start from.
+    ctrl: bool,
     /// What has been typed since the last Enter.
     line: String,
     /// The cells last painted; kept so a frame reuses its buffers.
@@ -75,6 +77,7 @@ impl Default for TerminalView {
             selection_revision: 0,
             selection_rows: None,
             copying: false,
+            ctrl: false,
             line: String::new(),
             screen: Screen::blank(0, 0),
             copied: None,
@@ -125,6 +128,9 @@ impl TerminalView {
         self.handle_mouse(terminal, ui, &response, inner, metrics);
         if focused {
             self.handle_keys(terminal, ui);
+        } else {
+            self.ctrl = ui.input(|i| i.modifiers.ctrl);
+            self.copying &= self.ctrl;
         }
         self.paint(terminal, ui, (rect, inner), metrics, palette, focused);
         self.take_back = None;
@@ -297,13 +303,18 @@ impl TerminalView {
 
     fn handle_keys(&mut self, terminal: &Terminal, ui: &egui::Ui) {
         let events = ui.input(|i| i.events.clone());
-        if !ui.input(|i| i.modifiers.ctrl) {
-            self.copying = false;
-        }
+        // A frame can hold a whole chord, and egui's modifiers say only how it ended: Ctrl as each event saw it.
+        let mut ctrl = self.ctrl;
         let modes = screen::modes(*terminal.term.lock().mode());
         let mut out: Vec<u8> = Vec::new();
         for event in events {
             match event {
+                egui::Event::ModifiersChanged(modifiers) => {
+                    ctrl = modifiers.ctrl;
+                    if !ctrl {
+                        self.copying = false;
+                    }
+                }
                 egui::Event::Text(text) => {
                     let mods = ui.input(|i| i.modifiers);
                     if !is_app_chord(&mods) && !mods.ctrl {
@@ -334,7 +345,7 @@ impl TerminalView {
                         self.selection = None;
                         self.selection_rows = None;
                         self.copying = true;
-                    } else if !cfg!(target_os = "macos") && ui.input(|i| i.modifiers.ctrl) && !self.copying {
+                    } else if !cfg!(target_os = "macos") && ctrl && !self.copying {
                         out.push(0x03);
                         terminal.record_input(std::time::Instant::now(), false);
                     }
@@ -360,6 +371,10 @@ impl TerminalView {
                 }
                 _ => {}
             }
+        }
+        self.ctrl = ui.input(|i| i.modifiers.ctrl);
+        if !self.ctrl {
+            self.copying = false;
         }
         if !out.is_empty() {
             // Typing on the desktop takes back a remote client's lease (a no-op without one).
@@ -923,6 +938,116 @@ mod tests {
             .drop_without_applying_deltas();
         assert!(captured_input(&terminal, &dir).is_empty());
         assert!(terminal.last_typed().is_none());
+    }
+
+    /// One frame of `events` on the context the view keeps being drawn in.
+    fn keys(
+        ctx: &egui::Context,
+        terminal: &Terminal,
+        view: &mut TerminalView,
+        events: Vec<egui::Event>,
+    ) -> Option<String> {
+        let output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| view.handle_keys(terminal, ui));
+        let copied = output.platform_output.commands.iter().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        });
+        output.drop_without_applying_deltas();
+        copied
+    }
+
+    fn c_up(modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key: Key::C, physical_key: Some(Key::C), pressed: false, repeat: false, modifiers }
+    }
+
+    fn ctrl(on: bool) -> egui::Event {
+        egui::Event::ModifiersChanged(if on { Modifiers::CTRL } else { Modifiers::NONE })
+    }
+
+    #[test]
+    fn a_ctrl_c_quicker_than_a_frame_still_interrupts_off_macos() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let ctx = egui::Context::default();
+        keys(&ctx, &terminal, &mut view, vec![ctrl(true), egui::Event::Copy, c_up(Modifiers::CTRL), ctrl(false)]);
+        let bytes = captured_input(&terminal, &dir);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(bytes, b"\x03");
+            assert!(terminal.last_typed().is_some());
+        }
+        #[cfg(target_os = "macos")]
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_ctrl_c_whose_ctrl_is_let_go_in_the_frame_of_the_c_still_interrupts_off_macos() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let ctx = egui::Context::default();
+        keys(&ctx, &terminal, &mut view, vec![ctrl(true)]);
+        keys(&ctx, &terminal, &mut view, vec![egui::Event::Copy, ctrl(false)]);
+        let bytes = captured_input(&terminal, &dir);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(bytes, b"\x03");
+        #[cfg(target_os = "macos")]
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn two_ctrl_cs_inside_one_frame_interrupt_twice_off_macos() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let ctx = egui::Context::default();
+        let chord = [ctrl(true), egui::Event::Copy, c_up(Modifiers::CTRL), ctrl(false)];
+        keys(&ctx, &terminal, &mut view, chord.iter().chain(&chord).cloned().collect());
+        let bytes = captured_input(&terminal, &dir);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(bytes, b"\x03\x03");
+        #[cfg(target_os = "macos")]
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_quick_ctrl_c_on_a_selection_copies_and_only_the_next_one_interrupts() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let ctx = egui::Context::default();
+        select_input_text(&terminal, &mut view);
+        let chord = vec![ctrl(true), egui::Event::Copy, c_up(Modifiers::CTRL), ctrl(false)];
+        assert_eq!(keys(&ctx, &terminal, &mut view, chord.clone()).as_deref(), Some("alpha beta gamma"));
+        assert!(terminal.last_typed().is_none(), "copying text is not terminal input");
+        assert_eq!(keys(&ctx, &terminal, &mut view, chord), None);
+        let bytes = captured_input(&terminal, &dir);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(bytes, b"\x03");
+        #[cfg(target_os = "macos")]
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_copy_repeat_in_the_frame_ctrl_is_let_go_stays_part_of_the_copy() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let ctx = egui::Context::default();
+        select_input_text(&terminal, &mut view);
+        assert_eq!(
+            keys(&ctx, &terminal, &mut view, vec![ctrl(true), egui::Event::Copy]).as_deref(),
+            Some("alpha beta gamma")
+        );
+        assert_eq!(keys(&ctx, &terminal, &mut view, vec![egui::Event::Copy, ctrl(false)]), None);
+        assert!(captured_input(&terminal, &dir).is_empty(), "the same key press: no interrupt");
+        assert!(terminal.last_typed().is_none());
+    }
+
+    #[test]
+    fn a_dedicated_copy_key_after_ctrl_was_let_go_sends_no_interrupt() {
+        let (terminal, dir) = raw_input_terminal();
+        let mut view = TerminalView::default();
+        let ctx = egui::Context::default();
+        keys(&ctx, &terminal, &mut view, vec![ctrl(true), ctrl(false), egui::Event::Copy]);
+        keys(&ctx, &terminal, &mut view, vec![egui::Event::Copy]);
+        assert!(captured_input(&terminal, &dir).is_empty());
     }
 
     #[test]

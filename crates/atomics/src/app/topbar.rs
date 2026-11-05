@@ -418,6 +418,43 @@ mod tests {
     }
 
     #[test]
+    fn the_count_says_idle_only_when_every_agent_is() {
+        with_app("app::topbar::tests::the_count_says_idle_only_when_every_agent_is", |app, ctx| {
+            let root = Path::new("/project/ATOMICS");
+            let cases: [(&[AgentStatus], &str); 7] = [
+                (&[AgentStatus::Idle, AgentStatus::Idle], "2 idle"),
+                (&[AgentStatus::Working, AgentStatus::NeedsInput], "1 working · 2 open"),
+                (&[AgentStatus::NeedsInput, AgentStatus::Idle], "1 needs you · 2 open"),
+                (&[AgentStatus::NeedsInput, AgentStatus::NeedsInput], "2 need you · 2 open"),
+                (&[AgentStatus::Done, AgentStatus::Idle], "1 finished · 2 open"),
+                (&[AgentStatus::Exited, AgentStatus::Idle], "1 exited · 2 open"),
+                (
+                    &[AgentStatus::NeedsInput, AgentStatus::Done, AgentStatus::Exited, AgentStatus::Idle],
+                    "1 needs you · 1 finished · 1 exited · 4 open",
+                ),
+            ];
+            for (statuses, expected) in cases {
+                app.runtime.sessions = statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, status)| session(&format!("agent-{i}"), AgentKind::Generic, *status, root))
+                    .collect();
+                let (_, output) = render(app, ctx, 5120.0, vec![]);
+                let (shown, count) =
+                    output.shapes.iter().fold((false, None), |(shown, count), shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == expected => (true, count),
+                        egui::Shape::Text(text) if text.galley.text().ends_with(" idle") => {
+                            (shown, Some(text.galley.text().to_string()))
+                        }
+                        _ => (shown, count),
+                    });
+                output.drop_without_applying_deltas();
+                assert!(shown, "{statuses:?}: expected {expected}, the bar says {count:?}");
+            }
+        });
+    }
+
+    #[test]
     fn the_chief_keeps_its_place_whatever_it_and_the_plans_do() {
         with_app("app::topbar::tests::the_chief_keeps_its_place_whatever_it_and_the_plans_do", |app, ctx| {
             for width in [480.0, 700.0, 1100.0, 1600.0, 2400.0] {

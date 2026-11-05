@@ -2,11 +2,18 @@ use super::*;
 use atomics_core::store::RestartState;
 
 impl State {
+    /// What holds a restart back when nobody in particular asked for it.
     pub(super) fn restart_blockers(&self) -> Vec<String> {
+        self.restart_blockers_for(None)
+    }
+
+    /// What holds back the restart `caller` asked for. A chief asking is executing this request, so its own turn is
+    /// the handoff; any other session's turn counts, the chief's included when someone else asks.
+    pub(super) fn restart_blockers_for(&self, caller: Option<&str>) -> Vec<String> {
         let mut blockers = Vec::new();
         for session in &self.sessions {
-            // The chief is executing this request; its own turn is the handoff.
-            if !session.chief && matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
+            let hands_off = session.chief && caller == Some(session.id.as_str());
+            if !hands_off && matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
                 blockers.push(format!("agent {} ({}) is {}", session.title, session.id, session.status.label()));
             }
             if session.status == AgentStatus::NeedsInput || session.approval_hold || !session.approvals.is_empty() {
@@ -62,10 +69,39 @@ impl State {
         blockers
     }
 
+    /// What the restart after an update waits for: all of [`Self::restart_blockers`], and what only this restart has
+    /// to look for, because nobody chose its moment. A turn still on the screen of an agent that already reported, the
+    /// background work an agent's footer lists, a command in a shell, and any running editor, whose unsaved work
+    /// nothing here can see. What cannot be seen at all is what the countdown is for.
+    pub(super) fn update_blockers(&self) -> Vec<String> {
+        let mut blockers = self.restart_blockers();
+        for session in &self.sessions {
+            let Some(terminal) = session.terminal.as_ref().filter(|terminal| !terminal.exited()) else { continue };
+            let name = format!("{} ({})", session.title, session.id);
+            if !session.is_agent() {
+                if terminal.foreground_process() {
+                    blockers.push(format!("shell {name} is running a command"));
+                }
+                continue;
+            }
+            if session.screen_busy && !matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
+                blockers.push(format!("agent {name} is still in a turn"));
+            }
+            if let Some(work) = sessions::background_work(&terminal.screen_text(sessions::FOOTER_LINES)) {
+                blockers.push(format!("agent {name} has background work: {work}"));
+            }
+        }
+        let mut editors: Vec<_> =
+            self.editors.iter().filter(|(_, terminal)| !terminal.exited()).map(|(root, _)| root).collect();
+        editors.sort();
+        blockers.extend(editors.into_iter().map(|root| format!("editor open in {}", root.display())));
+        blockers
+    }
+
     /// Relaunches with the arguments ATOMICS started with, but the workspace open now.
-    pub(super) fn restart(&mut self, force: bool, reason: Option<String>) -> ControlResponse {
+    pub(super) fn restart(&mut self, force: bool, reason: Option<String>, caller: Option<&str>) -> ControlResponse {
         let workspace = self.workspace.clone();
-        self.restart_using(force, reason, move || crate::restart::Target::current(workspace.as_deref()))
+        self.restart_for(force, reason, caller, move || crate::restart::Target::current(workspace.as_deref()))
     }
 
     pub(super) fn restart_using(
@@ -74,11 +110,21 @@ impl State {
         reason: Option<String>,
         target: impl FnOnce() -> anyhow::Result<crate::restart::Target>,
     ) -> ControlResponse {
+        self.restart_for(force, reason, None, target)
+    }
+
+    fn restart_for(
+        &mut self,
+        force: bool,
+        reason: Option<String>,
+        caller: Option<&str>,
+        target: impl FnOnce() -> anyhow::Result<crate::restart::Target>,
+    ) -> ControlResponse {
         let result = (|| -> anyhow::Result<()> {
             if self.hook_error.is_some() {
                 anyhow::bail!("this instance does not own its control socket");
             }
-            let blockers = self.restart_blockers();
+            let blockers = self.restart_blockers_for(caller);
             if !force && !blockers.is_empty() {
                 anyhow::bail!("restart refused:\n- {}", blockers.join("\n- "));
             }
@@ -370,11 +416,37 @@ mod tests {
                 }
                 app.runtime.sessions[0].chief = true;
                 app.runtime.sessions[0].status = AgentStatus::Working;
-                assert!(app.runtime.restart_blockers().is_empty());
+                let chief = app.runtime.sessions[0].id.clone();
+                assert!(app.runtime.restart_blockers_for(Some(&chief)).is_empty(), "the chief that asks hands off");
+                assert_eq!(app.runtime.restart_blockers_for(Some("someone-else")).len(), 1, "anyone else waits for it");
+                assert_eq!(app.runtime.restart_blockers().len(), 1, "as a request from nobody does");
+                refused(app, "is working");
+                let response = request(app, json!({"cmd":"restart", "pane":"someone-else"}));
+                assert!(response.error.unwrap().contains("is working"), "another session is not the chief");
                 app.runtime.sessions[0].approval_hold = true;
+                assert!(!app.runtime.restart_blockers_for(Some(&chief)).is_empty(), "what is the user's still counts");
                 refused(app, "approval or question");
             },
         );
+    }
+
+    #[test]
+    fn the_chief_that_asks_restarts_over_its_own_turn() {
+        with_app("app::restart::tests::the_chief_that_asks_restarts_over_its_own_turn", |app, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            let exe = paths::atomics_home().join("version-probe");
+            crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
+            let target =
+                || Ok(crate::restart::Target { executable: exe.clone(), command: vec!["/usr/bin/true".into()] });
+            let refused = app.runtime.restart_for(false, None, Some("someone-else"), target);
+            assert!(refused.error.unwrap().contains("chief"));
+            assert!(!app.runtime.restarting);
+            let handed_off = app.runtime.restart_for(false, None, Some("chief"), target);
+            assert!(handed_off.ok, "{handed_off:?}");
+            assert!(app.runtime.restarting);
+        });
     }
 
     #[test]

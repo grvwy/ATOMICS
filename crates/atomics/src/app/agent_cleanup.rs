@@ -154,14 +154,14 @@ impl State {
                     .iter()
                     .flat_map(|plan| &plan.tasks)
                     .find(|task| task.session.as_deref() == Some(&session.id));
-                let reason = if task.is_some_and(|task| task.status == TaskStatus::Done) {
-                    "accepted task"
-                } else if health.merged {
-                    "merged branch"
-                } else if task.is_none() && health.empty {
-                    "no task or changes"
-                } else {
-                    return None;
+                // A task still open is the chief's to accept. Its branch tells nothing: with no commits yet, HEAD is
+                // at the merge base just as a merged branch's is, and the worker may be waiting for an answer.
+                let reason = match task {
+                    Some(task) if task.status == TaskStatus::Done => "accepted task",
+                    Some(_) => return None,
+                    None if health.merged => "merged branch",
+                    None if health.empty => "no task or changes",
+                    None => return None,
                 };
                 Some(format!("{} ({reason})", session.id))
             })
@@ -429,6 +429,53 @@ mod tests {
                 assert_eq!(app.runtime.agent_cleanup_candidates().len(), 2);
                 app.runtime.integration_dirty.store(true, Ordering::Relaxed);
                 assert!(app.runtime.agent_cleanup_candidates().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn a_worker_with_a_task_and_no_commits_is_not_listed_as_a_merged_branch() {
+        with_app(
+            "app::agent_cleanup::tests::a_worker_with_a_task_and_no_commits_is_not_listed_as_a_merged_branch",
+            |app, _| {
+                let (_dir, repo) = repository();
+                app.runtime.config.base_ref = "main".into();
+                app.runtime.config.plan.close_done_agents = false;
+                app.runtime.config.cleanup.completed_plans = false;
+                let work = repo.with_file_name("work");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                app.runtime.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Idle, &work)];
+                app.runtime.plans = vec![Plan {
+                    id: "plan".into(),
+                    tasks: vec![Task {
+                        id: "code".into(),
+                        branch: Some("task".into()),
+                        session: Some("worker".into()),
+                        status: TaskStatus::Running,
+                        ..Task::default()
+                    }],
+                    ..Plan::default()
+                }];
+                for status in [TaskStatus::Planned, TaskStatus::Running, TaskStatus::Blocked, TaskStatus::Review] {
+                    app.runtime.plans[0].tasks[0].status = status;
+                    finish_checks(app.runtime);
+                    assert_eq!(app.runtime.agent_cleanup_candidates(), Vec::<String>::new(), "{status:?}");
+                }
+                // Its branch landing does not change who decides while the task is open: the chief accepts it.
+                commit(&work);
+                git::git(&repo, &["merge", "--ff-only", "task"]).unwrap();
+                *app.runtime.agent_cleanup.files.lock().unwrap().entry(work.clone()).or_default() += 1;
+                finish_checks(app.runtime);
+                assert_eq!(app.runtime.agent_cleanup_candidates(), Vec::<String>::new(), "landed, not accepted");
+                // Accepted, it is the chief's to close, and with no task a merged branch still is.
+                app.runtime.plans[0].tasks[0].status = TaskStatus::Done;
+                *app.runtime.agent_cleanup.files.lock().unwrap().entry(work.clone()).or_default() += 1;
+                finish_checks(app.runtime);
+                assert_eq!(app.runtime.agent_cleanup_candidates(), ["worker (accepted task)"]);
+                app.runtime.plans.clear();
+                *app.runtime.agent_cleanup.files.lock().unwrap().entry(work).or_default() += 1;
+                finish_checks(app.runtime);
+                assert_eq!(app.runtime.agent_cleanup_candidates(), ["worker (merged branch)"]);
             },
         );
     }

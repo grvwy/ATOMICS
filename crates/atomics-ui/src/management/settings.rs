@@ -111,9 +111,14 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         ui.colored_label(p.warning, problem);
     }
     // A window on the host says nothing while nothing is new; a client always shows which version the host runs.
+    // One id either way, a scope's or a skipped one, so that the section appearing leaves a field below it the keyboard.
     if let Some(update) = backend.update().filter(|update| update.has_news() || !backend.available(&Command::Update)) {
         let summary = update_summary(&update);
-        section(ui, &p, "Updates", &summary, update.has_news(), |ui| updates(ui, backend, client, &update));
+        ui.scope(|ui| {
+            section(ui, &p, "Updates", &summary, update.has_news(), |ui| updates(ui, backend, client, &update));
+        });
+    } else {
+        ui.skip_ahead_auto_ids(1);
     }
     let selected = info.themes.choices.iter().find(|choice| choice.selected).map_or("", |choice| &choice.name);
     section(ui, &p, "Theme", selected, true, |ui| theme(ui, backend, client, info));
@@ -196,6 +201,7 @@ fn update_summary(update: &UpdateInfo) -> String {
     match (&update.phase, &update.latest) {
         (UpdatePhase::Working { step }, _) => step.clone(),
         (UpdatePhase::WaitingForAgents { .. }, _) => "restarts when agents finish".into(),
+        (UpdatePhase::RestartsIn { seconds }, _) => format!("restarting in {seconds} s"),
         (UpdatePhase::Failed { .. }, _) => "update failed".into(),
         (UpdatePhase::Installed { version }, _) => format!("{version} installed"),
         (_, Some(latest)) => format!("{latest} available"),
@@ -225,6 +231,12 @@ fn updates(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, update
             for blocker in blockers {
                 note(ui, &p, blocker.clone());
             }
+            if backend.available(&Command::CancelUpdate) && button(ui, client, "Cancel").clicked() {
+                client.send(Command::CancelUpdate);
+            }
+        }
+        UpdatePhase::RestartsIn { seconds } => {
+            ui.label(format!("Restarting in {seconds} s."));
             if backend.available(&Command::CancelUpdate) && button(ui, client, "Cancel").clicked() {
                 client.send(Command::CancelUpdate);
             }

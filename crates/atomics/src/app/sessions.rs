@@ -1209,6 +1209,54 @@ fn status_line(line: &str) -> bool {
         || after.strip_prefix(" for ").is_some_and(|time| time.starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// How much of an agent's screen is its footer and the prompt it sits around: Claude Code's line at the very bottom,
+/// Codex's above its prompt.
+pub(super) const FOOTER_LINES: usize = 12;
+
+/// What an agent's footer says runs in the background, which a restart would lose: Claude Code's `1 shell`,
+/// `2 local agents`, `1 shell, 1 monitor`, and Codex's `1 background terminal (cargo test) running`. A footer item is
+/// the whole of what stands between its `·` separators, so a line of the transcript that mentions a shell is not one.
+pub(super) fn background_work(screen: &str) -> Option<String> {
+    let lines: Vec<_> = screen.lines().collect();
+    let items: Vec<_> = lines[lines.len().saturating_sub(FOOTER_LINES)..]
+        .iter()
+        .flat_map(|line| line.split('·'))
+        .map(str::trim)
+        .filter(|item| background_item(item))
+        .collect();
+    (!items.is_empty()).then(|| items.join(", "))
+}
+
+/// What `3 things` counts.
+fn counted(part: &str) -> Option<&str> {
+    part.split_once(' ').filter(|(count, _)| count.parse::<u32>().is_ok()).map(|(_, what)| what)
+}
+
+fn background_item(item: &str) -> bool {
+    if counted(item).is_some_and(|what| what.starts_with("background terminal")) {
+        return true;
+    }
+    item.split(", ").all(|part| {
+        counted(part).is_some_and(|what| {
+            matches!(
+                what,
+                "shell"
+                    | "shells"
+                    | "monitor"
+                    | "monitors"
+                    | "local agent"
+                    | "local agents"
+                    | "team"
+                    | "teams"
+                    | "background task"
+                    | "background tasks"
+                    | "MCP task"
+                    | "MCP tasks"
+            )
+        })
+    })
+}
+
 /// Footers can wrap or change case, including Codex's `esc to interrupt` and Claude's `Esc to interrupt`.
 fn screen_busy(screen: &str, busy: &str) -> bool {
     let compact =
@@ -1325,6 +1373,47 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn background_work_is_what_a_footer_lists_and_nothing_a_transcript_says() {
+        // Claude Code's footer, as it stood with one background shell running.
+        let live = "❯\n─────\n  Claude · session 96% · weekly 14%\n  ⏵⏵ auto mode on · 1 shell · ← 1 agent";
+        assert_eq!(background_work(live).as_deref(), Some("1 shell"));
+        for item in [
+            "2 shells",
+            "1 shell, 1 monitor",
+            "3 monitors",
+            "1 local agent",
+            "2 local agents",
+            "1 team",
+            "2 background tasks",
+            "1 MCP task",
+        ] {
+            assert_eq!(background_work(&format!("  ⏵⏵ auto mode on · {item}")).as_deref(), Some(item));
+        }
+        // Codex's, above its prompt.
+        let codex =
+            "  1 background terminal (cargo test) running · /ps to view · /stop to close\n\n› \n\n  gpt · 80% left";
+        assert_eq!(background_work(codex).as_deref(), Some("1 background terminal (cargo test) running"));
+        let codex = "  2 background terminals running · /ps to view · /stop to close";
+        assert_eq!(background_work(codex).as_deref(), Some("2 background terminals running"));
+
+        for quiet in [
+            "",
+            "  ⏵⏵ auto mode on · ← 1 agent",
+            "  Claude · session 96% · weekly 14%",
+            "  • No background terminals running.",
+            "  1 cloud session",
+            "It left 1 shell running",
+            "fixed 2 shells and more",
+            "shell",
+        ] {
+            assert_eq!(background_work(quiet), None, "{quiet:?}");
+        }
+        // Scrolled out of the footer, it is the transcript's.
+        let old = format!("1 shell\n{}", "line\n".repeat(FOOTER_LINES));
+        assert_eq!(background_work(&old), None);
+    }
 
     #[test]
     fn two_instances_do_not_overwrite_each_others_provider_trust_slots() {

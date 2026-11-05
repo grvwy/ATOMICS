@@ -717,7 +717,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     };
     if let Some(map) = args.as_object_mut() {
         map.insert("cmd".into(), json!(cmd));
-        if cmd == "report" || cmd == "config_propose" {
+        if cmd == "report" || cmd == "config_propose" || cmd == "restart" {
             map.insert("pane".into(), json!(std::env::var("ATOMICS_PANE").ok()));
         }
     }
@@ -907,11 +907,11 @@ mod tests {
             }
         }
         let default = super::request_for_tool("atomics_restart", serde_json::json!({})).unwrap();
-        assert!(matches!(default, atomics_core::control::ControlRequest::Restart { force: false, reason: None }));
+        assert!(matches!(default, atomics_core::control::ControlRequest::Restart { force: false, reason: None, .. }));
         let force =
             super::request_for_tool("atomics_restart", serde_json::json!({"force":true,"reason":"upgrade"})).unwrap();
         assert!(
-            matches!(force, atomics_core::control::ControlRequest::Restart {force:true,reason:Some(reason)} if reason == "upgrade")
+            matches!(force, atomics_core::control::ControlRequest::Restart {force:true,reason:Some(reason),..} if reason == "upgrade")
         );
         assert_eq!(super::call_agent(&serde_json::json!({"name":"atomics_restart"}))["isError"], true);
     }

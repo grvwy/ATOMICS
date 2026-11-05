@@ -198,9 +198,13 @@ pub enum UpdatePhase {
     Working { step: String },
     /// Installed; the host restarts once nothing below is in the way. It never forces that.
     WaitingForAgents { blockers: Vec<String> },
+    /// Nothing known is in the way, and the window closes in this many seconds unless someone cancels. The host cannot
+    /// see everything, a half-typed prompt for one.
+    RestartsIn { seconds: u64 },
     /// Installed, the wait was cancelled, and this host still runs the old version.
     Installed { version: String },
-    /// Nothing was installed, and why.
+    /// The update stopped, and why. A release leaves the install as it was; a checkout's install script may have put
+    /// the new program in place before it stopped, and then says so.
     Failed { error: String },
     /// A phase from a newer host.
     #[serde(other)]
@@ -627,6 +631,16 @@ impl Projections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_countdown_reaches_a_client_and_an_older_one_reads_it_as_unknown() {
+        let phase = UpdatePhase::RestartsIn { seconds: 7 };
+        let wire = serde_json::to_value(&phase).unwrap();
+        assert_eq!(wire, serde_json::json!({"state": "restarts_in", "seconds": 7}));
+        assert_eq!(serde_json::from_value::<UpdatePhase>(wire).unwrap(), phase);
+        let newer = serde_json::json!({"state": "something_later"});
+        assert_eq!(serde_json::from_value::<UpdatePhase>(newer).unwrap(), UpdatePhase::Unknown);
+    }
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {

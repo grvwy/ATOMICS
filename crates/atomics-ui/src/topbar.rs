@@ -64,13 +64,9 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
     }
     if size == BrandSize::Full {
         let sessions = backend.session_list();
-        let agents = sessions.iter().filter(|s| !s.chief && s.kind != AgentKind::Shell).count();
-        let working = sessions
-            .iter()
-            .filter(|s| !s.chief && s.kind != AgentKind::Shell && s.status == AgentStatus::Working)
-            .count();
-        let label = if working == 0 { format!("{agents} idle") } else { format!("{working} working · {agents} open") };
-        let response = ui.label(RichText::new(label).color(client.palette.muted));
+        let statuses: Vec<_> =
+            sessions.iter().filter(|s| !s.chief && s.kind != AgentKind::Shell).map(|s| s.status).collect();
+        let response = ui.label(RichText::new(agent_count(&statuses)).color(client.palette.muted));
         record_item(ui, "agents", &response);
         let names: HashSet<_> = sessions.iter().filter_map(|s| s.sandbox.as_ref()).collect();
         if !names.is_empty() {
@@ -90,6 +86,24 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
         }
     }
     ui.separator();
+}
+
+/// How the agents stand, in the fewest words that are true: "idle" only when every one of them is.
+fn agent_count(statuses: &[AgentStatus]) -> String {
+    let count = |status| statuses.iter().filter(|s| **s == status).count();
+    let open = statuses.len();
+    if count(AgentStatus::Working) > 0 {
+        return format!("{} working · {open} open", count(AgentStatus::Working));
+    }
+    let need = count(AgentStatus::NeedsInput);
+    let parts = [
+        (need, if need == 1 { "needs you" } else { "need you" }),
+        (count(AgentStatus::Done), "finished"),
+        (count(AgentStatus::Exited), "exited"),
+        (count(AgentStatus::Starting), "starting"),
+    ];
+    let parts: Vec<_> = parts.iter().filter(|(n, _)| *n > 0).map(|(n, what)| format!("{n} {what}")).collect();
+    if parts.is_empty() { format!("{open} idle") } else { format!("{} · {open} open", parts.join(" · ")) }
 }
 
 /// `response` with a tooltip naming the chord `key` reads from the `[keys]`, on a platform that takes them.

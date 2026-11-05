@@ -155,7 +155,11 @@ impl Source {
         let output = std::fs::read(&self.log).unwrap_or_default();
         let output = String::from_utf8_lossy(&output);
         let last = output.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or("it printed nothing");
-        Err(anyhow!("The install script stopped ({status}): {last}. The whole log is at {}.", self.log.display()))
+        Err(anyhow!(
+            "The install script stopped ({status}): {last}. It may already have put the new program in place. The whole log \
+             is at {}.",
+            self.log.display()
+        ))
     }
 }
 
@@ -359,6 +363,7 @@ mod tests {
         fixture.push_commit("Add the thing");
         let error = format!("{:#}", fixture.source.install(&|_| {}).unwrap_err());
         assert!(error.contains("error: it does not build"), "{error}");
+        assert!(error.contains("may already have put the new program in place"), "{error}");
         assert!(error.contains("update.log"), "{error}");
 
         run(&fixture.other(), &["rm", "--quiet", "scripts/linux-install.sh"]);
