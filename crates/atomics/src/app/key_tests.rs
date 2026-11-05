@@ -653,8 +653,8 @@ fn two_agents(app: &mut Desktop<'_>, dir: &Path) -> (PathBuf, PathBuf) {
     (first, second)
 }
 
-/// `id` is active, its diff against main is on screen, and the diff holds the keyboard, its keys included.
-fn shows_the_diff_of(app: &mut Desktop<'_>, ctx: &egui::Context, id: &str, root: &Path) {
+/// `id` is active and its diff against main is on screen, independently of what holds the keyboard.
+fn draws_the_diff_of(app: &mut Desktop<'_>, ctx: &egui::Context, id: &str, root: &Path) {
     assert_eq!(app.runtime.active.as_deref(), Some(id));
     assert_eq!(app.runtime.diff_target().as_deref(), Some(root));
     assert!(app.runtime.panel == PanelMode::Diff, "the panel shows the diff");
@@ -672,6 +672,11 @@ fn shows_the_diff_of(app: &mut Desktop<'_>, ctx: &egui::Context, id: &str, root:
     output.drop_without_applying_deltas();
     assert!(text.iter().any(|t| t.contains(&format!("{id}.rs"))), "{id}'s diff is drawn: {text:?}");
     assert!(text.iter().any(|t| t.contains("vs origin/main")), "against main: {text:?}");
+}
+
+/// `id` is active, its diff against main is on screen, and the diff holds the keyboard, its keys included.
+fn shows_the_diff_of(app: &mut Desktop<'_>, ctx: &egui::Context, id: &str, root: &Path) {
+    draws_the_diff_of(app, ctx, id, root);
     assert!(panel_focused(ctx), "the diff holds the keyboard");
     for key in [Key::PageDown, Key::ArrowDown, Key::End, Key::Home] {
         press(app, ctx, key, NONE);
@@ -828,11 +833,16 @@ fn an_agent_chord_with_settings_holding_the_keyboard_still_switches_the_agent() 
             click_on(app, ctx, "Find a setting");
             typed(app, ctx, "x");
             assert_eq!(app.client.ui.management.filter, "x", "its field has the keyboard");
+            let field = ctx.memory(|m| m.focused()).expect("Settings holds the keyboard");
 
             press(app, ctx, Key::Num2, agent_chord());
             assert_eq!(app.client.ui.management.filter, "x", "the chord isn't typed into it");
             assert!(app.client.ui.management.settings, "Settings stays open");
-            shows_the_diff_of(app, ctx, "second", &second);
+            draws_the_diff_of(app, ctx, "second", &second);
+            assert!(ctx.memory(|m| m.has_focus(field)), "the open window keeps its field's keyboard");
+            typed(app, ctx, "yz");
+            run(app, ctx, vec![egui::Event::Paste(" pasted".into())]);
+            assert_eq!(app.client.ui.management.filter, "xyz pasted", "typing and paste stay in Settings");
             untouched(app, &[("first", &first), ("second", &second)], "end");
 
             press(app, ctx, Key::Escape, NONE);
