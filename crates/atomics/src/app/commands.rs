@@ -313,10 +313,6 @@ impl Desktop<'_> {
         &mut self,
         draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client, &mut dyn TerminalSurface) -> R,
     ) -> R {
-        if self.dialog_open() {
-            self.client.focus_terminal = None;
-            self.client.ui.focus_editor = false;
-        }
         if self.runtime.github.pr_diff.is_some() && self.runtime.github_pr_diff().is_none() {
             self.client.ui.pr_view = None;
         }
@@ -407,6 +403,16 @@ impl Desktop<'_> {
                 debug_assert!(!command.is_view(), "the desktop does not show {command:?}");
                 self.runtime.backend().send(command);
             }
+        }
+    }
+
+    /// A reply to this window's own control request. Only its own starts select their result; an external start
+    /// never passes through this handler.
+    pub(super) fn control_reply(&mut self, start: bool, response: ControlResponse) {
+        if let Some(error) = response.error {
+            self.runtime.toast(error);
+        } else if start && let Some(id) = response.result.get("id").and_then(|id| id.as_str()) {
+            self.activate(id, false);
         }
     }
 

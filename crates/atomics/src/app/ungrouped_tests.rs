@@ -96,7 +96,13 @@ fn new_sessions_start_ungrouped_in_scratch_folders_named_by_their_first_prompt()
             let value = serde_json::to_value(request_sent).unwrap();
             assert_eq!(value["folder"], json!(null));
             assert_eq!(value["repo"], json!(null));
-            let index = start(app, value);
+            let active_before = app.runtime.active.clone();
+            let response = request(app, value);
+            assert!(response.ok, "{:?}", response.error);
+            assert_eq!(app.runtime.active, active_before, "the host start leaves the desktop's selection alone");
+            let index = app.runtime.find(response.result["id"].as_str().unwrap()).unwrap();
+            // The host starts it without moving the desktop. Its own window applies the reply, as App::logic does.
+            app.control_reply(true, response);
 
             let scratch = app.runtime.sessions[index].scratch.clone().unwrap();
             assert_eq!(scratch.parent(), Some(paths::scratch_dir().as_path()));

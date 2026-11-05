@@ -849,11 +849,7 @@ impl eframe::App for App {
         let mut state = self.host.state();
         self.replies.retain(|(start, reply)| match reply.try_recv() {
             Ok(ControlOutcome::Done(response)) => {
-                if let Some(error) = response.error {
-                    state.toast(error);
-                } else if *start && let Some(id) = response.result.get("id").and_then(|id| id.as_str()) {
-                    Desktop { runtime: &mut state, client: &mut self.client }.activate(id, false);
-                }
+                Desktop { runtime: &mut state, client: &mut self.client }.control_reply(*start, response);
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
