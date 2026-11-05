@@ -35,7 +35,7 @@ use atomics_core::ops::{
     self, Grant, Outcome, Pending, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
 };
 use atomics_core::plan::{Plan, PlanStatus, Report, Task, TaskStatus};
-use atomics_core::projection::{DiffFileBody, DiffFileSummary, PlanInfo, SessionInfo, TaskInfo};
+use atomics_core::projection::{DiffFileBody, DiffFileSummary, DiffSummary, PlanInfo, SessionInfo, TaskInfo};
 use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
@@ -131,8 +131,8 @@ struct State {
     diffs: BTreeMap<String, Fetched>,
     /// The worktrees whose files' hunks to fetch: those on screen.
     wanted: BTreeSet<String>,
-    /// `diff_get` requests in flight, by request ID: the worktree and path, to place an error.
-    requests: HashMap<String, (String, String)>,
+    /// `diff_get` requests in flight, by request ID: the worktree, path and revision, to place the answer.
+    requests: HashMap<String, (String, String, u64)>,
     next_request: u64,
     outgoing: Vec<Envelope>,
     notice: Option<String>,
@@ -205,7 +205,11 @@ fn delivery_note(result: &serde_json::Value) -> Option<String> {
 /// One worktree's diff at one revision.
 struct Fetched {
     revision: u64,
+    /// How each file's read at this revision goes.
     files: BTreeMap<String, Body>,
+    /// Each file's last whole body from an earlier read. The summary cannot say which files a new revision
+    /// changed, so all are read again, and this stays on screen until the new body is whole.
+    kept: BTreeMap<String, FileDiff>,
     /// Built from the summary and the bodies so far; cleared when either changes.
     prepared: Option<Arc<Prepared>>,
 }
@@ -218,7 +222,41 @@ enum Body {
 
 impl Fetched {
     fn new(revision: u64) -> Self {
-        Self { revision, files: BTreeMap::new(), prepared: None }
+        Self { revision, files: BTreeMap::new(), kept: BTreeMap::new(), prepared: None }
+    }
+
+    /// Starts reading every file again at `revision`, keeping what is whole on screen.
+    fn read_again(&mut self, revision: u64) {
+        self.revision = revision;
+        for (path, body) in std::mem::take(&mut self.files) {
+            if let Body::Got { file, more: false, .. } = body {
+                self.kept.insert(path, file);
+            }
+        }
+        self.prepared = None;
+    }
+
+    /// Moves to the summary's revision. A file it no longer lists, or lists as binary, has no body to keep.
+    fn follow(&mut self, summary: &DiffSummary) {
+        if self.revision == summary.revision {
+            return;
+        }
+        self.read_again(summary.revision);
+        let readable: BTreeSet<String> = summary.files.iter().filter(|f| !f.binary).map(summary_path).collect();
+        self.kept.retain(|path, _| readable.contains(path));
+    }
+
+    /// What the diff shows of a file: this read's body once whole, else the body kept from an earlier read, else
+    /// the pages of a first read so far.
+    fn shown(&self, path: &str) -> Option<&FileDiff> {
+        let read = match self.files.get(path) {
+            Some(Body::Got { file, more, .. }) => Some((file, *more)),
+            _ => None,
+        };
+        read.filter(|(_, more)| !more)
+            .map(|(file, _)| file)
+            .or_else(|| self.kept.get(path))
+            .or(read.map(|(file, _)| file))
     }
 }
 
@@ -518,10 +556,9 @@ impl RemoteBackend {
         let mut s = self.state.borrow_mut();
         let key = worktree.to_string_lossy().into_owned();
         if let Some(fetched) = s.diffs.get_mut(&key) {
-            let revision = fetched.revision;
-            *fetched = Fetched::new(revision);
+            fetched.read_again(fetched.revision);
         }
-        s.requests.retain(|_, (w, _)| *w != key);
+        s.requests.retain(|_, (w, _, _)| *w != key);
         s.wanted.insert(key);
         s.fetch();
     }
@@ -859,7 +896,12 @@ impl State {
                 }
             }
             Message::TracePage(page) => self.trace_page(page, envelope.request_id.as_deref()),
-            Message::DiffFile { body, truncated, next_offset } => self.diff_page(body, *truncated, *next_offset),
+            Message::DiffFile { body, truncated, next_offset } => {
+                // A refresh forgets what it asked before: such a page would land among the new read's.
+                if envelope.request_id.as_deref().and_then(|id| self.requests.remove(id)).is_some() {
+                    self.diff_page(body, *truncated, *next_offset);
+                }
+            }
             Message::CommandResult(result) => {
                 let Some(outcome) = self.pending.apply(result) else { return };
                 match &outcome {
@@ -927,8 +969,12 @@ impl State {
                 }
                 let request = envelope.request_id.as_deref().and_then(|id| self.requests.remove(id));
                 match request {
-                    Some((worktree, path)) => {
+                    Some((worktree, path, revision)) => {
                         let Some(fetched) = self.diffs.get_mut(&worktree) else { return };
+                        // An answer to an earlier read says nothing about this one.
+                        if revision != fetched.revision {
+                            return;
+                        }
                         if *code == ErrorCode::StaleRevision {
                             // The diff moved on; its new summary brings a revision to ask at.
                             fetched.files.remove(&path);
@@ -1035,25 +1081,30 @@ impl State {
             }
             _ => return,
         };
-        fetched.prepared = None;
-        if let (true, Some(offset)) = (truncated, next_offset)
-            && pages < MAX_PAGES
-        {
-            if let Some(Body::Got { more, .. }) = fetched.files.get_mut(&path) {
-                *more = true;
-            }
-            let worktree = body.worktree.clone();
-            let revision = Some(Seq(body.revision));
-            let message =
-                Message::DiffGet { worktree: worktree.clone(), path: path.clone(), revision, offset: Some(offset) };
-            self.request(message, worktree, path);
+        let next = next_offset.filter(|_| truncated && pages < MAX_PAGES);
+        let Some(Body::Got { file, more, .. }) = fetched.files.get_mut(&path) else { return };
+        *more = next.is_some();
+        // A file already on screen changes once, when all of it is in, and not at all if it is the same.
+        let shown = fetched.kept.get(&path);
+        let redraw = if *more { shown.is_none() } else { shown != Some(&*file) };
+        if redraw {
+            fetched.prepared = None;
+        }
+        if !*more {
+            fetched.kept.remove(&path);
+        }
+        if let Some(offset) = next {
+            self.ask(body.worktree.clone(), path, body.revision, Some(offset));
         }
     }
 
-    fn request(&mut self, message: Message, worktree: String, path: String) {
+    /// Asks for a page of a file's hunks at `revision`.
+    fn ask(&mut self, worktree: String, path: String, revision: u64, offset: Option<u32>) {
         self.next_request += 1;
         let id = format!("diff-{}", self.next_request);
-        self.requests.insert(id.clone(), (worktree, path));
+        let message =
+            Message::DiffGet { worktree: worktree.clone(), path: path.clone(), revision: Some(Seq(revision)), offset };
+        self.requests.insert(id.clone(), (worktree, path, revision));
         self.outgoing.push(Envelope::new(message).reply_to(Some(id)));
     }
 
@@ -1066,12 +1117,13 @@ impl State {
         for worktree in &self.wanted {
             let Some(summary) = self.mirror.diffs.get(worktree) else { continue };
             let fetched = self.diffs.entry(worktree.clone()).or_insert_with(|| Fetched::new(summary.revision));
-            if fetched.revision != summary.revision {
-                *fetched = Fetched::new(summary.revision);
-            }
+            fetched.follow(summary);
             let mut in_flight =
                 fetched.files.values().filter(|b| matches!(b, Body::Asked | Body::Got { more: true, .. })).count();
-            for file in &summary.files {
+            // What shows nothing yet goes before what only refreshes.
+            let (refreshing, empty): (Vec<_>, Vec<_>) =
+                summary.files.iter().partition(|file| fetched.kept.contains_key(&summary_path(file)));
+            for file in empty.into_iter().chain(refreshing) {
                 if in_flight >= MAX_IN_FLIGHT {
                     break;
                 }
@@ -1085,31 +1137,23 @@ impl State {
             }
         }
         for (worktree, path, revision) in asks {
-            let message = Message::DiffGet {
-                worktree: worktree.clone(),
-                path: path.clone(),
-                revision: Some(Seq(revision)),
-                offset: None,
-            };
-            self.request(message, worktree, path);
+            self.ask(worktree, path, revision, None);
         }
     }
 
     fn snapshot(&mut self, worktree: &str) -> Option<DiffSnapshot> {
         let summary = self.mirror.diffs.get(worktree)?;
         let fetched = self.diffs.entry(worktree.to_string()).or_insert_with(|| Fetched::new(summary.revision));
-        if fetched.revision != summary.revision {
-            *fetched = Fetched::new(summary.revision);
-        }
+        fetched.follow(summary);
         let prepared = match &fetched.prepared {
             Some(prepared) => prepared.clone(),
             None => {
                 let files: Vec<FileDiff> = summary
                     .files
                     .iter()
-                    .map(|f| match fetched.files.get(&summary_path(f)) {
-                        Some(Body::Got { file, .. }) => file.clone(),
-                        _ => FileDiff {
+                    .map(|f| match fetched.shown(&summary_path(f)) {
+                        Some(file) => file.clone(),
+                        None => FileDiff {
                             old_path: f.old_path.clone(),
                             new_path: f.new_path.clone(),
                             status: f.status,

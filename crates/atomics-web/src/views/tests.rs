@@ -3,7 +3,7 @@
 
 use atomics_core::approvals::Decision;
 use atomics_core::ops::HostAction;
-use atomics_core::projection::{HostInfo, SignInState};
+use atomics_core::projection::{DiffFileSummary, HostInfo, SignInState};
 use atomics_core::theme::ThemeMode;
 use atomics_core::wire::{ErrorCode, Message, WireError};
 use serde_json::json;
@@ -4317,4 +4317,294 @@ fn an_unreadable_pairing_offers_try_again_instead_of_pairing() {
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Try again")));
         assert_eq!(world.driver.status(), &Status::Live, "the retry reads the existing pairing");
     }
+}
+
+/// A host whose worktree changed eight files, of `lines` added lines each.
+fn many_files(lines: u32) -> fake_host::FakeHost {
+    let mut host = fake_host::working();
+    let template = host.board.diffs[0].files[0].clone();
+    let name = |i: usize| format!("src/f{i}.rs");
+    host.board.diffs[0].files = (0..8)
+        .map(|i| DiffFileSummary { old_path: Some(name(i)), new_path: Some(name(i)), ..template.clone() })
+        .collect();
+    for i in 0..8 {
+        host.files.insert((WORKTREE.into(), name(i)), fake_host::file_diff(&name(i), lines));
+    }
+    host
+}
+
+/// The host's diff moves on a revision, with what `change` makes of its files.
+fn diff_moves_on(world: &mut World, change: impl FnOnce(&mut Vec<DiffFileSummary>, &mut fake_host::FakeHost)) {
+    let mut summary = world.host.board.diffs[0].clone();
+    summary.revision += 1;
+    change(&mut summary.files, &mut world.host);
+    let frames = world.host.event(|cursor| Message::DiffSummary { cursor, summary });
+    world.deliver(frames);
+}
+
+/// Where a click lands on the first text starting `label`.
+fn on_line(shown: &[(String, Rect)], label: &str) -> egui::Pos2 {
+    shown.iter().find(|(text, _)| text.starts_with(label)).unwrap_or_else(|| panic!("{label}: {shown:?}")).1.center()
+}
+
+/// That a row stands where it stood. egui rounds the top of what scrolls to a whole pixel, so a row whose index
+/// changed can stand part of a pixel off.
+#[track_caller]
+fn stays(now: Option<f32>, then: f32, what: &str) {
+    let now = now.unwrap_or_else(|| panic!("{what}: not on screen, at {then} before"));
+    assert!((now - then).abs() < 1.0, "{what}: at {now}, at {then} before");
+}
+
+/// Where the first text starting `label` is drawn, from the top of the window.
+fn top_of(shown: &[(String, Rect)], label: &str) -> Option<f32> {
+    shown.iter().find(|(text, _)| text.starts_with(label)).map(|(_, rect)| rect.top())
+}
+
+#[test]
+fn a_new_revision_keeps_the_place_at_the_nth_file_by_its_path() {
+    let shift_down = || press(egui::Key::ArrowDown, egui::Modifiers::SHIFT);
+    let (ctx, mut world, mut client, mut view, _) = diff_of(live_with(many_files(120)), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    for _ in 0..5 {
+        drawn(ctx, world, client, view, WIDE, shift_down());
+        settled(ctx, world, client, view, WIDE);
+    }
+    assert_eq!(focused_file(client, WORKTREE).as_deref(), Some("src/f4.rs"));
+    let shown = settled(ctx, world, client, view, WIDE);
+    let header = top_of(&shown, "src/f4.rs").expect("the file at the top of the diff");
+    let line = top_of(&shown, "    step(7);").expect("a line of it");
+
+    // The file right above it grows, the body it shows comes back the same: nothing moves in any frame of the refresh.
+    diff_moves_on(world, |_, host| {
+        host.files.insert((WORKTREE.into(), "src/f3.rs".into()), fake_host::file_diff("src/f3.rs", 300));
+    });
+    for frame in 0..6 {
+        let shown = drawn(ctx, world, client, view, WIDE, Vec::new());
+        stays(top_of(&shown, "src/f4.rs"), header, &format!("its header, frame {frame}"));
+        stays(top_of(&shown, "    step(7);"), line, &format!("its line, frame {frame}"));
+    }
+    assert_eq!(focused_file(client, WORKTREE).as_deref(), Some("src/f4.rs"));
+    let state = &client.diff_views[Path::new(WORKTREE)];
+    let lines = |path: &str| {
+        let file = state.prepared.as_ref().unwrap().diff.files.iter().find(|f| f.path() == path).unwrap();
+        file.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>()
+    };
+    assert_eq!(lines("src/f3.rs"), 301, "the new body did arrive");
+
+    // Shift+↓ goes on from there, and not from the first file.
+    drawn(ctx, world, client, view, WIDE, shift_down());
+    settled(ctx, world, client, view, WIDE);
+    assert_eq!(focused_file(client, WORKTREE).as_deref(), Some("src/f5.rs"));
+}
+
+#[test]
+fn a_new_revision_keeps_the_scroll_inside_an_unchanged_file() {
+    use egui::{Key, Modifiers};
+    let (ctx, mut world, mut client, mut view, _) = diff_of(live_with(many_files(120)), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    for _ in 0..4 {
+        drawn(ctx, world, client, view, WIDE, press(Key::ArrowDown, Modifiers::SHIFT));
+        settled(ctx, world, client, view, WIDE);
+    }
+    for _ in 0..30 {
+        drawn(ctx, world, client, view, WIDE, press(Key::ArrowDown, Modifiers::NONE));
+    }
+    let shown = settled(ctx, world, client, view, WIDE);
+    assert_eq!(top_of(&shown, "src/f3.rs"), None, "scrolled past its header");
+    let line = top_of(&shown, "    step(60);").expect("a line further down");
+
+    diff_moves_on(world, |files, host| {
+        // One file above goes, another grows.
+        files.remove(0);
+        host.files.insert((WORKTREE.into(), "src/f1.rs".into()), fake_host::file_diff("src/f1.rs", 30));
+    });
+    for frame in 0..6 {
+        let shown = drawn(ctx, world, client, view, WIDE, Vec::new());
+        stays(top_of(&shown, "    step(60);"), line, &format!("the line, frame {frame}"));
+    }
+    assert_eq!(focused_file(client, WORKTREE).as_deref(), Some("src/f3.rs"));
+
+    // The file itself goes: the one that took its place shows, from its start.
+    diff_moves_on(world, |files, _| files.retain(|f| f.new_path.as_deref() != Some("src/f3.rs")));
+    let shown = settled(ctx, world, client, view, WIDE);
+    let next = top_of(&shown, "src/f4.rs").expect("the next file");
+    assert!(next < line, "at the top of the diff, under its header: {next}");
+}
+
+fn pointer(at: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+    let button = egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    vec![egui::Event::PointerMoved(at), button]
+}
+
+/// The diff at its third file with the keyboard in the panel, and the frame it shows.
+fn at_the_third_file() -> (egui::Context, World, Client, View, Vec<(String, Rect)>) {
+    let (ctx, mut world, mut client, mut view, _) = diff_of(live_with(many_files(120)), WIDE);
+    for _ in 0..3 {
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::ArrowDown, egui::Modifiers::SHIFT));
+        settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    }
+    assert_eq!(focused_file(&client, WORKTREE).as_deref(), Some("src/f2.rs"));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    (ctx, world, client, view, shown)
+}
+
+/// The text of a line of the fake diff, as far as it tells the lines apart.
+fn step(n: u32) -> String {
+    format!("    step({n});")
+}
+
+/// A person's click, its press and release some frames apart, with the frames it takes to show.
+fn slow_click(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    at: egui::Pos2,
+) -> Vec<(String, Rect)> {
+    drawn(ctx, world, client, view, WIDE, pointer(at, true));
+    settled(ctx, world, client, view, WIDE);
+    drawn(ctx, world, client, view, WIDE, pointer(at, false));
+    settled(ctx, world, client, view, WIDE)
+}
+
+const COMMENT_BOX: &str = "Comment for the agent";
+
+#[test]
+fn a_click_on_a_line_leaves_it_and_what_is_above_it_where_they_are() {
+    let (ctx, mut world, mut client, mut view, shown) = at_the_third_file();
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    let header = top_of(&shown, "src/f2.rs").expect("the file's header");
+    let line = top_of(&shown, &step(9)).expect("a line of it");
+    let at = |shown: &[(String, Rect)], n: u32| on_line(shown, &step(n));
+
+    let after = slow_click(ctx, world, client, view, at(&shown, 9));
+    assert_eq!(top_of(&after, "src/f2.rs"), Some(header), "the scroll stays, to the pixel");
+    assert_eq!(top_of(&after, &step(9)), Some(line), "the line stays, to the pixel");
+    let row = top_of(&shown, &step(10)).unwrap() - line;
+    assert_eq!(top_of(&after, COMMENT_BOX).map(|y| ((y - line) / row).round()), Some(1.0), "the box is under it");
+    assert_eq!(focused_file(client, WORKTREE).as_deref(), Some("src/f2.rs"));
+
+    // Empty, it gives way to a click further down: the line that was clicked gets the box and stays put, however
+    // long the press takes.
+    let target = top_of(&after, &step(20)).unwrap();
+    let press = at(&after, 20);
+    drawn(ctx, world, client, view, WIDE, pointer(press, true));
+    for frame in 0..4 {
+        let held = drawn(ctx, world, client, view, WIDE, Vec::new());
+        assert_eq!(top_of(&held, &step(20)), Some(target), "nothing moves during the press: frame {frame}");
+    }
+    drawn(ctx, world, client, view, WIDE, pointer(press, false));
+    let after = settled(ctx, world, client, view, WIDE);
+    stays(top_of(&after, &step(20)), target, "the clicked line");
+    assert_eq!(top_of(&after, COMMENT_BOX).map(|y| ((y - target) / row).round()), Some(1.0), "the box is under it");
+    assert_eq!(after.iter().filter(|(text, _)| text.starts_with(COMMENT_BOX)).count(), 1);
+
+    // And to a click further up: nothing above the new box moves.
+    let target = top_of(&after, &step(5)).unwrap();
+    let header = top_of(&after, "src/f2.rs");
+    let after = slow_click(ctx, world, client, view, at(&after, 5));
+    assert_eq!(top_of(&after, &step(5)), Some(target));
+    assert_eq!(top_of(&after, "src/f2.rs"), header);
+    assert_eq!(top_of(&after, COMMENT_BOX).map(|y| ((y - target) / row).round()), Some(1.0), "the box is under it");
+}
+
+#[test]
+fn an_empty_comment_box_closes_when_the_press_elsewhere_is_over() {
+    let (ctx, mut world, mut client, mut view, shown) = at_the_third_file();
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    let after = slow_click(ctx, world, client, view, on_line(&shown, &step(9)));
+    assert!(top_of(&after, COMMENT_BOX).is_some());
+    // The file's header: what a click does there is its own.
+    let empty = on_line(&after, "@@ -1,1 +1,9 @@");
+    let after = slow_click(ctx, world, client, view, empty);
+    assert_eq!(top_of(&after, COMMENT_BOX), None);
+}
+
+#[test]
+fn ctrl_n_reaches_the_nth_agents_diff_from_a_comment_box_opened_by_a_click() {
+    let (ctx, mut world, mut client, mut view) = at_a_terminal(agents(), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    forwarded(ctx, world, client, view, "2", CHORD);
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+    let shown = settled(ctx, world, client, view, WIDE);
+    let after = slow_click(ctx, world, client, view, on_line(&shown, &step(2)));
+    assert!(top_of(&after, COMMENT_BOX).is_some());
+    assert!(!panel_has_the_keys(ctx), "the box has them");
+
+    sized(ctx, world, client, view, WIDE, press(egui::Key::Num3, CHORD));
+    assert_eq!(view.desk.active.as_deref(), Some("s2"), "the third of s0, s1 and s2");
+    assert_eq!(view.desk.diff_target(&world.driver.remote).as_deref(), Some(Path::new("/w/two")));
+    assert_eq!(view.desk.panel, PanelMode::Diff);
+    assert!(panel_has_the_keys(ctx), "the diff holds the keyboard");
+    no_bytes(world);
+}
+
+#[test]
+fn a_new_title_keeps_the_place() {
+    // The scroll area goes by the title, which an agent's session changes as it works.
+    let (ctx, mut world, mut client, mut view, shown) = at_the_third_file();
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    let line = top_of(&shown, &step(9)).expect("a line of the file");
+    let header = top_of(&shown, "src/f2.rs").expect("the file's header");
+    let mut session = world.host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
+    session.title = "Another title".into();
+    let frames = world.host.event(|cursor| Message::SessionUpsert { cursor, session });
+    world.deliver(frames);
+    for frame in 0..4 {
+        let shown = drawn(ctx, world, client, view, WIDE, Vec::new());
+        stays(top_of(&shown, "src/f2.rs"), header, &format!("its header, frame {frame}"));
+        stays(top_of(&shown, &step(9)), line, &format!("its line, frame {frame}"));
+    }
+    assert_eq!(focused_file(client, WORKTREE).as_deref(), Some("src/f2.rs"));
+}
+
+#[test]
+fn typing_a_comment_leaves_the_code_scrolled_sideways() {
+    let mut host = many_files(120);
+    for file in host.files.values_mut() {
+        for line in &mut file.hunks[0].lines {
+            line.text.push_str(&"y".repeat(300));
+        }
+    }
+    let (ctx, mut world, mut client, mut view, _) = diff_of(live_with(host), WIDE);
+    let (ctx, world, client, view) = (&ctx, &mut world, &mut client, &mut view);
+    drawn(ctx, world, client, view, WIDE, press(egui::Key::ArrowDown, egui::Modifiers::SHIFT));
+    let shown = settled(ctx, world, client, view, WIDE);
+    let left = |shown: &[(String, Rect)]| shown.iter().find(|(text, _)| text.starts_with(&step(9))).unwrap().1.left();
+    let start = left(&shown);
+    // The line runs on past the window, so not the middle of its text.
+    let at = egui::pos2(start + 40.0, on_line(&shown, &step(9)).y);
+
+    let wheel = egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(-400.0, 0.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: egui::Modifiers::NONE,
+    };
+    drawn(ctx, world, client, view, WIDE, vec![egui::Event::PointerMoved(at)]);
+    drawn(ctx, world, client, view, WIDE, vec![wheel]);
+    for _ in 0..40 {
+        drawn(ctx, world, client, view, WIDE, Vec::new());
+    }
+    let shown = settled(ctx, world, client, view, WIDE);
+    let scrolled = left(&shown);
+    assert!(scrolled < start - 100.0, "scrolled sideways: {start} to {scrolled}");
+
+    let shown = slow_click(ctx, world, client, view, at);
+    assert_eq!(left(&shown), scrolled, "the click leaves it");
+    let hint = top_of(&shown, COMMENT_BOX);
+    assert!(hint.is_some(), "the box is on screen: {shown:?}");
+    drawn(ctx, world, client, view, WIDE, text("n"));
+    for _ in 0..40 {
+        drawn(ctx, world, client, view, WIDE, Vec::new());
+    }
+    let shown = settled(ctx, world, client, view, WIDE);
+    assert!(shown.iter().any(|(drawn, _)| drawn == "n"), "the box took the text: {shown:?}");
+    assert_eq!(left(&shown), scrolled, "typing leaves it");
 }

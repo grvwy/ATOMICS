@@ -1199,7 +1199,9 @@ approval goes back to its banner, a refused comment back into its box with its t
 with the outcome. A comment box open when the connection drops keeps its draft and the keyboard: Enter does nothing
 until the connection is back, then sends. If the host sends the whole board again, as after a restart, the box goes
 for a moment, so the draft stays and the keyboard takes a click. A diff on screen is fetched file by file with
-`diff_get`, four files at a time, up to 16 pages each; the browser draws it without syntax colours.
+`diff_get`, four files at a time, up to 16 pages each; the browser draws it without syntax colours. A new revision
+does not say which files changed, so all are read again, and each file's old hunks stay on screen until all of its new
+ones are in. The view stays on its file and line by path, wherever rows came or went above it.
 
 **Layouts (C4).** A wide window draws the desktop's own window, `atomics_ui::shell::frame`, in the boot's theme
 as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
