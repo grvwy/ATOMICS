@@ -248,7 +248,7 @@ mod tests {
                             .shapes
                             .iter()
                             .find_map(|shape| match &shape.shape {
-                                egui::epaint::Shape::Text(t) if t.galley.text() == "resume" => {
+                                egui::epaint::Shape::Text(t) if t.galley.text() == "Resume" => {
                                     Some(t.pos + t.galley.rect.center().to_vec2())
                                 }
                                 _ => None,
@@ -321,7 +321,8 @@ mod tests {
                 (text, action)
             };
             for available in [true, false] {
-                for label in ["diff", "resume"] {
+                // The buttons' words, and the actions they report.
+                for (label, expected) in [("Diff", "diff"), ("Resume", "resume")] {
                     let (text, _) = render(vec![]);
                     let pos = text.iter().find(|(t, _)| t == label).unwrap().1;
                     for pressed in [true, false] {
@@ -335,7 +336,7 @@ mod tests {
                             },
                         ]);
                         if !pressed {
-                            assert_eq!(action, available.then_some(label));
+                            assert_eq!(action, available.then_some(expected));
                         }
                     }
                 }
@@ -450,8 +451,8 @@ mod tests {
                         "Finished task",
                         "Agent completed in 13m 10s",
                         "+412 −88",
-                        "diff",
-                        "resume",
+                        "Diff",
+                        "Resume",
                         "reported 25 min ago",
                     ] {
                         assert!(text.iter().any(|(t, _)| t == expected), "missing {expected}: {text:?}");
@@ -466,7 +467,7 @@ mod tests {
                     assert!(!render(app, board, vec![]).iter().any(|(t, _)| t == "reported 25 min ago"));
                 }
                 let text = render(app, false, vec![]);
-                let pos = text.iter().find(|(t, _)| t == "diff").unwrap().1;
+                let pos = text.iter().find(|(t, _)| t == "Diff").unwrap().1;
                 for pressed in [true, false] {
                     render(
                         app,
