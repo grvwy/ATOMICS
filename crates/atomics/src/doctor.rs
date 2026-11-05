@@ -837,6 +837,7 @@ mod tests {
                 crate::test_support::write_program(&codex, format!("#!/bin/sh\n{probe}\n"));
             }
             std::fs::write(&config, format!("base_ref = \"main\"\n[approvals]\nallow = [\"{allow}\"]\n")).unwrap();
+            std::fs::write(state.join("plans/conversation.remote.json"), "{}").unwrap();
             if bad_plan {
                 std::fs::write(state.join("plans/bad.json"), "bad JSON").unwrap();
                 if !merged.exists() {
