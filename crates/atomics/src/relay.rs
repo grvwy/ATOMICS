@@ -904,7 +904,7 @@ impl Keychain {
         ] {
             command.env_remove(name);
         }
-        if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
+        if let Some(path) = crate::setup::login_path_now().as_ref() {
             command.env("PATH", path);
         }
         crate::sandbox::setup::private_output(&mut command, Duration::from_secs(60))

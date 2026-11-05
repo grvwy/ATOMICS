@@ -91,6 +91,7 @@ impl State {
             }),
             remote,
             themes: self.themes.clone(),
+            setup: self.setup_info(),
         }
     }
 
@@ -249,6 +250,19 @@ impl State {
                     };
                     let _ = actions.send(Box::new(move |state| state.toast(message)));
                 });
+            }
+            SettingsTool::CheckPrograms => self.check_programs(),
+            SettingsTool::SetIsolation { mode } => {
+                self.set_isolation(mode).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+            }
+            SettingsTool::FinishSetup => {
+                self.finish_setup().map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+            }
+            SettingsTool::InitProject { path } => {
+                self.init_project(&path).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+            }
+            SettingsTool::AnswerStart { run_here } => {
+                self.answer_start(run_here).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
             }
             SettingsTool::SetAzure { enabled } => {
                 // The reload takes back what the relay granted when the setting goes off.

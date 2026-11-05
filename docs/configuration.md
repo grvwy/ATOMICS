@@ -51,7 +51,8 @@ ATOMICS starts from the built-in defaults, then applies `config.toml`, then this
   default, not the main config's value. A workspace can turn tickets off with `system = ""`.
 - A workspace's `[workflow]` also replaces the whole section. A repo may override it for its project.
 - A workspace's `[isolation]` merges key by key, like a host file. A repo may only tighten it to
-  `mode = "sandbox"`; see [Agent isolation](isolation.md).
+  `mode = "sandbox"`; see [Agent isolation](isolation.md). A config file that names no `[isolation] mode` means
+  `sandbox`; the file a new install starts with says `bare`.
 - Repository config overlays only its documented declarative keys; `[tickets] branch` keeps the workspace provider.
 - `[chief] prompt` adds up instead of replacing; see below.
 

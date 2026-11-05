@@ -36,6 +36,9 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
     }
 }
 
+/// Set by a test of a first run: its home has no config, as a person's has.
+pub(super) const FRESH_HOME: &str = "ATOMICS_TEST_FRESH_HOME";
+
 pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Context)) {
     with_state(name, |mut state, ctx| {
         let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
@@ -103,9 +106,13 @@ fn run_state(
         // environment while it changes.
         unsafe { crate::setup::adopt_login_path() };
     }
+    if std::env::var_os(FRESH_HOME).is_some() {
+        // SAFETY: as above. The config goes where a person's does, by the folder this home's XDG variable names.
+        unsafe { std::env::remove_var("ATOMICS_CONFIG") };
+    }
     // Agents run bare in tests unless a test sets up a fake sbx; State never reaches the real one.
     let config = paths::config_file();
-    if !config.exists() {
+    if !config.exists() && std::env::var_os(FRESH_HOME).is_none() {
         std::fs::write(&config, atomics_core::config::DEFAULT_CONFIG.replace("mode = \"sandbox\"", "mode = \"bare\""))
             .unwrap();
     }

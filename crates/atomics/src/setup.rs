@@ -10,6 +10,9 @@ use atomics_core::paths;
 /// PATH, hiding tools installed by the user's shell startup files.
 pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_path().path.clone().ok());
 
+/// The login shell's PATH when someone last asked ATOMICS to look again ([`refresh_login_path`]).
+static REFRESHED_PATH: Mutex<Option<String>> = Mutex::new(None);
+
 /// How long ATOMICS waits for the login shell to print a variable. A shell that takes longer
 /// is stopped, and ATOMICS goes on with what it has.
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -185,9 +188,9 @@ pub fn login_path() -> &'static LoginPath {
 /// is the shell's current one. Blocks while the shell starts the first time, so call it off the
 /// window's thread.
 pub fn child_path() -> Option<String> {
-    let login = SHELL_PATH.as_ref()?;
+    let login = login_path_now()?;
     let current = std::env::var("PATH").unwrap_or_default();
-    (!missing_folders(&current, login).is_empty()).then(|| with_login_path(&current, login))
+    (!missing_folders(&current, &login).is_empty()).then(|| with_login_path(&current, &login))
 }
 
 /// Where ATOMICS keeps the login shell's PATH from its last read.
@@ -416,8 +419,23 @@ pub fn known_env_var(name: &str) -> Option<String> {
 }
 
 pub fn find_program(program: &str) -> Option<PathBuf> {
-    let path = SHELL_PATH.clone().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
+    let path = login_path_now().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
     find_on_path(program, &path)
+}
+
+/// The login shell's PATH for what ATOMICS starts now: [`SHELL_PATH`], or what [`refresh_login_path`] read since.
+pub fn login_path_now() -> Option<String> {
+    REFRESHED_PATH.lock().unwrap().clone().or_else(|| SHELL_PATH.clone())
+}
+
+/// Reads the login shell's PATH again, so that what was installed while ATOMICS ran can be found and started without
+/// a restart. Waits for the shell, up to five seconds: call it off the window's thread. Returns the PATH to look on.
+pub fn refresh_login_path() -> String {
+    let login = login_shell_var("PATH");
+    if let Some(login) = &login {
+        *REFRESHED_PATH.lock().unwrap() = Some(login.clone());
+    }
+    login.or_else(login_path_now).or_else(|| std::env::var("PATH").ok()).unwrap_or_default()
 }
 
 pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {

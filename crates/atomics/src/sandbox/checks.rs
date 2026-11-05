@@ -416,6 +416,18 @@ fn prerequisite_lines(mac: bool, installed: impl Fn(&str) -> bool) -> Vec<String
         .collect()
 }
 
+/// What to run to get `program`, for a person to copy.
+pub(crate) fn install_command(program: &str, mac: bool) -> String {
+    match (program, mac) {
+        ("git", true) => "xcode-select --install".into(),
+        ("git", false) => "sudo apt-get install git".into(),
+        ("claude", _) => "curl -fsSL https://claude.ai/install.sh | bash".into(),
+        ("codex", true) => "brew install --cask codex".into(),
+        ("codex", false) => "npm install -g @openai/codex".into(),
+        (other, _) => format!("install {other}"),
+    }
+}
+
 pub(super) fn install_hint(name: &str, mac: bool) -> &'static str {
     match (name, mac) {
         ("git", true) => "install with `xcode-select --install` (or `brew install git`)",

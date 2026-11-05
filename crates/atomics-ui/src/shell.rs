@@ -66,6 +66,12 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let p = read(platform, |_, client| client.palette.clone());
     let time = ui.input(|i| i.time);
     platform.draw(|backend, client, _| nav::track(backend, client, time));
+    if read(platform, |backend, client| crate::management::setup::fills_window(backend, client)) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(16)))
+            .show(ui, |ui| platform.draw(|backend, client, _| crate::management::setup::page(ui, backend, client)));
+        return;
+    }
     egui::Panel::top("top")
         .exact_size(34.0)
         .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))

@@ -547,6 +547,7 @@ mod tests {
                         reply: None,
                         task: None,
                         isolation: None,
+                        interactive: false,
                     };
                     state.create_worktree(repo.clone(), branch.into(), None, launch);
                     state
@@ -639,6 +640,7 @@ mod tests {
                             reply: None,
                             task: None,
                             isolation: None,
+                            interactive: false,
                         },
                     );
                     let event = state

@@ -82,10 +82,12 @@ says what to take along and what to set up again.
 
 ## Run
 
-On a fresh Mac or Ubuntu machine, run `atomics setup` after installing ATOMICS. It guides tool
-installation, Docker sign-in, network policy, credentials (over stdin, the Claude subscription into the OS
-keychain) and Linear authorization,
-and resumes completed steps on rerun. See [fresh-machine setup](docs/isolation.md#fresh-machine-one-guided-command).
+The first start of ATOMICS opens a setup screen: which agents it found, where they run, a first project and
+connections, every one of which can wait. See [First run](docs/how-it-works.md#first-run). Agents run on this machine
+under your own login until you choose sandboxes; `atomics setup` guides those from a terminal, with tool installation,
+Docker sign-in, network policy, credentials (over stdin, the Claude subscription into the OS keychain) and Linear
+authorization, and resumes completed steps on rerun. See
+[fresh-machine setup](docs/isolation.md#fresh-machine-one-guided-command).
 
 ```sh
 cargo install --path crates/atomics     # or: cargo run --release -p atomics
@@ -357,7 +359,8 @@ scripts/linux-qa.sh shell
 `screenshot` builds ATOMICS, starts a disposable project with a shell under Xvfb, waits for its isolated control socket,
 captures the window through `atomics ctl`, verifies the PNG size and exits. Each `--ctl` request is sent to that
 instance first, in order, to set the scene; one that fails stops the run. The default size is 1600x1000; supported
-sizes range from 480x320 to 8192x8192. The image uses Debian, Rust 1.98, Xvfb and Mesa's lavapipe Vulkan driver
+sizes range from 480x320 to 8192x8192. Its instance names its config, so the setup screen stays away;
+`ATOMICS_QA_FIRST_RUN=1` shows a person's first run instead. The image uses Debian, Rust 1.98, Xvfb and Mesa's lavapipe Vulkan driver
 (software rendering for wgpu). No display server, GPU, agent credentials or ATOMICS state from the host are shared.
 
 The repository and linked-worktree git metadata are mounted read-only. Each checkout gets a separate Docker target

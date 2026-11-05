@@ -60,6 +60,9 @@ pub struct RestartState {
 pub struct Store {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartState>,
+    /// This install started with no config and nobody has finished or skipped the setup screen yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub setup_pending: bool,
     #[serde(default)]
     pub chief_dock: Option<ChiefDock>,
     #[serde(default)]

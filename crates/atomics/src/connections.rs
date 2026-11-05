@@ -290,7 +290,7 @@ impl Browser {
             command.arg(url);
         }
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
+        if let Some(path) = crate::setup::login_path_now().as_ref() {
             command.env("PATH", path);
         }
         let mut child = command.spawn().with_context(|| format!("could not run {}", self.program))?;
@@ -646,7 +646,7 @@ pub fn run_host(server: &str, env: bool, command: &[String]) -> Result<std::conv
         }
     }
     let store = Store::new(crate::relay::Keychain::current());
-    let mut host = host_command(&store, server, env, command, crate::setup::SHELL_PATH.as_deref())?;
+    let mut host = host_command(&store, server, env, command, crate::setup::login_path_now().as_deref())?;
     Err(host.exec()).with_context(|| format!("running {}", command[0]))
 }
 

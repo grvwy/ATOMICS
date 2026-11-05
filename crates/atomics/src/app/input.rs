@@ -520,6 +520,7 @@ pub(super) fn new_session_request(dialog: &NewDialog) -> Result<ControlRequest, 
         prompt: text(&dialog.prompt),
         args: Vec::new(),
         isolation: dialog.isolation,
+        interactive: true,
     })
 }
 
@@ -932,7 +933,7 @@ mod tests {
         with_app(
             "app::input::tests::agent_chords_keep_settings_and_desktop_dialogs_from_typing_into_terminals",
             |app, ctx| {
-                for window in ["settings", "remote", "project", "new", "rename", "quick", "github"] {
+                for window in ["settings", "remote", "project", "setup", "new", "rename", "quick", "github"] {
                     app.runtime.sessions.clear();
                     let dir = crate::test_support::tempdir().unwrap();
                     let first = dir.path().join("first");
@@ -948,6 +949,7 @@ mod tests {
                         "settings" => app.client.ui.management.settings = true,
                         "remote" => app.client.ui.management.remote = true,
                         "project" => app.client.ui.management.project = true,
+                        "setup" => app.client.ui.management.setup = true,
                         "new" => app.open_new_dialog(None),
                         "rename" => app.begin_rename("first"),
                         "quick" => {
@@ -980,6 +982,7 @@ mod tests {
                     app.client.ui.management.settings = false;
                     app.client.ui.management.remote = false;
                     app.client.ui.management.project = false;
+                    app.client.ui.management.setup = false;
                     app.client.new_dialog = None;
                     app.client.rename = None;
                     app.client.quick_open = None;

@@ -174,6 +174,7 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
+        let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
         let agent = if chief {
             atomics_core::config::AgentConfig {
@@ -213,6 +214,7 @@ impl State {
             runtime,
             ref_guard: None,
             relay: None,
+            interactive,
         };
         if let Some(job) = job {
             self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
@@ -225,9 +227,10 @@ impl State {
                 // removing its worktree. This thread waits for that, never the UI thread.
                 crate::lifecycle::wait_for(&jobs, Some(&job.name), Some(&job.cwd));
                 let ready = crate::sandbox::prepare(&job)
-                    .map_err(|err| format!("Could not start the sandbox: {err:#}"))
+                    .map_err(|err| super::NotPrepared::Sandbox(format!("Could not start the sandbox: {err:#}")))
                     .and_then(|granted| {
-                        let opened = crate::ref_guard::open_and_check(&checks, &job.cwd, snapshot, exempt);
+                        let opened = crate::ref_guard::open_and_check(&checks, &job.cwd, snapshot, exempt)
+                            .map_err(super::NotPrepared::Other);
                         if opened.is_err()
                             && let (Some(relay), Some(granted)) = (&job.relay, &granted)
                         {
@@ -261,7 +264,7 @@ impl State {
                         })
                     })
                     .map(|grant| (None, Some(grant), Vec::new()))
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| super::NotPrepared::Other(error.to_string()));
                 let _ = tx.send(ready);
             });
             self.pending_sandbox.push((launch, rx));
@@ -435,7 +438,7 @@ impl State {
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay } = launch;
+        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
@@ -466,7 +469,7 @@ impl State {
             env.insert("ANTHROPIC_AUTH_TOKEN".into(), String::new());
             env.insert("ANTHROPIC_BASE_URL".into(), format!("http://127.0.0.1:{}/api.anthropic.com", granted.port));
         }
-        if let Some(path) = SHELL_PATH.as_ref() {
+        if let Some(path) = crate::setup::login_path_now().as_ref() {
             env.insert("PATH".into(), path.clone());
         }
         // `atomics queue` in an agent resolves to this ATOMICS, and its compilers share one job pool.

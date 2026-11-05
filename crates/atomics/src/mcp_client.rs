@@ -294,7 +294,7 @@ impl StdioServer {
         let mut command = Command::new(crate::setup::resolve_program(program));
         command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // Launched from the Dock, ATOMICS's own PATH lacks what the login shell adds (npx, brew).
-        if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
+        if let Some(path) = crate::setup::login_path_now().as_ref() {
             command.env("PATH", path);
         }
         command.envs(&server.env);

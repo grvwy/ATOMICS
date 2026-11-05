@@ -162,6 +162,7 @@ fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
                 reply: None,
                 task: None,
                 isolation: None,
+                interactive: false,
             };
             app.runtime.config.worktree_path = next.display().to_string();
             app.runtime.create_worktree(repo.clone(), "next".into(), None, launch);

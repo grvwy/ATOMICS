@@ -1090,6 +1090,13 @@ impl AgentConfig {
     }
 }
 
+/// The config file a new install starts from: [`DEFAULT_CONFIG`], with agents on this machine under the user's own
+/// login. Sandboxes are a later click, since they need Docker's tools and account. A file that does not name a mode
+/// still means sandboxes, as it did when it was written, so no existing install changes.
+pub fn new_install_config() -> String {
+    DEFAULT_CONFIG.replacen("\nmode = \"sandbox\"\n", "\nmode = \"bare\"\n", 1)
+}
+
 impl Config {
     /// Loads the config, writing the commented default first if none exists.
     #[cfg(feature = "native")]
@@ -1098,7 +1105,10 @@ impl Config {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, DEFAULT_CONFIG)?;
+            // A config someone named belongs to a test, a QA instance or a managed host, none of them a person's first
+            // run: it keeps meaning what it always did.
+            let named = crate::paths::config_named();
+            std::fs::write(path, if named { DEFAULT_CONFIG.to_string() } else { new_install_config() })?;
         }
         Self::load(path)
     }
@@ -1515,6 +1525,16 @@ kind = "shell"
         assert_eq!(serde_json::to_value(&parsed).unwrap(), serde_json::to_value(&built_in).unwrap());
         assert_eq!(parsed.agent("claude").unwrap().kind, AgentKind::Claude);
         assert!(parsed.steer.session_context.contains("{base_ref}"));
+    }
+
+    #[test]
+    fn a_new_install_runs_agents_on_this_machine_and_a_file_without_a_mode_keeps_sandboxes() {
+        let new: Config = toml::from_str(&new_install_config()).unwrap();
+        assert_eq!(new.isolation.mode, crate::isolation::IsolationMode::Bare);
+        let changed = new_install_config().lines().zip(DEFAULT_CONFIG.lines()).filter(|(a, b)| a != b).count();
+        assert_eq!(changed, 1, "only the mode differs from the template");
+        let existing: Config = toml::from_str("base_ref = \"main\"").unwrap();
+        assert_eq!(existing.isolation.mode, crate::isolation::IsolationMode::Sandbox);
     }
 
     #[test]

@@ -126,7 +126,7 @@ impl Azure {
             .env("AZURE_LOGGING_ENABLE_LOG_FILE", "false")
             .env("AZURE_CORE_COLLECT_TELEMETRY", "false")
             .env("AZURE_CORE_ONLY_SHOW_ERRORS", "true");
-        if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
+        if let Some(path) = crate::setup::login_path_now().as_ref() {
             command.env("PATH", path);
         }
         use crate::sandbox::setup::{OutputError, private_output};

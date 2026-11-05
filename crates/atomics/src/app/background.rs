@@ -27,6 +27,7 @@ impl State {
         machine_paths.push(paths::atomics_home());
         changed |= self.machine.tick(machine_paths, machine_roots, self.wake.clone());
         changed |= self.poll_sandbox_check();
+        changed |= self.poll_programs_check();
         changed |= self.poll_connections();
         changed |= self.github_tick();
         for record in std::mem::take(&mut self.resume) {
@@ -66,7 +67,9 @@ impl State {
         }
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             changed = true;
+            self.interactive_start = true;
             self.spawn(&agent, dir, None);
+            self.interactive_start = false;
         }
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
@@ -94,7 +97,9 @@ impl State {
                     self.pending_sandbox.push((launch, ready));
                     continue;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Sandbox preparation stopped".into()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(super::NotPrepared::Other("Sandbox preparation stopped".into()))
+                }
             };
             changed = true;
             if !self.sessions.iter().any(|s| s.id == launch.id) {
@@ -115,6 +120,21 @@ impl State {
             let name = match &launch.runtime {
                 AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
                 AgentRuntime::Bare => None,
+            };
+            // A person pressed Start, for this agent alone, and it has no plan task to block: they get to say.
+            let result = match result {
+                Err(super::NotPrepared::Sandbox(why))
+                    if launch.interactive
+                        && launch.resume.is_none()
+                        && !self
+                            .plans
+                            .iter()
+                            .any(|plan| plan.tasks.iter().any(|t| t.session.as_deref() == Some(&id))) =>
+                {
+                    self.ask_about_start(launch, why);
+                    continue;
+                }
+                result => result.map_err(String::from),
             };
             let launched = result.and_then(|(guard, granted, needed)| {
                 let (guard, alerts) = guard.unzip();
@@ -178,7 +198,9 @@ impl State {
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
                 let role = Role::Agent(launch.isolation);
+                self.interactive_start = launch.interactive;
                 let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
+                self.interactive_start = false;
                 if warmed && outcome.is_ok() {
                     self.toast("warm cache from main");
                 }

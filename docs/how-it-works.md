@@ -3,6 +3,14 @@
 A short map of the moving parts. Each section links to the page with the details;
 [Fresh start on Linux](fresh-start-linux.md) sets a machine up from scratch.
 
+## First run
+
+With no config yet, ATOMICS opens the setup screen instead of its usual window: which agents it found, with **Check
+again**, where agents run, a first project folder, and connections (GitHub, Azure DevOps, tickets, remote devices), each
+with **Connect later**. Nothing on it holds up anything else. The Start buttons work as soon as an agent is found, and
+**Skip for now** or Escape leave for later: **Settings → Getting started** brings it back, as a window over whatever is
+running. An install that already has a config never sees it.
+
 ## Sessions
 
 A session is one agent in a terminal tile: Claude, Codex or a shell. It works in a git worktree of a
