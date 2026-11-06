@@ -162,6 +162,8 @@ jobs:
           sudo apt-get install -y nix-bin zstd
           sudo mkdir -p /etc/nix
           echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
+          # systemd-repart builds the image in a user namespace, which Ubuntu 24.04 refuses by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo systemctl enable --now nix-daemon.socket
           # Ubuntu's package keeps the socket's folder to the nix-users group, which this login joined too late to count.
           sudo chmod a+rx /nix/var/nix/daemon-socket
