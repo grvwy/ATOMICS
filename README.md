@@ -24,6 +24,12 @@ Open it, and its first run opens a [setup screen](docs/how-it-works.md#first-run
 to install itself the same way, on that screen or with `atomics install`. After that, ATOMICS updates itself:
 [Updates](docs/how-it-works.md#updates) says what it keeps and how to go back.
 
+On an Apple Silicon Mac, agents can run in a [NixOS VM](docs/nixos-vm.md) while the window stays
+native. With Lima 2.2 and Rosetta installed, `atomics vm setup` downloads this version's signed VM
+image and configures it for your account; no Docker or Nix build is needed. Run the sign-ins it lists,
+then `atomics vm config --apply` to connect the app. Defaults are cores minus four, half the Mac's
+memory and a 100 GiB sparse disk; `--cpus`, `--memory-gib` and `--disk-gib` override them.
+
 To build it instead, see [Run](#run). `rust-version` in `Cargo.toml` is the oldest Rust it builds on, and
 `rust-toolchain.toml` is the one it is built and tested with; rustup picks that up by itself.
 

@@ -19,14 +19,6 @@ let
   inShare = path: lib.any (share: within share.path path) shares;
   # Paths travel through sshd, cloud-init and tmpfiles lines unquoted.
   plainPath = path: builtins.match "/[A-Za-z0-9._@+/-]+" path != null && !(lib.hasSuffix "/" path);
-  parents = path:
-    let parts = lib.filter (part: part != "") (lib.splitString "/" path);
-    in map (n: "/" + lib.concatStringsSep "/" (lib.take n parts)) (lib.range 1 (lib.length parts - 1));
-  # The Mac home belongs to the VM user. Other folders are made if missing, never re-moded:
-  # an ancestor may be /tmp or another system folder.
-  ownedDir = dir:
-    if within cfg.home dir then "d ${dir} 0755 ${atomics.user} ${vmGroup} - -" else "d ${dir} - - - - -";
-
   execPath = "/run/current-system/sw/bin/atomics-vm-exec";
   sshConfig = ''"''${LIMA_HOME:-$HOME/.lima}/${cfg.lima.instance}/ssh.config"'';
   host = "lima-${cfg.lima.instance}";
@@ -75,8 +67,13 @@ let
       [[ $i -lt ''${#fields[@]} ]] || fail "unreadable request"
       argv=("''${fields[@]:i+1}")
       if ! cd -- "$folder" 2>/dev/null; then
+        ATOMICS_MAC_SHARES=${lib.escapeShellArg (lib.concatMapStrings (share: " ${share.path}") shares)}
+        if [ -r /run/atomics-mac-desktop.env ]; then
+          # shellcheck source=/dev/null
+          . /run/atomics-mac-desktop.env
+        fi
         printf 'atomics-vm: %s is not in this VM. It mounts these Mac folders at the same paths:%s\n' \
-          "$folder" "${lib.concatMapStrings (share: " ${share.path}") shares}" >&2
+          "$folder" "$ATOMICS_MAC_SHARES" >&2
         exit 66
       fi
       [[ ''${#argv[@]} -gt 0 ]] || argv=("''${SHELL:-bash}" -l)
@@ -302,6 +299,7 @@ let
     };
     # Not plain mode, which drops mounts. Lima's boot scripts stay unused; its guest agent runs.
     plain = false;
+    param.ATOMICS_MAC_USER = cfg.user;
     mountType = "virtiofs";
     mounts = map (share: { location = share.path; mountPoint = share.path; inherit (share) writable; }) shares;
     # The VM's ports stay in the VM, as in plain mode: no guest listener appears on the Mac's
@@ -351,7 +349,7 @@ let
     install -m 0755 ${textFile "atomics-vm-install" installScript true} $out/install.sh
     install -m 0644 ${textFile "atomics-vm-config" configSnippet false} $out/config.d.toml
     install -m 0644 ${textFile "atomics-vm-plist" plist false} $out/launchd/${launchdLabel}.plist
-    install -m 0644 ${yaml.generate "lima.yaml" limaDefinition} $out/lima.yaml
+    install -m 0644 ${if cfg.runtimeIdentity then textFile "lima.json" (builtins.toJSON limaDefinition) false else yaml.generate "lima.yaml" limaDefinition} $out/lima.yaml
     install -m 0644 ${textFile "atomics-vm.json" bundleInfo false} $out/atomics-vm.json
     shellcheck --shell=sh $out/bin/* $out/install.sh
   '';
@@ -362,6 +360,12 @@ in
       agents for ATOMICS running natively on a Mac. ATOMICS starts its agents and chief in this
       machine over ssh, in the same folders, which this machine mounts from the Mac at the same paths
     '';
+
+    runtimeIdentity = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Read the Mac identity and shares from Lima cidata on every boot.";
+    };
 
     user = mkOption {
       type = types.str;
@@ -516,22 +520,9 @@ in
     # The Mac's forwarded socket; the host in this machine (atomics.vm.host) names its own instead.
     environment.sessionVariables.ATOMICS_SOCKET = lib.mkDefault cfg.socket;
     # What this machine expects of the Mac, for scripts/check-atomics-vm.sh and diagnosis.
-    environment.etc."atomics/mac-desktop.env".text = ''
-      ATOMICS_MAC_SOCKET=${cfg.socket}
-      ATOMICS_MAC_SHARES="${lib.concatMapStringsSep " " (share: "${share.path}:${if share.writable then "rw" else "ro"}") shares}"
-      ATOMICS_MAC_EXECUTABLES="${lib.concatStringsSep " " cfg.executables}"
-      ATOMICS_HOST_PORT=${if cfg.hostPort == null then "" else toString cfg.hostPort}
-    '';
-
+    environment.etc."atomics/mac-desktop.env".source = "/run/atomics-mac-desktop.env";
     # A forward that died leaves its socket file behind; the next one replaces it.
     services.openssh.settings.StreamLocalBindUnlink = true;
-
-    systemd.tmpfiles.rules = lib.unique (
-      map ownedDir (lib.filter (dir: dir != dirOf cfg.socket)
-        (lib.unique (lib.concatMap parents ([ (dirOf cfg.socket) ] ++ cfg.executables) ++ [ cfg.home ])))
-      ++ [ "d ${dirOf cfg.socket} 0700 ${atomics.user} ${vmGroup} - -" ]
-      ++ map (exe: "L+ ${exe} - - - - ${atomics.package}/bin/atomics") cfg.executables
-    );
 
     # Outside plain mode `limactl start` reports the VM degraded until Lima's guest agent answers.
     # It is Lima's own binary on the cidata disk, which mounts without exec permission. With every
@@ -569,39 +560,24 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
       };
-      path = [ pkgs.coreutils pkgs.gawk pkgs.util-linux ];
-      script = ''
-        tag_of() {
-          awk -v want="$1" '
-            /^[[:space:]]*- \[/ {
-              line = $0
-              sub(/^[[:space:]]*- \[/, "", line)
-              sub(/\][[:space:]]*$/, "", line)
-              n = split(line, field, /, /)
-              if (n >= 3 && field[2] == want && field[3] == "virtiofs") { print field[1]; exit }
-            }' ${cfg.lima.cidata}/user-data
-        }
-        share() {
-          local path=$1 mode=$2 tag
-          tag=$(tag_of "$path")
-          if [ -z "$tag" ]; then
-            echo "Lima does not share $path; create the VM from the bundle's lima.yaml" >&2
-            return 1
-          fi
-          mountpoint -q "$path" && return 0
-          if [ ! -d "$path" ]; then
-            mkdir -p "$path"
-            chown ${atomics.user}:${vmGroup} "$path"
-          fi
-          mount -t virtiofs -o "$mode,nosuid,nodev" "$tag" "$path"
-          echo "Mounted $tag at $path ($mode)"
-        }
-        status=0
-        ${lib.concatMapStrings (share: ''
-          share ${share.path} ${if share.writable then "rw" else "ro"} || status=1
-        '') shares}
-        exit "$status"
-      '';
+      path = [ pkgs.coreutils pkgs.gawk pkgs.gnused pkgs.util-linux ];
+      script = let
+        settings = pkgs.writeText "atomics-mac-shares.conf" (lib.concatStringsSep "\n"
+          (lib.mapAttrsToList (name: value: "${name}=${lib.escapeShellArg value}") {
+            dynamic = if cfg.runtimeIdentity then "true" else "false";
+            cidata = cfg.lima.cidata;
+            mac_home = cfg.home;
+            socket = cfg.socket;
+            executables = lib.concatStringsSep " " cfg.executables;
+            shares = lib.concatMapStringsSep " " (share: "${share.path}:${if share.writable then "rw" else "ro"}") shares;
+            owner = atomics.user;
+            group = vmGroup;
+            guest_home = vmUser.home;
+            binary = "${atomics.package}/bin/atomics";
+            host_port = if cfg.hostPort == null then "" else toString cfg.hostPort;
+            output = "/run/atomics-mac-desktop.env";
+          }));
+      in "exec ${pkgs.bash}/bin/bash ${../vm/mac-shares.sh} ${settings}";
     };
   };
 }

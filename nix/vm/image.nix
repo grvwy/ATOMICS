@@ -61,6 +61,21 @@ in
     };
   };
 
+  # Lima can enlarge the raw disk at creation. Match the existing GPT root partition, then grow
+  # its mounted btrfs filesystem; run on subsequent boots too if the disk was enlarged again.
+  systemd.repart = {
+    enable = true;
+    partitions."20-root" = { Type = "root-arm64"; Label = "atomics-root"; };
+  };
+  systemd.services.atomics-grow-root = {
+    wantedBy = [ "multi-user.target" ];
+    requires = [ "systemd-repart.service" ];
+    after = [ "systemd-repart.service" ];
+    before = [ "atomics-host.service" ];
+    serviceConfig.Type = "oneshot";
+    script = "${pkgs.btrfs-progs}/bin/btrfs filesystem resize max /";
+  };
+
   systemd.services.atomics-register-store = {
     wantedBy = [ "multi-user.target" ];
     before = [ "nix-daemon.service" ];
