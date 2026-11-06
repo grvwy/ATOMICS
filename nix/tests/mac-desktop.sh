@@ -122,6 +122,13 @@ jq -e '.plain == false and .mountType == "virtiofs" and .vmType == "vz"
   and any(.mounts[]; .writable == true and (.location | endswith("/repos")))
   and .user.uid != null and .vmOpts.vz.rosetta.enabled' "$work/lima.json" >/dev/null || fail "lima.yaml: $(cat "$work/lima.json")"
 
+# The updater can reproduce the image's build inputs from the installed bundle alone.
+jq -e --slurpfile lima "$work/lima.json" '
+  .version == 1 and .build.cpus == $lima[0].cpus
+  and ((.build.memoryGiB | tostring) + "GiB") == $lima[0].memory
+  and ((.build.diskGiB | tostring) + "GiB") == $lima[0].disk
+' "$bundle/atomics-vm.json" >/dev/null || fail "atomics-vm.json has different build settings from lima.yaml"
+
 # The config snippet parses, runs every agent bare through the bundle, and the chief too.
 remarshal --if toml --of json "$bundle/config.d.toml" >"$work/config.json"
 jq -e '([.agents[] | select(.isolation == "bare")] | length) == (.agents | length)

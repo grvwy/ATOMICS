@@ -184,6 +184,7 @@ fn a_token_the_vms_host_refuses_is_kept_until_the_user_pairs_again() {
         mac_user: "user".into(),
         install_dir: dir.path().display().to_string(),
         host: Some(crate::vm::HostInfo { port: addr.port() }),
+        build: None,
     };
     let keychain = crate::relay::Keychain::in_folder(&dir.path().join("credentials"));
     keychain.write_item(vm::KEYCHAIN_SERVICE, &info.instance, "test", "the-token").unwrap();

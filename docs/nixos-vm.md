@@ -210,9 +210,8 @@ sparse. The bundle is a few dozen KiB of `sh` scripts and text.
    `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
 
 Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running) and `check` (the
-guest check and the sign-ins left). Setup installs a newer bundle each time, but keeps the instance it
-made, and with it the guest system it was made from: to move the VM to a newer image, `limactl delete
-<instance>` (its disk goes, and with it the sign-ins in the VM) and run setup again. The desktop's top bar shows the VM too, while a bundle is
+guest check and the sign-ins left). Setup installs a newer bundle each time and keeps the instance it
+made. Use `atomics vm update` to update its system while keeping its disk and sign-ins. The desktop's top bar shows the VM too, while a bundle is
 installed: **VM** with its state, and a menu to start or stop it. On Linux every `atomics vm` command
 says that the VM path is for macOS.
 
@@ -272,6 +271,79 @@ guest; no unauthenticated TCP Docker listener is enabled.
 Sign in inside the guest with `atomics-onboard` ([below](#sign-in-inside-the-vm)). Keep tokens, SSH
 private keys, passwords, package feed credentials and agent login state on its writable disk. Do not
 add them to Nix settings, image contents, flake inputs or the Nix store.
+
+## Updating the VM in place
+
+After updating ATOMICS on the Mac, run:
+
+```sh
+atomics vm update
+```
+
+It reads the installed bundle's `atomics-vm.json`, builds the guest's NixOS system and Mac bundle
+inside the guest through `limactl shell`, and reinstalls the bundle with its `install.sh`. New bundles
+save the CPU, memory and disk build inputs in the JSON; for older bundles these come from Lima's saved
+configuration. The instance, guest user, Mac account, install directory and host port are retained.
+The Mac needs no Nix or Docker for this update.
+
+If `[update] source` points to a checkout in a folder shared with the guest at the same path, the build
+uses `git+file://<checkout>?rev=<HEAD>`. Only that commit's tracked files enter the store; dirty and
+untracked files are excluded. The command does not fetch or move HEAD. Otherwise it builds
+`github:xmagit/ATOMICS/v<version>`, matching this Mac's own ATOMICS version, and prints which source it
+selected. Keep a worktree's Git metadata in the shares too, so the guest can read its revision.
+
+Before building and again before installing, it asks the host's socket in the guest for `list` and
+refuses busy work: working or starting agents, agents waiting for you, and pending approvals or queue
+work. New hosts also publish the in-app updater's full blocker list, including background work, shells
+running commands and open editors. `--yes` explicitly continues despite reported busy work. An
+unreachable host is an error; it is never taken to mean idle. In the older agents-over-ssh layout this
+needs the socket forward to the Mac's host.
+
+The build waits for a test slot and starting the VM waits for a QA slot, using the existing queue.
+Nothing is selected until both outputs are built, copied and checked. If a build or installation
+fails, the VM keeps its current boot selection; a boot-staging failure restores the previous profile
+and bootloader. The update uses `switch-to-configuration boot`, leaving the running system alone
+until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
+
+The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
+quits and reopens `ATOMICS.app` if installed, restarting the VM **only** when the system changed. With
+`--no-restart` it leaves both the window and VM running; a changed system takes effect on the next
+boot. If restarting fails after installation, the command says the next boot is already installed and
+how to start the VM again.
+
+Keep the fresh-image route for a broken VM or disk-size changes: build a new image with
+`scripts/macos-vm-build.sh`, delete the old instance with `limactl delete <instance>`, and run
+`atomics vm setup --from DIR` again. **Deleting the instance loses its disk and sign-ins.** Save what
+you need first. An in-place update does not resize or repair the disk.
+
+## Your own NixOS modules
+
+In the main config or this Mac's host config (`config.d/<host>.toml`):
+
+```toml
+[vm]
+modules = ["~/repos/team/team.nix"]
+```
+
+For example, `team.nix` can add a package and a Docker setting:
+
+```nix
+{ pkgs, ... }: {
+  environment.systemPackages = [ pkgs.ripgrep ];
+  virtualisation.docker.daemon.settings."log-driver" = "local";
+}
+```
+
+Run `atomics vm update` to apply it. When setup creates a new instance and the list is non-empty, it
+runs this same build once after the first boot and checks the updated guest before listing sign-ins.
+The modules stay in your config for later updates; no team setting belongs in ATOMICS's public flake.
+
+`~` expands on the Mac. Modules inside the guest's shares are imported at their paths, preserving
+relative imports such as `./tools.nix` and file references such as `./certificate.pem`. Keep those
+files beside the module in the shared repository. A module outside the shares is copied as a single
+file and prints a warning that relative paths in it will not resolve. A module that changes the
+instance, user, home, install directory or host connection is refused by this update; create a new
+instance for that layout instead.
 
 ## The host in the VM
 

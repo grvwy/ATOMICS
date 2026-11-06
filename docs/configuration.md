@@ -214,6 +214,28 @@ quiet and shows only in Settings. `check = false` stops looking. `atomics update
 install script. That script runs what the checkout holds, with no signature behind it, so a proposal that changes
 `source` is labelled "runs commands".
 
+## VM modules (macOS)
+
+```toml
+[vm]
+modules = ["~/repos/team/team.nix"]
+```
+
+Set this in the main config or this Mac's `config.d/<host>.toml`. A host override replaces the whole
+list. `atomics vm update` adds these NixOS module files to the guest build; the first `atomics vm setup`
+also applies them after booting a new instance. `~` expands to this Mac's home folder.
+
+A module in a folder shared with the guest at the same path is imported **in place**, so relative
+imports and nearby files work. Outside the shares only the module file is copied, with a warning:
+relative imports and file paths in it will not resolve. Put a team's module and its supporting files
+in a shared repository. Modules run Nix code and can change the guest system; a proposal changing
+`vm.modules` is labelled "runs commands". See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
+
+`atomics vm update [--yes] [--no-restart]` keeps the VM's disk and sign-ins while updating its system
+and Mac wrappers. It uses the HEAD revision of `[update] source` when that checkout is shared with the
+guest; otherwise it uses the release matching this Mac's ATOMICS version. It prints the source it used.
+This command does not fetch or advance a checkout. See [Updating the VM in place](nixos-vm.md#updating-the-vm-in-place).
+
 ## Reviewing a proposal
 
 The oldest proposal opens in the ATOMICS window, above Settings if that is open. It shows the file and scope, who proposed it and why, and a
@@ -222,7 +244,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source` |
+| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 

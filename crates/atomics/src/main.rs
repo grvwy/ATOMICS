@@ -197,6 +197,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VmCommand {
+    /// Update the guest system and Mac wrappers in place, keeping the disk and sign-ins
+    Update {
+        /// Continue even if the VM's host reports busy work
+        #[arg(long)]
+        yes: bool,
+        /// Install and select the next boot, leaving the VM and window running
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Install the bundle, create the Lima instance from the image, start and check it, list the
     /// sign-ins left and show the config change for this Mac (written only by `vm config --apply`)
     Setup {
@@ -468,6 +477,7 @@ fn main() -> eframe::Result {
         Some(Command::Vm { command }) => {
             let result = match command {
                 VmCommand::Setup { from, replace, yes } => vm::setup::setup(vm::setup::Setup { from, replace, yes }),
+                VmCommand::Update { yes, no_restart } => vm::update::update(vm::update::Update { yes, no_restart }),
                 VmCommand::Start => vm::setup::start(),
                 VmCommand::Stop => vm::setup::stop(),
                 VmCommand::Status => vm::setup::status(),

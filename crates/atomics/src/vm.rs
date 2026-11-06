@@ -9,6 +9,7 @@
 //! replaced unless the user confirms it.
 
 pub mod setup;
+pub mod update;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,6 +37,19 @@ pub struct BundleInfo {
     /// The ATOMICS host in the VM, when the bundle was built with it (`--host`).
     #[serde(default)]
     pub host: Option<HostInfo>,
+    /// Build inputs saved by newer bundles; older bundles recover these from Lima's config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildInfo {
+    pub cpus: u32,
+    #[serde(rename = "memoryGiB")]
+    pub memory_gib: u32,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

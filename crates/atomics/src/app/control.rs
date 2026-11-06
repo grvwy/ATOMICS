@@ -181,6 +181,7 @@ impl State {
                     "monitor": viewport.and_then(|viewport| viewport.monitor),
                     "layout": layout,
                     "sessions": sessions,
+                    "update_blockers": self.update_blockers(),
                 })))
             }
             ControlRequest::Open { session, path } => match self.find(&session) {

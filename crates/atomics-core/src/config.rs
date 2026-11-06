@@ -544,6 +544,9 @@ forward = "cmd+alt+right"
 [update]
 # check = true              # look for a new version on start and every 6 hours
 # source = ""               # a checkout to build new versions from, against its origin/main; empty = signed releases
+
+[vm]
+# modules = ["~/repos/team/team.nix"]  # extra NixOS modules for vm setup and vm update (macOS)
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +577,14 @@ pub struct Config {
     pub remote: RemoteAccessConfig,
     pub client: ClientConfig,
     pub update: UpdateConfig,
+    pub vm: VmConfig,
+}
+
+/// Extra NixOS modules applied by `atomics vm setup` and `atomics vm update` on the Mac.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VmConfig {
+    pub modules: Vec<String>,
 }
 
 /// `[update]`: whether this host looks for new versions, and where it takes one from. `atomics update` reads
@@ -1021,6 +1032,7 @@ impl Default for Config {
             remote: RemoteAccessConfig::default(),
             client: ClientConfig::default(),
             update: UpdateConfig::default(),
+            vm: VmConfig::default(),
         }
     }
 }
@@ -1133,12 +1145,23 @@ impl Config {
     /// Arrays and scalar values are replaced; only files actually read are returned.
     #[cfg(feature = "native")]
     pub fn load_with_sources(path: &Path) -> Result<(Self, Vec<PathBuf>)> {
+        Self::read_sources(path, false)
+    }
+
+    /// Config for a CLI command that need not create a main file before using host overrides.
+    #[cfg(feature = "native")]
+    pub fn load_existing(path: &Path) -> Result<Self> {
+        Self::read_sources(path, true).map(|(config, _)| config)
+    }
+
+    #[cfg(feature = "native")]
+    fn read_sources(path: &Path, optional_main: bool) -> Result<(Self, Vec<PathBuf>)> {
         let mut tables = Vec::new();
         let mut sources = Vec::new();
         for (index, file) in Self::source_paths(path).into_iter().enumerate() {
             let text = match std::fs::read_to_string(&file) {
                 Ok(text) => text,
-                Err(err) if index > 0 && err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) if (optional_main || index > 0) && err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err).with_context(|| format!("reading {}", file.display())),
             };
             tables.push(toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?);
@@ -1347,6 +1370,8 @@ enabled = false
 processor_count = 3
 [voice]
 api_key = "secret-from-base"
+[vm]
+modules = ["~/repos/team/base.nix"]
 "#,
         )
         .unwrap();
@@ -1356,6 +1381,7 @@ api_key = "secret-from-base"
         let (base, sources) = Config::load_with_sources(&path).unwrap();
         assert_eq!(sources, std::slice::from_ref(&path));
         assert_eq!(base.layout.sidebar_width, 300.0);
+        assert_eq!(base.vm.modules, ["~/repos/team/base.nix"]);
         std::fs::write(
             &host_file,
             r#"
@@ -1367,6 +1393,8 @@ sidebar_width = 350.0
 enabled = true
 [worktrees]
 warm = []
+[vm]
+modules = ["~/repos/team/team.nix", "~/repos/team/tools.nix"]
 [[agents]]
 name = "local-shell"
 kind = "shell"
@@ -1385,6 +1413,7 @@ kind = "shell"
         assert_eq!(config.resources.dotnet.processor_count, Some(3));
         assert_eq!(config.voice.api_key.as_deref(), Some("secret-from-base"));
         assert!(config.worktrees.warm.is_empty());
+        assert_eq!(config.vm.modules, ["~/repos/team/team.nix", "~/repos/team/tools.nix"]);
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "local-shell");
         assert_eq!(config.repos, ["~/repos/host", "~"]);
@@ -1406,6 +1435,12 @@ kind = "shell"
         assert_eq!(Config::load_with_sources(&path).unwrap().1, std::slice::from_ref(&path));
         std::fs::remove_file(&path).unwrap();
         assert!(Config::load(&path).is_err());
+        assert!(Config::load_existing(&path).unwrap().vm.modules.is_empty());
+        std::fs::write(&host_file, "[vm]\nmodules = ['~/repos/team/team.nix']").unwrap();
+        assert_eq!(Config::load_existing(&path).unwrap().vm.modules, ["~/repos/team/team.nix"]);
+        assert!(!path.exists(), "reading host-only config creates no main file");
+        std::fs::write(&host_file, "[invalid").unwrap();
+        assert!(Config::load_existing(&path).is_err());
     }
 
     #[test]
