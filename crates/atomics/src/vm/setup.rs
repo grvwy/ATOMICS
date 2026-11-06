@@ -93,6 +93,7 @@ pub fn setup(options: Setup) -> Result<()> {
     let installed = PathBuf::from(&info.install_dir);
 
     say(&format!("The Lima instance {}", info.instance));
+    let mut created = false;
     match super::lima_status(&info.instance)? {
         Some(state) if super::created_here(&info.instance) => {
             println!("{} exists ({}); it was set up here before, so it is kept", info.instance, state.to_lowercase());
@@ -125,8 +126,12 @@ pub fn setup(options: Setup) -> Result<()> {
             }
             super::forget(&info.instance);
             create(&info, &installed, &image)?;
+            created = true;
         }
-        None => create(&info, &installed, &image)?,
+        None => {
+            create(&info, &installed, &image)?;
+            created = true;
+        }
     }
 
     say("Start");
@@ -140,6 +145,13 @@ pub fn setup(options: Setup) -> Result<()> {
 
     say("Check the guest");
     check(&info)?;
+
+    let config = super::update::load_config()?;
+    if created && !config.vm.modules.is_empty() {
+        say("Apply your NixOS modules");
+        super::update::run(&installed, &info, &config, super::update::Update { yes: false, no_restart: false })?;
+        check(&info)?;
+    }
 
     say("Sign-ins left");
     sign_ins(&info);
