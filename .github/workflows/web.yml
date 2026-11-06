@@ -6,6 +6,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      vm_image:
+        description: Also build the VM image, to prove its job without cutting a tag
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -146,7 +151,7 @@ jobs:
           if-no-files-found: error
 
   vm-image:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.vm_image
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
@@ -158,6 +163,8 @@ jobs:
           sudo mkdir -p /etc/nix
           echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
           sudo systemctl enable --now nix-daemon.socket
+          # Ubuntu's package keeps the socket's folder to the nix-users group, which this login joined too late to count.
+          sudo chmod a+rx /nix/var/nix/daemon-socket
           sudo chmod a+rw /nix/var/nix/daemon-socket/socket
       - name: Build the generic image and bundle template
         run: bash scripts/release-vm-image.sh
