@@ -123,11 +123,13 @@ pub fn compute(
     };
     let main_width = |sidebar: bool| available(sidebar) - dock_width;
 
-    let mut placed = place_diff(main_width(sidebar), height, diff_open, cfg);
+    // With no agent tiles to show (the welcome screen), the right panel may take the whole width.
+    let tiles = sessions + completed > 0;
+    let mut placed = place_diff(main_width(sidebar), height, diff_open, tiles, cfg);
     // Reviewing next to the agent beats seeing the session list: drop the sidebar
     // when that is what it takes to keep the diff beside the agents.
     if sidebar && diff_open && !matches!(placed.0, DiffPlacement::Right { .. }) {
-        let without = place_diff(main_width(false), height, diff_open, cfg);
+        let without = place_diff(main_width(false), height, diff_open, tiles, cfg);
         if matches!(without.0, DiffPlacement::Right { .. }) {
             sidebar = false;
             placed = without;
@@ -162,11 +164,19 @@ pub fn compute(
     }
 }
 
-/// Returns where the diff goes and the space left for agent tiles.
-fn place_diff(main_width: f32, height: f32, diff_open: bool, cfg: &LayoutConfig) -> (DiffPlacement, f32, f32) {
+/// Returns where the diff goes and the space left for agent tiles. Room for one tile is kept only when there
+/// are `tiles` to show; otherwise a dragged panel may cover the whole width.
+fn place_diff(
+    main_width: f32,
+    height: f32,
+    diff_open: bool,
+    tiles: bool,
+    cfg: &LayoutConfig,
+) -> (DiffPlacement, f32, f32) {
+    let min_tile_width = if tiles { cfg.min_tile_width } else { 0.0 };
     if !diff_open {
         (DiffPlacement::Hidden, main_width, height)
-    } else if main_width - cfg.diff_min_width >= cfg.min_tile_width {
+    } else if main_width - cfg.diff_min_width >= min_tile_width {
         let mut diff_width = main_width * cfg.diff_fraction;
         if cfg.diff_max_width > 0.0 {
             diff_width = diff_width.min(cfg.diff_max_width);
@@ -174,7 +184,7 @@ fn place_diff(main_width: f32, height: f32, diff_open: bool, cfg: &LayoutConfig)
         if let Some(dragged) = cfg.diff_width {
             diff_width = dragged;
         }
-        let diff_width = diff_width.max(cfg.diff_min_width).min(main_width - cfg.min_tile_width);
+        let diff_width = diff_width.max(cfg.diff_min_width).min(main_width - min_tile_width);
         (DiffPlacement::Right { width: diff_width }, main_width - diff_width, height)
     } else if height - cfg.diff_min_height >= cfg.min_tile_height {
         let diff_height = (height * cfg.diff_fraction).max(cfg.diff_min_height).min(height - cfg.min_tile_height);
@@ -270,6 +280,19 @@ mod tests {
         assert_eq!(layout.diff, DiffPlacement::Right { width: 2600.0 });
         let too_wide = LayoutConfig { diff_width: Some(9000.0), ..cfg() };
         let DiffPlacement::Right { width } = compute(3000.0, 1200.0, 2, 0, true, 0.0, &too_wide).diff else { panic!() };
+        assert_eq!(width, 3000.0 - 250.0 - 520.0);
+    }
+
+    #[test]
+    fn with_no_agents_a_dragged_board_covers_the_welcome_screen() {
+        let too_wide = LayoutConfig { diff_width: Some(9000.0), ..cfg() };
+        let layout = compute(3000.0, 1200.0, 0, 0, true, 0.0, &too_wide);
+        assert_eq!(layout.diff, DiffPlacement::Right { width: 3000.0 - 250.0 });
+        // The default width is unchanged; only a drag takes the room.
+        let layout = compute(3000.0, 1200.0, 0, 0, true, 0.0, &cfg());
+        assert_eq!(layout.diff, DiffPlacement::Right { width: 1400.0 });
+        // Once an agent shows, it gets its tile back.
+        let DiffPlacement::Right { width } = compute(3000.0, 1200.0, 1, 0, true, 0.0, &too_wide).diff else { panic!() };
         assert_eq!(width, 3000.0 - 250.0 - 520.0);
     }
 

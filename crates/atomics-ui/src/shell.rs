@@ -170,7 +170,10 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         };
         if let Some(term_rect) = term_rect {
             if visible.is_empty() && layout.completed == 0 {
-                platform.draw(|backend, client, _| welcome(ui, term_rect, byline, backend, client));
+                // The board may be dragged over the welcome screen; a sliver too narrow for it stays empty.
+                if term_rect.width() >= WELCOME_MIN_WIDTH {
+                    platform.draw(|backend, client, _| welcome(ui, term_rect, byline, backend, client));
+                }
             } else {
                 platform.draw(|backend, client, terminals| {
                     fleet::tiles(ui, term_rect, &layout, &tiled, backend, client, terminals)
@@ -203,6 +206,9 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         });
     }
 }
+
+/// The least width the welcome screen is drawn in.
+const WELCOME_MIN_WIDTH: f32 = 360.0;
 
 /// The divider between the tiles and the right panel `rect`, `width` wide: dragging it gives the panel more
 /// or less room, a double click its default width again.
