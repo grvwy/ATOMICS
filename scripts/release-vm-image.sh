@@ -11,7 +11,7 @@ out=${1:-"$repo/target/vm-release"}
 mkdir -p "$out"
 out=$(cd "$out" && pwd -P)
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)
-if [ -n "${GITHUB_REF_NAME:-}" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
   echo 'Release tag must match workspace.package.version' >&2; exit 1
 fi
 image=$(nix build "$repo#atomics-vm-release-image" --no-link --print-out-paths)
