@@ -188,7 +188,9 @@ fn build_script(src: &str, settings: &Value, modules: &[Module]) -> String {
 
 fn guest(info: &BundleInfo, script: &str) -> Result<String> {
     let output = super::guest_shell(info)?
-        .args(["bash", "--login", "-c", script])
+        // A login shell sets PATH and the profile up, then hands over to a plain bash: an `exit` in a login
+        // shell would source /etc/bash_logout, which fails under the script's `set -u`.
+        .args(["bash", "--login", "-c", "exec bash -c \"$1\"", "atomics-vm-update", script])
         .stderr(Stdio::inherit())
         .output()
         .context("running the VM update step")?;

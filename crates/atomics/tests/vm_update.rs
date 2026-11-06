@@ -64,7 +64,10 @@ case "$1" in
       test "$VM_MODE" != build-fail
       printf '/tmp/atomics-vm-update.fixture\n/nix/store/00000000000000000000000000000000-nixos-system-test\n/nix/store/11111111111111111111111111111111-atomics-vm-mac\n'
     elif [ "$6" = -c ]; then
-      case "$7" in
+      # Scripts run in a plain bash that the login shell execs: `exec bash -c "$1" atomics-vm-update SCRIPT`.
+      script=$7
+      if [ "$7" = 'exec bash -c "$1"' ]; then test "$8" = atomics-vm-update; script=$9; fi
+      case "$script" in
         *'atomics ctl'*)
           if [ "$VM_MODE" = busy ]; then
             printf '{"ok":true,"result":{"sessions":[{"status":"needs you","title":"worker"}]}}\n'
