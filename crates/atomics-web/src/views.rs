@@ -44,6 +44,7 @@ use crate::boot::Boot;
 use crate::desk::{self, Desk};
 use crate::dialogs::{self, Picker};
 use crate::driver::{Driver, Status};
+use crate::gesture::TAP_SLOP;
 use crate::layout::{self, LayoutMode, Viewport};
 use crate::remote::RemoteBackend;
 use crate::term_pane::{TermInput, TermPane, Terminals};
@@ -125,6 +126,8 @@ pub struct View {
     pub term: TermPane,
     /// Every other terminal on screen, by session id.
     pub tiles: HashMap<String, TermPane>,
+    /// Where a finger's tap takes the keyboard: the text boxes on screen and what opens one ([`text_boxes`]).
+    pub text_boxes: Vec<Rect>,
     /// The new-session picker, while it is open.
     pub picker: Option<Picker>,
     /// A ticket key from the boot, opened once the board is in.
@@ -260,6 +263,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     }
     view.looks.apply(ui.ctx(), client, view.compact);
     view.term.touch = client.touch;
+    click_distance(ui.ctx(), view.viewport.coarse);
     sync(ui.ctx(), driver, client, view);
     window_keys(ui.ctx(), driver, client, view);
     if view.compact {
@@ -278,6 +282,47 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     want(&driver.remote, client, view);
     driver.flush();
     atomics_ui::panel_nav::settle_focus(ui.ctx());
+    view.text_boxes = text_boxes(ui.ctx(), view.viewport.coarse);
+}
+
+/// How far a press may move and still be a click: a finger wobbles on the glass ([`TAP_SLOP`]).
+fn click_distance(ctx: &egui::Context, coarse: bool) {
+    let distance =
+        if coarse { TAP_SLOP / ctx.zoom_factor().max(0.01) } else { egui::InputOptions::default().max_click_dist };
+    if ctx.options(|o| o.input_options.max_click_dist) != distance {
+        ctx.options_mut(|o| o.input_options.max_click_dist = distance);
+    }
+}
+
+/// With a finger, where a tap takes the keyboard: the text boxes this frame drew, what [`touch::opens_keyboard`] marked,
+/// and of those what nothing lies over. The page has to know in the touch's own handler: iOS opens no keyboard for a text
+/// box focused a frame later.
+fn text_boxes(ctx: &egui::Context, coarse: bool) -> Vec<Rect> {
+    let marked = touch::keyboard_openers(ctx);
+    if !coarse {
+        return Vec::new();
+    }
+    let drawn: Vec<(egui::LayerId, Rect, egui::Id)> = ctx.viewport(|viewport| {
+        let widgets = viewport.this_pass.widgets.layers().flat_map(|(_, widgets)| widgets.iter());
+        widgets.filter(|w| w.enabled && w.sense.senses_click()).map(|w| (w.layer_id, w.interact_rect, w.id)).collect()
+    });
+    let boxes = drawn.into_iter().filter(|(_, _, id)| egui::TextEdit::load_state(ctx, *id).is_some());
+    let on_top = |layer: egui::LayerId, rect: Rect| {
+        rect.is_positive() && ctx.layer_id_at(rect.center()).unwrap_or(egui::LayerId::background()) == layer
+    };
+    boxes
+        .map(|(layer, rect, _)| (layer, rect))
+        .chain(marked)
+        .filter(|(layer, rect)| on_top(*layer, *rect))
+        .map(|(_, rect)| rect)
+        .collect()
+}
+
+/// [`View::text_boxes`] for the page, in CSS pixels.
+pub fn text_boxes_json(boxes: &[Rect], zoom: f32) -> String {
+    let boxes: Vec<[f32; 4]> =
+        boxes.iter().map(|r| [r.left() * zoom, r.top() * zoom, r.width() * zoom, r.height() * zoom]).collect();
+    serde_json::to_string(&boxes).unwrap_or_default()
 }
 
 /// The keys that move around the window, as every client takes them ([`keys`]); those the terminal's input

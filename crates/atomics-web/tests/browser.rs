@@ -7,6 +7,9 @@
 //! `ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser binary. The client's page is
 //! served under the strict CSP the bundle is built for.
 //!
+//! `a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases` needs no bundle: the page's input alone, in a
+//! phone's Chrome, under real touches and a soft keyboard's editing commands.
+//!
 //! `the_bundle_pairs_reconnects_and_reloads_in_a_browser`: a page on another origin frames the bundle and
 //! boots it over `postMessage`, a third origin's frame keeps posting a boot of its own, and the browser pairs
 //! (keeping its key in IndexedDB), says `hello`, reconnects with a fresh ticket and resumes, and after a
@@ -29,6 +32,9 @@
 //! draws on a canvas, so the test finds what to tap by colour in the screenshots, using the palette the
 //! client draws with, and the pane bar from the client's own layout code, whose points are `layout::ZOOM`
 //! CSS pixels.
+//!
+//! `the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip`: on an iPhone 16 Pro's screen, by touch
+//! alone, each of those takes the browser's focus in the touch's own handler, as iOS asks, and takes what is typed.
 //!
 //! `the_bundle_draws_the_desktops_frame_in_a_wide_window`: the bundle in a 1600 × 1000 window draws the
 //! desktop's own frame over the fake host: the top bar, the chief docked with its terminal, the agent's tile
@@ -857,6 +863,147 @@ fn device_store_recovers_connections_and_preserves_unreadable_keys() {
     );
 }
 
+/// What the page's input (`web/terminal.js`, or `ATOMICS_WEB_TERMINAL_JS`) makes of a finger and a soft keyboard, in a
+/// phone's Chrome. Every check runs and the failures are listed together. A headless browser has no soft keyboard to
+/// see, so what opens one is checked as what iOS asks for: the field focused in the touch's own handler.
+#[test]
+#[ignore = "needs Chrome; no built bundle required"]
+fn a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let script = std::env::var("ATOMICS_WEB_TERMINAL_JS")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/web/terminal.js").to_string());
+    let script = std::fs::read_to_string(script).expect("the page's input");
+    serve(
+        listener,
+        Arc::new(move |_, path, _| match path {
+            "/" => Some(Reply::new("text/html", include_str!("browser/terminal-input.html"))),
+            "/terminal.js" => Some(Reply::new("text/javascript", script.clone())),
+            "/style.css" => Some(Reply::new("text/css", include_str!("../web/style.css"))),
+            _ => None,
+        }),
+    );
+    let log = Arc::new(Log::default());
+    let browser = launch(&["--window-size=402,874".into()], &url, &log, Duration::from_secs(90));
+    let mut page = DevTools::open(&browser.devtools(), "the input", |t| t["type"] == "page" && t["url"] == url);
+    let metrics = json!({ "width": 402, "height": 874, "deviceScaleFactor": 1, "mobile": true });
+    page.call("Emulation.setDeviceMetricsOverride", metrics);
+    page.call("Emulation.setTouchEmulationEnabled", json!({ "enabled": true, "maxTouchPoints": 5 }));
+    page.wait("the module", "window.ready === true && matchMedia('(pointer: coarse)').matches");
+
+    // The input lies at y 100 to 600, the canvas shows above and under it.
+    let terminal = pos2(200.0, 300.0);
+    let canvas = pos2(200.0, 800.0);
+    let mut failed: Vec<String> = Vec::new();
+    let mut check = |what: &str, got: serde_json::Value, want: serde_json::Value| {
+        if got != want {
+            failed.push(format!("{what}: got {got}, wanted {want}"));
+        }
+    };
+    let take = "window.reports.splice(0)";
+    let focused = "document.activeElement === window.ta";
+    let calls = "window.calls.splice(0)";
+    let unfocus = "window.ta.blur(); window.agent.blur(); window.reports.length = 0; window.calls.length = 0; true";
+    let soft = |page: &mut DevTools, command: &str| {
+        let key =
+            json!({ "type": "rawKeyDown", "windowsVirtualKeyCode": 229, "key": "Unidentified", "commands": [command] });
+        page.call("Input.dispatchKeyEvent", key);
+    };
+
+    // A tap takes the field in the touch's own handler.
+    page.tap(terminal);
+    check("a tap focuses", page.eval(focused), json!(true));
+    check("in the touch itself", page.eval(calls), json!(["input touchend"]));
+    check("and says so", page.eval(take), json!(["focus:true"]));
+
+    // A tap on a field that kept the focus while the keyboard was put away takes it again, quietly.
+    page.tap(terminal);
+    check("a second tap asks again", page.eval(calls), json!(["input touchend"]));
+    check("nobody hears of it", page.eval(take), json!([]));
+    check("the key bar stays", page.eval("document.getElementById('atomics-keybar').hidden"), json!(false));
+    // A word under way stays.
+    page.eval("window.ta.dispatchEvent(new CompositionEvent('compositionstart', { data: '' })); true");
+    page.tap(terminal);
+    check("a tap leaves a word under way", page.eval(calls), json!([]));
+    page.eval("window.ta.dispatchEvent(new CompositionEvent('compositionend', { data: 'é' })); true");
+    check("which then is typed", page.eval(take), json!(["preedit:", "text:é"]));
+
+    // Erasing, as a soft keyboard does it: its key has no name, and it only deletes where there is something to delete.
+    soft(&mut page, "deleteBackward");
+    check("a soft Backspace in the empty line", page.eval(take), json!(["key:Backspace"]));
+    soft(&mut page, "deleteBackward");
+    check("and another", page.eval(take), json!(["key:Backspace"]));
+    soft(&mut page, "deleteWordBackward");
+    check("holding it, by the word", page.eval(take), json!(["key:Backspace"]));
+    page.key("Backspace", 8, None);
+    check("a named Backspace, once", page.eval(take), json!(["key:Backspace"]));
+    page.call("Input.insertText", json!({ "text": "a" }));
+    check("typing", page.eval(take), json!(["text:a"]));
+    soft(&mut page, "deleteBackward");
+    check("a Backspace after typing", page.eval(take), json!(["key:Backspace"]));
+    // A browser that deletes without a cancelable beforeinput.
+    page.eval("window.ta.value = ''; window.ta.dispatchEvent(new InputEvent('input')); true");
+    check("what keeps the field from being empty, deleted", page.eval(take), json!(["key:Backspace"]));
+    page.eval("window.ta.value += 'xy'; window.ta.dispatchEvent(new InputEvent('input')); true");
+    check("what a browser inserted so", page.eval(take), json!(["text:xy"]));
+    soft(&mut page, "deleteBackward");
+    check("and a Backspace after that", page.eval(take), json!(["key:Backspace"]));
+
+    // A finger wobbles a little, and a tap stays a tap; further is a drag.
+    let touched = |page: &mut DevTools, by: f32| {
+        page.touch("touchStart", &[terminal]);
+        thread::sleep(Duration::from_millis(40));
+        page.touch("touchMove", &[terminal + vec2(by, 0.0)]);
+        thread::sleep(Duration::from_millis(40));
+        page.touch("touchEnd", &[]);
+    };
+    page.eval(unfocus);
+    touched(&mut page, 11.0);
+    check("11 pixels of wobble is a tap", page.eval(focused), json!(true));
+    page.eval(unfocus);
+    touched(&mut page, 14.0);
+    check("14 pixels is a drag", page.eval(focused), json!(false));
+
+    // A read-only field opens nothing.
+    page.eval("window.input.setWritable(false); window.reports.length = 0; true");
+    page.tap(terminal);
+    check("read only, a tap does nothing", page.eval(focused), json!(false));
+    page.eval("window.input.setWritable(true); true");
+
+    // The words on the strip over the terminal count as the terminal.
+    let strip = pos2(100.0, 75.0);
+    page.eval("window.input.placeStrip?.(0, 50, 300, 50); true");
+    page.eval(unfocus);
+    page.tap(strip);
+    check("a tap on the strip's words", page.eval(focused), json!(true));
+    check("in the touch itself", page.eval(calls), json!(["input touchend"]));
+    page.eval("window.input.placeStrip?.(0, 0, 0, 0); true");
+    page.eval(unfocus);
+    page.tap(strip);
+    check("no strip, nothing", page.eval(focused), json!(false));
+
+    // A tap on a text box the app draws takes eframe's input in the touch; the app's own click follows.
+    page.eval("window.input.setTextBoxes?.('[[100, 780, 200, 44]]'); true");
+    page.tap(terminal);
+    page.eval(unfocus);
+    page.tap(canvas);
+    check("a text box takes the keyboard", page.eval("document.activeElement === window.agent"), json!(true));
+    check("in the touch itself", page.eval(calls), json!(["agent touchend"]));
+    page.tap(terminal);
+    check("back on the terminal", page.eval(focused), json!(true));
+    page.eval("window.calls.length = 0; window.reports.length = 0; true");
+    page.tap(canvas);
+    check("a text box from the terminal", page.eval("document.activeElement === window.agent"), json!(true));
+    check("the terminal lets go", page.eval(take), json!(["focus:false"]));
+    page.eval(unfocus);
+    page.tap(pos2(50.0, 800.0));
+    check("beside a text box, nothing", page.eval(calls), json!([]));
+    page.drag(canvas, canvas + vec2(0.0, 40.0));
+    check("dragging from one, nothing", page.eval(calls), json!([]));
+
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
@@ -1399,6 +1546,93 @@ fn the_bundle_works_on_a_phone_by_touch() {
     for path in &screens.saved {
         eprintln!("  {}", path.display());
     }
+}
+
+/// An iPhone 16 Pro's screen in CSS pixels.
+const IPHONE_16_PRO: (f32, f32) = (402.0, 874.0);
+
+/// iOS opens the keyboard only for a field focused in the touch's own handler. On a phone, by touch alone, the steer
+/// bar, a diff's line that opens a comment box, and the words on a terminal's strip all do that on the first tap.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip() {
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), IPHONE_16_PRO, true);
+    log.wait("hello new", 1);
+    frame.wait("an iPhone's screen in the frame", "matchMedia('(pointer: coarse)').matches");
+    // Every call that moves the keyboard to or from eframe's input, with the event it ran in.
+    frame.eval(
+        "window.moves = [];
+         const agent = document.querySelector('#atomics + input');
+         for (const name of ['focus', 'blur']) {
+           const move = agent[name].bind(agent);
+           agent[name] = (options) => { window.moves.push(window.event ? window.event.type : 'a frame'); move(options); };
+         }
+         true",
+    );
+    let in_the_touch = "window.moves.includes('touchend') && !window.moves.includes('a frame')";
+    let boxes = "JSON.parse(document.getElementById('atomics').dataset.textBoxes || '[]')";
+    let center = |r: &serde_json::Value| {
+        let n = |i: usize| r[i].as_f64().expect("a number") as f32;
+        pos2(n(0) + n(2) / 2.0, n(1) + n(3) / 2.0)
+    };
+
+    // The steer bar: the first tap, then what is typed goes there.
+    page.tap(phone_pane(IPHONE_16_PRO, Tab::Agents));
+    frame.wait("the steer bar's place", &format!("{boxes}.length > 0"));
+    let steer = frame.eval(&format!("{boxes}[0]"));
+    keep(&mut page, "iphone-agents");
+    frame.eval("window.moves.length = 0; true");
+    page.tap(center(&steer));
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(frame.eval(in_the_touch), json!(true), "in the touch itself: {}", frame.eval("window.moves"));
+    page.call("Input.insertText", json!({ "text": "go on" }));
+    keep(&mut page, "iphone-steer-typed");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the steer", |h| h.steered.iter().any(|(_, text)| text == "go on"));
+
+    // A line of a diff: the same tap opens the comment box and the keyboard.
+    page.tap(phone_pane(IPHONE_16_PRO, Tab::Diffs));
+    thread::sleep(Duration::from_millis(400));
+    let at = |x: f32, y: f32| pos2(x * layout::ZOOM, y * layout::ZOOM);
+    page.tap(at(45.4, 67.8));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    frame.wait("the diff's lines", &format!("{boxes}.length > 2"));
+    keep(&mut page, "iphone-diff");
+    frame.eval("window.moves.length = 0; true");
+    let line = frame.eval(&format!("{boxes}[2]"));
+    page.tap(center(&line));
+    frame.wait("the keyboard on the comment box", TEXT_BOX);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(frame.eval(in_the_touch), json!(true), "in the touch itself: {}", frame.eval("window.moves"));
+    page.call("Input.insertText", json!({ "text": "Why this step?" }));
+    keep(&mut page, "iphone-comment-typed");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "Why this step?"));
+
+    // The words on the strip over a terminal type there, as the terminal does.
+    page.tap(phone_pane(IPHONE_16_PRO, Tab::Terminal));
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let strip = "document.getElementById('atomics-strip')";
+    frame.wait("the strip", &format!("!{strip}.hidden"));
+    let words = frame.eval(&format!(
+        "(() => {{ const r = {strip}.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; }})()"
+    ));
+    keep(&mut page, "iphone-terminal");
+    page.tap(center(&words));
+    frame.wait("the focus on the input after a tap on the strip", FOCUSED);
+    log.wait("acquire s1", 1);
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed into the agent's terminal", |h| h.terminals["s1"].typed == "ls");
+    keep(&mut page, "iphone-terminal-typing");
+    // A soft keyboard's Backspace, in the line it has nothing to delete from.
+    let erase = json!({ "type": "rawKeyDown", "windowsVirtualKeyCode": 229, "key": "Unidentified", "commands": ["deleteBackward"] });
+    page.call("Input.dispatchKeyEvent", erase);
+    wait_host(&host, "Backspace as DEL", |h| h.terminals["s1"].typed == "ls\x7f");
 }
 
 /// A wide window, the size the desktop's QA screenshots are taken at.

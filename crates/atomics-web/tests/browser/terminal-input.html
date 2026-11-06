@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>The input</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <canvas id="atomics"></canvas>
+  <!-- Where eframe puts its text agent: right after the canvas. -->
+  <input type="text" style="position: absolute; opacity: 0; width: 1px; height: 1px; font-size: 16px">
+  <script type="module">
+    // The page's input as the app sets it up, with a terminal at y 100 to 600. What it reports, and every call that
+    // would take the keyboard with the event that made it, are kept for the test.
+    const canvas = document.getElementById("atomics");
+    // eframe prevents a touch's default on the canvas, so no mouse events follow to take the focus.
+    canvas.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
+    document.addEventListener("touchend", (e) => { if (e.target === canvas) e.preventDefault(); }, { passive: false });
+    const input = await import("/terminal.js");
+    window.input = input;
+    window.reports = [];
+    window.calls = [];
+    const kept = (e) => e.kind === "pointer" || e.kind === "viewport" ? null : e.kind === "key" ? `key:${e.text}` : e.kind === "focus" ? `focus:${e.on}` : `${e.kind}:${e.text}`;
+    input.install(JSON.stringify([[{ label: "Esc", name: "Escape", kind: "key", value: "Escape", wide: false }]]), false, (e) => {
+      const seen = kept(e);
+      if (seen) window.reports.push(seen);
+    });
+    input.place(0, 100, 402, 500);
+    input.setWritable(true);
+    const watch = (element, name) => {
+      const focus = element.focus.bind(element);
+      element.focus = (options) => {
+        window.calls.push(`${name} ${window.event ? window.event.type : "none"}`);
+        focus(options);
+      };
+    };
+    window.ta = document.getElementById("atomics-input");
+    window.agent = document.querySelector("#atomics + input");
+    watch(window.ta, "input");
+    watch(window.agent, "agent");
+    window.ready = true;
+  </script>
+</body>
+</html>

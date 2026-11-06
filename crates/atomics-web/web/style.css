@@ -56,7 +56,17 @@ body {
   -webkit-touch-callout: none;
 }
 
+/* The words on the strip over the terminal, which a finger may tap to type (web/terminal.js). The app draws them. */
+#atomics-strip {
+  position: fixed;
+  z-index: 1;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+
 #atomics-input[hidden],
+#atomics-strip[hidden],
 #atomics-keybar[hidden],
 #atomics-copy[hidden] {
   display: none;

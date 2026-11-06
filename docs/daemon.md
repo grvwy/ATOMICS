@@ -1254,20 +1254,27 @@ button takes the keyboard off it, and without the renew the host ended the lease
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
   from `keydown` (Ctrl+V and Cmd stay the browser's), a soft keyboard's Return and Backspace from `beforeinput`
-  where its `keydown` names no key, and pastes. The keys that move around the window (docs/navigation.md) go to the
-  app instead, wherever the keyboard is on the page. The field has autocorrect, autocapitalisation, autocomplete and
-  spellcheck off. A touch on it is handled by the client: a tap focuses it from the touch's own handler (which
-  opens the keyboard), and the browser's loupe, callout and page zoom never start. It takes the pointer only where
+  where its `keydown` names no key, and pastes. The field is never quite empty: one zero-width character stays before
+  the caret, because some soft keyboards raise nothing for a Backspace with nothing to delete. The keys that move
+  around the window (docs/navigation.md) go to the app instead, wherever the keyboard is on the page. The field has
+  autocorrect, autocapitalisation, autocomplete and spellcheck off. A touch on it is handled by the client: a tap
+  focuses it from the touch's own handler (which opens the keyboard), and the browser's loupe, callout and page zoom
+  never start. A field that kept the focus while the keyboard was put away takes it again on a tap, quietly, so the
+  lease and the key bar do not change. The strip's words count as the terminal for a finger, its buttons do not. It takes the pointer only where
   egui would give the terminal the pointer: a floating window over the terminal is cut out of it with a `clip-path`,
   so the browser sends that part's pointer to the canvas, and all of it goes while a menu or popup is open, so a click
   away closes the popup as it does anywhere else. A click on a text box the page draws, the steer bar or a comment
-  box, takes the browser's focus with it: what is typed goes there, and nothing reaches the terminal.
+  box, takes the browser's focus with it: what is typed goes there, and nothing reaches the terminal. iOS opens the
+  keyboard only for a field focused in the touch's own handler, a frame later is too late, so the app tells the page
+  each frame where a tap takes the keyboard: the text boxes on screen with nothing over them, and a diff's lines,
+  which open a comment box. The page focuses eframe's input in that touch, and the app's own click follows.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
   while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
   safe area's sides, and takes the bottom bar's place. Its keys are at least 44 CSS pixels each way (a screen
   narrower than 375 scrolls a row) and never take the focus; Paste reads the clipboard on the touch's end.
-- **Touch and mouse.** A tap clicks the cell (press and release) where the program asked for mouse reports and this
-  client types; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
+- **Touch and mouse.** A finger may wobble 12 CSS pixels and still tap, on a terminal and on any other control (a
+  mouse keeps its 6 points to click and 8 to select). A tap clicks the cell (press and release) where the program
+  asked for mouse reports and this client types; a tap where someone else types shows up **Take over**; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
   output does not move a view scrolled back) and pans; a long press (450 ms) selects the word under the finger
   (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
   each end to drag; a **Copy** chip, above the selection or below it where there is no room in the terminal, copies
