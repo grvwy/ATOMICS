@@ -168,8 +168,8 @@ fn run_version(executable: &Path, timeout: Duration, stdout: Stdio) -> Result<()
     }
     let mut command = Command::new(executable);
     command.arg("--version").stdin(Stdio::null()).stdout(stdout).stderr(Stdio::null()).process_group(0);
-    let mut child = spawn_when_free(&mut command)
-        .with_context(|| format!("cannot run {} --version", executable.display()))?;
+    let mut child =
+        spawn_when_free(&mut command).with_context(|| format!("cannot run {} --version", executable.display()))?;
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
