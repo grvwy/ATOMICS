@@ -15,8 +15,11 @@ use std::collections::BTreeMap;
 
 use egui::{Pos2, Vec2};
 
-/// How far a press may move and still be a tap or a long press, in points.
+/// How far a mouse may move and still click, in points.
 pub const SLOP: f32 = 8.0;
+/// How far a finger may move and still tap or long press, in CSS pixels: it wobbles on the glass. The page's own tap goes
+/// by this too (`web/terminal.js`), so what opens the keyboard there is a tap here.
+pub const TAP_SLOP: f32 = 12.0;
 /// How long a still touch takes to become a long press.
 pub const LONG_PRESS_MS: f64 = 450.0;
 
@@ -88,15 +91,26 @@ enum Mode {
 pub struct Recognizer {
     mode: Mode,
     down: BTreeMap<i32, Pos2>,
+    /// [`TAP_SLOP`] in the points of the page's zoom.
+    touch_slop: f32,
 }
 
 impl Default for Recognizer {
     fn default() -> Self {
-        Self { mode: Mode::Idle, down: BTreeMap::new() }
+        Self { mode: Mode::Idle, down: BTreeMap::new(), touch_slop: TAP_SLOP }
     }
 }
 
 impl Recognizer {
+    /// The page's zoom, which a finger's wobble on the glass does not change.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.touch_slop = TAP_SLOP / zoom.max(0.01);
+    }
+
+    fn slop(&self, kind: Kind) -> f32 {
+        if kind == Kind::Mouse { SLOP } else { self.touch_slop }
+    }
+
     /// The two fingers of a pinch: their distance and centre.
     fn pair(&self) -> Option<(f32, Pos2)> {
         let mut points = self.down.values();
@@ -121,7 +135,7 @@ impl Recognizer {
                     self.down.insert(e.id, e.pos);
                 }
                 match self.mode {
-                    Mode::Pressed { id, start, kind, .. } if id == e.id && e.pos.distance(start) > SLOP => {
+                    Mode::Pressed { id, start, kind, .. } if id == e.id && e.pos.distance(start) > self.slop(kind) => {
                         if kind == Kind::Mouse {
                             self.mode = Mode::Selecting { id, from: start, to: e.pos, word: false };
                             out.push(Gesture::Select { from: start, to: e.pos, done: false, word: false });
@@ -208,6 +222,39 @@ mod tests {
 
     fn run(r: &mut Recognizer, events: &[Pointer]) -> Vec<Gesture> {
         events.iter().flat_map(|e| r.event(e)).collect()
+    }
+
+    #[test]
+    fn a_finger_that_wobbles_still_taps_at_any_zoom_and_a_mouse_keeps_its_drag() {
+        let t = Kind::Touch;
+        let moved = |r: &mut Recognizer, kind, x| {
+            run(
+                r,
+                &[
+                    at(1, Phase::Down, 0.0, 0.0, kind, 0.0),
+                    at(1, Phase::Move, x, 0.0, kind, 40.0),
+                    at(1, Phase::Up, x, 0.0, kind, 80.0),
+                ],
+            )
+        };
+        let mut r = Recognizer::default();
+        r.set_zoom(1.25);
+        // In points at the phone's zoom: 11.25 and 12.5 CSS pixels on the glass.
+        assert_eq!(moved(&mut r, t, 9.0), [Gesture::Tap(pos2(0.0, 0.0))]);
+        assert_eq!(moved(&mut r, t, 10.0), [Gesture::Drag(vec2(10.0, 0.0))]);
+        r.set_zoom(1.0);
+        assert_eq!(moved(&mut r, t, 11.0), [Gesture::Tap(pos2(0.0, 0.0))]);
+        assert_eq!(moved(&mut r, t, 13.0), [Gesture::Drag(vec2(13.0, 0.0))]);
+        // A mouse selects as it always has, whatever a finger may do.
+        let selected = moved(&mut r, Kind::Mouse, 9.0);
+        assert!(matches!(selected[0], Gesture::Select { word: false, .. }), "{selected:?}");
+    }
+
+    #[test]
+    fn the_page_and_the_app_agree_on_what_a_tap_is() {
+        let page = include_str!("../web/terminal.js");
+        assert!(page.contains(&format!("const SLOP = {TAP_SLOP};")), "web/terminal.js has its own idea");
+        assert!(page.contains(&format!("const TAP_MS = {LONG_PRESS_MS};")), "web/terminal.js has its own idea");
     }
 
     #[test]

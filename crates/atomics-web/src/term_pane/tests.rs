@@ -228,6 +228,53 @@ fn losing_the_lease_blurs_the_overlay_and_another_typist_makes_it_read_only() {
     assert_eq!(typed(&world), "ab");
 }
 
+#[test]
+fn a_finger_may_tap_the_words_on_the_strip_and_its_buttons_stay_buttons() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    let cells = view.term.overlay.rect.expect("the terminal");
+    let strip = view.term.overlay.strip.expect("a terminal to type in");
+    assert_eq!((strip.bottom(), strip.left()), (cells.top(), cells.left()), "the strip lies right over the terminal");
+    let whole = strip.width();
+
+    // Typing, a button stands at its end, and the strip's words stop short of it.
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true)]);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let short = view.term.overlay.strip.expect("still a terminal to type in");
+    assert!(short.width() < whole - 40.0, "Fit to this screen is a button: {short:?} of {whole}");
+
+    // Someone else types, so a tap there would type nowhere.
+    let taken = world.host.other_takes("s1", "Firefox on Linux");
+    world.deliver(taken);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.term.overlay.strip, None);
+
+    // A mouse clicks the terminal itself: the strip is a finger's.
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, (1600.0, 1000.0));
+    }
+    assert!(view.term.overlay.rect.is_some(), "a terminal in the wide window");
+    assert_eq!(view.term.overlay.strip, None);
+}
+
+#[test]
+fn a_tap_where_someone_else_types_shows_up_take_over_and_asks_for_nothing() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    let taken = world.host.other_takes("s1", "Firefox on Linux");
+    world.deliver(taken);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(view.term.nudged_until <= view.now_ms);
+    let at = view.term.overlay.rect.expect("the terminal").center();
+    let down = touch(1, Phase::Down, at, view.now_ms);
+    let up = touch(1, Phase::Up, at, view.now_ms + 40.0);
+    send(&ctx, &mut world, &mut client, &mut view, vec![down, up]);
+    assert!(view.term.nudged_until > view.now_ms, "it stands out for a moment");
+    assert_eq!(acquires(&world), 0, "only Take over takes it over");
+    view.now_ms += NUDGE_MS;
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(view.term.nudged_until <= view.now_ms, "and then it stops");
+}
+
 fn acquires(world: &World) -> usize {
     world.sent().iter().filter(|m| matches!(m, Message::LeaseAcquire { .. })).count()
 }

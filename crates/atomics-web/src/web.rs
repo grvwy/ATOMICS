@@ -55,6 +55,10 @@ extern "C" {
     fn place(x: f32, y: f32, width: f32, height: f32);
     #[wasm_bindgen(js_name = setClip)]
     fn set_clip(clip: &str);
+    #[wasm_bindgen(js_name = placeStrip)]
+    fn place_strip(x: f32, y: f32, width: f32, height: f32);
+    #[wasm_bindgen(js_name = setTextBoxes)]
+    fn set_text_boxes(boxes: &str);
     fn hide();
     #[wasm_bindgen(js_name = setWritable)]
     fn set_writable(on: bool);
@@ -161,6 +165,8 @@ struct App {
     _visibility: Closure<dyn FnMut()>,
     /// What the overlay was last set to.
     applied: Overlay,
+    /// The text boxes the page was last told of.
+    applied_boxes: Vec<egui::Rect>,
     /// The layout last kept in the page's storage.
     saved_layout: LayoutMode,
     /// The view the switcher chose that this browser keeps, as last saved.
@@ -302,6 +308,7 @@ impl App {
             _page: page,
             _visibility: visibility,
             applied: Overlay::default(),
+            applied_boxes: Vec::new(),
             saved_layout: layout,
             saved_view,
         }
@@ -329,6 +336,10 @@ impl App {
         if let Some(rect) = now.rect.filter(|_| now.rect != last.rect || now.covered != last.covered) {
             set_clip(&term_pane::clip_path(rect, &now.covered, zoom));
         }
+        if now.strip != last.strip {
+            let r = now.strip.unwrap_or(egui::Rect::ZERO);
+            place_strip(r.left() * zoom, r.top() * zoom, r.width() * zoom, r.height() * zoom);
+        }
         if (now.ctrl, now.alt) != (last.ctrl, last.alt) {
             set_sticky(now.ctrl, now.alt);
         }
@@ -343,6 +354,10 @@ impl App {
             }
         }
         self.applied = now;
+        if self.view.text_boxes != self.applied_boxes {
+            set_text_boxes(&views::text_boxes_json(&self.view.text_boxes, zoom));
+            self.applied_boxes.clone_from(&self.view.text_boxes);
+        }
     }
 
     fn post(&self, kind: &str) {

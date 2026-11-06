@@ -15,7 +15,8 @@
 //!   at the desktop's font, as the desktop does with its own panes ([`TermPane::fit`]), and follows the pane as it
 //!   changes. The pane the input goes to and every other keep the same room for the strip saying who types, so
 //!   picking a terminal never resizes it.
-//! - **Touch.** A tap focuses the overlay (the browser opens the keyboard) and, where the program takes
+//! - **Touch.** A tap focuses the overlay (the browser opens the keyboard), the words on the strip over it too
+//!   ([`Overlay::strip`]), and, where the program takes
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
 //!   only) and pans; a long press selects the word under the finger, with a handle at each end to drag
 //!   and Copy for just that range; a pinch sets the font size. A mouse clicks and drag-selects; its wheel
@@ -66,6 +67,8 @@ const RENEW_MS: f64 = 10_000.0;
 /// A selection handle's knob, and how far from its centre a finger still takes it.
 const KNOB: f32 = 6.0;
 const KNOB_REACH: f32 = 24.0;
+/// How long a tap where someone else types shows up Take over.
+const NUDGE_MS: f64 = 1500.0;
 
 /// What the overlay forwards.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +118,9 @@ pub struct Overlay {
     pub focus: bool,
     /// The terminal is an editor's, which keeps Shift with the arrows ([`atomics_ui::window_keys`]).
     pub editor: bool,
+    /// For a finger, the part of the strip over the terminal that holds its words and no buttons, while a tap would
+    /// type here. A tap there opens the keyboard as one on the terminal does.
+    pub strip: Option<Rect>,
 }
 
 /// One line and column of the terminal: `line` is a line ID (history below the screen's first).
@@ -183,6 +189,9 @@ pub struct TermPane {
     painted: Option<Frame>,
     /// The layer the terminal was last drawn in.
     layer: LayerId,
+    /// A tap where someone else types: until when Take over stands out.
+    nudged_until: f64,
+    nudge: bool,
 }
 
 impl Default for TermPane {
@@ -215,6 +224,8 @@ impl Default for TermPane {
             handed: Vec::new(),
             painted: None,
             layer: LayerId::background(),
+            nudged_until: 0.0,
+            nudge: false,
         }
     }
 }
@@ -380,6 +391,10 @@ impl TermPane {
             if let Some(rect) = self.overlay.rect {
                 self.overlay.covered = covered(ctx, self.layer, rect);
             }
+            // What lies over the strip takes its taps, as what lies over the terminal does.
+            if self.overlay.strip.is_some_and(|strip| !covered(ctx, self.layer, strip).is_empty()) {
+                self.overlay.strip = None;
+            }
             // The keyboard is in a text box the page draws or in the panel: another browser would see the lease held
             // until it expires, by someone who has moved on. A click back asks again.
             let elsewhere = ctx.output(|output| output.ime.is_some())
@@ -483,7 +498,12 @@ impl TermPane {
         let mut actions = Actions::default();
         let mut child =
             ui.new_child(egui::UiBuilder::new().id_salt(("term-header", session)).max_rect(header.shrink2(margin)));
-        child.horizontal_centered(|ui| self.header(ui, &lease, may_type, live, p, &mut actions));
+        let nudged = now_ms < self.nudged_until;
+        let buttons =
+            child.horizontal_centered(|ui| self.header(ui, &lease, may_type, live, nudged, p, &mut actions)).inner;
+        if nudged {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis((self.nudged_until - now_ms) as u64 + 1));
+        }
         let body = rect.with_min_y(header.bottom());
 
         let Some(frame) = self.frame(ui, body, session, remote, p) else {
@@ -507,6 +527,7 @@ impl TermPane {
         let modes = remote.with_screen(session, |s| s.map(|(screen, _)| screen.modes)).unwrap_or_default();
         let mut typed = String::new();
         let was_focused = self.focused;
+        self.gestures.set_zoom(ui.ctx().zoom_factor());
         for input in std::mem::take(&mut self.inputs) {
             self.input(input, &frame, &modes, &lease, lost, remote, session, &mut typed, now_ms);
         }
@@ -529,6 +550,9 @@ impl TermPane {
         }
         for gesture in self.gestures.tick(now_ms) {
             self.gesture(gesture, &frame, &modes, &lease, &mut typed);
+        }
+        if std::mem::take(&mut self.nudge) {
+            self.nudged_until = now_ms + NUDGE_MS;
         }
         if !typed.is_empty() && live && may_type {
             self.top = None;
@@ -589,13 +613,25 @@ impl TermPane {
             blur: lost || std::mem::take(&mut self.blur_next) || (self.focused && !(writable && typing)),
             focus: std::mem::take(&mut self.focus_next) && writable,
             editor: remote.editors().iter().any(|e| e.terminal == session),
+            strip: (self.touch.is_some() && writable).then(|| header.with_max_x(buttons)),
         };
         if self.overlay.blur {
             self.focused = false;
         }
     }
 
-    fn header(&self, ui: &mut egui::Ui, lease: &Lease, may_type: bool, live: bool, p: &Palette, actions: &mut Actions) {
+    /// The strip's words and buttons. Returns where the buttons start.
+    #[allow(clippy::too_many_arguments)]
+    fn header(
+        &self,
+        ui: &mut egui::Ui,
+        lease: &Lease,
+        may_type: bool,
+        live: bool,
+        nudged: bool,
+        p: &Palette,
+        actions: &mut Actions,
+    ) -> f32 {
         let (text, color) = if !live {
             ("Disconnected: typing is off".to_string(), p.warning)
         } else if !may_type {
@@ -614,31 +650,49 @@ impl TermPane {
             }
         };
         ui.label(RichText::new(text).color(color).size(12.5));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.header_buttons(ui, lease, may_type, live, nudged, p, actions);
+            ui.min_rect().left()
+        })
+        .inner
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn header_buttons(
+        &self,
+        ui: &mut egui::Ui,
+        lease: &Lease,
+        may_type: bool,
+        live: bool,
+        nudged: bool,
+        p: &Palette,
+        actions: &mut Actions,
+    ) {
         let touch = self.touch;
         let button = |ui: &mut egui::Ui, text: &str| touch::button(ui, touch, text);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if self.top.is_some() && button(ui, "↓ Live").on_hover_text("Back to the live screen").clicked() {
-                actions.live = true;
-            }
-            if !live || !may_type {
-                return;
-            }
-            if lease.yours {
-                if lease.resized {
-                    if button(ui, "Computer's size").clicked() {
-                        actions.fit = Some(false);
-                    }
-                } else if self.fit.is_none()
-                    && button(ui, "Fit to this screen")
-                    .on_hover_text("Resize the terminal to this screen; the computer shows it, and gets its size back when it types")
-                    .clicked()
-                {
-                    actions.fit = Some(true);
+        if self.top.is_some() && button(ui, "↓ Live").on_hover_text("Back to the live screen").clicked() {
+            actions.live = true;
+        }
+        if !live || !may_type {
+            return;
+        }
+        if lease.yours {
+            if lease.resized {
+                if button(ui, "Computer's size").clicked() {
+                    actions.fit = Some(false);
                 }
-            } else if lease.holder.is_some() && button(ui, "Take over").clicked() {
-                actions.take_over = true;
+            } else if self.fit.is_none()
+                && button(ui, "Fit to this screen")
+                .on_hover_text("Resize the terminal to this screen; the computer shows it, and gets its size back when it types")
+                .clicked()
+            {
+                actions.fit = Some(true);
             }
-        });
+        } else if lease.holder.is_some() {
+            let take_over =
+                if nudged { atomics_ui::controls::primary(ui, "Take over", touch, p) } else { button(ui, "Take over") };
+            actions.take_over = take_over.clicked();
+        }
     }
 
     /// The cell size at the font in use, and which lines show where.
@@ -763,6 +817,8 @@ impl TermPane {
                 if self.selection.take().is_some() {
                     return;
                 }
+                // A finger asks to type where someone else does: the way to is right there.
+                self.nudge = self.touch.is_some() && lease.holder.is_some() && !lease.yours;
                 if lease.yours && encode::reports_mouse(modes) {
                     let cell = frame.cell_at(at);
                     if let Some(row) = frame.screen_row(cell) {

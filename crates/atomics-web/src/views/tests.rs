@@ -1972,6 +1972,113 @@ fn headless_shots() {
     }
 }
 
+/// A finger on a phone's page: where a tap takes the keyboard, and whether the page's word for it is right.
+#[test]
+fn a_fingers_tap_takes_the_keyboard_on_a_text_box_and_on_a_line_that_opens_one() {
+    let (ctx, mut world, mut client, mut view) = live();
+    view.viewport.coarse = true;
+    view.tab = Tab::Agents;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let steer = *view.text_boxes.first().expect("the steer bar");
+    assert!(ctx.memory(|m| m.focused()).is_none());
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, click(steer.center()));
+    assert!(
+        ctx.memory(|m| m.focused()).is_some_and(|id| egui::TextEdit::load_state(&ctx, id).is_some()),
+        "the app focuses what the page took the keyboard for"
+    );
+
+    // Nothing to type in, and nothing marked.
+    view.tab = Tab::Board;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.text_boxes, []);
+
+    // What lies over a text box takes its taps.
+    view.tab = Tab::Agents;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let steer = *view.text_boxes.first().expect("the steer bar");
+    for _ in 0..3 {
+        view.now_ms += 16.0;
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(PHONE.0, PHONE.1));
+        let input = egui::RawInput { screen_rect: Some(screen), ..egui::RawInput::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            let over = egui::Area::new(egui::Id::NULL.with("over the steer bar")).order(egui::Order::Foreground);
+            over.fixed_pos(steer.min).show(ui.ctx(), |ui| ui.allocate_space(steer.size()));
+            draw(ui, &mut world.driver, &mut client, &mut view);
+        });
+        output.textures_delta.clear();
+        world.pump();
+    }
+    assert_eq!(view.text_boxes, [], "with something over it");
+
+    // A mouse needs none of it.
+    let (ctx, mut world, mut client, mut view) = live();
+    view.tab = Tab::Agents;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.text_boxes, []);
+
+    // A line of a diff opens a comment box under the finger, in the same tap; a viewer's opens nothing.
+    let show_diff = |view: &mut View| {
+        view.viewport.coarse = true;
+        view.tab = Tab::Diffs;
+        view.diff = Some(PathBuf::from(WORKTREE));
+    };
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    show_diff(&mut view);
+    for _ in 0..4 {
+        settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    assert!(view.text_boxes.len() > 2, "its lines: {:?}", view.text_boxes);
+    // The box asks for the keyboard in the frame of the tap: a frame with none would take it from the page's input.
+    let line = view.text_boxes[2];
+    view.now_ms += 16.0;
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(PHONE.0, PHONE.1));
+    let input = egui::RawInput { screen_rect: Some(screen), events: click(line.center()), ..egui::RawInput::default() };
+    let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+    output.textures_delta.clear();
+    assert!(output.platform_output.ime.is_some(), "the comment box, at once");
+    let (ctx, mut world, mut client, mut view) = viewing(fake_host::working());
+    show_diff(&mut view);
+    for _ in 0..4 {
+        settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    assert_eq!(view.text_boxes, []);
+}
+
+#[test]
+fn the_page_learns_the_text_boxes_in_css_pixels() {
+    let boxes = [Rect::from_min_size(egui::pos2(8.0, 16.0), vec2(80.0, 40.0))];
+    assert_eq!(text_boxes_json(&boxes, 1.25), "[[10.0,20.0,100.0,50.0]]");
+}
+
+/// 11 CSS pixels of wobble is 8.8 points at the phone's zoom: too far for a mouse's click, not for a finger's tap.
+#[test]
+fn a_finger_that_wobbles_still_presses_a_button_and_a_mouse_clicks_as_it_did() {
+    for (coarse, pressed) in [(true, true), (false, false)] {
+        let (ctx, mut world, mut client, mut view) = live();
+        view.viewport.coarse = coarse;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+        assert_eq!(view.tab, Tab::Board);
+        let at = on(&shown, "Agents");
+        let button = |pressed, pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let moved = at + vec2(8.8, 0.0);
+        let events = [
+            vec![egui::Event::PointerMoved(at), button(true, at)],
+            vec![egui::Event::PointerMoved(moved)],
+            vec![button(false, moved)],
+        ];
+        for events in events {
+            sized(&ctx, &mut world, &mut client, &mut view, PHONE, events);
+        }
+        settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+        assert_eq!(view.tab == Tab::Agents, pressed, "coarse: {coarse}");
+    }
+}
+
 /// A first run's host: the setup screen opens by itself, in every layout, and skipping it tells the host; a client that
 /// may not change the host never sees it; the question a refused start asks goes the same way.
 #[test]

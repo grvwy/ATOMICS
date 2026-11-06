@@ -9,9 +9,14 @@ const NAMED = new Set([
   "Escape", "Tab", "Enter", "Backspace", "Delete", "Insert", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
   "Home", "End", "PageUp", "PageDown", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
 ]);
-// How far a touch may move and still be a tap, and how long a tap may take (the app's gesture rules).
-const SLOP = 8;
+// How far a touch may move and still be a tap: a finger wobbles on the glass (`gesture::TAP_SLOP`). How long a tap may
+// take (the app's gesture rules), and how long egui still takes a press for a click, which is what focuses a text box.
+const SLOP = 12;
 const TAP_MS = 450;
+const CLICK_MS = 800;
+// The field is never empty, because a soft keyboard's Backspace needs something to delete: some raise no event at all
+// in an empty field. This character is never typed, and stays before the caret.
+const KEEP = "\u200b";
 const LAYOUT_KEY = "atomics.layout";
 const VIEW_KEY = "atomics.view";
 
@@ -22,11 +27,13 @@ let hardKeyboard = false;
 let ta = null;
 let bar = null;
 let chip = null;
+let strip = null;
 let probe = null;
 let writable = false;
 let copyText = null;
 let composing = false;
-let touch = null;
+// Where the app draws a text box, or a line that opens one, in CSS pixels: a tap there takes the keyboard.
+let textBoxes = [];
 // The input's focus moves away and back while Copy uses a scratch field; the app is not told.
 let quiet = false;
 // The pointers over the terminal the app was told are down.
@@ -71,6 +78,78 @@ function windowKeys(e) {
     toCanvas();
     send({ kind: "key", text: e.key, mods: mods(e) });
   }
+}
+
+// What a finger does on an element, as far as a tap goes. Fed its touch events, `end` says whether they made a tap.
+function tapTracker() {
+  let at = null;
+  return {
+    start(e) {
+      const t = e.touches[0];
+      at = e.touches.length === 1 ? { x: t.clientX, y: t.clientY, time: e.timeStamp } : null;
+    },
+    move(e) {
+      const t = e.touches[0];
+      if (at && (e.touches.length > 1 || Math.hypot(t.clientX - at.x, t.clientY - at.y) > SLOP)) at = null;
+    },
+    end(e, ms) {
+      const tapped = at !== null && e.timeStamp - at.time < ms;
+      at = null;
+      return tapped;
+    },
+  };
+}
+
+// The field holds only what keeps it from being empty. Moving the caret focuses a field in some browsers, so only one
+// that has the focus gets that.
+function emptyField() {
+  ta.value = KEEP;
+  if (document.activeElement === ta) ta.setSelectionRange(1, 1);
+}
+
+// A finger asks to type: this has to run in the touch's own handler, or iOS opens no keyboard. A field that kept the
+// focus while the keyboard was put away takes it again, quietly: focus alone would do nothing, and neither the lease
+// nor the key bar changes. Where the keyboard is plainly up, nothing moves, and a word under way stays.
+function openKeyboard() {
+  if (!writable || ta.hidden) return;
+  if (document.activeElement !== ta) {
+    ta.focus({ preventScroll: true });
+    return;
+  }
+  const keyboardUp = vv && innerHeight - vv.height > 120;
+  if (composing || keyboardUp) return;
+  quiet = true;
+  try {
+    ta.blur();
+    ta.focus({ preventScroll: true });
+  } finally {
+    quiet = false;
+  }
+}
+
+// A tap on a text box the app draws takes eframe's hidden input in the touch itself, or iOS opens no keyboard until a
+// second tap. The app's own click then finds the keyboard where it wants it. This sees the touch before eframe does.
+function watchCanvas() {
+  const canvas = document.getElementById("atomics");
+  const tap = tapTracker();
+  let over = false;
+  const on = (type, handler) => addEventListener(type, handler, { capture: true, passive: true });
+  on("touchstart", (e) => {
+    over = e.target === canvas;
+    if (over) tap.start(e);
+  });
+  on("touchmove", (e) => {
+    if (over) tap.move(e);
+  });
+  on("touchend", (e) => {
+    if (!over) return;
+    const t = e.changedTouches[0];
+    const hit = textBoxes.some(([x, y, width, height]) =>
+      t.clientX >= x && t.clientX <= x + width && t.clientY >= y && t.clientY <= y + height);
+    if (!tap.end(e, CLICK_MS) || !hit) return;
+    const agent = document.querySelector("#atomics + input");
+    if (agent) agent.focus({ preventScroll: true });
+  });
 }
 
 // Letting go of the input leaves the keyboard on the canvas, so the app keeps reading keys there.
@@ -190,6 +269,28 @@ function buildBar(rows) {
   document.body.append(bar);
 }
 
+// A tap on `el` opens the keyboard, and nothing else happens to its touches.
+function tapOpensKeyboard(el) {
+  const tap = tapTracker();
+  el.addEventListener("touchstart", (e) => { e.preventDefault(); tap.start(e); }, { passive: false });
+  el.addEventListener("touchmove", (e) => { e.preventDefault(); tap.move(e); }, { passive: false });
+  el.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    if (tap.end(e, TAP_MS)) openKeyboard();
+  }, { passive: false });
+}
+
+// The strip over the terminal says to tap the terminal, so a tap on the words themselves counts too.
+function buildStrip() {
+  strip = document.createElement("div");
+  strip.id = "atomics-strip";
+  strip.hidden = true;
+  strip.setAttribute("role", "button");
+  strip.setAttribute("aria-label", "Type in this terminal");
+  tapOpensKeyboard(strip);
+  document.body.append(strip);
+}
+
 function buildOverlay() {
   ta = document.createElement("textarea");
   ta.id = "atomics-input";
@@ -199,16 +300,18 @@ function buildOverlay() {
     ["spellcheck", "false"], ["enterkeyhint", "enter"], ["aria-label", "Terminal input"]]) {
     ta.setAttribute(name, value);
   }
+  ta.value = KEEP;
   document.body.append(ta);
 
   ta.addEventListener("focus", () => {
+    emptyField();
     if (quiet) return;
     send({ kind: "focus", on: true });
     showBar(true);
   });
   ta.addEventListener("blur", () => {
     composing = false;
-    ta.value = "";
+    emptyField();
     if (quiet) return;
     // The caret stays in a field that lost the focus, and text a keyboard or IME commits after that would
     // focus the field again, be typed and ask for the lease: it goes with the focus. Typing again is a tap.
@@ -223,13 +326,13 @@ function buildOverlay() {
     composing = false;
     send({ kind: "preedit", text: "" });
     if (e.data) send({ kind: "text", text: e.data });
-    ta.value = "";
+    emptyField();
   });
   ta.addEventListener("beforeinput", (e) => {
     if (composing || e.isComposing) return;
     const type = e.inputType;
     let event = null;
-    if (type.startsWith("delete") && ta.value === "") event = { kind: "key", text: "Backspace", mods: 0 };
+    if (type.startsWith("delete") && (ta.value === KEEP || ta.value === "")) event = { kind: "key", text: "Backspace", mods: 0 };
     else if (type === "insertLineBreak" || type === "insertParagraph") event = { kind: "key", text: "Enter", mods: 0 };
     else if ((type === "insertFromPaste" || type === "insertFromDrop") && e.dataTransfer) {
       event = { kind: "paste", text: e.dataTransfer.getData("text/plain") };
@@ -239,11 +342,19 @@ function buildOverlay() {
       send(event);
     }
   });
-  // What a browser inserted without a cancelable beforeinput: forward it and keep the field empty.
+  // What a browser changed without a cancelable beforeinput: forward it and start over. With nothing left, not even
+  // what keeps the field from being empty, that was a Backspace.
   ta.addEventListener("input", () => {
-    if (composing || !ta.value) return;
-    send({ kind: "text", text: ta.value });
-    ta.value = "";
+    if (composing || ta.value === KEEP) return;
+    const text = ta.value.split(KEEP).join("");
+    send(text ? { kind: "text", text } : { kind: "key", text: "Backspace", mods: 0 });
+    emptyField();
+  });
+  // The caret stays after that character, so a Backspace always has it to delete.
+  document.addEventListener("selectionchange", () => {
+    if (document.activeElement === ta && !composing && ta.selectionStart !== ta.value.length) {
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
   });
   ta.addEventListener("keydown", (e) => {
     // A soft keyboard that names no key (229) is read from beforeinput (above). A key named here is sent
@@ -295,24 +406,8 @@ function buildOverlay() {
     const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
     send({ kind: "wheel", dx: e.deltaX * unit, dy: e.deltaY * unit, x: e.clientX, y: e.clientY, zoom: e.ctrlKey });
   }, { passive: false });
-  // A touch is the app's: no loupe, callout, page zoom or scroll. A tap focuses the field, which opens the
-  // keyboard; it has to happen here, in the touch's own handler.
-  ta.addEventListener("touchstart", (e) => {
-    e.preventDefault();
-    const t = e.touches[0];
-    touch = e.touches.length === 1 ? { x: t.clientX, y: t.clientY, at: e.timeStamp } : null;
-  }, { passive: false });
-  ta.addEventListener("touchmove", (e) => {
-    e.preventDefault();
-    const t = e.touches[0];
-    if (touch && (e.touches.length > 1 || Math.hypot(t.clientX - touch.x, t.clientY - touch.y) > SLOP)) touch = null;
-  }, { passive: false });
-  ta.addEventListener("touchend", (e) => {
-    e.preventDefault();
-    const tap = touch && e.timeStamp - touch.at < TAP_MS;
-    touch = null;
-    if (tap && writable && document.activeElement !== ta) ta.focus({ preventScroll: true });
-  }, { passive: false });
+  // A touch is the app's: no loupe, callout, page zoom or scroll. A tap opens the keyboard.
+  tapOpensKeyboard(ta);
   for (const type of ["gesturestart", "gesturechange", "gestureend"]) ta.addEventListener(type, (e) => e.preventDefault());
 }
 
@@ -326,6 +421,8 @@ export function install(keys, command, callback) {
   probe.id = "atomics-insets";
   document.body.append(probe);
   buildOverlay();
+  buildStrip();
+  watchCanvas();
   buildBar(JSON.parse(keys));
   chip = document.createElement("button");
   chip.id = "atomics-copy";
@@ -349,6 +446,20 @@ export function install(keys, command, callback) {
 export function place(x, y, width, height) {
   Object.assign(ta.style, { left: x + "px", top: y + "px", width: width + "px", height: height + "px" });
   ta.hidden = false;
+}
+
+/** Lay the tappable part of the strip over the terminal; nothing there while `width` is 0. */
+export function placeStrip(x, y, width, height) {
+  Object.assign(strip.style, { left: x + "px", top: y + "px", width: width + "px", height: height + "px" });
+  strip.hidden = width <= 0;
+}
+
+/** Where a tap takes the keyboard for a text box the app draws: `[[x, y, width, height]]` in CSS pixels, as JSON. */
+export function setTextBoxes(boxes) {
+  textBoxes = JSON.parse(boxes);
+  // The canvas says nothing else about what it draws, and this is how a test finds them.
+  const canvas = document.getElementById("atomics");
+  if (canvas) canvas.dataset.textBoxes = boxes;
 }
 
 /** Leave out of the overlay what the app draws over it (a CSS clip-path, empty for nothing): the browser gives

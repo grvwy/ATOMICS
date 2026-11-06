@@ -307,6 +307,8 @@ enum Row {
     Pair(usize, usize, SplitRow),
     Comment(usize),
     Editor,
+    /// Under a comment box a finger's size: the rows it takes beyond its own, which nothing paints over.
+    EditorRoom,
     FileLine(usize),
 }
 
@@ -420,7 +422,7 @@ pub fn show(
     }
 
     if let Some(path) = state.viewing.clone() {
-        if let Some(line) = show_file(ui, state, &path, palette, font, header.review, header.edit) {
+        if let Some(line) = show_file(ui, state, &path, palette, font, header.review, header.edit, touch) {
             action = DiffAction::Edit { path: Some(path), line: Some(line) };
         }
         return action;
@@ -502,6 +504,7 @@ pub fn show(
                 }
                 if state.editor.as_ref().is_some_and(|e| e.anchor == Anchor::Diff(fi, hi, li)) {
                     rows.push(Row::Editor);
+                    rows.extend(std::iter::repeat_n(Row::EditorRoom, editor_room(touch, row_h)));
                 }
             };
             if split {
@@ -669,6 +672,9 @@ pub fn show(
                         );
                     }
                     if line.kind != LineKind::Note {
+                        if can_review && touch.is_some() {
+                            touch::opens_keyboard(ui, &response);
+                        }
                         if can_edit && response.double_clicked() {
                             edit_line = Some((diff.files[fi].path().to_string(), edit_target(line)));
                         } else if can_review && response.clicked() {
@@ -731,12 +737,12 @@ pub fn show(
                                 gutter,
                             ),
                         };
-                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font, can_review);
+                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font, can_review, touch);
                         commit_editor |= commit;
                         cancel_editor |= cancel;
                     }
                 }
-                Row::FileLine(_) => {}
+                Row::EditorRoom | Row::FileLine(_) => {}
             }
             if split && matches!(row, Row::Pair(..) | Row::Comment(_) | Row::Editor) {
                 ui.painter().vline(mid, rect.y_range(), Stroke::new(1.0, palette.border));
@@ -798,6 +804,7 @@ pub fn show(
     if let Some((fi, hi, li)) = clicked_line {
         state.editor =
             Some(Editor { anchor: Anchor::Diff(fi, hi, li), text: String::new(), focus: true, leaving: false });
+        comment_box_opens(ui, touch);
         // The line stays under the pointer, whichever box above it this one replaces.
         if let Some(row) = rows.iter().position(|row| row.shows((fi, hi, li))) {
             state.place = Some(Place::at(offset, row, &diff.files, &file_rows, &rows, row_h));
@@ -928,6 +935,7 @@ fn diff_buttons(
 
 /// A whole file, read-only, where clicking a line starts a comment just like in the diff, with `review`.
 /// Returns a line that was double-clicked, to edit there, with `edit`.
+#[allow(clippy::too_many_arguments)]
 fn show_file(
     ui: &mut egui::Ui,
     state: &mut DiffState,
@@ -936,6 +944,7 @@ fn show_file(
     font: &FontId,
     review: bool,
     edit: bool,
+    touch: Option<Touch>,
 ) -> Option<u32> {
     ui.horizontal(|ui| {
         ui.label(RichText::new(path).monospace().color(palette.foreground));
@@ -964,6 +973,7 @@ fn show_file(
             anchored.entry(line).or_default().push(i);
         }
     }
+    let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
     let mut rows = Vec::with_capacity(file.lines.len());
     for i in 0..file.lines.len() {
         rows.push(Row::FileLine(i));
@@ -972,11 +982,11 @@ fn show_file(
         }
         if state.editor.as_ref().is_some_and(|e| e.anchor == Anchor::File(i)) {
             rows.push(Row::Editor);
+            rows.extend(std::iter::repeat_n(Row::EditorRoom, editor_room(touch, row_h)));
         }
     }
 
     let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
-    let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
     let gutter = char_w * 9.0;
     let content_w = (gutter + char_w * (file.longest_line as f32 + 2.0)).max(ui.available_width());
     let mut clicked: Option<usize> = None;
@@ -1013,6 +1023,9 @@ fn show_file(
                     let job = line_job(&file.lines[i], spans, &[], palette.background, font, palette);
                     let galley = ui.fonts_mut(|f| f.layout_job(job));
                     ui.painter().galley(text_pos(gutter), galley, palette.foreground);
+                    if review && touch.is_some() {
+                        touch::opens_keyboard(ui, &response);
+                    }
                     if edit && response.double_clicked() {
                         double_clicked = Some(i);
                     } else if review && response.clicked() {
@@ -1028,7 +1041,7 @@ fn show_file(
                 }
                 Row::Editor => {
                     if let Some(editor) = state.editor.as_mut() {
-                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font, review);
+                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font, review, touch);
                         commit |= c;
                         cancel |= x;
                     }
@@ -1062,8 +1075,22 @@ fn show_file(
     }
     if let Some(i) = clicked {
         state.editor = Some(Editor { anchor: Anchor::File(i), text: String::new(), focus: true, leaving: false });
+        comment_box_opens(ui, touch);
     }
     None
+}
+
+/// The rows a comment box takes beyond its own: a row of text is too short for a finger.
+fn editor_room(touch: Option<Touch>, row_h: f32) -> usize {
+    touch.map_or(0, |touch| (touch.target / row_h.max(1.0)).ceil() as usize - 1)
+}
+
+/// A line tapped: the box goes on screen in this very frame, not the next. The page gave its keyboard to the box in the
+/// touch ([`touch::opens_keyboard`]), and a frame with no text box would take it away again, for good on iOS.
+fn comment_box_opens(ui: &egui::Ui, touch: Option<Touch>) {
+    if touch.is_some() {
+        ui.ctx().request_discard("a comment box opens");
+    }
 }
 
 /// Draws a pending comment under its line, with a × when hovered (a click deletes it).
@@ -1096,6 +1123,7 @@ fn comment_row(
 
 /// The inline comment input. Returns (commit, cancel). Without `review` Enter does nothing: the box keeps its draft
 /// and the keyboard. Its id is its own, so that it keeps the keyboard when what is drawn before it changes.
+#[allow(clippy::too_many_arguments)]
 fn editor_row(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -1104,20 +1132,26 @@ fn editor_row(
     editor: &mut Editor,
     font: &FontId,
     review: bool,
+    touch: Option<Touch>,
 ) -> (bool, bool) {
     let field = rect.with_min_x(rect.left() + gutter - char_w);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("comment-editor").max_rect(field));
+    let id = child.scope_id().with("comment-box");
+    // Before it draws, so that it asks for the keyboard in the frame it opens in.
+    if std::mem::take(&mut editor.focus) {
+        child.memory_mut(|m| m.request_focus(id));
+    }
     let edit = crate::controls::single_line(&mut editor.text)
-        .id(child.scope_id().with("comment-box"))
+        .id(id)
         .hint_text("Comment for the agent · Enter adds · Esc cancels")
         .font(font.clone())
         .desired_width(field.width().min(900.0));
     let edit = if review { edit } else { edit.return_key(None::<egui::KeyboardShortcut>) };
+    let edit = match touch {
+        Some(touch) => edit.min_size(vec2(0.0, touch.target)),
+        None => edit,
+    };
     let response = child.add(edit);
-    if editor.focus {
-        response.request_focus();
-        editor.focus = false;
-    }
     if !response.lost_focus() {
         return (false, false);
     }
