@@ -249,6 +249,12 @@ pub fn panel(ui: &mut egui::Ui, vm: &dyn Capability, panel: &mut Panel) {
             }
             if ui.add_enabled(instance.is_some(), egui::Button::new("Resize…")).clicked() {
                 panel.resize = !panel.resize;
+                if panel.resize
+                    && let Some(instance) = instance
+                {
+                    panel.resources = instance.resources.clone();
+                    panel.stop_first = false;
+                }
             }
             if ui
                 .add_enabled(

@@ -17,6 +17,7 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
             .arg("setup")
             .env_clear()
             .env("HOME", dir.path())
+            .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
             .env("SHELL", shell)
             .env("PATH", bin)
             .env("ATOMICS_HOME", dir.path().join("state"))
@@ -60,6 +61,7 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
                 .arg("doctor")
                 .env_clear()
                 .env("HOME", dir.path())
+                .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("SHELL", &shell)
                 .env("PATH", &bin)
                 .env("ATOMICS_HOME", dir.path().join("state"))
@@ -77,6 +79,9 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
         assert!(text.contains("✗ claude not found"), "{text}");
         assert!(text.contains("✗ ATOMICS not running (warning)"), "{text}");
         assert!(text.contains("✗ global Claude hooks not installed (warning)"), "{text}");
+        if cfg!(all(target_os = "macos", debug_assertions)) {
+            assert!(text.contains("VM pairing: not paired"), "the isolated credential folder is empty: {text}");
+        }
         assert!(!text.contains("✗ ATOMICS running") && !text.contains("✗ global Claude hooks installed"), "{text}");
         if expected == 0 {
             assert!(text.contains("✓ git found (git version fixture)"), "{text}");
@@ -163,6 +168,7 @@ fn doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_s
                 .arg("doctor")
                 .env_clear()
                 .env("HOME", dir.path())
+                .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("SHELL", &shell)
                 // As a desktop launcher starts it.
                 .env("PATH", "/usr/bin:/bin")

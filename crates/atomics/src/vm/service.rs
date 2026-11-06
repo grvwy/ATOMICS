@@ -414,6 +414,8 @@ impl Worker {
         }
         super::remember_bundle(&self.instance, &image, &installed)?;
         std::fs::write(super::record_dir().join("selected-bundle"), installed.as_os_str().as_encoded_bytes())?;
+        let instances = self.list()?;
+        self.change(|s| s.instances = instances);
         if !existing.is_some_and(|i| i.state == State::Running) {
             self.start()?;
         }
@@ -508,19 +510,20 @@ impl Worker {
                     };
                     complete |= event["status"].as_str() == Some("complete");
                     self.change(|s| {
-                        if let Some(address) = event["url"].as_str().filter(|u| safe_sign_in_url(u)) {
-                            if s.addresses.len() < 8 && !s.addresses.iter().any(|u| u == address) {
-                                s.addresses.push(address.into());
-                            }
+                        if let Some(address) = event["url"].as_str().filter(|u| safe_sign_in_url(u))
+                            && s.addresses.len() < 8
+                            && !s.addresses.iter().any(|u| u == address)
+                        {
+                            s.addresses.push(address.into());
                         }
                         if let Some(code) = event["code"].as_str().filter(|s| {
                             s.len() >= 6
                                 && s.len() <= 16
                                 && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-                        }) {
-                            if s.codes.len() < 8 && !s.codes.iter().any(|c| c == code) {
-                                s.codes.push(code.into());
-                            }
+                        }) && s.codes.len() < 8
+                            && !s.codes.iter().any(|c| c == code)
+                        {
+                            s.codes.push(code.into());
                         }
                     });
                 }

@@ -838,10 +838,11 @@ impl Keychain {
             crate::setup::find_program("secret-tool")
                 .map_or_else(|| "/usr/bin/secret-tool".into(), |path| path.to_string_lossy().into_owned())
         };
-        // Only where it is asked for, and never on a Mac, whose keychain is always there.
+        // Only where asked for; release Macs always use their keychain. Debug builds allow
+        // an explicit folder on macOS for isolated QA homes without keychain prompts.
         let files = atomics_core::paths::env_override("CREDENTIALS_DIR")
             .map(std::path::PathBuf::from)
-            .filter(|dir| !mac && dir.is_absolute());
+            .filter(|dir| (!mac || cfg!(debug_assertions)) && dir.is_absolute());
         Self { program, mac, files }
     }
 

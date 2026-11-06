@@ -244,48 +244,6 @@ pub fn guest_shell(info: &BundleInfo) -> Result<Command> {
 pub const MACOS_ONLY: &str = "The ATOMICS VM is for macOS: on Linux, ATOMICS and its agents run on the machine itself \
      (docs/nixos-vm.md). Build the VM's image here with `nix build .#atomics-vm-image` for a Mac to use.";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lima_lists_one_instance_per_line() {
-        let text = concat!(
-            r#"{"name":"atomics","status":"Stopped","dir":"/home/user/.lima/atomics","cpus":4}"#,
-            "\n",
-            r#"{"name":"atomics-host","status":"Running","dir":"/home/user/.lima/atomics-host"}"#,
-            "\nnot json\n"
-        );
-        let listed = parse_list(text);
-        assert_eq!(listed.len(), 2);
-        assert_eq!((listed[1].name.as_str(), listed[1].status.as_str()), ("atomics-host", "Running"));
-    }
-
-    #[test]
-    fn the_bundle_names_its_instance_and_user() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = r#"{"version":1,"instance":"atomics-host","user":"atomics","home":"/home/atomics",
-            "macUser":"user","installDir":"/Users/user/.local/share/atomics-vm","host":{"port":47800}}"#;
-        std::fs::write(dir.path().join(BUNDLE_INFO), text).unwrap();
-        let info = BundleInfo::read(dir.path()).unwrap();
-        assert_eq!(info.instance, "atomics-host");
-        assert_eq!(info.host, Some(HostInfo { port: 47800 }));
-        std::fs::write(dir.path().join(BUNDLE_INFO), text.replace("atomics-host", "a b")).unwrap();
-        assert!(BundleInfo::read(dir.path()).is_err(), "an instance name a shell would split");
-        std::fs::write(dir.path().join(BUNDLE_INFO), text.replace("\"version\":1", "\"version\":2")).unwrap();
-        assert!(BundleInfo::read(dir.path()).is_err(), "a newer bundle format");
-    }
-
-    #[test]
-    fn instance_names_are_limas() {
-        assert!(valid_instance("atomics-host"));
-        assert!(valid_instance("a.b_c-1"));
-        for bad in ["", "a b", "a/b", "a;b", "~x"] {
-            assert!(!valid_instance(bad), "{bad}");
-        }
-    }
-}
-
 /// A bundle installed for this instance; the historical default remains supported.
 pub fn bundle_for(instance: &str) -> Option<(PathBuf, BundleInfo)> {
     if !valid_instance(instance) {
@@ -351,4 +309,46 @@ fn in_use(instance: &str) -> bool {
         return false;
     }
     instance_lock(instance, true).is_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lima_lists_one_instance_per_line() {
+        let text = concat!(
+            r#"{"name":"atomics","status":"Stopped","dir":"/home/user/.lima/atomics","cpus":4}"#,
+            "\n",
+            r#"{"name":"atomics-host","status":"Running","dir":"/home/user/.lima/atomics-host"}"#,
+            "\nnot json\n"
+        );
+        let listed = parse_list(text);
+        assert_eq!(listed.len(), 2);
+        assert_eq!((listed[1].name.as_str(), listed[1].status.as_str()), ("atomics-host", "Running"));
+    }
+
+    #[test]
+    fn the_bundle_names_its_instance_and_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"{"version":1,"instance":"atomics-host","user":"atomics","home":"/home/atomics",
+            "macUser":"user","installDir":"/Users/user/.local/share/atomics-vm","host":{"port":47800}}"#;
+        std::fs::write(dir.path().join(BUNDLE_INFO), text).unwrap();
+        let info = BundleInfo::read(dir.path()).unwrap();
+        assert_eq!(info.instance, "atomics-host");
+        assert_eq!(info.host, Some(HostInfo { port: 47800 }));
+        std::fs::write(dir.path().join(BUNDLE_INFO), text.replace("atomics-host", "a b")).unwrap();
+        assert!(BundleInfo::read(dir.path()).is_err(), "an instance name a shell would split");
+        std::fs::write(dir.path().join(BUNDLE_INFO), text.replace("\"version\":1", "\"version\":2")).unwrap();
+        assert!(BundleInfo::read(dir.path()).is_err(), "a newer bundle format");
+    }
+
+    #[test]
+    fn instance_names_are_limas() {
+        assert!(valid_instance("atomics-host"));
+        assert!(valid_instance("a.b_c-1"));
+        for bad in ["", "a b", "a/b", "a;b", "~x"] {
+            assert!(!valid_instance(bad), "{bad}");
+        }
+    }
 }

@@ -54,6 +54,7 @@ impl Instance {
             .args(args)
             .current_dir(self.dir.path())
             .env("HOME", self.dir.path())
+            .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
             .env("ATOMICS_HOME", self.home())
             .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
             .env("ATOMICS_SOCKET", self.socket())
