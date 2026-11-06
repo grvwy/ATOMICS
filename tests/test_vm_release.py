@@ -36,6 +36,7 @@ class VmReleaseTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
                         FIXTURE_IMAGE=str(self.image), FIXTURE_BUNDLE=str(self.bundle))
         self.env.pop('GITHUB_REF_NAME', None)
+        self.env.pop('GITHUB_REF_TYPE', None)
 
     def run_script(self):
         return subprocess.run(['bash', str(ROOT / 'scripts/release-vm-image.sh'), str(self.out)],
@@ -63,6 +64,7 @@ class VmReleaseTests(unittest.TestCase):
 
     def test_refuses_wrong_release_tag(self):
         self.env['GITHUB_REF_NAME'] = 'v0.0.0'
+        self.env['GITHUB_REF_TYPE'] = 'tag'
         self.assertNotEqual(self.run_script().returncode, 0)
         self.assertFalse(list(self.out.glob('*.zst')))
 
