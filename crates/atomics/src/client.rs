@@ -343,12 +343,13 @@ impl ClientApp {
                 ui.label(RichText::new(headline).size(16.0));
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("Agents, the chief, hooks and git run in the VM; this window shows them.").color(p.muted),
+                    RichText::new("Agents, the chief, hooks and git run in the VM; this window shows them.")
+                        .color(p.muted),
                 );
                 ui.add_space(14.0);
                 match &view.status {
                     crate::vm::Status::NotSetUp => {
-                        ui.label("Build it with scripts/macos-vm-build.sh --host, then run: atomics vm setup --from <folder>");
+                        ui.label("Run atomics vm setup to download and set up this version's Linux VM.");
                     }
                     _ if view.starting => {
                         ui.spinner();

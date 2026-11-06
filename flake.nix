@@ -13,6 +13,9 @@
         modules = [ { atomics.examples.dotnetAzure.enable = true; } ];
       };
       # The recommended layout: the ATOMICS host runs in the VM and the Mac only shows it.
+      vmRelease = vm.extendModules {
+        modules = [ { atomics.vm = { macUser = null; host.enable = true; }; } ];
+      };
       vmWithHost = vm.extendModules {
         modules = [ { atomics.vm.host.enable = true; } ];
       };
@@ -27,6 +30,8 @@
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;
         } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
+          atomics-vm-release-image = vmRelease.config.system.build.image;
+          atomics-vm-release-bundle = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-image = vm.config.system.build.image;
           # The Mac side of the VM: wrappers, socket forward, lima.yaml and config snippet.
           atomics-vm-mac = vm.config.programs.atomics.macDesktop.bundle;
@@ -39,6 +44,12 @@
           } // args);
         in
         {
+          atomics-mac-shares = nixpkgs.legacyPackages.${system}.runCommand "atomics-mac-shares-test" {
+            nativeBuildInputs = [ nixpkgs.legacyPackages.${system}.python3 nixpkgs.legacyPackages.${system}.bash ];
+          } ''
+            python3 ${./nix/tests/mac-shares-test.py} ${./nix/vm/mac-shares.sh}
+            mkdir $out
+          '';
           atomics = self.packages.${system}.atomics;
           atomics-onboard = onboardTest { };
           atomics-onboard-dotnet-azure = onboardTest {
@@ -56,6 +67,8 @@
             pkgs = import nixpkgs { inherit system; };
             vm = vm.config;
           };
+          atomics-vm-generic = vmRelease.config.system.build.toplevel;
+          atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };

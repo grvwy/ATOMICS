@@ -209,9 +209,11 @@ enum VmCommand {
     /// Install the bundle, create the Lima instance from the image, start and check it, list the
     /// sign-ins left and show the config change for this Mac (written only by `vm config --apply`)
     Setup {
-        /// The build's folder, with atomics-vm.raw and bundle/ (scripts/macos-vm-build.sh prints it)
+        /// Use a local build folder instead of downloading this version's signed VM image
         #[arg(long, value_name = "DIR")]
         from: Option<PathBuf>,
+        #[command(flatten)]
+        sizes: vm::download::Sizes,
         /// Delete and recreate an instance of the bundle's name that this setup did not create
         #[arg(long)]
         replace: bool,
@@ -476,7 +478,9 @@ fn main() -> eframe::Result {
         }
         Some(Command::Vm { command }) => {
             let result = match command {
-                VmCommand::Setup { from, replace, yes } => vm::setup::setup(vm::setup::Setup { from, replace, yes }),
+                VmCommand::Setup { from, sizes, replace, yes } => {
+                    vm::setup::setup(vm::setup::Setup { from, sizes, replace, yes })
+                }
                 VmCommand::Update { yes, no_restart } => vm::update::update(vm::update::Update { yes, no_restart }),
                 VmCommand::Start => vm::setup::start(),
                 VmCommand::Stop => vm::setup::stop(),

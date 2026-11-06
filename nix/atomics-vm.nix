@@ -39,11 +39,11 @@ in
     };
 
     macUser = mkOption {
-      type = types.str;
+      type = types.nullOr types.str;
       default = cfg.user;
       defaultText = lib.literalExpression "config.atomics.vm.user";
       example = "alice";
-      description = "Your account name on the Mac. The VM mounts folders of /Users/<macUser> at the same paths.";
+      description = "Optional build-time Mac account; null reads the account and shares from Lima cidata at boot.";
     };
 
     cpus = mkOption {
@@ -185,9 +185,8 @@ in
     };
     systemd.services.lima-ready = {
       wantedBy = [ "multi-user.target" ];
-      requires = [ "cloud-init.service" ];
+      requires = [ "cloud-init.service" "atomics-mac-shares.service" ];
       # `limactl start` returns once the Mac's folders are mounted too.
-      wants = [ "atomics-mac-shares.service" ];
       after = [ "cloud-init.service" "atomics-mac-shares.service" ];
       unitConfig.RequiresMountsFor = "/mnt/lima-cidata";
       serviceConfig.Type = "oneshot";
@@ -236,7 +235,7 @@ in
     systemd.services.atomics-host = lib.mkIf cfg.host.enable {
       description = "ATOMICS host (agents, chief, hooks and git for the Mac's ATOMICS)";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "atomics-mac-shares.service" ];
+      requires = [ "atomics-mac-shares.service" ];
       after = [ "atomics-mac-shares.service" "network.target" ];
       environment = {
         ATOMICS_SOCKET = hostSocket;
@@ -246,10 +245,17 @@ in
       serviceConfig = {
         User = cfg.user;
         Group = "users";
-        WorkingDirectory = hostFolder;
+        WorkingDirectory = if cfg.macUser == null then home else hostFolder;
         RuntimeDirectory = "atomics";
         RuntimeDirectoryMode = "0700";
-        ExecStart = "${pkgs.bash}/bin/bash --login -c ${lib.escapeShellArg "exec atomics host ${hostArgs}"}";
+        ExecStart = "${pkgs.bash}/bin/bash --login ${pkgs.writeShellScript "atomics-host-start" ''
+          set -e
+          ${lib.optionalString (cfg.macUser == null) ''
+            . /run/atomics-mac-desktop.env
+            cd "$ATOMICS_HOST_FOLDER"
+          ''}
+          exec atomics host ${hostArgs}
+        ''}";
         Restart = "on-failure";
         RestartSec = 5;
         TimeoutStopSec = 30;
@@ -261,7 +267,8 @@ in
     # ATOMICS runs natively on the Mac and starts agents and the chief here (docs/nixos-vm.md).
     programs.atomics.macDesktop = {
       enable = true;
-      user = cfg.macUser;
+      user = if cfg.macUser == null then "@ATOMICS_MAC_USER@" else cfg.macUser;
+      runtimeIdentity = cfg.macUser == null;
       hostPort = if cfg.host.enable then cfg.host.port else null;
       lima.settings = {
         minimumLimaVersion = "2.2.0";

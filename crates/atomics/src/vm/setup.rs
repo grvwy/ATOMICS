@@ -18,6 +18,7 @@ const CHECK_SCRIPT: &str = include_str!("../../../../scripts/check-atomics-vm.sh
 pub struct Setup {
     /// The build's output folder: `atomics-vm.raw` and `bundle/`.
     pub from: Option<PathBuf>,
+    pub sizes: super::download::Sizes,
     /// Replace an instance of the bundle's name that this setup did not create.
     pub replace: bool,
     /// Answer yes to the confirmation `replace` asks for (non-interactive use).
@@ -75,9 +76,13 @@ pub fn setup(options: Setup) -> Result<()> {
     check_mac()?;
 
     say("The bundle");
+    let downloaded;
     let from = match &options.from {
         Some(from) => from.clone(),
-        None => bail!("name the build's folder: atomics vm setup --from DIR (scripts/macos-vm-build.sh prints it)"),
+        None => {
+            downloaded = super::download::prepare(&options.sizes, &|message| println!("{message}"))?;
+            downloaded.path().to_path_buf()
+        }
     };
     let (image, bundle) = build_outputs(&from)?;
     let info = BundleInfo::read(&bundle)?;
@@ -278,9 +283,7 @@ fn installed() -> Result<BundleInfo> {
     if !cfg!(target_os = "macos") {
         bail!(super::MACOS_ONLY);
     }
-    BundleInfo::installed()
-        .map(|(_, info)| info)
-        .context("no VM bundle is installed; build one with scripts/macos-vm-build.sh and run atomics vm setup")
+    BundleInfo::installed().map(|(_, info)| info).context("no VM bundle is installed; run atomics vm setup")
 }
 
 pub fn status() -> Result<()> {

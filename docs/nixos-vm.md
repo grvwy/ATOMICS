@@ -23,13 +23,41 @@ reachable from the VM.
 The older layout keeps the host on the Mac and starts each agent in the VM over ssh
 ([Agents in the VM](#agents-in-the-vm)); a bundle built without the host has it.
 
-Quick start on a Mac with Docker, Lima 2.2 and Rosetta (no Nix needed):
+Quick start on an Apple Silicon Mac with Lima 2.2 and Rosetta (no Docker, Nix or checkout needed):
 
 ```sh
-scripts/macos-vm-build.sh --host --instance atomics-vm   # image and bundle in target/atomics-vm
-atomics vm setup --from target/atomics-vm                # create, start and check the VM
-limactl shell --workdir=/home/atomics atomics-vm atomics-onboard   # your sign-ins, in the VM
+atomics vm setup                                        # download, verify, create, start and check
+limactl shell --workdir=/home/atomics atomics atomics-onboard   # your sign-ins, in the VM
 atomics vm config --apply                                # [client] connect = "vm" on this Mac
+```
+
+Install Lima with `brew install lima` and, if needed, Rosetta with
+`softwareupdate --install-rosetta --agree-to-license`. Setup downloads the signed VM assets for the
+installed ATOMICS version; that release must include them. It checks SHA-256 and an Ed25519 signature
+against either release key built into the app before decompressing the image or running any bundle
+script. The signed bundle also binds the image checksum to this version. A missing asset, bad checksum
+or untrusted signature stops setup.
+
+The downloaded image has the host enabled and contains no Mac account name. Setup fills the
+Nix-generated Mac bundle template for the current account. Defaults are this Mac's logical cores
+minus four (at least one), half its memory in whole GiB (at least one), and a 100 GiB sparse disk:
+
+```sh
+atomics vm setup --cpus 8 --memory-gib 16 --disk-gib 200
+```
+
+The disk must be at least 100 GiB. These flags apply to downloaded bundles; a local `--from DIR`
+bundle retains the sizes it was built with. Existing instances retain their resources and data.
+Downloads and decompression report progress, and temporary files are removed when setup finishes or
+fails. Empty disk regions remain sparse (on macOS, setup punches holes on APFS). Lima keeps its own disk
+copy after the first boot. The template supports standard `/Users/<account>` homes; use a custom
+`--from DIR` bundle for other home paths.
+
+For a custom image or a release without VM assets, the build route still works:
+
+```sh
+scripts/macos-vm-build.sh --host --instance atomics-vm
+atomics vm setup --from target/atomics-vm
 ```
 
 ## How the Mac and the VM fit together
@@ -74,7 +102,7 @@ your Mac account ([The socket forward](#the-socket-forward)). Inside the VM ther
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `user` | `atomics` | the VM's login user (UID 1000); agents, the chief and their sign-ins run as `<user>` in `/home/<user>` |
-| `macUser` | `user` | your account name on the Mac; its folders are mounted at `/Users/<mac-user>/…` |
+| `macUser` | `user` | optional build-time Mac account; `null` reads the account and shares from Lima cidata at boot, as release images do |
 | `cpus` | `4` | virtual CPUs in the Lima definition |
 | `memoryGiB` | `8` | memory in the Lima definition |
 | `diskGiB` | `100` | size of the (sparse) disk image and of the Lima disk |
@@ -113,7 +141,8 @@ of your own that extends this configuration, then build from that flake:
 
 (Add `self` to the `outputs` arguments for the `packages` part.) CPUs and memory can also change after
 the VM exists: `limactl edit atomics --cpus 8 --memory 24` with the VM stopped. The disk cannot shrink,
-and the image's root partition is sized when it is built, so choose `diskGiB` before the first build.
+and the image cannot be shrunk. On boot, systemd-repart grows the root partition to the disk Lima supplied,
+then btrfs grows to fill it. This also handles later disk increases.
 
 ## Build
 
@@ -191,9 +220,33 @@ volume that already held most of the closure:
 The image is a 100 GiB sparse disk with 7.5 GiB in use; copying it out of the container keeps it
 sparse. The bundle is a few dozen KiB of `sh` scripts and text.
 
+### Build release assets
+
+On an ARM Linux Nix builder with Python 3.11 or newer and zstd:
+
+```sh
+bash scripts/release-vm-image.sh [OUTPUT_DIRECTORY]
+```
+
+This builds `atomics-vm-release-image` and `atomics-vm-release-bundle`: the generic host-enabled
+image with default build sizes and the bundle from `mac-desktop.nix`, using `@ATOMICS_MAC_USER@`
+placeholders. It writes `atomics-vm-<version>-aarch64-linux.raw.zst`, a `.bundle.json` containing the
+bundle files, version and image digest, and a `.sha256` for each. zstd reads the sparse image directly;
+setup recreates zero regions as holes while decompressing.
+
+The tag workflow builds these without secrets, then the existing protected `sign` job runs
+`scripts/sign-release.sh` on both assets' exact bytes, alongside the desktop archives. Each gets a
+raw Ed25519 `.sig` using the same CI key (or the offline key for manual recovery). All six VM files
+are attached before the release becomes latest. Never give the image build a signing key. See
+[release signing](releasing.md) for the key and approval process.
+
+The image build, Nix evaluation and first boot on a real Mac remain required release checks: verify
+share permissions, executable paths, the host, root growth, a second boot, and `atomics vm update`.
+
 ## Set up the VM on the Mac
 
-`atomics vm setup --from DIR` takes a Mac from a build's folder to a checked, running VM:
+`atomics vm setup` downloads this version's image and fills its bundle for this Mac;
+`atomics vm setup --from DIR` uses an existing build's folder. Both produce a checked, running VM:
 
 1. checks for Lima 2.2 or newer and Rosetta;
 2. installs the bundle (its `install.sh`: `~/.local/share/atomics-vm`, and the shared folders);
@@ -250,7 +303,12 @@ build image. Leave it stopped with `limactl stop atomics` when it is not in use.
 The definition is not in Lima's plain mode, because plain mode drops every mount. Lima's container
 runtime and boot scripts stay unused. NixOS mounts the shares itself (`atomics-mac-shares.service`),
 matching each mount point to the virtiofs tag Lima lists in its cidata `user-data` (tags are hashes,
-not `mount0`). Outside plain mode `limactl start` reports the VM degraded until Lima's guest agent
+not `mount0`). In a generic image (`macUser = null`), the service reads `ATOMICS_MAC_USER` from
+Lima's `param.env` and takes the mount paths and access modes from `user-data` on every boot. It
+creates the Mac-path executable links and socket directory, mounts the repositories and briefs,
+and writes `/run/atomics-mac-desktop.env` for the guest check and the host's working directory.
+The host and Lima readiness both require this service to succeed. A build-time `macUser` and
+custom shares still work with older cidata that has no account parameter. Outside plain mode `limactl start` reports the VM degraded until Lima's guest agent
 answers, so `lima-guestagent.service` runs Lima's own agent from the cidata disk. Every port forward
 is ignored, for listeners on the guest's loopback as well as on all its addresses (a rule for
 `0.0.0.0` alone leaves Lima forwarding loopback ones): the VM's listeners, such as a database

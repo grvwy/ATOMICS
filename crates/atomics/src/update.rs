@@ -33,7 +33,7 @@ const MAX_SIDECAR: u64 = 4 * 1024;
 /// an offline one kept for when that is lost or leaks. A signature from either will do, so that a release signed offline
 /// can bring a new CI key to every install. They are the only trust anchors: nothing at run time can name another, and a
 /// key that came with a download proves nothing.
-const BUILT_IN_KEYS: &[&str] = include!(concat!(env!("OUT_DIR"), "/release_keys.rs"));
+pub(crate) const BUILT_IN_KEYS: &[&str] = include!(concat!(env!("OUT_DIR"), "/release_keys.rs"));
 /// What a PEM Ed25519 public key decodes to, before the 32 bytes of the key itself.
 const ED25519_PUBLIC_KEY_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
 const NO_KEY: &str = "This build has no release signing key, so it cannot check a download and will not install \
@@ -301,7 +301,7 @@ fn parse_public_key(pem: &str) -> Result<[u8; 32], String> {
 
 /// Every key in `pems`, or why updates are off: a build with a key it cannot read is a broken build, and guessing which of
 /// its keys still counts is no way to treat a trust anchor.
-fn built_in_keys(pems: &[&str]) -> Result<Vec<[u8; 32]>, String> {
+pub(crate) fn built_in_keys(pems: &[&str]) -> Result<Vec<[u8; 32]>, String> {
     if pems.is_empty() {
         return Err(NO_KEY.to_string());
     }
@@ -309,7 +309,7 @@ fn built_in_keys(pems: &[&str]) -> Result<Vec<[u8; 32]>, String> {
 }
 
 /// The checksum, then the raw 64-byte Ed25519 signature over the archive's exact bytes, from any one of `keys`.
-fn verify(archive: &[u8], name: &str, checksum: &[u8], signature: &[u8], keys: &[[u8; 32]]) -> Result<()> {
+pub(crate) fn verify(archive: &[u8], name: &str, checksum: &[u8], signature: &[u8], keys: &[[u8; 32]]) -> Result<()> {
     let listed = std::str::from_utf8(checksum)
         .ok()
         .and_then(|text| {

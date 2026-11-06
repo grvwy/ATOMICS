@@ -42,7 +42,7 @@ in {
 "#;
 
 #[derive(Debug, Deserialize)]
-struct LimaConfig {
+pub(super) struct LimaConfig {
     cpus: u32,
     memory: String,
     disk: String,
@@ -57,18 +57,35 @@ struct Mount {
     mount_point: Option<String>,
 }
 
+impl LimaConfig {
+    pub(super) fn sizes(&self) -> Result<BuildInfo> {
+        let gib = |size: &str| -> Result<u32> {
+            size.strip_suffix("GiB")
+                .or_else(|| size.strip_suffix('G'))
+                .and_then(|n| n.parse().ok())
+                .filter(|&n| n > 0)
+                .with_context(|| format!("expected a positive whole GiB size in Lima's config, got {size:?}"))
+        };
+        if self.cpus == 0 {
+            bail!("Lima's saved CPU count must be positive");
+        }
+        Ok(BuildInfo { cpus: self.cpus, memory_gib: gib(&self.memory)?, disk_gib: gib(&self.disk)? })
+    }
+}
+
+pub(super) fn read_lima(instance: &str) -> Result<LimaConfig> {
+    let output = super::limactl_command()?.args(["list", "--format", "{{json .Config}}", instance]).output()?;
+    if !output.status.success() {
+        bail!("could not read Lima's config: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    serde_json::from_slice(&output.stdout).context("reading Lima's saved build settings")
+}
+
 /// Settings present in old bundles' Lima definition, now also saved in atomics-vm.json.
 fn build_info(info: &BundleInfo, lima: &LimaConfig) -> Result<BuildInfo> {
-    let gib = |size: &str| -> Result<u32> {
-        size.strip_suffix("GiB")
-            .or_else(|| size.strip_suffix('G'))
-            .and_then(|n| n.parse().ok())
-            .filter(|&n| n > 0)
-            .with_context(|| format!("expected a positive whole GiB size in Lima's config, got {size:?}"))
-    };
     let build = match &info.build {
         Some(build) => build.clone(),
-        None => BuildInfo { cpus: lima.cpus, memory_gib: gib(&lima.memory)?, disk_gib: gib(&lima.disk)? },
+        None => lima.sizes()?,
     };
     if build.cpus == 0 || build.memory_gib == 0 || build.disk_gib == 0 {
         bail!("the bundle has invalid VM build settings");
@@ -379,11 +396,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
     check_busy(info, options.yes)?;
-    let output = super::limactl_command()?.args(["list", "--format", "{{json .Config}}", &info.instance]).output()?;
-    if !output.status.success() {
-        bail!("could not read Lima's config: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let lima: LimaConfig = serde_json::from_slice(&output.stdout).context("reading Lima's saved build settings")?;
+    let lima = read_lima(&info.instance)?;
     let settings = settings(info, &build_info(info, &lima)?);
     let shares = shared_paths(&lima);
     let modules = resolve_modules(&config.vm.modules, &shares, &|message| eprintln!("warning: {message}"))?;

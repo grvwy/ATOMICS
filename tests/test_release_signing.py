@@ -128,7 +128,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         code = "\n".join(line for line in sign.splitlines() if not line.lstrip().startswith("#"))
         for word in ("cargo", "rust-cache", "rust-toolchain", "rustc", "actions/cache", "apt-get", "brew"):
             self.assertNotIn(word, code, word)
-        self.assertEqual(re.findall(r"needs: (.*)", sign), ["desktop"])
+        self.assertEqual(re.findall(r"needs: (.*)", sign), ["[desktop, vm-image]"])
         self.assertIn("contents: read", sign)
         self.assertNotIn("contents: write", sign)
 
@@ -189,6 +189,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             unsigned.mkdir()
             names = [f"atomics-1.2.3-{target}.tar.gz" for target in
                      ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")]
+            names += [f"atomics-vm-1.2.3-aarch64-linux.{suffix}" for suffix in ("raw.zst", "bundle.json")]
             for name in names:
                 (unsigned / name).write_bytes(name.encode())
                 # As the desktop job writes them, with shasum.

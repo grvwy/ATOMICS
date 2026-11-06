@@ -145,14 +145,36 @@ jobs:
             target/desktop/atomics-*.tar.gz.sha256
           if-no-files-found: error
 
+  vm-image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Nix and image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix-bin zstd
+          sudo mkdir -p /etc/nix
+          echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl enable --now nix-daemon.socket
+          sudo chmod a+rw /nix/var/nix/daemon-socket/socket
+      - name: Build the generic image and bundle template
+        run: bash scripts/release-vm-image.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atomics-unsigned-vm
+          path: target/vm-release/*
+          if-no-files-found: error
+
   # The only job that sees the signing key, and only once a person has approved it. Everything a build runs runs in the
   # jobs above, on other machines, so nothing in the dependency tree comes near the key: no build, no cargo, no cache, and
   # the signing script from the tagged commit. What it signs is data to it. Each action is pinned to a commit, since an
   # action that moved could otherwise leave something behind for the step that holds the key.
   sign:
     if: startsWith(github.ref, 'refs/tags/v')
-    name: Sign the desktop builds
-    needs: desktop
+    name: Sign the desktop and VM builds
+    needs: [desktop, vm-image]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
@@ -187,6 +209,14 @@ jobs:
             fi
             (cd "$UNSIGNED" && sha256sum --check --strict "$archive.sha256")
           done
+          for suffix in raw.zst bundle.json; do
+            archive="atomics-vm-$version-aarch64-linux.$suffix"
+            if [ -L "$UNSIGNED/$archive" ] || [ ! -f "$UNSIGNED/$archive" ]; then
+              echo "::error::The builds did not make $archive."
+              exit 1
+            fi
+            (cd "$UNSIGNED" && sha256sum --check --strict "$archive.sha256")
+          done
       - name: Sign and verify each archive
         env:
           ATOMICS_RELEASE_SIGNING_KEY: ${{ secrets.ATOMICS_RELEASE_SIGNING_KEY }}
@@ -196,10 +226,13 @@ jobs:
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
             sh scripts/sign-release.sh "$UNSIGNED/atomics-$version-$target.tar.gz"
           done
+          for suffix in raw.zst bundle.json; do
+            sh scripts/sign-release.sh "$UNSIGNED/atomics-vm-$version-aarch64-linux.$suffix"
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: atomics-signatures
-          path: ${{ runner.temp }}/unsigned/atomics-*.tar.gz.sig
+          path: ${{ runner.temp }}/unsigned/atomics-*.sig
           if-no-files-found: error
 
   desktop-release:
@@ -225,6 +258,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          files=(target/desktop/atomics-*.tar.gz target/desktop/atomics-*.tar.gz.sha256 target/desktop/atomics-*.tar.gz.sig)
+          files=(target/desktop/atomics-*.tar.gz{,.sha256,.sig} target/desktop/atomics-vm-*.raw.zst{,.sha256,.sig} target/desktop/atomics-vm-*.bundle.json{,.sha256,.sig})
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
           gh release edit "$GITHUB_REF_NAME" --prerelease=false --latest
