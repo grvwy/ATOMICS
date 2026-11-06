@@ -3,6 +3,9 @@
 # The release workflow signs the exact .raw.zst and .bundle.json bytes with sign-release.sh.
 # Usage: bash scripts/release-vm-image.sh [OUTPUT_DIRECTORY]
 set -euo pipefail
+for tool in nix zstd python3 sha256sum; do
+  command -v "$tool" >/dev/null || { echo "release-vm-image: needs $tool on PATH" >&2; exit 69; }
+done
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 out=${1:-"$repo/target/vm-release"}
 mkdir -p "$out"

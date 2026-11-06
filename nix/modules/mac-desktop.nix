@@ -300,6 +300,9 @@ let
     # Not plain mode, which drops mounts. Lima's boot scripts stay unused; its guest agent runs.
     plain = false;
     param.ATOMICS_MAC_USER = cfg.user;
+    # Lima refuses a param that no provision, probe or forward uses. The guest reads it from cidata itself
+    # (atomics-mac-shares.service) and Lima's boot scripts stay unused, so this step only names it.
+    provision = [ { mode = "system"; script = "#!/bin/sh\n: \"{{.Param.ATOMICS_MAC_USER}}\"\n"; } ];
     mountType = "virtiofs";
     mounts = map (share: { location = share.path; mountPoint = share.path; inherit (share) writable; }) shares;
     # The VM's ports stay in the VM, as in plain mode: no guest listener appears on the Mac's
