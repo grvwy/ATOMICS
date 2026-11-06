@@ -166,13 +166,9 @@ fn run_version(executable: &Path, timeout: Duration, stdout: Stdio) -> Result<()
     if !executable.is_file() {
         bail!("restart target is missing: {}", executable.display());
     }
-    let mut child = Command::new(executable)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
+    let mut command = Command::new(executable);
+    command.arg("--version").stdin(Stdio::null()).stdout(stdout).stderr(Stdio::null()).process_group(0);
+    let mut child = spawn_when_free(&mut command)
         .with_context(|| format!("cannot run {} --version", executable.display()))?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -192,10 +188,42 @@ fn run_version(executable: &Path, timeout: Duration, stdout: Stdio) -> Result<()
     }
 }
 
+/// Starts `command`. A program just copied can be busy for a moment: a fork elsewhere in this process inherits the
+/// copy's write handle until it execs, and the system refuses to run a file open for writing.
+fn spawn_when_free(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const TRIES: u32 = 40;
+    for _ in 1..TRIES {
+        match command.spawn() {
+            Err(why) if why.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            outcome => return outcome,
+        }
+    }
+    command.spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_program_still_open_for_writing_runs_once_it_is_free() {
+        use std::io::Write;
+        let dir = crate::test_support::tempdir().unwrap();
+        let program = dir.path().join("program");
+        let mut writer = std::fs::File::create(&program).unwrap();
+        writer.write_all(b"#!/bin/sh\necho 'atomics 2.0.0 (v2)'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let closes = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(writer);
+        });
+        let output = version_output(&program).unwrap();
+        closes.join().unwrap();
+        assert_eq!(output.trim(), "atomics 2.0.0 (v2)");
+    }
 
     #[test]
     fn detached_relauncher_waits_for_old_pid_and_survives_hangup() {
