@@ -7,6 +7,9 @@
 //! `ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser binary. The client's page is
 //! served under the strict CSP the bundle is built for.
 //!
+//! `an_ipad_draws_the_real_frame_and_works_by_touch`, `an_ipad_approves_by_touch` and
+//! `pairing_shows_its_code_on_a_phone_and_a_tablet` say what they do; their screens are saved in `target/actions-shots/`.
+//!
 //! `a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases` needs no bundle: the page's input alone, in a
 //! phone's Chrome, under real touches and a soft keyboard's editing commands.
 //!
@@ -20,7 +23,7 @@
 //! the page shows once the board is in, and `ATOMICS_WEB_TERMINAL_SCREENSHOT=out.png` the terminal with its
 //! echo selected.
 //!
-//! `the_bundle_works_on_a_phone_by_touch`: the same bundle on an iPhone (390 × 844 points at 3 pixels a
+//! `the_bundle_works_on_a_phone_by_touch`: the same bundle on an iPhone 16 Pro (402 × 874 points at 3 pixels a
 //! point, a touch screen, Safari's user agent), framed full screen by a hosting page, and used by touch alone
 //! (`Input.dispatchTouchEvent`). It pairs, shows the board, the AGENTS list and a two-file diff, approves the
 //! plan (`plan_command` approve) and a tool request with a tap on their buttons, and opens an agent's tile,
@@ -121,9 +124,10 @@ const READ: Duration = Duration::from_secs(5);
 const OVERALL: Duration = Duration::from_secs(150);
 const PHONE_OVERALL: Duration = Duration::from_secs(240);
 
-/// The phone: an iPhone's screen in CSS pixels (egui's points), its pixels a point, and Safari's user agent.
-const PHONE: (f32, f32) = (390.0, 844.0);
+/// The phone: an iPhone 16 Pro's screen in CSS pixels (egui's points), its pixels a point, and Safari's user agent.
+const PHONE: (f32, f32) = (402.0, 874.0);
 const PHONE_SCALE: f32 = 3.0;
+const TABLET_SCALE: f32 = 2.0;
 const IOS_SAFARI: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 \
                           (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
 
@@ -1548,15 +1552,12 @@ fn the_bundle_works_on_a_phone_by_touch() {
     }
 }
 
-/// An iPhone 16 Pro's screen in CSS pixels.
-const IPHONE_16_PRO: (f32, f32) = (402.0, 874.0);
-
 /// iOS opens the keyboard only for a field focused in the touch's own handler. On a phone, by touch alone, the steer
 /// bar, a diff's line that opens a comment box, and the words on a terminal's strip all do that on the first tap.
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip() {
-    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), IPHONE_16_PRO, true);
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), PHONE, true);
     log.wait("hello new", 1);
     frame.wait("an iPhone's screen in the frame", "matchMedia('(pointer: coarse)').matches");
     // Every call that moves the keyboard to or from eframe's input, with the event it ran in.
@@ -1577,7 +1578,7 @@ fn the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip()
     };
 
     // The steer bar: the first tap, then what is typed goes there.
-    page.tap(phone_pane(IPHONE_16_PRO, Tab::Agents));
+    page.tap(phone_pane(PHONE, Tab::Agents));
     frame.wait("the steer bar's place", &format!("{boxes}.length > 0"));
     let steer = frame.eval(&format!("{boxes}[0]"));
     keep(&mut page, "iphone-agents");
@@ -1592,7 +1593,7 @@ fn the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip()
     wait_host(&host, "the steer", |h| h.steered.iter().any(|(_, text)| text == "go on"));
 
     // A line of a diff: the same tap opens the comment box and the keyboard.
-    page.tap(phone_pane(IPHONE_16_PRO, Tab::Diffs));
+    page.tap(phone_pane(PHONE, Tab::Diffs));
     thread::sleep(Duration::from_millis(400));
     let at = |x: f32, y: f32| pos2(x * layout::ZOOM, y * layout::ZOOM);
     page.tap(at(45.4, 67.8));
@@ -1614,7 +1615,7 @@ fn the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip()
     wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "Why this step?"));
 
     // The words on the strip over a terminal type there, as the terminal does.
-    page.tap(phone_pane(IPHONE_16_PRO, Tab::Terminal));
+    page.tap(phone_pane(PHONE, Tab::Terminal));
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
     let strip = "document.getElementById('atomics-strip')";
@@ -1633,6 +1634,196 @@ fn the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip()
     let erase = json!({ "type": "rawKeyDown", "windowsVirtualKeyCode": 229, "key": "Unidentified", "commands": ["deleteBackward"] });
     page.call("Input.dispatchKeyEvent", erase);
     wait_host(&host, "Backspace as DEL", |h| h.terminals["s1"].typed == "ls\x7f");
+}
+
+/// An iPhone 16 Pro held sideways stays a phone: its panes, a tap that types in the terminal, the key bar over what is
+/// left, and the ⋯ menu. Its screens go to `target/actions-shots/`.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_phone_held_sideways_stays_a_phone_and_types() {
+    const SIDEWAYS: (f32, f32) = (874.0, 402.0);
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), SIDEWAYS, true);
+    log.wait("hello new", 1);
+    frame.wait(
+        "a phone's screen",
+        "matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 600",
+    );
+    thread::sleep(Duration::from_millis(500));
+    keep(&mut page, "iphone-sideways-board");
+    page.tap(phone_pane(SIDEWAYS, Tab::Agents));
+    thread::sleep(Duration::from_millis(400));
+    keep(&mut page, "iphone-sideways-agents");
+    page.tap(phone_pane(SIDEWAYS, Tab::Terminal));
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    thread::sleep(Duration::from_millis(400));
+    keep(&mut page, "iphone-sideways-terminal");
+    let cells = input_rect(&mut frame);
+    page.tap(cells.center());
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input", FOCUSED);
+    frame.wait("the key bar", "!document.getElementById('atomics-keybar').hidden");
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed", |h| h.terminals["s1"].typed == "ls");
+    thread::sleep(Duration::from_millis(400));
+    keep(&mut page, "iphone-sideways-typing");
+    let bar_top = frame.eval("document.getElementById('atomics-keybar').getBoundingClientRect().top");
+    let above = input_rect(&mut frame);
+    assert!(above.bottom() <= bar_top.as_f64().expect("a number") as f32 + 0.5, "{above:?} and {bar_top}");
+    assert_eq!(frame.eval("document.getElementById('atomics-keybar').offsetHeight < 60"), json!(true), "one row");
+    frame.eval("document.getElementById('atomics-input').blur(); true");
+    frame.wait("the key bar gone", "document.getElementById('atomics-keybar').hidden");
+    // The ⋯ menu, at the top bar's end.
+    thread::sleep(Duration::from_millis(300));
+    page.tap(pos2(SIDEWAYS.0 - layout::GUTTER * layout::ZOOM - 22.0, 26.0));
+    frame.wait("the menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
+    thread::sleep(Duration::from_millis(300));
+    keep(&mut page, "iphone-sideways-menu");
+}
+
+/// An iPad, upright and sideways: the desktop's frame by touch alone, within what the user sees. A tap types in the
+/// terminal, with the key bar under it; a Command+digit from a keyboard goes to that agent's diff; the sidebar opens as a
+/// drawer where it does not fit. The screens go to `target/actions-shots/` for a person to look at.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn an_ipad_draws_the_real_frame_and_works_by_touch() {
+    for (name, size) in [("ipad", (820.0, 1180.0)), ("ipad-sideways", (1180.0, 820.0))] {
+        let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), size, true);
+        log.wait("hello new", 1);
+        frame.wait(
+            "a tablet's screen",
+            "matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) >= 600",
+        );
+        log.wait("subscribe s1", 1);
+        terminal_input(&mut frame);
+        thread::sleep(Duration::from_millis(500));
+        keep(&mut page, &format!("{name}-frame"));
+
+        // A tap types in the terminal, and the key bar shows under it.
+        let cells = input_rect(&mut frame);
+        page.tap(cells.center());
+        log.wait("acquire s1", 1);
+        frame.wait("the focus on the input", FOCUSED);
+        frame.wait("the key bar", "!document.getElementById('atomics-keybar').hidden");
+        page.call("Input.insertText", json!({ "text": "ls" }));
+        wait_host(&host, "\"ls\" typed", |h| h.terminals["s1"].typed == "ls");
+        thread::sleep(Duration::from_millis(400));
+        keep(&mut page, &format!("{name}-typing"));
+        let bar_top = frame.eval("document.getElementById('atomics-keybar').getBoundingClientRect().top");
+        let bar_top = bar_top.as_f64().expect("a number") as f32;
+        let above = input_rect(&mut frame);
+        assert!(above.bottom() <= bar_top + 0.5, "{name}: the terminal stops at the key bar: {above:?} and {bar_top}");
+        frame.eval("document.getElementById('atomics-input').blur(); true");
+        frame.wait("the key bar gone", "document.getElementById('atomics-keybar').hidden");
+
+        // The sidebar: beside the agents, or a tap away in the top bar.
+        let drawer = name == "ipad";
+        if drawer {
+            page.tap(pos2(10.0 + layout::TABLET_TOUCH / 2.0, 26.0));
+            frame.wait("the drawer taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
+            thread::sleep(Duration::from_millis(300));
+            keep(&mut page, &format!("{name}-drawer"));
+            page.tap(pos2(size.0 - 40.0, size.1 / 2.0));
+            frame.wait("the drawer closed", &format!("{CLIP} === ''"));
+        }
+        assert_eq!(typed(&host, "s1"), "ls", "{name}: none of that reached the terminal");
+
+        // A keyboard's chord goes to the agent's diff, and types nothing.
+        page.chord(4, "1", "Digit1", 49);
+        wait_host(&host, "the diff asked for", |h| h.received.iter().any(|m| matches!(m, Message::DiffGet { .. })));
+        thread::sleep(Duration::from_millis(500));
+        keep(&mut page, &format!("{name}-diff"));
+        assert_eq!(typed(&host, "s1"), "ls", "{name}: the chord typed nothing");
+
+        // The chief, which does not sit beside the agents here: its pill opens it over what is under the top bar, a
+        // tap types there, and the pill closes it.
+        let pill = pos2(size.0 / 2.0, 27.0);
+        page.tap(pill);
+        // The input moves over its terminal.
+        frame.wait(
+            "the input over the chief",
+            "document.getElementById('atomics-input').getBoundingClientRect().top < 300",
+        );
+        let middle = pos2(size.0 / 2.0, size.1 / 2.0);
+        thread::sleep(Duration::from_millis(400));
+        keep(&mut page, &format!("{name}-chief"));
+        page.tap(middle);
+        log.wait("acquire chief", 1);
+        frame.wait("the focus on the chief's input", FOCUSED);
+        page.call("Input.insertText", json!({ "text": "go" }));
+        wait_host(&host, "\"go\" typed to the chief", |h| h.terminals["chief"].typed == "go");
+        thread::sleep(Duration::from_millis(400));
+        keep(&mut page, &format!("{name}-chief-typing"));
+        frame.eval("document.getElementById('atomics-input').blur(); true");
+        page.tap(pill);
+        thread::sleep(Duration::from_millis(400));
+        keep(&mut page, &format!("{name}-chief-closed"));
+    }
+}
+
+/// On an iPad either way up, a plan's Approve and a permission request's Allow, by touch, with the board and the tile.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn an_ipad_approves_by_touch() {
+    for (name, size) in [("ipad", (820.0, 1180.0)), ("ipad-sideways", (1180.0, 820.0))] {
+        let Opened { host, log, _browser, mut page, mut frame, palette: p, .. } = open(fake_host::host(), size, true);
+        log.wait("hello new", 1);
+        frame.wait("a tablet's screen", "matchMedia('(pointer: coarse)').matches");
+        let pixels = (size.0 * TABLET_SCALE, size.1 * TABLET_SCALE);
+        let below_bars = Rect::from_min_max(pos2(0.0, 98.0), pos2(size.0, size.1));
+        let dir = actions_dir();
+        let (approve, _) = until_on(&mut page, pixels, &dir, "Approve plan", |page| {
+            boxes(page, p.accent, 6, below_bars, 150.0).into_iter().find(|b| b.width() >= 60.0 && b.height() >= 40.0)
+        });
+        keep(&mut page, &format!("{name}-approve"));
+        page.tap(approve.center());
+        wait_host(&host, "the plan approved", |h| h.board.plans[0].approved);
+
+        // The tile's banner, and its first button, a finger's size.
+        let (allow, _) = until_on(&mut page, pixels, &dir, "the Allow button", |page| {
+            let banner = boxes(page, p.panel, 2, below_bars, 5000.0)
+                .into_iter()
+                .find(|b| b.width() >= 300.0 && b.height() >= 90.0)?;
+            boxes(page, p.raised, 2, banner, 100.0)
+                .into_iter()
+                .filter(|b| b.width() >= 40.0 && (40.0..=50.0).contains(&b.height()))
+                .min_by(|a, b| (a.top() as i32, a.left() as i32).cmp(&(b.top() as i32, b.left() as i32)))
+        });
+        keep(&mut page, &format!("{name}-approval"));
+        page.tap(allow.center());
+        wait_host(&host, "approval_decide allow for a1", |h| {
+            h.received
+                .iter()
+                .any(|m| matches!(m, Message::ApprovalDecide(d) if d.approval == "a1" && d.decision == Decision::Allow))
+        });
+        thread::sleep(Duration::from_millis(400));
+        keep(&mut page, &format!("{name}-approved"));
+    }
+}
+
+/// Pairing on an iPhone 16 Pro and an iPad either way up: the code shows large until the host's user accepts it.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn pairing_shows_its_code_on_a_phone_and_a_tablet() {
+    for (name, size, scale) in [
+        ("iphone", PHONE, PHONE_SCALE),
+        ("ipad", (820.0, 1180.0), TABLET_SCALE),
+        ("ipad-sideways", (1180.0, 820.0), TABLET_SCALE),
+    ] {
+        let mut waiting = fake_host::host();
+        waiting.hold = true;
+        let Opened { host, log, _browser, mut page, palette: p, pending, .. } = open_unpaired(waiting, size, true);
+        wait_host(&host, "the pairing request", |h| h.named.is_some());
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(size.0, size.1));
+        until_on(&mut page, (size.0 * scale, size.1 * scale), &actions_dir(), "the code", |page| {
+            (amount(page, p.accent, 24, screen) >= 300.0).then_some(())
+        });
+        keep(&mut page, &format!("{name}-pairing"));
+        let answer = host.lock().unwrap().confirm();
+        pending.lock().unwrap().extend(answer);
+        log.wait("parent atomics.paired", 1);
+        log.wait("hello new", 1);
+    }
 }
 
 /// A wide window, the size the desktop's QA screenshots are taken at.
@@ -1774,7 +1965,15 @@ struct Opened {
     pending: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
+fn open(host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
+    let opened = open_unpaired(host, size, touch);
+    opened.log.wait("parent atomics.paired", 1);
+    opened.log.wait("hello new", 1);
+    opened
+}
+
+/// [`open`], without waiting for the pairing that a host holding its code has not answered yet.
+fn open_unpaired(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
     let dist = dist();
     let pairing = host.open_pairing();
     let host = Arc::new(Mutex::new(host));
@@ -1802,13 +2001,20 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
     let pending = Arc::default();
     broker(tunnel, host.clone(), log.clone(), client_origin.clone(), line.clone(), Arc::clone(&pending));
 
-    let scale = if touch { PHONE_SCALE } else { 1.0 };
+    let scale = if !touch {
+        1.0
+    } else if size.0.min(size.1) < layout::NARROW {
+        PHONE_SCALE
+    } else {
+        TABLET_SCALE
+    };
     let mut flags = vec![
         format!("--window-size={},{}", size.0, size.1),
         format!("--force-device-scale-factor={scale}"),
         "--hide-scrollbars".to_string(),
     ];
     if touch {
+        flags.push(format!("--screen-info={{{}x{}}}", size.0, size.1));
         flags.push(format!("--user-agent={IOS_SAFARI}"));
     }
     let browser = launch(&flags, &format!("{parent_origin}/"), &log, PHONE_OVERALL);
@@ -1830,10 +2036,15 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
         let attached = page.event("Target.attachedToTarget", |e| e["params"]["targetInfo"]["type"] == "iframe");
         let session = attached["params"]["sessionId"].as_str().expect("the frame's session").to_string();
         page.call_in(Some(&session), "Emulation.setTouchEmulationEnabled", screen);
+        // The page's emulation does not reach its `screen` either, which says what device this is.
+        let device = format!(
+            "Object.defineProperty(screen, 'width', {{ value: {} }}); Object.defineProperty(screen, 'height', {{ value: {} }});",
+            size.0, size.1
+        );
+        page.call_in(Some(&session), "Page.enable", json!({}));
+        page.call_in(Some(&session), "Page.addScriptToEvaluateOnNewDocument", json!({ "source": device }));
         page.call_in(Some(&session), "Runtime.runIfWaitingForDebugger", json!({}));
     }
-    log.wait("parent atomics.paired", 1);
-    log.wait("hello new", 1);
     let frame_url = format!("{client_origin}/");
     let frame = DevTools::open(&devtools, "the client's frame", |t| {
         t["type"] == "iframe" && t["url"].as_str().is_some_and(|u| u.starts_with(&frame_url))
@@ -1909,31 +2120,24 @@ fn a_menu_over_a_terminal_acts_and_takes_no_lease() {
         session.status = AgentStatus::Idle;
         session.pending_approvals = 0;
     }
-    let Opened { log, _browser, mut page, mut frame, palette, .. } = open(board, WIDE, false);
+    let Opened { log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
     log.wait("subscribe s1", 1);
     frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
 
-    // Hide Board: the agent's terminal reaches the right edge, under where the ⋯ menu opens.
-    let panel = panel_button(&mut page, &palette, true);
-    page.click(panel);
-    frame.wait(
-        "the terminal under the menu's place",
-        "document.getElementById('atomics-input').getBoundingClientRect().right > 1560",
-    );
-    let (dots, desktop, terminal) = ((1585.0, 16.0), (1542.0, 105.0), (1000.0, 500.0));
+    // The Boards dropdown's menu, its row beside the chief where the agent's terminal is.
+    let (boards, row, terminal) = ((535.0, 16.0), (700.0, 71.0), (1000.0, 500.0));
 
     // An entry over the terminal: the menu acts, and the terminal hears nothing of it.
-    page.click(dots);
+    page.click(boards);
     frame.wait("the open menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
-    assert_eq!(frame.eval(&format!("document.elementFromPoint({}, {}).id", desktop.0, desktop.1)), json!("atomics"));
-    page.click(desktop);
-    frame.wait("the menu's choice kept", "localStorage.getItem('atomics.layout') === 'desktop'");
+    assert_eq!(frame.eval(&format!("document.elementFromPoint({}, {}).id", row.0, row.1)), json!("atomics"));
+    page.click(row);
     frame.wait("the menu closed", &format!("{CLIP} === ''"));
     assert!(!log.has("acquire s1"), "no lease was taken");
     assert_eq!(frame.eval(FOCUSED), json!(false));
 
     // A click away closes the menu, as anywhere else; the next click is the terminal's.
-    page.click(dots);
+    page.click(boards);
     frame.wait("the menu open again", &format!("{CLIP} === 'inset(50%)'"));
     page.click(terminal);
     frame.wait("the menu closed by a click away", &format!("{CLIP} === ''"));
@@ -2726,20 +2930,20 @@ fn a_plan_closes_and_a_new_session_starts() {
     terminal_input(&mut frame);
 
     // + New's picker: what the mirror names, started in a scratch folder, on the Ungrouped tab.
-    page.click((1388.5, 16.0));
+    page.click((1430.0, 16.0));
     keep(&mut page, "wide-new-session");
     page.click((700.6, 545.0));
     keep(&mut page, "wide-new-session-cancelled");
     assert_eq!(host.lock().unwrap().board.sessions.len(), 2, "Cancel starts nothing");
     // Refused: it says why, and the page stays on the plan.
-    page.click((1388.5, 16.0));
+    page.click((1430.0, 16.0));
     thread::sleep(Duration::from_millis(400));
     host.lock().unwrap().refuse_next = Some(WireError::new(ErrorCode::NotFound, "no agent claude is configured"));
     page.click((640.0, 545.0));
     wait_host(&host, "the refusal used", |h| h.refuse_next.is_none());
     keep(&mut page, "wide-new-session-refused");
     assert_eq!(host.lock().unwrap().board.sessions.len(), 2);
-    page.click((1388.5, 16.0));
+    page.click((1430.0, 16.0));
     thread::sleep(Duration::from_millis(400));
     page.click((640.0, 545.0));
     wait_host(&host, "a new session", |h| h.board.sessions.iter().any(|s| s.id.starts_with("new-")));

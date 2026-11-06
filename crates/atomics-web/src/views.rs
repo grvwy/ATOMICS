@@ -1,18 +1,18 @@
-//! The frame's screens, drawn by atomics-ui over the remote backend in one of two layouts ([`crate::layout`]):
+//! The frame's screens, drawn by atomics-ui over the remote backend in one of two shells ([`crate::layout`]):
 //!
-//! - **Wide**: the desktop's own window, `atomics_ui::shell::frame`, through [`Web`], this page's
-//!   `Platform`: the top bar, the sidebar, the tiled terminals, the board or a diff in the right panel and the
-//!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials,
-//!   GitHub) are hooks this page leaves empty; its connection's state, the ticket sign-in while the host needs
-//!   one, the host's workspace and the layout menu take the top bar's last slots, connection trouble a line
-//!   under the frame, and what the page has to say, why a command failed above all, a note under the top bar
-//!   that a click dismisses.
-//! - **Phone**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
+//! - **The frame**, on a computer and a tablet: the desktop's own window, `atomics_ui::shell::frame`, through [`Web`], this
+//!   page's `Platform`: the top bar, the sidebar, the tiled terminals, the board or a diff in the right panel and the
+//!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials, GitHub) are
+//!   hooks this page leaves empty; its connection's state, the ticket sign-in while the host needs one and the host's
+//!   workspace take the top bar's last slots, connection trouble a line under the frame, and what the page has to say,
+//!   why a command failed above all, a note under the top bar that a click dismisses. A tablet draws it with a finger's
+//!   sizes inside the part of the screen the user sees, the sidebar becoming a drawer where it does not fit.
+//! - **The phone's shell**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
 //!   current plan's board under a picker of the others, the approval banners, a worktree's diff panel, an
 //!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
 //!   sees, in the phone's look ([`Looks`]): the theme's colours with proportional UI text, zoomed, spaced for a
-//!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]). Its top bar's ⋯ menu has the layout and
-//!   the host's workspace, account usage and load.
+//!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]). Its top bar's ⋯ menu has the host's workspace,
+//!   account usage and load.
 //!
 //! Terminals are drawn by [`TermPane`]s through [`Terminals`]. After each piece of the frame, what the user
 //! asked for in it is carried out: a view command here, on the page's [`Desk`], any other through the
@@ -45,7 +45,7 @@ use crate::desk::{self, Desk};
 use crate::dialogs::{self, Picker};
 use crate::driver::{Driver, Status};
 use crate::gesture::TAP_SLOP;
-use crate::layout::{self, LayoutMode, Viewport};
+use crate::layout::{self, Viewport};
 use crate::remote::RemoteBackend;
 use crate::term_pane::{TermInput, TermPane, Terminals};
 
@@ -87,6 +87,8 @@ impl Tab {
 pub const BAR: [(Tab, &str); 4] =
     [(Tab::Agents, "Agents"), (Tab::Board, "Board"), (Tab::Diffs, "Diffs"), (Tab::Terminal, "Terminal")];
 
+/// How many seconds the line over the pane on screen takes to reach the next.
+const PANE_GLIDE: f32 = 0.14;
 /// How long the wide layout keeps a note of this page's.
 const NOTICE_MS: f64 = 12_000.0;
 /// How far under the window's top the wide layout's note hangs: clear of the top bar.
@@ -120,7 +122,6 @@ pub struct View {
     pub desk: Desk,
     /// The worktree whose diff the phone's Diffs pane shows; the list of worktrees while none.
     pub diff: Option<PathBuf>,
-    pub layout: LayoutMode,
     pub viewport: Viewport,
     /// The terminal the page's input goes to, with the overlay.
     pub term: TermPane,
@@ -137,6 +138,8 @@ pub struct View {
     /// The last frame drew the phone layout.
     pub compact: bool,
     pub looks: Looks,
+    /// The chief's window was given its first place: a finger's first look is not at a window over everything.
+    chief_placed: bool,
     /// A native client's word on where its host's agents run, shown in the top bar ([`Place`]).
     pub place: Option<Place>,
     /// The place's action was clicked this frame; the native client takes it.
@@ -159,7 +162,10 @@ impl View {
         self.tab = tab;
         match tab {
             Tab::Diffs => self.desk.panel = PanelMode::Diff,
-            Tab::Chief => self.desk.chief.open = true,
+            Tab::Chief => {
+                self.desk.chief.open = true;
+                self.chief_placed = true;
+            }
             _ => {}
         }
     }
@@ -174,15 +180,23 @@ impl FontHook for BundledFonts {
     }
 }
 
-/// The theme in each layout's look: as the desktop draws it (monospace UI text where the theme says so), and
+/// How a frame draws: as the desktop does, as a tablet does, the same with controls a finger's size, or as a phone does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Desktop,
+    Tablet,
+    Phone,
+}
+
+/// The theme in each look: as the desktop draws it (monospace UI text where the theme says so), and
 /// on a phone with proportional UI text (monospace stays for code, terminals and IDs), zoomed by
 /// [`layout::ZOOM`] through the theme's UI size, with controls a finger's size and room between them.
 pub struct Looks {
     tokens: ThemeTokens,
     pub desktop: Arc<Palette>,
     pub phone: Arc<Palette>,
-    /// The look egui has: the phone's (`true`) or the desktop's; `None` until a frame gives it one.
-    applied: Option<bool>,
+    /// The look egui has; `None` until a frame gives it one.
+    applied: Option<Look>,
 }
 
 impl Looks {
@@ -198,21 +212,27 @@ impl Looks {
         }
     }
 
-    /// Give egui and the client the look of the layout this frame draws. A change discards the frame, and
+    /// Give egui and the client the look this frame draws in. A change discards the frame, and
     /// egui draws it again at the look's zoom.
-    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, compact: bool) {
-        client.touch = compact.then_some(Touch { target: layout::TOUCH, gutter: layout::GUTTER });
-        if self.applied == Some(compact) {
+    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, look: Look) {
+        client.touch = match look {
+            Look::Desktop => None,
+            Look::Tablet => Some(Touch { target: layout::TABLET_TOUCH, gutter: layout::TABLET_GUTTER, stack: false }),
+            Look::Phone => Some(Touch { target: layout::TOUCH, gutter: layout::GUTTER, stack: true }),
+        };
+        if self.applied == Some(look) {
             return;
         }
-        let palette = if compact { &self.phone } else { &self.desktop };
+        let palette = if look == Look::Phone { &self.phone } else { &self.desktop };
         palette.apply(ctx, &BundledFonts);
-        if compact {
-            ctx.all_styles_mut(phone_style);
+        match look {
+            Look::Desktop => {}
+            Look::Tablet => ctx.all_styles_mut(tablet_style),
+            Look::Phone => ctx.all_styles_mut(phone_style),
         }
         client.palette = palette.clone();
-        self.applied = Some(compact);
-        ctx.request_discard("the layout changed");
+        self.applied = Some(look);
+        ctx.request_discard("the look changed");
     }
 }
 
@@ -223,8 +243,9 @@ impl Default for Looks {
     }
 }
 
-/// The phone's spacing and text sizes, in its zoomed points.
+/// The phone's spacing and text sizes, in its zoomed points. A finger's press on text scrolls what it is in.
 fn phone_style(style: &mut egui::Style) {
+    style.interaction.selectable_labels = false;
     let spacing = &mut style.spacing;
     spacing.interact_size = vec2(layout::TOUCH, layout::TOUCH);
     spacing.button_padding = vec2(10.0, 4.0);
@@ -240,6 +261,16 @@ fn phone_style(style: &mut egui::Style) {
     }
 }
 
+/// A tablet's spacing: the desktop's text, with controls a finger's size. A finger's press on text scrolls what it is in.
+fn tablet_style(style: &mut egui::Style) {
+    style.interaction.selectable_labels = false;
+    let spacing = &mut style.spacing;
+    spacing.interact_size.y = layout::TABLET_TOUCH;
+    spacing.button_padding = vec2(10.0, 4.0);
+    spacing.item_spacing = vec2(8.0, 6.0);
+    spacing.menu_margin = egui::Margin::same(6);
+}
+
 /// Look as the hosting page does: its theme, or a built-in one of its scheme, from the next frame on.
 pub fn apply_theme(view: &mut View, boot: &Boot) {
     view.looks = Looks::new(&boot.theme_tokens());
@@ -253,16 +284,26 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
         view.term.let_go();
     }
     let screen = ui.max_rect();
-    // The layout follows the page's width in CSS pixels, which the phone's zoom leaves as they are.
-    view.compact = layout::compact(screen.width() * ui.ctx().zoom_factor(), view.viewport.coarse, view.layout);
+    // The shell follows the page's size in CSS pixels, which the phone's zoom leaves as they are.
+    let zoom = ui.ctx().zoom_factor();
+    view.compact = layout::compact(screen.width() * zoom, screen.height() * zoom, &view.viewport);
     if let Some(info) = driver.remote.management()
         && let Ok(tokens) = serde_json::from_value::<ThemeTokens>(info.config["theme_tokens"].clone())
         && tokens != view.looks.tokens
     {
         view.looks = Looks::new(&tokens);
     }
-    view.looks.apply(ui.ctx(), client, view.compact);
+    let look = if view.compact {
+        Look::Phone
+    } else if view.viewport.coarse {
+        Look::Tablet
+    } else {
+        Look::Desktop
+    };
+    view.looks.apply(ui.ctx(), client, look);
     view.term.touch = client.touch;
+    client.typing = client.touch.is_some() && view.term.typing();
+    client.reduce_motion = view.viewport.reduce_motion;
     click_distance(ui.ctx(), view.viewport.coarse);
     sync(ui.ctx(), driver, client, view);
     window_keys(ui.ctx(), driver, client, view);
@@ -283,6 +324,26 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     driver.flush();
     atomics_ui::panel_nav::settle_focus(ui.ctx());
     view.text_boxes = text_boxes(ui.ctx(), view.viewport.coarse);
+}
+
+/// What a soft keyboard, a notch and the key bar cover, for what egui places itself: windows, menus and dialogs. A mouse's
+/// screen has none of them.
+pub fn safe_area(view: &View, screen: Rect, zoom: f32) -> egui::SafeAreaInsets {
+    if !view.viewport.coarse {
+        return egui::SafeAreaInsets::default();
+    }
+    let inner = layout::frame_rect(screen, &view.viewport.points(zoom), key_bar_up(view));
+    egui::SafeAreaInsets(egui::epaint::MarginF32 {
+        left: inner.left() - screen.left(),
+        right: screen.right() - inner.right(),
+        top: inner.top() - screen.top(),
+        bottom: screen.bottom() - inner.bottom(),
+    })
+}
+
+/// The page's key bar shows, on the keyboard, while the user types in a terminal with a finger.
+fn key_bar_up(view: &View) -> bool {
+    view.term.typing() && view.viewport.keybar > 0.0
 }
 
 /// How far a press may move and still be a click: a finger wobbles on the glass ([`TAP_SLOP`]).
@@ -524,6 +585,13 @@ impl Platform for Web<'_> {
 
     fn laid_out(&mut self, layout: &Grid) {
         self.view.desk.dock_fits = layout.dock_width > 0.0;
+        // Where it cannot sit beside the agents a finger opens it from its pill; a boot that asked for it has it.
+        if self.client.touch.is_some()
+            && !std::mem::replace(&mut self.view.chief_placed, true)
+            && !self.view.desk.dock_fits
+        {
+            self.view.desk.chief.open = false;
+        }
         self.view.desk.diff_fills = layout.diff == DiffPlacement::Full;
     }
 
@@ -538,16 +606,15 @@ impl Platform for Web<'_> {
         self.draw(|backend, client, _| atomics_ui::topbar::workspace_menu(ui, backend, client));
         self.view.place_clicked |= place(ui, self.view.place.as_ref(), &p);
     }
-
-    /// Where the desktop has its Settings: the layout this page draws.
-    fn top_bar_settings(&mut self, ui: &mut egui::Ui) {
-        layout_menu(ui, self.view, |_| {});
-    }
 }
 
 /// Lends `draw` the backend, the client and the page's terminals; a terminal a click picks takes the
 /// page's input next.
 fn typing_target(remote: &RemoteBackend, view: &View) -> Option<String> {
+    // A finger's chief that fills the room is what a tap types in: no other terminal shows.
+    if view.term.touch.is_some() && view.desk.chief.open && !view.desk.dock_fits {
+        return remote.session_list().into_iter().find(|s| s.chief).map(|s| s.id);
+    }
     if view.desk.diff_open
         && view.desk.panel == PanelMode::Editor
         && view.desk.typing_in.is_none()
@@ -716,8 +783,23 @@ fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
     view.desk.apply(command, remote);
 }
 
-/// The wide layout: the desktop's window, or before there is a board the connection's state.
+/// The wide layout: the desktop's window. A touch screen's draws in what the user sees, its bars' colours reaching the
+/// screen's edges under the notch, the home indicator and the key bar.
 fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    if !view.viewport.coarse {
+        return wide_inside(ui, driver, client, view);
+    }
+    let screen = ui.max_rect();
+    let inside = layout::frame_rect(screen, &view.viewport.points(ui.ctx().zoom_factor()), key_bar_up(view));
+    let p = client.palette.clone();
+    ui.painter().rect_filled(screen, 0.0, p.panel);
+    ui.painter().rect_filled(screen.with_max_y(inside.top()), 0.0, p.topbar);
+    let mut frame = ui.new_child(egui::UiBuilder::new().id_salt("frame-inside").max_rect(inside));
+    wide_inside(&mut frame, driver, client, view);
+}
+
+/// The desktop's window, or before there is a board the connection's state.
+fn wide_inside(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
     if waiting_room(driver) {
         let p = client.palette.clone();
         egui::Panel::top("atomics-top")
@@ -733,7 +815,6 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                     }
                     // Nothing beside the brand but the connection: where agents run goes right.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        layout_menu(ui, view, |_| {});
                         view.place_clicked |= place(ui, view.place.as_ref(), &p);
                     });
                 });
@@ -816,13 +897,26 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     // switcher stays.
     let typing = view.tab.terminal() && view.term.typing() && view.viewport.keybar > 0.0;
     let regions = layout::regions(screen, &view.viewport.points(ui.ctx().zoom_factor()), typing);
+    view.term.cramped = regions.cramped;
+    // With no board yet there are no panes to go to: what there is to read takes the screen.
+    let bar = regions.bar.filter(|_| !waiting_room(driver));
+    let bottom = match (bar, regions.bar) {
+        (Some(bar), _) => bar.top(),
+        (None, Some(hidden)) => hidden.bottom(),
+        (None, None) => regions.body.bottom(),
+    };
+    let body = regions.body.with_max_y(bottom);
     // The bars' colour reaches the screen's edges, under the notch and the home indicator.
     let top = Rect::from_x_y_ranges(screen.x_range(), screen.top()..=regions.top.bottom());
     ui.painter().rect_filled(top, 0.0, p.topbar);
-    region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| phone_top(ui, driver, client, view));
-    region(ui, regions.body, "phone-body", |ui| phone_body(ui, driver, client, view));
+    if !regions.cramped {
+        region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| {
+            phone_top(ui, driver, client, view)
+        });
+    }
+    region(ui, body, "phone-body", |ui| phone_body(ui, driver, client, view));
     ui.painter().hline(screen.x_range(), top.bottom() - 0.5, Stroke::new(1.0, p.separator));
-    if let Some(bar) = regions.bar {
+    if let Some(bar) = bar {
         pane_bar(ui, bar, screen, driver, view, &p);
     }
     if let Some(keys) = regions.keybar {
@@ -831,7 +925,7 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
 }
 
 /// The phone's top bar: the name and the connection on the left, the chief's pill in the middle, as on the
-/// desktop, and the approvals and the ⋯ menu (the layout and the host's workspace) on the right: a phone's top
+/// desktop, and the approvals and the ⋯ menu (the host's workspace and more) on the right: a phone's top
 /// bar has no room for the wide layout's items. A tap on the pill opens the chief's pane, and another goes back
 /// to the pane before it.
 fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
@@ -839,6 +933,14 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     let rect = ui.max_rect();
     let gap = ui.spacing().item_spacing.x;
     let name = RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace();
+    // With no board yet there is no chief to open and no menu to give: the name and how the connection stands.
+    if waiting_room(driver) {
+        let (text, good) = status_line(driver);
+        return topbar::slot(ui, "phone-brand", rect, |ui| {
+            ui.label(name);
+            ui.label(RichText::new(text).color(status_color(good, &p)).size(11.0));
+        });
+    }
     let name_width = topbar::measure(ui, |ui| {
         ui.label(name.clone());
     });
@@ -891,26 +993,34 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
             atomics_ui::update::countdown(ui.ctx(), backend, client);
             // The phone's ⋯ menu also carries the host's usage and governor details.
             let (shown, mut clicked) = (view.place.clone(), false);
-            layout_menu(ui, view, |ui| {
-                atomics_ui::update::top_bar_item(ui, backend, client);
-                atomics_ui::management::buttons(ui, backend, client);
-                if backend.management().is_some() {
-                    ui.menu_button("Project", |ui| atomics_ui::topbar::project_menu(ui, backend, client));
-                }
-                topbar::new_button(ui, true, backend, client);
-                atomics_ui::topbar::workspace_menu(ui, backend, client);
-                if backend.tickets().is_some() && atomics_ui::touch::button(ui, client.touch, "Tickets").clicked() {
-                    client.send(Command::ToggleView(PanelMode::Tickets));
-                    ui.close();
-                }
-                clicked = place(ui, shown.as_ref(), &p);
-                ui.separator();
-                atomics_ui::machine::button(ui, backend, client);
-                if atomics_ui::resources::load(ui, backend, &p, true) {
-                    client.machine_open = !client.machine_open;
-                    ui.close();
-                }
-                atomics_ui::resources::section(ui, backend, &p);
+            let dots = egui::Button::new("⋯").min_size(vec2(layout::TOUCH, layout::TOUCH));
+            egui::containers::menu::MenuButton::from_button(dots).ui(ui, |ui| {
+                // No wider than it has to be, and it scrolls on a phone held sideways.
+                let room = ui.ctx().content_rect();
+                ui.set_max_width((room.width() - 32.0).min(320.0));
+                let height = room.height() - 32.0;
+                let scroll = egui::ScrollArea::vertical().id_salt("phone-menu");
+                scroll.max_height(height).min_scrolled_height(height).show(ui, |ui| {
+                    atomics_ui::update::top_bar_item(ui, backend, client);
+                    atomics_ui::management::buttons(ui, backend, client);
+                    if backend.management().is_some() {
+                        ui.menu_button("Project", |ui| atomics_ui::topbar::project_menu(ui, backend, client));
+                    }
+                    topbar::new_button(ui, true, backend, client);
+                    atomics_ui::topbar::workspace_menu(ui, backend, client);
+                    if backend.tickets().is_some() && atomics_ui::touch::button(ui, client.touch, "Tickets").clicked() {
+                        client.send(Command::ToggleView(PanelMode::Tickets));
+                        ui.close();
+                    }
+                    clicked = place(ui, shown.as_ref(), &p);
+                    ui.separator();
+                    atomics_ui::machine::button(ui, backend, client);
+                    if atomics_ui::resources::load(ui, backend, &p, true) {
+                        client.machine_open = !client.machine_open;
+                        ui.close();
+                    }
+                    atomics_ui::resources::section(ui, backend, &p);
+                });
             });
             view.place_clicked |= clicked;
             if approvals > 0 {
@@ -923,24 +1033,6 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
                 }
             }
         });
-    });
-}
-
-/// "Layout": automatic (from the screen), phone or desktop, then what `more` adds.
-fn layout_menu(ui: &mut egui::Ui, view: &mut View, more: impl FnOnce(&mut egui::Ui)) {
-    let button = egui::Button::new("⋯");
-    let button = if view.compact { button.min_size(vec2(layout::TOUCH, layout::TOUCH)) } else { button };
-    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-        ui.label(RichText::new("Layout").small());
-        for (mode, label) in
-            [(LayoutMode::Auto, "Automatic"), (LayoutMode::Phone, "Phone"), (LayoutMode::Desktop, "Desktop")]
-        {
-            if ui.radio(view.layout == mode, label).clicked() {
-                view.layout = mode;
-                ui.close();
-            }
-        }
-        more(ui);
     });
 }
 
@@ -959,7 +1051,16 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
     // The board and the diff are the view switcher's, with its icons and counts.
     let segments = switcher::segments(&driver.remote, p);
     let segment = |mode: PanelMode| segments.iter().find(|s| s.mode == mode);
-    for ((tab, label), item) in BAR.iter().zip(layout::bar_items(bar, BAR.len())) {
+    // The line over the pane on screen glides to the next one.
+    let items = layout::bar_items(bar, BAR.len());
+    if let Some(item) = BAR.iter().position(|(tab, _)| *tab == view.tab).map(|index| items[index]) {
+        let time = if view.viewport.reduce_motion { 0.0 } else { PANE_GLIDE };
+        let left =
+            ui.ctx().animate_value_with_time(ui.scope_id().with("pane-line"), item.left() + item.width() * 0.25, time);
+        let line = Rect::from_min_size(pos2(left, item.top()), vec2(item.width() * 0.5, 2.0));
+        ui.painter().rect_filled(line, 1.0, p.accent);
+    }
+    for ((tab, label), item) in BAR.iter().zip(items) {
         let response = ui.interact(item, ui.scope_id().with(("pane", label)), Sense::click());
         let active = view.tab == *tab;
         let color = if active {
@@ -969,10 +1070,8 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
         } else {
             p.muted
         };
-        if active {
-            let line =
-                Rect::from_min_size(item.left_top() + vec2(item.width() * 0.25, 0.0), vec2(item.width() * 0.5, 2.0));
-            ui.painter().rect_filled(line, 1.0, p.accent);
+        if response.is_pointer_button_down_on() {
+            ui.painter().rect_filled(item, 0.0, p.hover());
         }
         let galley = ui.painter().layout_no_wrap(label.to_string(), p.ui(12.0), color);
         let at = item.center() + vec2(-galley.size().x / 2.0, 1.0);
@@ -1285,6 +1384,9 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
     let active = view.desk.active.as_deref();
     let index = agents.iter().copied().find(|&i| Some(sessions[i].id.as_str()) == active).unwrap_or(first);
     view.target = Some(sessions[index].id.clone());
+    if view.term.cramped {
+        return terminal_alone(ui, driver, client, view, index, &sessions[index].id);
+    }
     let grid = Grid {
         sidebar: false,
         dock_width: 0.0,
@@ -1311,12 +1413,34 @@ fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
         }
         return;
     };
-    view.target = Some(chief.id);
+    view.target = Some(chief.id.clone());
+    if view.term.cramped {
+        let index = driver.remote.session_list().iter().position(|s| s.chief).unwrap_or_default();
+        return terminal_alone(ui, driver, client, view, index, &chief.id);
+    }
     fill(ui, |ui, rect| {
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("chief").max_rect(rect));
         lend(driver, client, view, |backend, client, terminals| {
             chief::draw(&mut child, backend, client, terminals);
         });
+    });
+}
+
+/// A terminal with nothing around it, for when a keyboard leaves no room for its header.
+fn terminal_alone(
+    ui: &mut egui::Ui,
+    driver: &Driver,
+    client: &mut Client,
+    view: &mut View,
+    index: usize,
+    session: &str,
+) {
+    fill(ui, |ui, rect| {
+        lend(driver, client, view, |backend, client, terminals| {
+            let p = client.palette.clone();
+            let metrics = atomics_ui::terminal::Metrics::new(ui, &p, backend.ui_config().font.size);
+            terminals.show(ui, index, session, rect, egui::Id::NULL.with(("alone", session)), &metrics, &p);
+        })
     });
 }
 

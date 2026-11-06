@@ -58,8 +58,9 @@ pub const MIN_FONT: f32 = 5.0;
 pub const MAX_FONT: f32 = 28.0;
 const FIT_MIN: f32 = 7.0;
 const FIT_MAX: f32 = 14.0;
-/// On a phone the fitted font stays readable: a wider grid pans instead.
+/// For a finger the fitted font stays readable: a wider grid pans instead.
 const PHONE_FIT_MIN: f32 = 13.0;
+const TABLET_FIT_MIN: f32 = 11.0;
 /// Space between the pane's edge and the cells; on a phone the cells keep to the screen's gutter.
 const PAD: f32 = 4.0;
 /// How often the lease is renewed while the user stays at the terminal without typing, or while its size is in force.
@@ -172,8 +173,10 @@ pub struct TermPane {
     pub overlay: Overlay,
     /// This frame drew a terminal.
     drawn: bool,
-    /// The phone layout's measures while it draws, set by the views each frame.
+    /// A finger's measures, set by the views each frame.
     pub touch: Option<Touch>,
+    /// A keyboard leaves so little that nothing but the cells shows, set by the views each frame.
+    pub cramped: bool,
     /// The desktop's terminal font size where this client gives the terminal its pane's size, set by the views
     /// each frame; `None` shows the host's grid as it is.
     pub fit: Option<f32>,
@@ -217,6 +220,7 @@ impl Default for TermPane {
             overlay: Overlay::default(),
             drawn: false,
             touch: None,
+            cramped: false,
             fit: None,
             sized: false,
             blur_next: false,
@@ -455,7 +459,7 @@ impl TermPane {
 
     /// The strip over the terminal the input goes to, which says who types.
     fn header_height(&self) -> f32 {
-        self.touch.map_or(24.0, |touch| touch.target + 8.0)
+        if self.cramped { 0.0 } else { self.touch.map_or(24.0, |touch| touch.target + 8.0) }
     }
 
     /// Where this client gives the terminal its size ([`TermPane::fit`]): the grid the pane holds, whenever that
@@ -499,8 +503,11 @@ impl TermPane {
         let mut child =
             ui.new_child(egui::UiBuilder::new().id_salt(("term-header", session)).max_rect(header.shrink2(margin)));
         let nudged = now_ms < self.nudged_until;
-        let buttons =
-            child.horizontal_centered(|ui| self.header(ui, &lease, may_type, live, nudged, p, &mut actions)).inner;
+        let buttons = if height > 0.0 {
+            child.horizontal_centered(|ui| self.header(ui, &lease, may_type, live, nudged, p, &mut actions)).inner
+        } else {
+            header.right()
+        };
         if nudged {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis((self.nudged_until - now_ms) as u64 + 1));
         }
@@ -613,7 +620,7 @@ impl TermPane {
             blur: lost || std::mem::take(&mut self.blur_next) || (self.focused && !(writable && typing)),
             focus: std::mem::take(&mut self.focus_next) && writable,
             editor: remote.editors().iter().any(|e| e.terminal == session),
-            strip: (self.touch.is_some() && writable).then(|| header.with_max_x(buttons)),
+            strip: (self.touch.is_some() && writable && !self.cramped).then(|| header.with_max_x(buttons)),
         };
         if self.overlay.blur {
             self.focused = false;
@@ -707,7 +714,7 @@ impl TermPane {
         let (cols, rows, first, cursor_row, oldest) = remote
             .with_screen(session, |s| s.map(|(s, _)| (s.cols, s.rows, s.first_line, s.cursor.row, s.oldest_line())))?;
         let (pad, fit_min) = match self.touch {
-            Some(touch) => (vec2(touch.gutter, 8.0), PHONE_FIT_MIN),
+            Some(touch) => (vec2(touch.gutter, 8.0), if touch.stack { PHONE_FIT_MIN } else { TABLET_FIT_MIN }),
             None => (vec2(PAD, PAD), FIT_MIN),
         };
         let ratio = ui.fonts_mut(|f| f.glyph_width(&p.mono(100.0), 'M')) / 100.0;

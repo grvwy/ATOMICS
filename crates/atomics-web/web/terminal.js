@@ -14,10 +14,11 @@ const NAMED = new Set([
 const SLOP = 12;
 const TAP_MS = 450;
 const CLICK_MS = 800;
+// With less of the screen than this in view, on a phone held sideways, the key bar keeps to one row that scrolls.
+const SHORT = 420;
 // The field is never empty, because a soft keyboard's Backspace needs something to delete: some raise no event at all
 // in an empty field. This character is never typed, and stays before the caret.
 const KEEP = "\u200b";
-const LAYOUT_KEY = "atomics.layout";
 const VIEW_KEY = "atomics.view";
 
 let report = null;
@@ -39,6 +40,7 @@ let quiet = false;
 // The pointers over the terminal the app was told are down.
 const down = new Set();
 const coarse = matchMedia("(pointer: coarse)");
+const calm = matchMedia("(prefers-reduced-motion: reduce)");
 const vv = window.visualViewport;
 
 // A microtask, so an event raised while the app runs never re-enters it.
@@ -65,7 +67,11 @@ function toCanvas() {
 // Ctrl+1 to 9 keeps them from the browser's tabs. Capture comes first, so nothing on the page sees them too. The app
 // decides what they do.
 function windowKeys(e) {
-  if (e.ctrlKey || e.metaKey || e.altKey) hardKeyboard = true;
+  if ((e.ctrlKey || e.metaKey || e.altKey) && !hardKeyboard) {
+    // It has these keys, and the key bar has no more to give.
+    hardKeyboard = true;
+    if (bar) showBar(false);
+  }
   if (composing || e.isComposing) return;
   const digit = agentDigit(e);
   if (digit) {
@@ -107,6 +113,10 @@ function emptyField() {
   if (document.activeElement === ta) ta.setSelectionRange(1, 1);
 }
 
+// Whether a soft keyboard plainly takes part of the screen. Where it shrinks the page too, or the page is in a frame,
+// this does not see it.
+const softKeyboardUp = () => vv !== undefined && vv !== null && innerHeight - vv.height > 120;
+
 // A finger asks to type: this has to run in the touch's own handler, or iOS opens no keyboard. A field that kept the
 // focus while the keyboard was put away takes it again, quietly: focus alone would do nothing, and neither the lease
 // nor the key bar changes. Where the keyboard is plainly up, nothing moves, and a word under way stays.
@@ -116,8 +126,7 @@ function openKeyboard() {
     ta.focus({ preventScroll: true });
     return;
   }
-  const keyboardUp = vv && innerHeight - vv.height > 120;
-  if (composing || keyboardUp) return;
+  if (composing || softKeyboardUp()) return;
   quiet = true;
   try {
     ta.blur();
@@ -165,7 +174,8 @@ function viewport() {
     ? { x: vv.offsetLeft, y: vv.offsetTop, w: vv.width, h: vv.height, scale: vv.scale }
     : { x: 0, y: 0, w: innerWidth, h: innerHeight, scale: 1 };
   send({
-    kind: "viewport", ...view, coarse: coarse.matches, keybar,
+    kind: "viewport", ...view, coarse: coarse.matches, keybar, screenShort: Math.min(screen.width, screen.height),
+    calm: calm.matches,
     insetTop: insets ? px(insets.paddingTop) : 0, insetBottom: insets ? px(insets.paddingBottom) : 0,
     insetLeft: insets ? px(insets.paddingLeft) : 0, insetRight: insets ? px(insets.paddingRight) : 0,
   });
@@ -174,6 +184,7 @@ function viewport() {
 // The key bar on the visual viewport's bottom edge, at a constant size even when the page is zoomed.
 function placeBar() {
   if (!bar || bar.hidden) return;
+  bar.classList.toggle("one-row", (vv ? vv.height : innerHeight) < SHORT);
   const s = vv ? vv.scale : 1;
   const [left, top, width, height] = vv ? [vv.offsetLeft, vv.offsetTop, vv.width, vv.height] : [0, 0, innerWidth, innerHeight];
   bar.style.width = width * s + "px";
@@ -182,7 +193,7 @@ function placeBar() {
 }
 
 function showBar(on) {
-  const show = on && writable && coarse.matches;
+  const show = on && writable && coarse.matches && !hardKeyboard;
   if (bar.hidden === !show) return;
   bar.hidden = !show;
   placeBar();
@@ -432,13 +443,22 @@ export function install(keys, command, callback) {
   chip.hidden = true;
   noFocus(chip, copy);
   document.body.append(chip);
-  const changed = () => { placeBar(); viewport(); };
+  const changed = () => {
+    // The soft keyboard came up after all, so its bar is wanted again.
+    if (hardKeyboard && softKeyboardUp()) {
+      hardKeyboard = false;
+      if (document.activeElement === ta) showBar(true);
+    }
+    placeBar();
+    viewport();
+  };
   if (vv) {
     vv.addEventListener("resize", changed);
     vv.addEventListener("scroll", changed);
   }
   addEventListener("resize", changed);
   coarse.addEventListener("change", changed);
+  calm.addEventListener("change", changed);
   viewport();
 }
 
@@ -525,15 +545,6 @@ export function setTheme(colors) {
   for (const [name, value] of Object.entries(JSON.parse(colors))) {
     document.documentElement.style.setProperty(`--atomics-${name}`, value);
   }
-}
-
-/** The layout the user chose on this browser, if any. */
-export function loadLayout() {
-  try { return localStorage.getItem(LAYOUT_KEY) || ""; } catch (_) { return ""; }
-}
-
-export function saveLayout(name) {
-  try { localStorage.setItem(LAYOUT_KEY, name); } catch (_) { /* a browser that keeps nothing */ }
 }
 
 /** The view (board or diff) the switcher last showed on this browser, if any. */

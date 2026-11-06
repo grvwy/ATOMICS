@@ -295,21 +295,23 @@ pub fn dock(ui: &mut egui::Ui, width: f32, palette: &Palette, add_contents: impl
 
 /// The floating chief: a window over the agents, at first half the screen wide and two thirds high in its
 /// middle, with `add_contents` ([`content`]) in it.
-pub fn window(ctx: &egui::Context, palette: &Palette, add_contents: impl FnOnce(&mut egui::Ui)) {
+pub fn window(ctx: &egui::Context, palette: &Palette, fills: Option<Rect>, add_contents: impl FnOnce(&mut egui::Ui)) {
     let screen = ctx.content_rect();
-    egui::Window::new("CHIEF AGENT")
-        .id(egui::Id::NULL.with("chief-window"))
-        .title_bar(false)
-        .resizable(true)
-        .default_size(vec2(screen.width() * 0.5, screen.height() * 0.66))
-        .default_pos(screen.center())
-        .pivot(egui::Align2::CENTER_CENTER)
-        .frame(
-            egui::Frame::window(&ctx.global_style())
-                .fill(palette.terminal)
-                .stroke(Stroke::new(1.5, palette.accent.gamma_multiply(0.8))),
-        )
-        .show(ctx, add_contents);
+    let window = egui::Window::new("CHIEF AGENT").id(egui::Id::NULL.with("chief-window")).title_bar(false).frame(
+        egui::Frame::window(&ctx.global_style())
+            .fill(palette.terminal)
+            .stroke(Stroke::new(1.5, palette.accent.gamma_multiply(0.8))),
+    );
+    // A finger has no use for a window to drag about: it takes the room it is given.
+    let window = match fills {
+        Some(rect) => window.resizable(false).fixed_rect(rect),
+        None => window
+            .resizable(true)
+            .default_size(vec2(screen.width() * 0.5, screen.height() * 0.66))
+            .default_pos(screen.center())
+            .pivot(egui::Align2::CENTER_CENTER),
+    };
+    window.show(ctx, add_contents);
 }
 
 /// The chief's header, terminal and shared trace lane. Nothing is drawn without a chief.
@@ -340,7 +342,9 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
             } else {
                 ("Float", "Float the chief in a window over the agents")
             };
-            if backend.available(&Command::SetChiefDock(chief.dock))
+            // A finger's chief sits beside the agents where it fits, and takes the room where it does not.
+            if touch.is_none()
+                && backend.available(&Command::SetChiefDock(chief.dock))
                 && touch::button(ui, touch, label).on_hover_text(hover).clicked()
             {
                 client.send(Command::SetChiefDock(if chief.dock == ChiefDock::Floating {

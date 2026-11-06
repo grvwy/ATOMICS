@@ -80,6 +80,7 @@ pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool
         if backend.machine_available() { format!("{details}\nClick to open Machine") } else { details.clone() },
     );
     crate::topbar::record_item(ui, "load", &response);
+    let response = if backend.machine_available() { crate::touch::reach(ui, response) } else { response };
     if in_menu {
         ui.label(RichText::new(details).font(p.ui(10.5)).color(p.muted));
     }

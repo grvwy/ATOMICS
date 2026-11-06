@@ -1209,8 +1209,7 @@ plan tabs and the chief's pill, the sidebar where the window has room for it, th
 headers and approval banners, the steer bar, the board or a worktree's diff in the right panel, and the chief docked
 (at first) or floating. The items only a host has (Settings, sandboxes, credentials, GitHub, the load gauge, USAGE,
 Project) are hooks the browser leaves empty; the connection's state takes the place of the desktop's Remote item,
-followed in the same hook by the shared sign-in and Workspace items the host's state gives, and the ⋯ layout menu
-that of Settings. What the desktop keeps in its
+followed in the same hook by the shared sign-in and Workspace items the host's state gives. What the desktop keeps in its
 host's model about its window (the tab, the active session, the right panel, the chief's window) the browser keeps
 per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view commands; the tabs are the plans'
 and Ungrouped, and a page opens as the desktop does, on the first open plan's with its board beside the agents, and
@@ -1220,8 +1219,8 @@ moves over it, focused, and lets go of the lease of the terminal it left. A chie
 the chief's terminal, and connection trouble (why the page stopped, or that the board may be out of date) stays in
 a line under the frame.
 
-On a phone (narrower than 600 CSS pixels, or 900 with a coarse pointer; the ⋯ menu overrides it, remembered in the
-client origin's `localStorage`), one pane at a time from a bottom bar, each a view of the desktop's: Agents (the
+On a phone (a window narrower than 600 CSS pixels, or a finger on a screen whose short side is: an iPhone stays one in
+both orientations), one pane at a time from a bottom bar, each a view of the desktop's: Agents (the
 sidebar's AGENTS list; a tap opens the agent's tile), Board (the current plan's board under one row to pick plans
 from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History, the one picked
 there joining the strip, which scrolls to it and keeps a tap's width of the plan before it), Diffs (the
@@ -1234,17 +1233,30 @@ controls take the theme's colours as CSS custom properties.
 
 The phone draws the theme's colours zoomed by 1.25 (through the theme's UI size, so code and terminals keep their
 CSS size), with proportional UI text and monospace only for code, terminals and IDs; every control is at least
-44 CSS pixels square and the content keeps a 16 px gutter from the sides. The shared views fit it through
+44 CSS pixels square, a label a finger can tap has a target of that size around it (`touch::reach`), and the content
+keeps a 16 px gutter from the sides. Under a finger text is not selectable, so a press on it scrolls what it is in. With no
+board yet, while pairing or connecting, the shell is the name, the connection's state and what it has to say, with no
+panes to go to. The line over the pane on screen glides to the next one, and the tablet's drawer slides in, unless the
+system asks for reduced motion. The shared views fit it through
 `Client::touch` (`atomics_ui::touch`), which the desktop never sets: the board stacks the statuses that have tasks
 with full-width cards under its header and buttons; a tile fills the pane to its sides with a finger-sized header;
 the diff header stacks the title, then the branch and counts, then its buttons in a row that wraps with Close last,
 and the diff shows one side, numbers each line once and wraps long lines under their indent, measured by the
-glyphs they are drawn with, so wide characters never run past the screen (**Wrap** turns that off); approval
-banners span the screen.
+glyphs they are drawn with, so wide characters never run past the screen (**Wrap** turns that off); a comment box stays
+in sight as it opens and as a keyboard comes up for it; approval banners span the screen.
+
+A tablet (a finger on any larger screen, an iPad in both orientations) gets the desktop's frame, so nothing but the phone
+has a shell of its own. It keeps the desktop's text and look at 1 point a CSS pixel, with every control 44 CSS pixels
+tall (`Touch::stack` false: what sits side by side stays so), and draws inside what the user sees, above the key bar;
+windows, menus and dialogs keep to the same part of the screen, through egui's safe-area insets. The sidebar opens as a
+drawer from the top bar where it does not fit, closing on a tap beside it or on going somewhere from it. The chief starts
+closed unless it fits beside the agents, and where it does not, its pill opens it over the area under the top bar. While
+a finger types, a keyboard that leaves room for only one of the panel and the terminal hides the panel, since a hidden
+terminal would take the keyboard with it. A mouse at any size draws as the desktop does.
 
 **Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and
 the history kept for it freed. Its cells are the desktop's grid, drawn by the shared painter: the font fits the
-width until the user pinches, on a phone never below 13 px, a wider grid pans, a grid taller than the pane keeps
+width until the user pinches, on a phone never below 13 px and on a tablet 11, a wider grid pans, a grid taller than the pane keeps
 the cursor in view, and the screen's own background fills the pane below a shorter one. Looking never resizes the
 PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
 desktop, and lasts as long as the lease (**Computer's size** gives it back early), so the keyboard moving to a text
@@ -1270,7 +1282,10 @@ button takes the keyboard off it, and without the renew the host ended the lease
   which open a comment box. The page focuses eframe's input in that touch, and the app's own click follows.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
   while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
-  safe area's sides, and takes the bottom bar's place. Its keys are at least 44 CSS pixels each way (a screen
+  safe area's sides, and takes the bottom bar's place. A key pressed with a modifier means a real keyboard is there, and
+  the bar goes until a soft keyboard comes up. With under 420 CSS pixels of the screen in view, on a phone held sideways,
+  its keys keep to one row that scrolls; and where a keyboard leaves under 240 for the phone's body, only the terminal
+  shows, with no top bar, header or strip, until the typing ends. Its keys are at least 44 CSS pixels each way (a screen
   narrower than 375 scrolls a row) and never take the focus; Paste reads the clipboard on the touch's end.
 - **Touch and mouse.** A finger may wobble 12 CSS pixels and still tap, on a terminal and on any other control (a
   mouse keeps its 6 points to click and 8 to select). A tap clicks the cell (press and release) where the program

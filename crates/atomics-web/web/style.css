@@ -3,6 +3,9 @@ body {
   margin: 0;
   height: 100%;
   overflow: hidden;
+  /* An installed app's page does not bounce or take a finger's scroll: everything in it is the app's. */
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
   background: #1f1e1d;
   color: #d8d4cc;
   /* The app selects terminal text itself (a long press, its handles, Copy); the browser's own selection
@@ -122,6 +125,28 @@ body {
 
 #atomics-keybar button.wide {
   flex: 2 0 90px;
+}
+
+/* A phone held sideways: every key on one row, which scrolls. */
+#atomics-keybar.one-row {
+  flex-direction: row;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+#atomics-keybar.one-row::-webkit-scrollbar {
+  display: none;
+}
+
+#atomics-keybar.one-row .atomics-keyrow {
+  flex: none;
+  overflow: visible;
+}
+
+#atomics-keybar.one-row button,
+#atomics-keybar.one-row button.wide {
+  flex: 0 0 auto;
+  min-width: 52px;
 }
 
 #atomics-keybar button.on {

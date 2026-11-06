@@ -42,6 +42,8 @@ pub struct DiffState {
     pub focused: Option<String>,
     /// Long lines run on to the right, to scroll to, where a phone would wrap them.
     pub unwrapped: bool,
+    /// How tall the rows' view was in the last frame: a soft keyboard coming up shrinks it.
+    view_height: Option<f32>,
 }
 
 /// Where the view stands in the diff, by file path and line: rows come and go above it as the worktree changes.
@@ -350,7 +352,7 @@ pub struct Header<'a> {
     pub can_send: bool,
     pub split: DiffSplit,
     pub editor_shortcut: &'a str,
-    /// A phone: the header stacks, a side shows at a time and long lines wrap ([`crate::touch`]).
+    /// A finger's sizes; on a phone the header stacks, a side shows at a time and long lines wrap ([`crate::touch`]).
     pub touch: Option<Touch>,
     /// A click on a line starts a review comment, a click on one deletes it, and Send review shows. Without it a
     /// comment box already open keeps its draft: Enter waits until it can go.
@@ -377,13 +379,14 @@ pub fn show(
     crate::panel_nav::focusable(ui, rect);
     let mut action = DiffAction::None;
     let touch = header.touch;
-    let mut split = header.split.split(rect.width()) && touch.is_none();
+    let stacked = touch::stacks(touch);
+    let mut split = header.split.split(rect.width()) && !stacked;
     ui.painter().rect_filled(rect, 0.0, palette.background);
     let margin = touch.map_or(vec2(10.0, 6.0), |touch| vec2(touch.gutter, 6.0));
     let mut panel = ui.new_child(egui::UiBuilder::new().id_salt("diff-panel").max_rect(rect.shrink2(margin)));
     let ui = &mut panel;
 
-    if touch.is_none() {
+    if !stacked {
         ui.horizontal(|ui| {
             // The buttons first: the title and the branch shorten into what they leave, and never run under them.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -440,10 +443,10 @@ pub fn show(
     };
     let diff = &prepared.diff;
 
-    if touch.is_none() {
+    if !stacked {
         ui.horizontal(|ui| {
             counts(ui, &prepared, state.error.as_deref(), palette);
-            diff_buttons(ui, state, diff, &mut split, None, &mut action);
+            diff_buttons(ui, state, diff, &mut split, touch, &mut action);
         });
     }
     ui.add_space(4.0);
@@ -459,14 +462,14 @@ pub fn show(
     let view = ui.available_rect_before_wrap();
     // A phone numbers each line once, as wide as the diff's highest number, and wraps long lines to the screen
     // unless the user turned that off.
-    let digits = touch.map(|_| {
+    let digits = stacked.then(|| {
         let lines = diff.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines);
         let highest = lines.filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
         highest.to_string().len().max(2)
     });
     let gutter = digits.map_or(char_w * 13.0, |digits| char_w * (digits as f32 + 3.0));
     // The width a wrapped row has for code, in points; a row holds at least eight digits.
-    let wrap = (touch.is_some() && !state.unwrapped && !split).then(|| (view.width() - gutter).max(char_w * 8.0));
+    let wrap = (stacked && !state.unwrapped && !split).then(|| (view.width() - gutter).max(char_w * 8.0));
     // How a line wraps there, measured with the glyphs it is drawn with.
     let ctx = ui.ctx().clone();
     let wrapped = |text: &str, width: f32| ctx.fonts_mut(|f| wrapping(text, width, |c| f.glyph_width(font, c)));
@@ -561,6 +564,18 @@ pub fn show(
         let held = state.place.as_ref()?.offset(&diff.files, &file_rows, &rows, row_h);
         ((held - before).abs() >= 0.5).then_some(held)
     });
+    // For a finger a comment box stays in sight as it opens and as the keyboard comes up for it.
+    let height = ui.available_height();
+    let shrunk = state.view_height.replace(height).is_some_and(|last| height < last - 1.0);
+    let opening = state.editor.as_ref().is_some_and(|editor| editor.focus);
+    let comment =
+        rows.iter().position(|row| matches!(row, Row::Editor)).filter(|_| touch.is_some() && (shrunk || opening));
+    let jump = comment
+        .and_then(|row| {
+            let bottom = (row + 1 + editor_room(touch, row_h)) as f32 * row_h;
+            (row as f32 * row_h < before || bottom > before + height).then(|| (bottom - height + row_h).max(0.0))
+        })
+        .or(jump);
     let resized = state.place.as_ref().is_some_and(|place| place.rows != rows.len());
     if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump) {
         scroll = scroll.vertical_scroll_offset(offset);
@@ -824,7 +839,7 @@ fn header_buttons(
 ) {
     let touch = header.touch;
     // Right to left on a desktop, so Close is the header's last button; a phone draws it after the rest.
-    if touch.is_none() {
+    if !touch::stacks(touch) {
         close_button(ui, touch, action);
     }
     if header.refresh && touch::button(ui, touch, "Refresh").on_hover_text("Read the changes again").clicked() {
@@ -919,7 +934,7 @@ fn diff_buttons(
             }
         }
     }
-    if touch.is_some() {
+    if touch::stacks(touch) {
         let wrap = egui::Button::selectable(!state.unwrapped, "Wrap");
         if ui.add(touch::sized(wrap, touch)).on_hover_text("Wrap long lines to the screen").clicked() {
             state.unwrapped = !state.unwrapped;

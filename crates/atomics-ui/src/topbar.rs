@@ -258,7 +258,7 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         .sense(Sense::click()),
     );
     record_item(ui, "notice", &response);
-    if response.on_hover_text(text).clicked()
+    if crate::touch::reach(ui, response).on_hover_text(text).clicked()
         && backend.available(&Command::Activate { session: String::new(), open_diff: true })
         && let Some(session) = sessions.iter().find(|s| s.status.needs_attention())
     {

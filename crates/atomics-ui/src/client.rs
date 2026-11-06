@@ -66,8 +66,16 @@ pub struct Client {
     pub steer_target: SteerTarget,
     /// The steer bar takes the keyboard when it is next drawn.
     pub focus_steer: bool,
-    /// Set while the platform draws for a finger on a small screen; the desktop leaves it `None`.
+    /// Set while the platform draws for a finger; the desktop leaves it `None`.
     pub touch: Option<Touch>,
+    /// The user asked for less motion: what would slide is simply there.
+    pub reduce_motion: bool,
+    /// A finger is typing in a terminal, which stays on screen whatever else wants the room.
+    pub typing: bool,
+    /// The sidebar did not fit in the last frame, and for a finger the top bar opens it as a drawer.
+    pub sidebar_hidden: bool,
+    /// The sidebar is open as a drawer.
+    pub drawer: bool,
     /// The places this window showed before and after the one on screen ([`crate::nav`]).
     pub history: History,
     /// The trace lane's navigation and layout in this client.
@@ -107,6 +115,10 @@ impl Default for Client {
             steer_target: SteerTarget::Active,
             focus_steer: false,
             touch: None,
+            reduce_motion: false,
+            typing: false,
+            sidebar_hidden: false,
+            drawer: false,
             history: History::default(),
             lane: Default::default(),
         }
@@ -116,6 +128,19 @@ impl Default for Client {
 impl Client {
     /// Records what the user asked for; the platform carries it out after the draw.
     pub fn send(&mut self, command: Command) {
+        // Going somewhere from the sidebar's drawer ends it.
+        if matches!(
+            command,
+            Command::Activate { .. }
+                | Command::OpenTaskSession(_)
+                | Command::OpenFile { .. }
+                | Command::Edit { .. }
+                | Command::ShowRoot(_)
+                | Command::ShowPlan(_)
+                | Command::OpenTicket(_)
+        ) {
+            self.drawer = false;
+        }
         self.commands.push(command);
     }
 }
