@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::*;
 use crate::fake_host::{self, WORKTREE};
+use crate::layout::Viewport;
 use crate::term_pane;
 use crate::world::{PARENT, World};
 
@@ -368,8 +369,7 @@ fn the_theme_follows_the_hosting_page() {
     assert_eq!(client.touch.map(|t| t.target), Some(layout::TOUCH));
     assert_eq!(ctx.global_style().spacing.interact_size.y, layout::TOUCH);
     // A desktop's in the desktop's.
-    view.layout = LayoutMode::Desktop;
-    frame(&ctx, &mut world, &mut client, &mut view);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert!(std::sync::Arc::ptr_eq(&client.palette, &view.looks.desktop) && client.touch.is_none());
     assert_eq!(ctx.zoom_factor(), 1.0);
     assert_eq!(Tab::named("approvals"), Tab::Approvals);
@@ -463,7 +463,6 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "Diff",
         "Board 0/2",
         "Connected",
-        "⋯",
         "◆ CHIEF AGENT",
         "TRACE",
         "Float",
@@ -593,17 +592,19 @@ fn a_wide_window_shows_a_diff_and_fetches_only_it() {
 }
 
 #[test]
-fn the_layout_is_the_users_choice_over_the_screens() {
+fn the_shell_follows_the_screen() {
     let (ctx, mut world, mut client, mut view) = live();
     frame(&ctx, &mut world, &mut client, &mut view);
     assert!(view.compact, "a phone's width");
-    view.layout = LayoutMode::Desktop;
-    frame(&ctx, &mut world, &mut client, &mut view);
-    assert!(!view.compact);
-    view.layout = LayoutMode::Auto;
-    view.viewport.coarse = true;
-    frame(&ctx, &mut world, &mut client, &mut view);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    assert!(!view.compact, "a computer's");
+    // A finger on a phone held sideways, and on a tablet upright.
+    view.viewport = Viewport { coarse: true, screen_short: 402.0, ..Viewport::default() };
+    sized(&ctx, &mut world, &mut client, &mut view, (874.0, 402.0), Vec::new());
     assert!(view.compact);
+    view.viewport.screen_short = 820.0;
+    sized(&ctx, &mut world, &mut client, &mut view, (820.0, 1180.0), Vec::new());
+    assert!(!view.compact);
 }
 
 #[test]
@@ -730,8 +731,8 @@ fn a_floating_window_takes_its_part_of_the_input_and_a_click_on_it_goes_to_its_t
 fn a_menu_over_a_terminal_acts_and_a_click_away_closes_it_taking_no_lease() {
     let (ctx, mut world, mut client, mut view) = live();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    let dots = on(&shown, "⋯");
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(dots));
+    let boards = on_bar(&shown, "Parse faster");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(boards));
     let opened = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert_eq!(view.term.overlay.covered, [view.term.overlay.rect.unwrap()]);
     assert_eq!(term_pane::clip_path(view.term.overlay.rect.unwrap(), &view.term.overlay.covered, 1.0), "inset(50%)");
@@ -739,10 +740,12 @@ fn a_menu_over_a_terminal_acts_and_a_click_away_closes_it_taking_no_lease() {
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, click(egui::pos2(800.0, 500.0)));
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(view.term.overlay.covered.is_empty(), "the menu closed: {:?}", view.term.overlay);
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(dots));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(boards));
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    sized(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&opened, "Phone")));
-    assert_eq!(view.layout, LayoutMode::Phone, "the menu acted");
+    let row = opened.iter().find(|(text, rect)| text == "Parse faster" && rect.top() > 34.0).expect("the board's row");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, click(row.1.center()));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(view.term.overlay.covered.is_empty(), "the menu acted, and closed: {:?}", view.term.overlay);
     assert!(!world.sent().iter().any(|m| matches!(m, Message::LeaseAcquire { .. })), "no lease was taken");
 }
 
@@ -1923,7 +1926,10 @@ fn headless_shots() {
     let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&dir).unwrap();
     // The last ones over a host whose ticket system needs the user to sign in again.
-    let shots: [(&str, (f32, f32), Tab, bool); 13] = [
+    let shots: [(&str, (f32, f32), Tab, bool); 16] = [
+        ("phone-402-board", (402.0, 874.0), Tab::Board, false),
+        ("phone-402-agents", (402.0, 874.0), Tab::Agents, false),
+        ("phone-874-sideways", (874.0, 402.0), Tab::Board, false),
         ("wide-2800-explorer", BOARD, Tab::Agents, false),
         ("phone-390-explorer", PHONE, Tab::Agents, false),
         ("phone-360-explorer", (360.0, 780.0), Tab::Agents, false),
@@ -2042,6 +2048,286 @@ fn a_fingers_tap_takes_the_keyboard_on_a_text_box_and_on_a_line_that_opens_one()
         settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     }
     assert_eq!(view.text_boxes, []);
+}
+
+/// A finger on a tablet's screen, as the page says it: all of it visible, nothing in the way yet.
+fn tablet(view: &mut View, (width, height): (f32, f32)) {
+    let visible = Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height));
+    view.viewport =
+        Viewport { visible: Some(visible), coarse: true, screen_short: width.min(height), ..Viewport::default() };
+}
+
+const IPAD: (f32, f32) = (820.0, 1180.0);
+const IPAD_SIDEWAYS: (f32, f32) = (1180.0, 820.0);
+
+#[test]
+fn a_tablet_draws_the_real_frame_with_a_fingers_sizes_either_way_up() {
+    for size in [IPAD, IPAD_SIDEWAYS] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+        tablet(&mut view, size);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!view.compact, "{size:?}");
+        assert_eq!(client.touch.map(|t| (t.target, t.stack)), Some((layout::TABLET_TOUCH, false)), "{size:?}");
+        assert_eq!(ctx.zoom_factor(), 1.0, "{size:?}");
+        assert_eq!(ctx.global_style().spacing.interact_size.y, layout::TABLET_TOUCH, "{size:?}");
+        assert!(Arc::ptr_eq(&client.palette, &view.looks.desktop), "the desktop's look of the theme");
+        assert!(in_bar_of(&shown, "ATOMICS", 54.0), "the frame's top bar: {shown:?}");
+        assert!(!shown.iter().any(|(text, _)| text == "Terminal"), "not the phone's panes: {shown:?}");
+        assert!(view.term.touch.is_some(), "the terminal is a finger's too");
+    }
+
+    // A mouse at the same size draws as it always has, with no drawer to open.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!view.compact && client.touch.is_none());
+    assert_eq!(ctx.global_style().spacing.interact_size.y, atomics_ui::theme::CONTROL_HEIGHT);
+}
+
+/// Whether `label` shows in the top `height` of the window.
+fn in_bar_of(shown: &[(String, Rect)], label: &str, height: f32) -> bool {
+    shown.iter().any(|(text, rect)| text == label && rect.bottom() <= height)
+}
+
+#[test]
+fn a_tablets_frame_and_its_windows_keep_to_what_the_user_sees() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    tablet(&mut view, IPAD);
+    view.viewport.inset_top = 24.0;
+    view.viewport.inset_bottom = 20.0;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!in_bar_of(&shown, "ATOMICS", 24.0), "under the status bar: {shown:?}");
+    assert!(in_bar_of(&shown, "ATOMICS", 24.0 + 54.0), "{shown:?}");
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(IPAD.0, IPAD.1));
+    let safe = safe_area(&view, screen, 1.0);
+    assert_eq!((safe.0.top, safe.0.bottom), (24.0, 20.0));
+
+    // The keyboard comes up with the key bar on it: the terminal and everything else stay above them.
+    view.viewport.visible = Some(screen.with_max_y(800.0));
+    view.viewport.keybar = 92.0;
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(view.term.typing(), "the terminal stays, or the keyboard would go with it: {:?}", view.term.overlay);
+    let bottom = 800.0 - 92.0;
+    assert!(view.term.overlay.rect.is_some_and(|r| r.bottom() <= bottom), "{:?}", view.term.overlay);
+    let under: Vec<_> = shown.iter().filter(|(_, rect)| rect.top() > bottom).collect();
+    assert!(under.is_empty(), "nothing under the key bar: {under:?}");
+    assert_eq!(safe_area(&view, screen, 1.0).0.bottom, 1180.0 - bottom, "nor any window");
+
+    // A mouse's screen has none of it.
+    let (_, _, _, view) = live();
+    assert_eq!(safe_area(&view, screen, 1.0), egui::SafeAreaInsets::default());
+}
+
+#[test]
+fn a_tablets_chief_starts_closed_and_opens_over_the_area_to_type_in_at_once() {
+    for size in [IPAD, IPAD_SIDEWAYS] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+        tablet(&mut view, size);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!view.desk.chief.open, "{size:?}: a first look is at the fleet and the board");
+        assert!(!has(&shown, "◆ CHIEF AGENT"), "{size:?}: {shown:?}");
+        let cells = view.term.overlay.rect.expect("the agent's terminal");
+
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, size, "CHIEF");
+        let shown = if has(&shown, "◆ CHIEF AGENT") {
+            shown
+        } else {
+            settled(&ctx, &mut world, &mut client, &mut view, size)
+        };
+        assert!(view.desk.chief.open && has(&shown, "◆ CHIEF AGENT"), "{size:?}: {shown:?}");
+        assert!(!has(&shown, "Float"), "{size:?}: a finger has no window to float: {shown:?}");
+        // The input is over the chief's terminal, so one tap types there.
+        let over = view.term.overlay.rect.expect("the chief's terminal");
+        assert_ne!(over, cells, "{size:?}");
+        assert_eq!(view.term.session(), Some("chief"), "{size:?}");
+        assert!(view.term.overlay.covered.is_empty(), "{size:?}: {:?}", view.term.overlay);
+        assert!(over.width() > size.0 * 0.9, "{size:?}: it takes the room: {over:?}");
+
+        // Its button closes it, and the input goes back to the agent.
+        click_on(&ctx, &mut world, &mut client, &mut view, size, "Minimize");
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!view.desk.chief.open, "{size:?}");
+        assert_eq!(view.term.session(), Some("s1"), "{size:?}");
+    }
+
+    // A boot that asked for the chief has it.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    tablet(&mut view, IPAD);
+    view.open(Tab::Chief);
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(view.desk.chief.open);
+}
+
+#[test]
+fn where_the_sidebar_does_not_fit_a_finger_opens_it_as_a_drawer() {
+    // The middle of the button that opens it: first in the top bar, a finger's size.
+    let button = egui::pos2(10.0 + layout::TABLET_TOUCH / 2.0, 26.0);
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    tablet(&mut view, IPAD);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(client.sidebar_hidden, "no room for it upright");
+    assert!(!has(&shown, "AGENTS"), "{shown:?}");
+
+    sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(button));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(client.drawer && has(&shown, "AGENTS"), "{shown:?}");
+    assert_eq!(view.term.overlay.covered, [view.term.overlay.rect.unwrap()], "it takes the terminal's pointer");
+
+    // A tap beside it closes it, and reaches nothing under it.
+    let before = world.sent().len();
+    sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(egui::pos2(700.0, 600.0)));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!client.drawer && !has(&shown, "AGENTS"), "{shown:?}");
+    assert!(!world.sent()[before..].iter().any(|m| matches!(m, Message::LeaseAcquire { .. })));
+    assert!(view.term.overlay.covered.is_empty(), "{:?}", view.term.overlay);
+
+    // Picking an agent in it closes it too.
+    sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(button));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    // The last drawn of that name: the tile's lies under the drawer.
+    let row = shown.iter().rfind(|(text, _)| text == "Fix the parser").expect("the agent's row");
+    sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(row.1.center()));
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!client.drawer, "it closed, though that agent was the active one already");
+    assert_eq!(view.desk.active.as_deref(), Some("s1"));
+
+    // A mouse at this size has no such button: a click there is on the brand.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(button));
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!client.drawer && client.touch.is_none());
+}
+
+/// What a finger can tap on this frame that is smaller than `target` either way, named by the text in it.
+fn too_small(ctx: &egui::Context, shown: &[(String, Rect)], target: f32) -> Vec<(String, Rect)> {
+    let screen = ctx.viewport_rect();
+    let tappable: Vec<Rect> = ctx.viewport(|viewport| {
+        let widgets = viewport.prev_pass.widgets.layers().flat_map(|(_, widgets)| widgets.iter());
+        // Clipped away, or scrolled out of the pane.
+        // What only takes a click so the card under it does not act on it offers a finger nothing.
+        let seen = widgets
+            .filter(|w| w.enabled && w.sense.senses_click() && w.sense.is_focusable() && w.interact_rect.is_positive());
+        seen.map(|w| w.rect).collect()
+    });
+    let big = |rect: &Rect| rect.width().min(rect.height()) >= target - 0.5;
+    // A finger's target laid around it, no bigger than it has to be ([`touch::reach`]).
+    let reached = |small: &Rect| {
+        tappable.iter().any(|around| big(around) && around.contains_rect(*small) && around.height() <= target + 0.5)
+    };
+    // A diff's rows are lines of text to read, and a scroll bar or a divider is dragged along its length.
+    let meant = |rect: &Rect| !(rect.width().min(rect.height()) < 26.0 && rect.width().max(rect.height()) > 300.0);
+    let small = tappable.iter().filter(|rect| screen.intersects(**rect) && !big(rect) && !reached(rect) && meant(rect));
+    small
+        .map(|rect| {
+            let named =
+                shown.iter().find(|(_, text)| rect.intersects(*text)).map_or("(no text)", |(name, _)| name.as_str());
+            (named.to_string(), *rect)
+        })
+        .collect()
+}
+
+/// Every pane of the phone, and the tablet's frame, for a finger: a control is 44 CSS pixels each way.
+#[test]
+fn every_control_a_finger_taps_is_a_fingers_size() {
+    let mut small = Vec::new();
+    for host in [fake_host::host, fake_host::working] {
+        for tab in [Tab::Agents, Tab::Board, Tab::Approvals, Tab::Diffs, Tab::Terminal, Tab::Chief] {
+            let (ctx, mut world, mut client, mut view) = live_with(host());
+            view.viewport = Viewport { coarse: true, screen_short: PHONE.0, ..Viewport::default() };
+            view.open(tab);
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+            small.extend(too_small(&ctx, &shown, layout::TOUCH).into_iter().map(|s| (format!("{tab:?}"), s)));
+            if tab == Tab::Diffs {
+                view.diff = Some(PathBuf::from(WORKTREE));
+                for _ in 0..4 {
+                    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+                }
+                let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+                small.extend(too_small(&ctx, &shown, layout::TOUCH).into_iter().map(|s| ("diff".to_string(), s)));
+            }
+        }
+        for size in [IPAD, IPAD_SIDEWAYS] {
+            let (ctx, mut world, mut client, mut view) = live_with(host());
+            tablet(&mut view, size);
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            small.extend(too_small(&ctx, &shown, layout::TABLET_TOUCH).into_iter().map(|s| (format!("{size:?}"), s)));
+        }
+    }
+    small.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+    small.dedup_by(|a, b| a.1.0 == b.1.0);
+    let list: Vec<String> = small
+        .iter()
+        .map(|(where_, (name, rect))| format!("{where_}: {name} {:.0}x{:.0}", rect.width(), rect.height()))
+        .collect();
+    assert!(list.is_empty(), "too small for a finger:\n{}", list.join("\n"));
+}
+
+/// A comment box under the fold, and then under a keyboard: it comes into sight both times.
+#[test]
+fn a_fingers_comment_box_stays_in_sight_as_it_opens_and_as_the_keyboard_comes_up() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    view.viewport = Viewport { coarse: true, screen_short: PHONE.0, ..Viewport::default() };
+    view.tab = Tab::Diffs;
+    view.diff = Some(PathBuf::from(WORKTREE));
+    for _ in 0..4 {
+        settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    let last = *view.text_boxes.last().expect("the diff's lines");
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, click(last.center()));
+    let hint = "Comment for the agent";
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, hint), "the box opened in sight: {:?}", shown.len());
+    // The soft keyboard comes up, and takes the lower half.
+    let height = PHONE.1 * layout::ZOOM;
+    let visible = Rect::from_min_size(egui::Pos2::ZERO, vec2(PHONE.0 * layout::ZOOM, height / 2.0));
+    view.viewport.visible = Some(visible);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let at = shown.iter().find(|(text, _)| text.starts_with(hint)).expect("the box, still drawn");
+    assert!(at.1.bottom() <= height / 2.0 / layout::ZOOM, "above the keyboard: {:?}", at.1);
+}
+
+#[test]
+fn a_phone_with_no_board_yet_offers_only_what_it_has_to_say() {
+    let mut host = fake_host::host();
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let mut world = World::new(host);
+    world.boot(Some(&pairing));
+    let (ctx, mut client, mut view) = (egui::Context::default(), Client::default(), View::default());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "Pairing this browser") && has(&shown, "Pairing"), "{shown:?}");
+    for absent in ["Agents", "Board", "Diffs", "Terminal", "CHIEF", "⋯"] {
+        assert!(!shown.iter().any(|(text, _)| text == absent), "{absent}: {shown:?}");
+    }
+}
+
+/// An iPhone held sideways with the keyboard up: the terminal has what is left, with nothing around it.
+#[test]
+fn a_keyboard_over_a_phone_held_sideways_leaves_the_terminal_the_room() {
+    const SIDEWAYS: (f32, f32) = (874.0 / layout::ZOOM, 402.0 / layout::ZOOM);
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    let visible = Rect::from_min_size(egui::Pos2::ZERO, vec2(874.0, 200.0));
+    view.viewport =
+        Viewport { visible: Some(visible), coarse: true, screen_short: 402.0, keybar: 48.0, ..Viewport::default() };
+    view.tab = Tab::Terminal;
+    settled(&ctx, &mut world, &mut client, &mut view, SIDEWAYS);
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, SIDEWAYS);
+    assert!(view.compact && view.term.typing() && view.term.cramped);
+    let cells = view.term.overlay.rect.expect("the terminal");
+    assert!(cells.height() * layout::ZOOM >= 150.0, "{cells:?}");
+    assert_eq!(cells.top(), 0.0, "{cells:?}");
+    assert!(!shown.iter().any(|(text, _)| text == "CHIEF" || text == "You are typing"), "{shown:?}");
+    // Typed text still goes there.
+    view.term.inputs.push(term_pane::TermInput::Text("ls".into()));
+    settled(&ctx, &mut world, &mut client, &mut view, SIDEWAYS);
+    assert_eq!(world.host.terminals["s1"].typed, "ls");
+    // The keyboard goes, and so does all of that.
+    view.viewport.visible = Some(visible.with_max_y(402.0));
+    view.term.inputs.push(term_pane::TermInput::Focus(false));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, SIDEWAYS);
+    assert!(!view.term.cramped && has(&shown, "CHIEF"), "{shown:?}");
 }
 
 #[test]
@@ -2466,7 +2752,7 @@ fn a_viewer_sees_where_the_sign_in_stands_and_nothing_to_press() {
     // The phone's menu has no workspace for it either.
     let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(SignInState::SignedIn));
     let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
-    assert!(has(&menu, "Layout") && !has(&menu, "Workspace") && !has(&menu, "No workspace"), "{menu:?}");
+    assert!(!has(&menu, "Workspace") && !has(&menu, "No workspace"), "{menu:?}");
 
     let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(SignInState::SigningIn));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
@@ -2577,7 +2863,6 @@ fn sign_in_from_the_bar(
 fn the_top_bars_sign_in_shows_its_steps_with_no_board_or_sidebar_on_screen() {
     for size in [WIDE, NARROW] {
         let (ctx, mut world, mut client, mut view) = no_board_nor_sidebar();
-        view.layout = LayoutMode::Desktop;
         let shown = sign_in_from_the_bar(&ctx, &mut world, &mut client, &mut view, size);
         assert_eq!(world.host.host_commands, [HostAction::SignIn], "{size:?}");
         // The host says it waits on its link: the item's popup, or its submenu in Actions, holds the steps.
@@ -2601,7 +2886,6 @@ fn the_top_bars_sign_in_shows_its_steps_with_no_board_or_sidebar_on_screen() {
 fn the_top_bars_sign_in_takes_the_address_in_its_popup() {
     for size in [WIDE, NARROW] {
         let (ctx, mut world, mut client, mut view) = no_board_nor_sidebar();
-        view.layout = LayoutMode::Desktop;
         let shown = sign_in_from_the_bar(&ctx, &mut world, &mut client, &mut view, size);
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "http://127.0.0.1:…")));
         let shown = drawn(&ctx, &mut world, &mut client, &mut view, size, Vec::new());
@@ -2634,7 +2918,6 @@ fn the_workspace_item_names_the_hosts_workspace_and_opens_another() {
     assert!(in_bar(&shown, "Workspace: daily"), "the host opened it: {shown:?}");
 
     // In a narrow window the bar's items fold into Actions, the workspace among them as a submenu.
-    view.layout = LayoutMode::Desktop;
     let narrow = (720.0, 900.0);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, narrow);
     assert!(!view.compact && in_bar(&shown, "Actions") && !has(&shown, "Workspace: daily"), "{shown:?}");
@@ -2651,16 +2934,16 @@ fn the_workspace_item_names_the_hosts_workspace_and_opens_another() {
 fn a_phones_menu_has_the_hosts_workspace() {
     let (ctx, mut world, mut client, mut view) = live();
     let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
-    assert!(has(&menu, "Automatic") && !has(&menu, "Workspace") && !has(&menu, "No workspace"), "none saved: {menu:?}");
+    assert!(has(&menu, "Machine") && !has(&menu, "Workspace") && !has(&menu, "No workspace"), "none saved: {menu:?}");
 
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SignedIn));
     let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
-    assert!(view.compact && has(&menu, "Layout") && has(&menu, "Workspace: team"), "{menu:?}");
+    assert!(view.compact && has(&menu, "Machine") && has(&menu, "Workspace: team"), "{menu:?}");
     let submenu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Workspace: team");
     assert!(has(&submenu, "team is open") && has(&submenu, "daily"), "{submenu:?}");
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "daily");
     assert_eq!(world.host.host_commands, [HostAction::OpenWorkspace { name: "daily".into() }]);
-    assert!(!has(&shown, "Layout"), "the menu closes: {shown:?}");
+    assert!(!has(&shown, "Machine"), "the menu closes: {shown:?}");
     let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
     assert!(has(&menu, "Workspace: daily"), "{menu:?}");
 }
@@ -3203,7 +3486,9 @@ fn usage_and_load_reach_the_wide_frame_and_the_phones_overflow_and_update_live()
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         let shown = if size == PHONE {
             assert!(!has(&shown, "USAGE") && !has(&shown, "load "), "under overflow: {shown:?}");
-            click_on(&ctx, &mut world, &mut client, &mut view, size, "⋯")
+            click_on(&ctx, &mut world, &mut client, &mut view, size, "⋯");
+            // The menu's scrolling part has its size from the next frame on.
+            settled(&ctx, &mut world, &mut client, &mut view, size)
         } else {
             shown
         };
@@ -4136,7 +4421,6 @@ fn a_window_with_no_room_for_the_diff_and_the_terminal_gives_the_terminal_back_b
     // Wide layout, small: the diff covers the terminals.
     const SMALL: (f32, f32) = (640.0, 300.0);
     let (ctx, mut world, mut client, mut view) = live_with(agents());
-    view.layout = layout::LayoutMode::Desktop;
     client.send(Command::SetView(None));
     settled(&ctx, &mut world, &mut client, &mut view, SMALL);
     sized(&ctx, &mut world, &mut client, &mut view, SMALL, press(egui::Key::Num3, CHORD));

@@ -72,6 +72,8 @@ pub fn read(event: &Value, zoom: f32) -> Option<PageEvent> {
             Some(PageEvent::Viewport(Viewport {
                 visible: (!scaled && visible.width() > 0.0 && visible.height() > 0.0).then_some(visible),
                 coarse: event.get("coarse").and_then(Value::as_bool).unwrap_or(false),
+                screen_short: inset("screenShort"),
+                reduce_motion: event.get("calm").and_then(Value::as_bool).unwrap_or(false),
                 keybar: inset("keybar"),
                 inset_top: inset("insetTop"),
                 inset_bottom: inset("insetBottom"),
@@ -137,12 +139,13 @@ mod tests {
     #[test]
     fn the_viewport_is_the_visible_part_unless_the_page_is_zoomed() {
         let event = json!({ "kind": "viewport", "x": 0, "y": 40, "w": 390, "h": 460, "scale": 1, "coarse": true,
-                            "keybar": 88, "insetTop": 47, "insetBottom": 0, "insetLeft": 0, "insetRight": 12 });
+                            "keybar": 88, "insetTop": 47, "insetBottom": 0, "insetLeft": 0, "insetRight": 12,
+                            "screenShort": 402 });
         // In CSS pixels, whatever egui's zoom: the layout turns them into points.
         let Some(PageEvent::Viewport(port)) = read(&event, 1.25) else { panic!("a viewport") };
         assert_eq!(port.visible, Some(Rect::from_min_size(pos2(0.0, 40.0), vec2(390.0, 460.0))));
         assert!(port.coarse);
-        assert_eq!((port.keybar, port.inset_top, port.inset_right), (88.0, 47.0, 12.0));
+        assert_eq!((port.keybar, port.inset_top, port.inset_right, port.screen_short), (88.0, 47.0, 12.0, 402.0));
         let mut zoomed = event.clone();
         zoomed["scale"] = json!(1.6);
         let Some(PageEvent::Viewport(port)) = read(&zoomed, 1.0) else { panic!("a viewport") };

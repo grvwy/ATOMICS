@@ -9,6 +9,7 @@ use egui::{Atom, AtomExt as _, Atoms, Color32, Rect, RichText, Sense, Stroke, St
 use crate::status::{Mark, PULSE_STEP, paint_mark, pulse};
 use crate::theme::{Palette, lerp};
 use crate::topbar::{measure, record_item};
+use crate::touch::Touch;
 use crate::{Backend, Client, Command, PanelMode, PlanRow, PlanState, controls};
 
 /// The size of the text on the button and in the rows.
@@ -228,7 +229,7 @@ fn section(
     ui.add_space(3.0);
     for &(index, row) in rows {
         let can_close = backend.available(&Command::ClosePlanTab(index));
-        match board_row(ui, row, shown == Some(index), can_close, &p) {
+        match board_row(ui, row, shown == Some(index), can_close, client.touch, &p) {
             Some(RowClick::Show) => {
                 client.send(show_command(row, index));
                 // A row is how a board is asked for: it shows, whichever view the panel was on.
@@ -255,8 +256,17 @@ enum RowClick {
 }
 
 /// A board's row: its mark and name, progress, state and close button, in columns that line up down the menu.
-fn board_row(ui: &mut egui::Ui, row: &PlanRow, selected: bool, can_close: bool, p: &Palette) -> Option<RowClick> {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+fn board_row(
+    ui: &mut egui::Ui,
+    row: &PlanRow,
+    selected: bool,
+    can_close: bool,
+    touch: Option<Touch>,
+    p: &Palette,
+) -> Option<RowClick> {
+    let height = touch.map_or(ROW, |touch| touch.target);
+    let close_width = touch.map_or(CLOSE, |touch| touch.target);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let time = ui.input(|input| input.time);
     let painter = ui.painter_at(rect);
     let over = ui.rect_contains_pointer(rect);
@@ -280,7 +290,7 @@ fn board_row(ui: &mut egui::Ui, row: &PlanRow, selected: bool, can_close: bool, 
         _ if row.needs_user() => paint_mark(&painter, mark, Mark::Diamond, color),
         _ => paint_mark(&painter, mark, Mark::Ring, p.muted),
     }
-    let close_left = rect.right() - CLOSE;
+    let close_left = rect.right() - close_width;
     let state_right = close_left - 4.0;
     let progress_right = state_right - STATE - 8.0;
     let name_left = rect.left() + 24.0;
@@ -303,7 +313,8 @@ fn board_row(ui: &mut egui::Ui, row: &PlanRow, selected: bool, can_close: bool, 
     }
     let mut clicked = response.on_hover_text(hover).clicked().then_some(RowClick::Show);
     if can_close {
-        let close = Rect::from_center_size(pos2(close_left + CLOSE / 2.0, y), vec2(18.0, 18.0));
+        let close_size = touch.map_or(18.0, |touch| touch.target);
+        let close = Rect::from_center_size(pos2(close_left + close_width / 2.0, y), vec2(close_size, close_size));
         let hit = ui.interact(close, ui.scope_id().with(("board-close", &row.id)), Sense::click());
         if hit.hovered() {
             painter.rect_filled(close, 2.0, p.border);

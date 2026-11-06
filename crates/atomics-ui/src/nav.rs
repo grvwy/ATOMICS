@@ -18,6 +18,12 @@ use crate::{Backend, Client, Command, PanelMode, switcher};
 
 /// The height of the location line.
 pub const HEIGHT: f32 = 24.0;
+
+/// The location line's height for a finger, whose arrows it holds.
+pub fn height(touch: Option<crate::touch::Touch>) -> f32 {
+    touch.map_or(HEIGHT, |touch| touch.target)
+}
+
 /// How many places each direction keeps.
 const KEEP: usize = 50;
 
@@ -294,7 +300,7 @@ pub fn location(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &m
         Some(chord) => format!("{verb} ({})", shortcut_label(ui.ctx(), chord)),
         None => verb.to_string(),
     };
-    let size = vec2(22.0, rect.height() - 4.0);
+    let size = client.touch.map_or(vec2(22.0, rect.height() - 4.0), |touch| vec2(touch.target, rect.height() - 4.0));
     let left = Rect::from_min_size(pos2(rect.left() + 4.0, rect.top() + 2.0), size);
     let right = left.translate(vec2(size.x + 2.0, 0.0));
     let (can_back, can_forward) = (client.history.can_go(-1), client.history.can_go(1));
@@ -337,7 +343,7 @@ pub fn location(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &m
         let response = response.inner.on_hover_text(&crumb.hover);
         record_item(&child, &format!("location:{index}"), &response);
         if let Some(command) = crumb.command {
-            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let response = crate::touch::reach(&mut child, response).on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.has_focus() {
                 child.painter().rect_stroke(
                     response.rect.expand(2.0),

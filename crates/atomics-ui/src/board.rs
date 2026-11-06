@@ -50,7 +50,7 @@ fn ticket_chip(
             // keyboard stop.
             .interact(if acts { Sense::click() } else { Sense::CLICK });
         if acts {
-            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            response = touch::reach(ui, response).on_hover_cursor(egui::CursorIcon::PointingHand);
         }
         let response = response.on_hover_ui(|ui| {
             if let Some(title) = &link.title {
@@ -372,7 +372,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 if plan.status == PlanStatus::Completed { "Completed · read-only" } else { "Archived · read-only" };
             ui.label(RichText::new(status).color(p.muted).size(12.0));
         }
-        if touch.is_none() {
+        if !touch::stacks(touch) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 end_buttons(ui);
                 main_buttons(ui);
@@ -387,7 +387,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
         ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.0))
             .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
     }
-    if touch.is_some() {
+    if touch::stacks(touch) {
         ui.horizontal_wrapped(|ui| {
             main_buttons(ui);
             end_buttons(ui);
@@ -402,10 +402,11 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 can_integrate_accepted && ui.add(touch::sized(egui::Button::new("Integrate"), touch)).clicked();
         };
         // On a phone the button goes under the words rather than off the screen.
-        match touch {
-            Some(_) => ui.horizontal_wrapped(row),
-            None => ui.horizontal(row),
-        };
+        if touch::stacks(touch) {
+            ui.horizontal_wrapped(row);
+        } else {
+            ui.horizontal(row);
+        }
     }
     // Needing a sign-in shows where the tickets do, with the button that signs in; with no open plan the
     // sidebar shows it instead.
@@ -536,7 +537,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                             egui::Label::new(RichText::new(&task.title).color(p.foreground).strong())
                                 .sense(Sense::click()),
                         );
-                        if title.clicked() {
+                        if touch::reach(ui, title).clicked() {
                             actions.push((task.id.clone(), "toggle"));
                         }
                         let mut meta =
@@ -564,7 +565,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                         if let Some(branch) = &task.branch {
                             let branch = RichText::new(branch).color(p.muted).size(11.0);
                             // A phone shows names like this one in monospace, its other text in the UI's font.
-                            let branch = if touch.is_some() { branch.monospace() } else { branch };
+                            let branch = if touch::stacks(touch) { branch.monospace() } else { branch };
                             ui.add(egui::Label::new(branch).truncate());
                         }
                         if let Some((note, checking)) = integration_notes.get(&task.id) {
@@ -750,7 +751,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     // A panel narrower than all the columns scrolls them sideways; only a panel too narrow for one whole
     // column stacks the statuses as a phone does, so that no card is cut at the panel's edge.
     let columns_fit = ui.available_width() >= MIN_COLUMN;
-    if !tasks.is_empty() && touch.is_none() && columns_fit {
+    if !tasks.is_empty() && !touch::stacks(touch) && columns_fit {
         egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             let columns = TaskStatus::ALL.len();
             let spacing = ui.spacing().item_spacing.x * (columns - 1) as f32;

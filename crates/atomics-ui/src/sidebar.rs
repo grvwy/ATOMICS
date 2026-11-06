@@ -29,7 +29,8 @@ fn session_row(
     selected: bool,
     number: Option<usize>,
 ) -> egui::Response {
-    let height = 38.0;
+    // A finger's size where the controls have one.
+    let height = ui.spacing().interact_size.y.max(38.0);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
     // What needs the user stands out whether or not it is the active one: a bar in the warning color.
@@ -164,7 +165,7 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             };
             let response = group_heading(ui, &p, &text, color, &hover);
             if let Some(show) = show.filter(|show| backend.available(show))
-                && response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                && crate::touch::reach(ui, response).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
             {
                 client.send(show);
             }

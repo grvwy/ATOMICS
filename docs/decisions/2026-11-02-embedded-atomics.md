@@ -274,6 +274,10 @@ own `touchend` handler; the spike let the browser focus it natively. And the key
 pointer, so a desktop browser's terminal keeps its pane switcher. The rest was checked in headless Chrome
 (`tests/browser.rs`): typing and Return, the echo, losing the lease to the desktop and taking it again.
 
+**Changed (2026-11-06).** The manual override is gone. A phone keeps its one-pane shell, an iPhone in both orientations by
+its screen's short side, and a tablet gets the desktop's frame with a finger's sizes in both, inside what the user sees.
+Rotating an iPad used to swap the whole UI, and sideways it had a mouse's sizes.
+
 ### 4.5 The entry point
 
 Where the hosting app shows ATOMICS is its decision; in Relay it is an item in the application switcher, shown on

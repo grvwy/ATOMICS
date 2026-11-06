@@ -29,7 +29,7 @@ use crate::boot::{self, ParentOrigin};
 use crate::desk;
 use crate::device::{self, Device};
 use crate::driver::{DeviceReadError, Driver, Output};
-use crate::layout::{self, LayoutMode};
+use crate::layout;
 use crate::page::{self, PageEvent};
 use crate::term_pane::{self, Overlay};
 use crate::views::{self, BundledFonts, Tab, View};
@@ -72,10 +72,6 @@ extern "C" {
     fn set_copy(text: Option<String>, x: f32, y: f32, below: f32);
     #[wasm_bindgen(js_name = setTheme)]
     fn set_theme(colors: &str);
-    #[wasm_bindgen(js_name = loadLayout)]
-    fn load_layout() -> String;
-    #[wasm_bindgen(js_name = saveLayout)]
-    fn save_layout(name: &str);
     #[wasm_bindgen(js_name = loadView)]
     fn load_view() -> String;
     #[wasm_bindgen(js_name = saveView)]
@@ -167,8 +163,6 @@ struct App {
     applied: Overlay,
     /// The text boxes the page was last told of.
     applied_boxes: Vec<egui::Rect>,
-    /// The layout last kept in the page's storage.
-    saved_layout: LayoutMode,
     /// The view the switcher chose that this browser keeps, as last saved.
     saved_view: PanelMode,
 }
@@ -287,9 +281,7 @@ impl App {
         };
         install(&layout::keybar_json().to_string(), atomics_ui::window_keys::command_chords(ctx.os()), &page);
         set_theme(&theme_colors(&client.palette));
-        let layout = LayoutMode::named(&load_layout());
         let mut view = View::default();
-        view.layout = layout;
         // The view the switcher last showed in this browser.
         if let Some(panel) = desk::named_view(&load_view()) {
             view.desk.panel = panel;
@@ -309,7 +301,6 @@ impl App {
             _visibility: visibility,
             applied: Overlay::default(),
             applied_boxes: Vec::new(),
-            saved_layout: layout,
             saved_view,
         }
     }
@@ -482,6 +473,13 @@ fn stored_device(host_id: &str, stored: &JsValue) -> Result<Option<Device>, Devi
 }
 
 impl eframe::App for App {
+    /// What a soft keyboard or a notch covers takes no window, menu or dialog, wherever they are drawn.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(screen) = raw_input.screen_rect {
+            raw_input.safe_area_insets = Some(views::safe_area(&self.view, screen, ctx.zoom_factor()));
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.driver.tick(js_sys::Date::now() as u64);
         let inputs: Vec<Input> = self.inbox.borrow_mut().drain(..).collect();
@@ -530,10 +528,6 @@ impl eframe::App for App {
         views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
         self.run_outputs();
         self.apply_overlay();
-        if self.view.layout != self.saved_layout {
-            save_layout(self.view.layout.name());
-            self.saved_layout = self.view.layout;
-        }
         if self.view.desk.panel != self.saved_view {
             save_view(desk::view_name(self.view.desk.panel));
             self.saved_view = self.view.desk.panel;

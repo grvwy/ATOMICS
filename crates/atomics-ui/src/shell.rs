@@ -45,9 +45,6 @@ pub trait Platform {
     /// The host's items after the top bar's Plan button; in the Actions menu when `in_menu`.
     fn top_bar_items(&mut self, _ui: &mut egui::Ui, _in_menu: bool) {}
 
-    /// Additional client preferences, such as the browser's layout chooser.
-    fn top_bar_settings(&mut self, _ui: &mut egui::Ui) {}
-
     /// The host's section above the sidebar's agents.
     fn sidebar_tickets(&mut self, _ui: &mut egui::Ui) {}
 
@@ -72,8 +69,9 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             .show(ui, |ui| platform.draw(|backend, client, _| crate::management::setup::page(ui, backend, client)));
         return;
     }
+    let touch = read(platform, |_, client| client.touch);
     egui::Panel::top("top")
-        .exact_size(34.0)
+        .exact_size(touch.map_or(34.0, |touch| touch.target + 10.0))
         .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
         .show(ui, |ui| top_bar(ui, platform));
     let steers =
@@ -85,6 +83,8 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     }
 
     let area = ui.available_rect_before_wrap();
+    let nav_height = nav::height(touch);
+    let tab_height = touch.map_or(TAB_HEIGHT, |touch| touch.target + 6.0);
     let (layout, visible, completed, history_board, diff_open, sidebar_width) = read(platform, |backend, client| {
         let hints = backend.view_hints();
         let history_board = hints.plan_view
@@ -105,19 +105,32 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let sidebar_width = config.sidebar_width;
         let layout_config = LayoutConfig { diff_width: client.split, ..config };
         let dock_width = chief::dock_width(&backend.chief(), area.width(), &layout_config);
-        let compute = |height| {
+        let compute = |height, diff_open| {
             layout::compute(area.width(), height, visible.len(), completed, diff_open, dock_width, &layout_config)
         };
-        // The location line takes the top of the agents' area.
-        let mut layout = compute(area.height() - nav::HEIGHT);
-        if layout.tabs {
-            layout = compute(area.height() - nav::HEIGHT - TAB_HEIGHT);
-            layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
+        let placed = |diff_open| {
+            // The location line takes the top of the agents' area.
+            let mut layout = compute(area.height() - nav_height, diff_open);
+            if layout.tabs {
+                layout = compute(area.height() - nav_height - tab_height, diff_open);
+                layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
+            }
+            layout
+        };
+        let mut layout = placed(diff_open);
+        // A keyboard leaves room for one of the panel and the terminal: a finger typing keeps the terminal, or the
+        // keyboard would go with it, and the terminal come back without it.
+        if client.typing && layout.diff == DiffPlacement::Full {
+            layout = placed(false);
         }
         (layout, visible, completed, history_board, diff_open, sidebar_width)
     });
 
     platform.laid_out(&layout);
+    platform.draw(|_, client, _| {
+        client.sidebar_hidden = !layout.sidebar;
+        client.drawer &= client.sidebar_hidden;
+    });
     if layout.sidebar {
         egui::Panel::left("sidebar")
             .exact_size(sidebar_width)
@@ -134,7 +147,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
         let mut rect = ui.max_rect();
-        let line = rect.with_max_y(rect.top() + nav::HEIGHT);
+        let line = rect.with_max_y(rect.top() + nav_height);
         platform.draw(|backend, client, _| nav::location(ui, line, backend, client));
         rect.min.y = line.bottom();
         if history_board {
@@ -149,9 +162,9 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             pick_tiled(&statuses, active, layout.tiled).into_iter().map(|k| visible[k]).collect()
         });
         if layout.tabs {
-            let strip = rect.with_max_y(rect.top() + TAB_HEIGHT);
+            let strip = rect.with_max_y(rect.top() + tab_height);
             platform.draw(|backend, client, _| fleet::tab_strip(ui, strip, &tiled, &visible, backend, client));
-            rect.min.y += TAB_HEIGHT;
+            rect.min.y += tab_height;
         }
         let byline = platform.byline();
         if visible.is_empty() && completed == 0 && !diff_open {
@@ -201,9 +214,70 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         platform.draw(|_, client, _| chief::divider(ui, rect, client));
     }
     if read(platform, |backend, _| backend.chief().open) && layout.dock_width == 0.0 {
-        chief::window(ui.ctx(), &p, |ui| {
+        chief::window(ui.ctx(), &p, touch.map(|_| area), |ui| {
             platform.draw(|backend, client, terminals| chief::draw(ui, backend, client, terminals))
         });
+    }
+    if read(platform, |_, client| client.drawer) {
+        drawer(ui.ctx(), area, platform, &p);
+    }
+}
+
+/// The widest the sidebar is as a drawer, and how many seconds it takes to come in.
+const DRAWER_WIDTH: f32 = 320.0;
+const DRAWER_TIME: f32 = 0.16;
+
+/// For a finger, the sidebar where it does not fit: over the rest, opened from the top bar. A tap beside it closes it, and
+/// so does going somewhere from it ([`Client::send`]).
+fn drawer(ctx: &egui::Context, area: Rect, platform: &mut impl Platform, p: &crate::theme::Palette) {
+    let width = DRAWER_WIDTH.min(area.width() * 0.85);
+    let time = if read(platform, |_, client| client.reduce_motion) { 0.0 } else { DRAWER_TIME };
+    let out = ctx.animate_bool_with_time(egui::Id::NULL.with("drawer-out"), true, time);
+    let shade = egui::Area::new(egui::Id::NULL.with("drawer-shade"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(area.min)
+        .show(ctx, |ui| {
+            let (rect, response) = ui.allocate_exact_size(area.size(), Sense::click());
+            ui.painter().rect_filled(rect, 0.0, p.background.gamma_multiply(0.6 * out));
+            response.clicked()
+        });
+    let at = area.min - vec2(width * (1.0 - out), 0.0);
+    let shown =
+        egui::Area::new(egui::Id::NULL.with("drawer")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+            egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                ui.set_width(width - 20.0);
+                ui.set_height(area.height() - 8.0);
+                self::sidebar(ui, platform);
+            });
+        });
+    ctx.move_to_top(shown.response.layer_id);
+    if shade.inner {
+        platform.draw(|_, client, _| client.drawer = false);
+    }
+    if !read(platform, |_, client| client.drawer) {
+        // The next time it opens, it comes in from the side again.
+        ctx.animate_bool_with_time(egui::Id::NULL.with("drawer-out"), false, 0.0);
+    }
+}
+
+/// What opens the [`drawer`], with a dot while something in it waits for the user.
+fn drawer_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    if client.touch.is_none() || !client.sidebar_hidden {
+        return;
+    }
+    let p = client.palette.clone();
+    let size = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let color = if client.drawer { p.accent } else { p.foreground };
+    let c = rect.center();
+    for line in [-5.0, 0.0, 5.0] {
+        ui.painter().hline((c.x - 8.0)..=(c.x + 8.0), c.y + line, Stroke::new(1.5, color));
+    }
+    if backend.session_list().iter().any(|s| s.status.needs_attention() || s.pending_approvals > 0) {
+        ui.painter().circle_filled(c + vec2(9.0, -8.0), 3.5, p.warning);
+    }
+    if response.on_hover_text("Agents").clicked() {
+        client.drawer = !client.drawer;
     }
 }
 
@@ -213,11 +287,13 @@ const WELCOME_MIN_WIDTH: f32 = 360.0;
 /// The divider between the tiles and the right panel `rect`, `width` wide: dragging it gives the panel more
 /// or less room, a double click its default width again.
 fn split_divider(ui: &mut egui::Ui, rect: Rect, width: f32, client: &mut Client) {
-    let handle = Rect::from_center_size(rect.left_center(), vec2(8.0, rect.height()));
+    let reach = client.touch.map_or(8.0, |_| 24.0);
+    let handle = Rect::from_center_size(rect.left_center(), vec2(reach, rect.height()));
     let response = ui.interact(handle, ui.scope_id().with("divider"), Sense::click_and_drag());
     if response.hovered() || response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        ui.painter().rect_filled(handle.shrink2(vec2(3.0, 0.0)), 0.0, client.palette.accent.gamma_multiply(0.6));
+        let line = Rect::from_center_size(handle.center(), vec2(2.0, handle.height()));
+        ui.painter().rect_filled(line, 0.0, client.palette.accent.gamma_multiply(0.6));
     }
     if response.dragged() {
         client.split = Some(width - response.drag_delta().x);
@@ -520,7 +596,10 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
 }
 
 fn brand(ui: &mut egui::Ui, platform: &mut impl Platform, size: BrandSize) {
-    platform.draw(|backend, client, _| topbar::brand(ui, size, backend, client));
+    platform.draw(|backend, client, _| {
+        drawer_button(ui, backend, client);
+        topbar::brand(ui, size, backend, client);
+    });
 }
 
 fn chief_pill(ui: &mut egui::Ui, platform: &mut impl Platform, size: chief::PillSize) {
@@ -569,7 +648,6 @@ fn top_bar_controls(
         platform.draw(|backend, client, _| crate::machine::button(ui, backend, client));
     }
     platform.draw(|backend, client, _| crate::management::buttons(ui, backend, client));
-    platform.top_bar_settings(ui);
 }
 
 /// What an empty frame shows in `rect`: the name with the platform's `byline`, and a button for each

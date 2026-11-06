@@ -1,18 +1,16 @@
-//! The phone layout (design §4.4): chosen from the viewport's width and a coarse pointer, with a manual
-//! override; one pane at a time, switched from a bottom bar; and only the part of the viewport the user
-//! sees (`visualViewport`), so nothing sits under the soft keyboard or the screen's notch and corners. While
-//! the user types into a terminal, the key bar takes the bottom bar's place: the page draws it on the
-//! keyboard, from [`KEYBAR`], and says how tall it is.
+//! The phone's shell (design §4.4): chosen from the viewport's width and, for a finger, the screen's short side; one
+//! pane at a time, switched from a bottom bar. Anything else gets the desktop's frame. On a touch screen both draw only in
+//! the part of the viewport the user sees (`visualViewport`), so nothing sits under the soft keyboard or the screen's
+//! notch and corners ([`regions`], [`frame_rect`]). While the user types into a terminal, the key bar takes the bottom of
+//! the screen: the page draws it on the keyboard, from [`KEYBAR`], and says how tall it is.
 //!
 //! The phone layout draws zoomed by [`ZOOM`], so the text and controls the shared views size in points
 //! come out right for a finger; its own measures are given in CSS pixels ([`px`]).
 
 use egui::{Rect, pos2, vec2};
 
-/// Narrower than this, in CSS pixels, is a phone whatever the pointer.
+/// Narrower than this, in CSS pixels, is a phone: a window whatever the pointer, and for a finger a screen's short side.
 pub const NARROW: f32 = 600.0;
-/// With a coarse pointer (a finger), narrower than this is too: a phone held sideways, a small tablet.
-pub const COARSE_NARROW: f32 = 900.0;
 /// How many CSS pixels a point is in the phone layout: the theme's UI size zooms egui by it.
 pub const ZOOM: f32 = 1.25;
 
@@ -27,42 +25,16 @@ pub const BOTTOM_BAR: f32 = px(56.0);
 pub const TOUCH: f32 = px(44.0);
 /// The space between the screen's sides (or its safe area's) and the content.
 pub const GUTTER: f32 = px(16.0);
+/// A tablet's frame draws at 1 point a CSS pixel: its touch target and the content's gutter there.
+pub const TABLET_TOUCH: f32 = 44.0;
+pub const TABLET_GUTTER: f32 = 12.0;
 
-/// The user's choice, kept by the page.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LayoutMode {
-    /// From the viewport.
-    #[default]
-    Auto,
-    Phone,
-    Desktop,
-}
-
-impl LayoutMode {
-    pub fn name(self) -> &'static str {
-        match self {
-            LayoutMode::Auto => "auto",
-            LayoutMode::Phone => "phone",
-            LayoutMode::Desktop => "desktop",
-        }
-    }
-
-    pub fn named(name: &str) -> LayoutMode {
-        match name {
-            "phone" => LayoutMode::Phone,
-            "desktop" => LayoutMode::Desktop,
-            _ => LayoutMode::Auto,
-        }
-    }
-}
-
-/// Whether to draw the phone layout.
-pub fn compact(width: f32, coarse: bool, mode: LayoutMode) -> bool {
-    match mode {
-        LayoutMode::Phone => true,
-        LayoutMode::Desktop => false,
-        LayoutMode::Auto => width < NARROW || (coarse && width < COARSE_NARROW),
-    }
+/// Whether to draw the phone's shell rather than the desktop's frame. A phone stays one in both orientations, by the short
+/// side of its screen; the page's height would not do, since a soft keyboard shrinks it on some browsers. A tablet gets
+/// the frame in both, unless its window is itself narrow, as a mouse's is.
+pub fn compact(width: f32, height: f32, viewport: &Viewport) -> bool {
+    let short = if viewport.screen_short > 0.0 { viewport.screen_short } else { width.min(height) };
+    width < NARROW || (viewport.coarse && short < NARROW)
 }
 
 /// What the page says about the viewport: in CSS pixels as the page reports it, in points once
@@ -73,6 +45,10 @@ pub struct Viewport {
     pub visible: Option<Rect>,
     /// The primary pointer is a finger.
     pub coarse: bool,
+    /// The short side of the device's screen, in CSS pixels at any zoom; 0 before the page said.
+    pub screen_short: f32,
+    /// The user asked for less motion.
+    pub reduce_motion: bool,
     /// The key bar's height while it shows, else 0.
     pub keybar: f32,
     /// The safe-area insets: the notch, the home indicator, and the sides of a phone held sideways.
@@ -91,6 +67,8 @@ impl Viewport {
                 .visible
                 .map(|r| Rect::from_min_max(pos2(at(r.min.x), at(r.min.y)), pos2(at(r.max.x), at(r.max.y)))),
             coarse: self.coarse,
+            screen_short: self.screen_short,
+            reduce_motion: self.reduce_motion,
             keybar: at(self.keybar),
             inset_top: at(self.inset_top),
             inset_bottom: at(self.inset_bottom),
@@ -109,16 +87,46 @@ pub struct Regions {
     pub bar: Option<Rect>,
     /// The space left for the page's key bar while typing.
     pub keybar: Option<Rect>,
+    /// Typing on a phone held sideways, a keyboard taking most of it: only the terminal shows, and the bars give way.
+    pub cramped: bool,
 }
 
-pub fn regions(screen: Rect, viewport: &Viewport, typing: bool) -> Regions {
+/// The part of `screen` the user sees.
+fn visible(screen: Rect, viewport: &Viewport) -> Rect {
     let visible = viewport.visible.map(|v| v.intersect(screen)).filter(|v| v.width() > 0.0 && v.height() > 0.0);
-    let visible = visible.unwrap_or(screen);
+    visible.unwrap_or(screen)
+}
+
+/// Where the desktop's frame draws on a touch screen: what the user sees, inside the safe area, and above the key bar while
+/// it shows.
+pub fn frame_rect(screen: Rect, viewport: &Viewport, typing: bool) -> Rect {
+    let visible = visible(screen, viewport);
+    let inset_top = if visible.top() <= screen.top() { viewport.inset_top } else { 0.0 };
+    let inset_bottom = if typing {
+        viewport.keybar
+    } else if visible.bottom() >= screen.bottom() {
+        viewport.inset_bottom
+    } else {
+        0.0
+    };
+    let (left, right) = (visible.left() + viewport.inset_left, visible.right() - viewport.inset_right);
+    let (left, right) = if right > left { (left, right) } else { (visible.left(), visible.right()) };
+    let top = visible.top() + inset_top;
+    Rect::from_min_max(pos2(left, top), pos2(right, (visible.bottom() - inset_bottom).max(top)))
+}
+
+/// With less than this for the body while typing, what is around the terminal gives it the room.
+pub const CRAMPED: f32 = px(240.0);
+
+pub fn regions(screen: Rect, viewport: &Viewport, typing: bool) -> Regions {
+    let visible = visible(screen, viewport);
+    let cramped = typing && visible.height() - viewport.keybar - TOP_BAR < CRAMPED;
     // The notch is under the top of the layout viewport only; the keyboard never covers it.
     let inset_top = if visible.top() <= screen.top() { viewport.inset_top } else { 0.0 };
     let (left, right) = (visible.left() + viewport.inset_left, visible.right() - viewport.inset_right);
     let (left, right) = if right > left { (left, right) } else { (visible.left(), visible.right()) };
-    let top = Rect::from_min_size(pos2(left, visible.top() + inset_top), vec2(right - left, TOP_BAR));
+    let top_bar = if cramped { 0.0 } else { TOP_BAR };
+    let top = Rect::from_min_size(pos2(left, visible.top() + inset_top), vec2(right - left, top_bar));
     let (bar, keybar, bottom) = if typing {
         let keybar = Rect::from_min_max(pos2(visible.left(), visible.bottom() - viewport.keybar), visible.max);
         (None, Some(keybar), keybar.top())
@@ -128,7 +136,7 @@ pub fn regions(screen: Rect, viewport: &Viewport, typing: bool) -> Regions {
         (Some(bar), None, bar.top())
     };
     let body = Rect::from_min_max(pos2(left, top.bottom()), pos2(right, bottom.max(top.bottom())));
-    Regions { top, body, bar, keybar }
+    Regions { top, body, bar, keybar, cramped }
 }
 
 /// The pane switcher's items, side by side across `bar` (its safe-area inset left below them).
@@ -225,18 +233,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_phone_layout_follows_the_width_and_the_pointer_unless_the_user_chose() {
-        for width in [360.0, 390.0, 430.0, 599.0] {
-            assert!(compact(width, false, LayoutMode::Auto), "{width}");
+    fn a_phone_is_one_in_both_orientations_and_a_tablet_gets_the_frame_in_both() {
+        let finger = |short| Viewport { coarse: true, screen_short: short, ..Viewport::default() };
+        // An iPhone 16 Pro, upright and sideways, with a keyboard or not.
+        assert!(compact(402.0, 874.0, &finger(402.0)));
+        assert!(compact(874.0, 402.0, &finger(402.0)), "sideways it is wider than a phone's width");
+        // An iPad mini, an iPad and a 13-inch one, either way up, the keyboard taking half the height.
+        for (short, long) in [(744.0, 1133.0), (820.0, 1180.0), (1024.0, 1366.0)] {
+            assert!(!compact(short, long, &finger(short)), "{short} upright");
+            assert!(!compact(long, short, &finger(short)), "{short} sideways");
+            assert!(!compact(long, short / 2.0, &finger(short)), "{short} under a keyboard");
         }
-        assert!(!compact(820.0, false, LayoutMode::Auto), "a narrow desktop window with a mouse");
-        assert!(compact(820.0, true, LayoutMode::Auto), "a tablet held upright");
-        assert!(!compact(1180.0, true, LayoutMode::Auto), "a tablet held sideways");
-        assert!(!compact(390.0, true, LayoutMode::Desktop) && compact(1440.0, false, LayoutMode::Phone));
-        for mode in [LayoutMode::Auto, LayoutMode::Phone, LayoutMode::Desktop] {
-            assert_eq!(LayoutMode::named(mode.name()), mode);
-        }
-        assert_eq!(LayoutMode::named("tablet"), LayoutMode::Auto);
+        // An iPad's app in a narrow column is narrow.
+        assert!(compact(375.0, 1180.0, &finger(820.0)));
+        // A mouse goes by the window alone.
+        let mouse = Viewport { screen_short: 1080.0, ..Viewport::default() };
+        assert!(compact(599.0, 900.0, &mouse));
+        assert!(!compact(600.0, 300.0, &mouse));
+        // Before the page has said what the screen is, what it shows stands in.
+        assert!(compact(844.0, 390.0, &finger(0.0)));
+        assert!(!compact(1180.0, 820.0, &finger(0.0)));
+    }
+
+    #[test]
+    fn the_frame_keeps_to_what_the_user_sees_above_the_key_bar() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(820.0, 1180.0));
+        let port = Viewport {
+            visible: Some(screen),
+            coarse: true,
+            keybar: 92.0,
+            inset_top: 24.0,
+            inset_bottom: 20.0,
+            ..Viewport::default()
+        };
+        assert_eq!(frame_rect(screen, &port, false), Rect::from_min_max(pos2(0.0, 24.0), pos2(820.0, 1160.0)));
+        // The keyboard is up, and the key bar sits on it: the home indicator is under the keyboard.
+        let keyboard = Viewport { visible: Some(screen.with_max_y(800.0)), ..port };
+        assert_eq!(frame_rect(screen, &keyboard, true), Rect::from_min_max(pos2(0.0, 24.0), pos2(820.0, 708.0)));
+        assert_eq!(frame_rect(screen, &keyboard, false), Rect::from_min_max(pos2(0.0, 24.0), pos2(820.0, 800.0)));
+        // The browser scrolled the page for the keyboard: the notch is out of sight.
+        let scrolled = Viewport { visible: Some(Rect::from_min_size(pos2(0.0, 100.0), vec2(820.0, 700.0))), ..port };
+        assert_eq!(frame_rect(screen, &scrolled, true).top(), 100.0);
+        // Nothing left is still a rect, with no height.
+        let tiny = Viewport { visible: Some(screen.with_max_y(50.0)), ..port };
+        assert_eq!(frame_rect(screen, &tiny, true).height(), 0.0);
     }
 
     #[test]
@@ -316,6 +356,23 @@ mod tests {
         let r = regions(screen, &port, true);
         assert_eq!(r.top.top(), 120.0, "no notch inset once the page moved under it");
         assert_eq!(r.keybar.unwrap().bottom(), 520.0);
+    }
+
+    #[test]
+    fn typing_with_a_keyboard_over_a_phone_held_sideways_gives_the_terminal_the_room() {
+        // 874 x 402 CSS pixels, a keyboard leaving 200, and the key bar on one row.
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(874.0, 402.0));
+        let port =
+            Viewport { visible: Some(screen.with_max_y(200.0)), coarse: true, keybar: 48.0, ..Viewport::default() };
+        let r = regions(screen, &port.points(1.0), true);
+        assert!(r.cramped);
+        assert_eq!(r.top.height(), 0.0, "no top bar");
+        assert_eq!((r.body.top(), r.body.bottom()), (0.0, 152.0), "the terminal has what is left");
+        // The same room with nothing typed keeps its bars, and upright typing has enough.
+        assert!(!regions(screen, &port.points(1.0), false).cramped);
+        let upright = Rect::from_min_size(pos2(0.0, 0.0), vec2(402.0, 874.0));
+        let keyboard = Viewport { visible: Some(upright.with_max_y(538.0)), keybar: 92.0, ..port };
+        assert!(!regions(upright, &keyboard.points(ZOOM), true).cramped);
     }
 
     #[test]

@@ -1,17 +1,24 @@
-//! Sizing for a finger on a small screen. A platform that draws a phone layout (the browser client) sets
-//! [`Client::touch`](crate::Client::touch); the shared views then stack what sits side by side, wrap long
-//! lines, keep their content off the screen's sides by [`Touch::gutter`] and make every control at least
-//! [`Touch::target`] square. The desktop leaves it `None` and draws as it always has.
+//! Sizing for a finger. A platform with a coarse pointer (the browser client) sets
+//! [`Client::touch`](crate::Client::touch); the shared views then make every control at least [`Touch::target`] square
+//! and keep their content off the screen's sides by [`Touch::gutter`], and on a small screen ([`Touch::stack`]) stack what
+//! sits side by side and wrap long lines. The desktop leaves it `None` and draws as it always has.
 
-use egui::{Button, IntoAtoms, LayerId, Rect, Response, Ui, vec2};
+use egui::{Button, IntoAtoms, LayerId, Rect, Response, Sense, Ui, vec2};
 
-/// A phone's measures, in points.
+/// A finger's measures, in points.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Touch {
     /// The least width and height of a control.
     pub target: f32,
     /// The space between the screen's sides and the content.
     pub gutter: f32,
+    /// A phone: no room for things side by side. A tablet has it.
+    pub stack: bool,
+}
+
+/// Whether views stack what sits side by side.
+pub fn stacks(touch: Option<Touch>) -> bool {
+    touch.is_some_and(|touch| touch.stack)
 }
 
 /// `button` as it is, or at least a target square under `touch`.
@@ -36,6 +43,18 @@ pub fn keyboard_openers(ctx: &egui::Context) -> Vec<(LayerId, Rect)> {
 
 fn openers() -> egui::Id {
     egui::Id::NULL.with("keyboard-openers")
+}
+
+/// `response`, with a finger's tap counting anywhere in a target around it, for a label or a mark drawn smaller than that.
+/// What is drawn does not move. Where controls have a mouse's size it is as it was.
+pub fn reach(ui: &mut Ui, response: Response) -> Response {
+    let target = ui.spacing().interact_size.y;
+    if target <= crate::theme::CONTROL_HEIGHT {
+        return response;
+    }
+    let rect = Rect::from_center_size(response.rect.center(), response.rect.size().max(vec2(target, target)));
+    let around = ui.interact(rect, response.id.with("finger"), Sense::click());
+    response | around
 }
 
 /// A button, one a finger can hit under `touch`.
