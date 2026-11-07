@@ -39,6 +39,13 @@
 //! `the_first_tap_takes_the_keyboard_on_a_text_box_a_comment_line_and_the_strip`: on an iPhone 16 Pro's screen, by touch
 //! alone, each of those takes the browser's focus in the touch's own handler, as iOS asks, and takes what is typed.
 //!
+//! `a_phone_fits_its_terminals_opens_a_calm_chief_and_scrolls_a_board_whole`: on an iPhone 16 Pro and an iPhone SE,
+//! upright and sideways, with a soft keyboard shown as the hosting page shows it (the frame ending above it), the
+//! terminal takes the phone's grid when a tap types there and keeps it as the keyboard comes and goes; the chief opens
+//! on its terminal; the board scrolls whole. Its screens go to `target/phone-fit-shots/`.
+//! `a_pinch_or_a_double_tap_zooms_nothing_on_a_phone`: emulated pinches and double taps on the board, a terminal, a
+//! key and a gap in the key bar leave the hosting page and the frame at their own size.
+//!
 //! `the_bundle_draws_the_desktops_frame_in_a_wide_window`: the bundle in a 1600 × 1000 window draws the
 //! desktop's own frame over the fake host: the top bar, the chief docked with its terminal, the agent's tile
 //! and the plan's board. Its screenshot is saved as `target/wide-shots/browser.png`; where
@@ -1086,7 +1093,7 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     log.wait("first 97 bytes, kind 2", 2);
     log.wait("hello new", 2);
 
-    // The terminal: following it takes no lease, and nothing ever resizes it.
+    // The terminal: following it takes no lease and resizes nothing.
     log.wait("subscribe s1", 1);
     assert!(!log.has("acquire s1"), "following a terminal never takes its lease");
     let frame_url = format!("{client_origin}/");
@@ -1119,11 +1126,17 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     );
     wait_host(&host, "\"echo hi\\r\" typed", |h| h.terminals["s1"].typed == "echo hi\r");
 
-    // The echo is on the client's screen: a drag over the first line selects it from the client's cells.
-    page.mouse("mousePressed", at(5.0, 6.0));
-    page.mouse("mouseMoved", at(200.0, 6.0));
-    page.mouse("mouseMoved", at(360.0, 6.0));
-    page.mouse("mouseReleased", at(360.0, 6.0));
+    // The echo is on the client's screen: a drag over the first line selects it from the client's cells. Typing, the
+    // phone fitted the terminal to itself and gave it the strip's room, so the cells are higher up now.
+    log.wait("resize s1", 1);
+    thread::sleep(Duration::from_millis(500));
+    let typing = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.left, r.top, r.width]; })()");
+    let cell =
+        |x: f64, y: f64| (number(&offset, 0) + number(&typing, 0) + x, number(&offset, 1) + number(&typing, 1) + y);
+    page.mouse("mousePressed", cell(5.0, 6.0));
+    page.mouse("mouseMoved", cell(200.0, 6.0));
+    page.mouse("mouseMoved", cell(360.0, 6.0));
+    page.mouse("mouseReleased", cell(360.0, 6.0));
     frame.wait("the echoed line selected", "document.getElementById('atomics-copy').title.includes('$ echo hi')");
     if let Some(out) = std::env::var_os("ATOMICS_WEB_TERMINAL_SCREENSHOT") {
         thread::sleep(Duration::from_millis(500));
@@ -1140,7 +1153,13 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     frame.wait("the focus back on the overlay", "document.activeElement === document.getElementById('atomics-input')");
     page.call("Input.insertText", json!({ "text": "x" }));
     wait_host(&host, "the second typing", |h| h.terminals["s1"].typed == "echo hi\r!x");
-    assert!(!log.has("resize s1"), "the phone never resized the terminal");
+    let count = |what: &str| log.lines.lock().unwrap().iter().filter(|l| l.starts_with(what)).count();
+    log.wait("resize s1", 2);
+    assert_eq!(
+        count("resize s1"),
+        count("acquire s1"),
+        "the phone fits the terminal once per lease, as it types there"
+    );
 
     log.wait("parent other posted", 1);
     assert!(!log.has("dial evil"), "a boot from another origin was never taken");
@@ -1543,7 +1562,11 @@ fn the_bundle_works_on_a_phone_by_touch() {
     assert_eq!(frame.eval("window.copied"), json!("hello world"), "Copy copies the selected range and nothing else");
     assert_eq!(typed(&host, "s1"), all, "selecting typed nothing");
     assert_eq!(log.lines.lock().unwrap().iter().filter(|l| l.starts_with("acquire s1")).count(), 1);
-    assert!(!log.has("resize s1"), "the phone never resized the terminal");
+    assert_eq!(
+        log.lines.lock().unwrap().iter().filter(|l| l.starts_with("resize s1")).count(),
+        1,
+        "the phone fitted the terminal once, when it typed there"
+    );
     assert!(!log.has("upgrade refused"), "every upgrade carried the client's exact origin and the subprotocol");
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
     eprintln!("phone screens:");
@@ -3450,4 +3473,195 @@ fn an_update_and_a_click_leave_the_diff_where_it_is() {
     for session in ["s1", "s2"] {
         assert_eq!(typed(&host, session), "", "{session}: no byte");
     }
+}
+
+/// The phone shots of the fit and calm pass, for a person to look at.
+fn fit_dir() -> PathBuf {
+    let dir = target().join("phone-fit-shots");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn keep_fit(page: &mut DevTools, name: &str) {
+    thread::sleep(Duration::from_millis(500));
+    let shot = page.call("Page.captureScreenshot", json!({ "format": "png" }));
+    let out = fit_dir().join(format!("{name}.png"));
+    std::fs::write(&out, base64(shot["data"].as_str().expect("a screenshot"))).unwrap();
+    eprintln!("fit: {}", out.display());
+}
+
+/// The phones of the pass, in CSS pixels upright, and how much of each a soft keyboard takes upright and sideways.
+const PHONES: [(&str, (f32, f32), (f32, f32)); 2] =
+    [("iphone16pro", (402.0, 874.0), (336.0, 200.0)), ("iphonese", (375.0, 667.0), (260.0, 175.0))];
+
+/// The soft keyboard up, `covered` CSS pixels of it, as the hosting page shows it to the client: the frame ends above it
+/// (a hosting page's keyboard inset). 0 puts it away.
+fn keyboard(page: &mut DevTools, covered: f32) {
+    page.eval(&format!("document.querySelector('iframe').style.height = 'calc(100dvh - {covered}px)'; true"));
+}
+
+/// The terminal's grid as the fake host has it.
+fn grid(host: &Mutex<FakeHost>, session: &str) -> (u16, u16) {
+    let host = host.lock().unwrap();
+    let screen = &host.terminals[session].screen;
+    (screen.cols, screen.rows)
+}
+
+/// On an iPhone 16 Pro and an iPhone SE, upright and sideways: a terminal shows the desktop's grid until a tap types
+/// there, then takes the phone's own grid at full width with nothing over it, and the keyboard coming and going
+/// resizes nothing; the chief opens on its terminal with no header and its trace's calls folded; a board scrolls as
+/// one surface, its header going up with the cards. The screens go to `target/phone-fit-shots/`.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_phone_fits_its_terminals_opens_a_calm_chief_and_scrolls_a_board_whole() {
+    let _ = std::fs::remove_dir_all(target().join("phone-fit-shots"));
+    for (phone, upright, (covers_upright, covers_sideways)) in PHONES {
+        for (way, size, covers) in
+            [("upright", upright, covers_upright), ("sideways", (upright.1, upright.0), covers_sideways)]
+        {
+            let name = format!("{phone}-{way}");
+            let mut host = fake_host::working();
+            host.trace = fake_host::trace_data();
+            let lines: String = (1..=40).map(|n| format!("output line {n} of the agent's work so far\r")).collect();
+            host.terminals.get_mut("s1").unwrap().write(&lines);
+            let Opened { host, log, _browser, mut page, mut frame, .. } = open(host, size, true);
+            frame.wait("a phone's screen", "matchMedia('(pointer: coarse)').matches");
+            thread::sleep(Duration::from_millis(500));
+
+            // The board, scrolled: its header goes up with the cards.
+            keep_fit(&mut page, &format!("{name}-board"));
+            // A finger's drag over its middle. egui lets a finger drag a list once it has seen a touch, so the page's
+            // first touch is a tap on the Board pane it is on.
+            page.tap(phone_pane(size, Tab::Board));
+            thread::sleep(Duration::from_millis(300));
+            let middle = pos2(size.0 / 2.0, size.1 * 0.6);
+            page.drag(middle, middle - vec2(0.0, size.1 * 0.35));
+            thread::sleep(Duration::from_millis(400));
+            keep_fit(&mut page, &format!("{name}-board-scrolled"));
+
+            // A terminal: the desktop's grid until a tap types there.
+            page.tap(phone_pane(size, Tab::Terminal));
+            log.wait("subscribe s1", 1);
+            terminal_input(&mut frame);
+            keep_fit(&mut page, &format!("{name}-terminal"));
+            assert_eq!(grid(&host, "s1"), (80, 12), "{name}: looking resizes nothing");
+            let resting = input_rect(&mut frame);
+            page.tap(resting.center());
+            log.wait("acquire s1", 1);
+            frame.wait("the focus on the input", FOCUSED);
+            keyboard(&mut page, covers);
+            wait_host(&host, "the phone's grid", |h| h.terminals["s1"].lease.as_ref().is_some_and(|l| l.sized));
+            let fitted = grid(&host, "s1");
+            page.call("Input.insertText", json!({ "text": "ls" }));
+            wait_host(&host, "\"ls\" typed", |h| h.terminals["s1"].typed.ends_with("ls"));
+            thread::sleep(Duration::from_millis(400));
+            keep_fit(&mut page, &format!("{name}-terminal-typing"));
+            let typing = input_rect(&mut frame);
+            assert!(typing.top() < resting.top() - 20.0, "{name}: nothing over it while typing: {typing:?}");
+            assert!((typing.width() - size.0).abs() < 1.0, "{name}: the full width: {typing:?}");
+
+            // The keyboard goes: the same grid, every column on the screen.
+            keyboard(&mut page, 0.0);
+            frame.eval("document.getElementById('atomics-input').blur(); true");
+            frame.wait("the key bar gone", "document.getElementById('atomics-keybar').hidden");
+            thread::sleep(Duration::from_millis(600));
+            keep_fit(&mut page, &format!("{name}-terminal-fitted"));
+            assert_eq!(grid(&host, "s1"), fitted, "{name}: the keyboard coming and going resizes nothing");
+            let resizes = log.lines.lock().unwrap().iter().filter(|l| l.starts_with("resize s1")).count();
+            assert!(resizes <= 1, "{name}: {resizes} resizes");
+
+            // The chief, opened fresh from its button: its terminal, no header, the trace folded.
+            page.tap(pos2(size.0 / 2.0, layout::TOP_BAR * layout::ZOOM / 2.0));
+            log.wait("subscribe chief", 1);
+            thread::sleep(Duration::from_millis(500));
+            keep_fit(&mut page, &format!("{name}-chief"));
+            let chief = input_rect(&mut frame);
+            page.tap(chief.center());
+            log.wait("acquire chief", 1);
+            frame.wait("the focus on the chief's input", FOCUSED);
+            keyboard(&mut page, covers);
+            thread::sleep(Duration::from_millis(500));
+            keep_fit(&mut page, &format!("{name}-chief-typing"));
+            keyboard(&mut page, 0.0);
+        }
+    }
+}
+
+/// What a pinch or a double tap does to the page's zoom, on the hosting page that frames the client and in the frame.
+fn zooms(page: &mut DevTools, frame: &mut DevTools) -> (f64, f64) {
+    let scale = |devtools: &mut DevTools| devtools.eval("visualViewport.scale").as_f64().expect("a scale");
+    (scale(page), scale(frame))
+}
+
+/// Two fingers spread apart around `at`, as DevTools dispatches them.
+fn spread(page: &mut DevTools, at: Pos2) {
+    let fingers = |gap: f32| {
+        json!([
+            { "x": at.x - gap, "y": at.y, "radiusX": 4, "radiusY": 4, "force": 1, "id": 1 },
+            { "x": at.x + gap, "y": at.y, "radiusX": 4, "radiusY": 4, "force": 1, "id": 2 },
+        ])
+    };
+    page.call("Input.dispatchTouchEvent", json!({ "type": "touchStart", "touchPoints": fingers(20.0) }));
+    for step in 1..=8 {
+        thread::sleep(Duration::from_millis(20));
+        page.call(
+            "Input.dispatchTouchEvent",
+            json!({ "type": "touchMove", "touchPoints": fingers(20.0 + 15.0 * step as f32) }),
+        );
+    }
+    page.call("Input.dispatchTouchEvent", json!({ "type": "touchEnd", "touchPoints": [] }));
+}
+
+/// On an iPhone 16 Pro, emulated touch: a pinch and a double tap on the board, on a terminal, on the key bar and on a
+/// gap between its keys leave the page at its own size, in the frame and on the hosting page that frames it.
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_pinch_or_a_double_tap_zooms_nothing_on_a_phone() {
+    let Opened { log, _browser, mut page, mut frame, .. } = open(fake_host::working(), PHONE, true);
+    frame.wait("a phone's screen", "matchMedia('(pointer: coarse)').matches");
+    thread::sleep(Duration::from_millis(500));
+    let mut zoomed = Vec::new();
+    let mut probe = |page: &mut DevTools, frame: &mut DevTools, what: &str, at: Pos2| {
+        spread(page, at);
+        thread::sleep(Duration::from_millis(300));
+        let pinch = page.call(
+            "Input.synthesizePinchGesture",
+            json!({ "x": at.x, "y": at.y, "scaleFactor": 2.5, "gestureSourceType": "touch" }),
+        );
+        thread::sleep(Duration::from_millis(300));
+        let after_pinch = zooms(page, frame);
+        let tap = page.call(
+            "Input.synthesizeTapGesture",
+            json!({ "x": at.x, "y": at.y, "tapCount": 2, "gestureSourceType": "touch" }),
+        );
+        thread::sleep(Duration::from_millis(500));
+        let after_tap = zooms(page, frame);
+        eprintln!("zoom {what} at {at:?}: pinch {after_pinch:?} ({pinch}), double tap {after_tap:?} ({tap})");
+        for (gesture, (outer, inner)) in [("pinch", after_pinch), ("double tap", after_tap)] {
+            if (outer - 1.0).abs() > 0.01 || (inner - 1.0).abs() > 0.01 {
+                zoomed.push(format!("{what}: a {gesture} zoomed the page to {outer} (frame {inner})"));
+                // Back to the page's own size for the next probe.
+                page.call("Emulation.resetPageScaleFactor", json!({}));
+                thread::sleep(Duration::from_millis(300));
+            }
+        }
+    };
+    probe(&mut page, &mut frame, "the board", pos2(PHONE.0 / 2.0, PHONE.1 / 2.0));
+    page.tap(phone_pane(PHONE, Tab::Terminal));
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let cells = input_rect(&mut frame);
+    probe(&mut page, &mut frame, "a terminal", cells.center());
+    page.tap(cells.center());
+    log.wait("acquire s1", 1);
+    frame.wait("the key bar", "!document.getElementById('atomics-keybar').hidden");
+    let bar = frame.eval(
+        "(() => { const r = document.getElementById('atomics-keybar').getBoundingClientRect(); \
+         const k = document.querySelector('#atomics-keybar button').getBoundingClientRect(); \
+         return [r.x, r.y, r.width, r.height, k.x, k.y, k.width, k.height]; })()",
+    );
+    let n = |i: usize| bar[i].as_f64().expect("a coordinate") as f32;
+    probe(&mut page, &mut frame, "a key", pos2(n(4) + n(6) / 2.0, n(5) + n(7) / 2.0));
+    probe(&mut page, &mut frame, "a gap in the key bar", pos2(n(4) + n(6) + 1.0, n(1) + 1.0));
+    assert!(zoomed.is_empty(), "{zoomed:#?}");
 }

@@ -287,7 +287,7 @@ mod tests {
             assert!(!all.contains("sk-live"));
             app.client.ui.lane.cleared = app.lane_entries().last().unwrap().seq;
             assert!(app.lane_entries().is_empty());
-            assert_eq!(app.client.ui.lane.height(&app.runtime.trace_data(), 600.0), 0.0);
+            assert_eq!(app.client.ui.lane.height(&app.runtime.trace_data(), 600.0, None), 0.0);
         });
     }
 }

@@ -1226,8 +1226,10 @@ from: the open ones in a strip that scrolls sideways, the finished ones behind a
 there joining the strip, which scrolls to it and keeps a tap's width of the plan before it), Diffs (the
 worktrees with changes, then the diff panel), Terminal (the active agent's fleet tile at the pane's size: its header,
 its approval banner, its terminal); Board and Diffs carry the view switcher's icons and counts. The chief's window
-(with the request it waits on) opens from the CHIEF pill in the middle of the top bar, as on the desktop; a second
-tap goes back to the pane before it. The approvals are behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
+(with the request it waits on) opens from the CHIEF pill in the middle of the top bar, as on the desktop, with no
+header of its own (the pill said whose it is) and, the first time, its trace's calls folded under the terminal; a
+second tap goes back to the pane before it. While the user types in a terminal, it has the pane to itself: the tile's
+header, the chief's trace and the strip over the terminal give way until the keyboard goes. The approvals are behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
 insets (the sides too, for a phone held sideways). The page's own
 controls take the theme's colours as CSS custom properties.
 
@@ -1239,7 +1241,7 @@ board yet, while pairing or connecting, the shell is the name, the connection's 
 panes to go to. The line over the pane on screen glides to the next one, and the tablet's drawer slides in, unless the
 system asks for reduced motion. The shared views fit it through
 `Client::touch` (`atomics_ui::touch`), which the desktop never sets: the board stacks the statuses that have tasks
-with full-width cards under its header and buttons; a tile fills the pane to its sides with a finger-sized header;
+with full-width cards under its header and buttons, all of it one surface that scrolls; a tile fills the pane to its sides with a finger-sized header;
 the diff header stacks the title, then the branch and counts, then its buttons in a row that wraps with Close last,
 and the diff shows one side, numbers each line once and wraps long lines under their indent, measured by the
 glyphs they are drawn with, so wide characters never run past the screen (**Wrap** turns that off); a comment box stays
@@ -1256,12 +1258,16 @@ terminal would take the keyboard with it. A mouse at any size draws as the deskt
 
 **Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and
 the history kept for it freed. Its cells are the desktop's grid, drawn by the shared painter: the font fits the
-width until the user pinches, on a phone never below 13 px and on a tablet 11, a wider grid pans, a grid taller than the pane keeps
-the cursor in view, and the screen's own background fills the pane below a shorter one. Looking never resizes the
-PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
-desktop, and lasts as long as the lease (**Computer's size** gives it back early), so the keyboard moving to a text
-box ends it too. The pane renews a lease whose size is in force while it shows the terminal: the click on the
-button takes the keyboard off it, and without the renew the host ended the lease, and the size, 30 s later.
+width until the user pinches (a tablet or a computer), for a finger never below 13 px on a phone and 11 on a tablet, a
+wider grid pans, a grid taller than the pane keeps the cursor in view, and the screen's own background fills the pane
+below a shorter one. Looking never resizes the PTY. On a tablet or a computer, **Fit to this screen** sends
+`terminal_resize` for the pane at the current font, shown on the desktop, and lasts as long as the lease
+(**Computer's size** gives it back early), so the keyboard moving to a text box ends it too. A phone fits by itself,
+with no button: whenever it holds the lease it sends `terminal_resize` for its pane at 13 px, as wide as the pane and
+as tall as the pane was with nobody typing, so a keyboard coming up keeps the grid and shows its lowest lines, the
+cursor's; turned sideways it fits again, and a new lease fits again. The pane renews a lease whose size is in force
+while it shows the terminal: the click on the button takes the keyboard off it, a phone's keyboard goes down, and
+without the renew the host ended the lease, and the size, 30 s later.
 
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
@@ -1289,13 +1295,21 @@ button takes the keyboard off it, and without the renew the host ended the lease
   narrower than 375 scrolls a row) and never take the focus; Paste reads the clipboard on the touch's end.
 - **Touch and mouse.** A finger may wobble 12 CSS pixels and still tap, on a terminal and on any other control (a
   mouse keeps its 6 points to click and 8 to select). A tap clicks the cell (press and release) where the program
-  asked for mouse reports and this client types; a tap where someone else types shows up **Take over**; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
-  output does not move a view scrolled back) and pans; a long press (450 ms) selects the word under the finger
+  asked for mouse reports and this client types; a tap where someone else types shows up **Take over**; a one-finger drag scrolls this client's own history and pans. New
+  output does not move a view scrolled back. Following a screen costs its snapshot alone; once the view is scrolled
+  back it asks for `history_get` pages of 500 lines, one round trip ahead of it in either direction, as far back as the
+  host keeps lines, and holds at most 5000 of them around the view (going back down asks again for those it let go).
+  A snapshot of the same generation after a gap keeps what is held; one after a reconnect starts over. A long press (450 ms) selects the word under the finger
   (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
   each end to drag; a **Copy** chip, above the selection or below it where there is no room in the terminal, copies
   just that range on its touch's end, leaving the focus where it was (see the iframe above). The page's own text
-  selection is off. A pinch sets the font size (5-28 points). A touch whose lift never reached the client is cancelled
-  when the next touch starts. A mouse clicks and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the
+  selection is off. On a tablet or a computer a pinch sets the font size (5-28 points). A touch whose lift never reached the client is cancelled
+  when the next touch starts. A mouse clicks and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. On a phone
+  nothing zooms a terminal, neither a pinch nor Ctrl+wheel, and nothing zooms the page: it and its key bar are
+  `touch-action: none` (the key bar's rows scroll sideways only), and a pinch's gesture events, two fingers' moves
+  and a double tap's `dblclick` are refused on the page. In a frame the hosting page's viewport is the one Safari
+  zooms, so that page holds its own zoom too while the frame shows (`maximum-scale=1` against a zoom on rotation or
+  focus, and the same refusals). In the
   alternate screen, or with SGR mouse reports, a scroll sends arrows or wheel reports instead, as the desktop does,
   only while this client types.
 - **Typing needs the lease.** Only the field gaining the focus asks for a free lease, by a tap, a click, or a pick

@@ -664,11 +664,12 @@ impl RemoteBackend {
         read(self.state.borrow().screens.view(session))
     }
 
-    /// Fill `view` with `rows` lines of `session` from line ID `top` on ([`Screens::fill`]).
-    pub fn fill_screen(&self, session: &str, top: u64, rows: u16, view: &mut Screen) -> bool {
+    /// Fill `view` with `rows` lines of `session` from line ID `top` on, asking for the history it reaches and up to
+    /// `ahead` lines on either side of it ([`Screens::fill`]).
+    pub fn fill_screen(&self, session: &str, top: u64, rows: u16, ahead: u64, view: &mut Screen) -> bool {
         let mut s = self.state.borrow_mut();
         let s = &mut *s;
-        s.screens.fill(session, top, rows, view, &mut s.outgoing).is_some()
+        s.screens.fill(session, top, rows, ahead, view, &mut s.outgoing).is_some()
     }
 
     pub fn lease(&self, session: &str) -> Lease {

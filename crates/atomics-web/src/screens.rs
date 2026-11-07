@@ -18,8 +18,12 @@
 //! - **No replay.** A disconnect forgets the lease, the waiting text and whatever was not known to be
 //!   applied (`Typist::disconnected`). The screen stays on view as it was, marked stale, until the next
 //!   snapshot.
-//! - **History.** Lines that scroll off the top are kept as they go; older ones are asked for with
-//!   `history_get` when the view reaches them. A snapshot starts the history over; unsubscribing frees it.
+//! - **History.** Lines that scroll off the top are kept as they go. A view scrolled back asks for older ones with
+//!   `history_get`, a page at a time, before it reaches them ([`READ_AHEAD`]), as far back as the host keeps
+//!   them; nothing is asked for until the user scrolls back, so following a screen costs no more than its snapshot.
+//!   What is kept is one run of lines around the view, at most [`MAX_HISTORY_KEPT`]: a view far back drops the
+//!   newest, which are asked for again on the way down. A snapshot starts the history over, but for one of the same
+//!   generation after a gap on the same connection: line IDs hold within a generation. Unsubscribing frees it.
 //! - **Requests.** Every frame a refusal can answer carries a request ID. The IDs kept to match refusals
 //!   are bounded: applied input and answered requests are forgotten, and past [`MAX_REQUESTS`] the
 //!   oldest go.
@@ -41,10 +45,13 @@ pub const MAX_TYPED_BYTES: usize = 1 << 20;
 pub const MAX_REQUESTS: usize = 1024;
 /// Starts every request ID the terminals use; an error naming one is theirs.
 const REQUEST_PREFIX: &str = "t-";
-/// History lines kept per terminal; the oldest go first.
-const MAX_HISTORY_KEPT: usize = 5000;
-/// Lines one `history_get` asks for.
-const HISTORY_PAGE: u64 = 200;
+/// History lines kept per terminal, around the view: the end farther from it goes first.
+pub const MAX_HISTORY_KEPT: usize = 5000;
+/// Lines one `history_get` asks for; the host sends the newest of them that fit one frame.
+pub const HISTORY_PAGE: u64 = 500;
+/// How many lines on either side of a view scrolled back are asked for before it reaches them: a page, so
+/// scrolling on finds them there, one round trip ahead.
+pub const READ_AHEAD: u64 = HISTORY_PAGE;
 
 /// Who types into a terminal, as this client knows it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,9 +130,14 @@ struct Term {
     /// The screen held is from before a disconnect.
     stale: bool,
     lost: Option<Lost>,
-    /// History lines by ID, contiguous and ending at the screen's `first_line`.
+    /// History lines by ID: one contiguous run below the screen's `first_line`, ending there unless the view is
+    /// further back than [`MAX_HISTORY_KEPT`] lets the run reach.
     history: BTreeMap<u64, Line>,
     history_asked: bool,
+    /// The top line of the view while it is scrolled back into history, which the lines kept stay around.
+    view_top: Option<u64>,
+    /// The oldest line the host said it still has, in this generation: older are gone for good.
+    host_oldest: u64,
 }
 
 impl Term {
@@ -137,9 +149,13 @@ impl Term {
         self.mirror.screen.as_ref()
     }
 
-    /// Keep the lines a delta scrolls off the top, when they follow the history held.
+    /// Keep the lines a delta scrolls off the top, when they follow the history held. A view far back keeps the run
+    /// it has instead; it asks for these again on its way down.
     fn keep_scrolled(&mut self, top: Vec<Line>, from: u64) {
         let follows = self.history.last_key_value().is_none_or(|(last, _)| last + 1 == from);
+        if !follows && self.view_top.is_some() {
+            return self.trim_history();
+        }
         if !follows {
             self.history.clear();
         }
@@ -149,12 +165,58 @@ impl Term {
         self.trim_history();
     }
 
+    /// The oldest line still to be had: what the screen says, or what the host said since.
+    fn oldest(&self) -> u64 {
+        self.screen().map_or(0, Screen::oldest_line).max(self.host_oldest)
+    }
+
+    /// Drop what the host no longer has, and past [`MAX_HISTORY_KEPT`] the end of the run farther from the view.
     fn trim_history(&mut self) {
-        let oldest = self.screen().map_or(0, Screen::oldest_line);
+        let oldest = self.oldest();
         self.history.retain(|id, _| *id >= oldest);
+        let around = self.view_top.or_else(|| self.screen().map(|s| s.first_line)).unwrap_or(0);
         while self.history.len() > MAX_HISTORY_KEPT {
-            self.history.pop_first();
+            let (Some((&low, _)), Some((&high, _))) = (self.history.first_key_value(), self.history.last_key_value())
+            else {
+                break;
+            };
+            if around.saturating_sub(low) >= high.saturating_sub(around) {
+                self.history.pop_first();
+            } else {
+                self.history.pop_last();
+            }
         }
+    }
+
+    /// The page of history a view of `rows` lines from line `top` wants next, as `(before, count)`: the lines it shows
+    /// that are not held, and those up to `ahead` lines on either side of it. The run held grows toward the view, older
+    /// lines first. With none held, or a run that neither meets nor overlaps what the view wants (dropped), it is the
+    /// page nearest the screen that still holds the view's first line.
+    fn wanted(&mut self, top: u64, rows: u16, ahead: u64) -> Option<(u64, u64)> {
+        let first = self.screen()?.first_line;
+        let oldest = self.oldest();
+        let from = top.saturating_sub(ahead).max(oldest);
+        let to = (top + u64::from(rows) + ahead).min(first);
+        if from >= to {
+            return None;
+        }
+        let held = self.history.first_key_value().map(|(low, _)| *low);
+        let held = held.zip(self.history.last_key_value().map(|(high, _)| high + 1));
+        let page = |before: u64| (before, before.saturating_sub(oldest).min(HISTORY_PAGE));
+        let wants = match held {
+            Some((low, high)) if to < low || from > high => {
+                self.history.clear();
+                page(to.min(top + HISTORY_PAGE))
+            }
+            Some((low, _)) if from < low => page(low),
+            Some((_, high)) if to > high => {
+                let before = (high + HISTORY_PAGE).min(first);
+                (before, before - high)
+            }
+            Some(_) => return None,
+            None => page(to.min(top + HISTORY_PAGE)),
+        };
+        (wants.1 > 0).then_some(wants)
     }
 }
 
@@ -226,6 +288,7 @@ impl Screens {
                 term.retype = false;
                 term.history = BTreeMap::new();
                 term.history_asked = false;
+                term.view_top = None;
                 let topics = vec![Topic::Screen { session: session.clone(), focused: false }];
                 frames.push(Message::Unsubscribe { topics });
             }
@@ -366,18 +429,20 @@ impl Screens {
     }
 
     /// Fill `view` with `rows` lines from line ID `top` on: history, then the live screen. Lines not held
-    /// yet are blank and asked for. `None` without a screen.
+    /// yet are blank and asked for, and so are up to `ahead` lines on either side of them ([`Term::wanted`]). `None`
+    /// without a screen.
     pub fn fill(
         &mut self,
         session: &str,
         top: u64,
         rows: u16,
+        ahead: u64,
         view: &mut Screen,
         out: &mut Vec<Envelope>,
     ) -> Option<()> {
         let term = self.terms.get_mut(session)?;
         let screen = term.mirror.screen.as_ref()?;
-        let (first, oldest) = (screen.first_line, screen.oldest_line());
+        let first = screen.first_line;
         view.cols = screen.cols;
         view.rows = rows;
         view.modes = screen.modes;
@@ -386,16 +451,9 @@ impl Screens {
         view.first_line = top;
         view.history = 0;
         view.lines.resize(usize::from(rows), Line::blank(screen.cols));
-        let mut missing = false;
         for (row, line) in view.lines.iter_mut().enumerate() {
             let id = top + row as u64;
-            let source = if id >= first {
-                screen.lines.get((id - first) as usize)
-            } else {
-                let held = term.history.get(&id);
-                missing |= held.is_none() && id >= oldest;
-                held
-            };
+            let source = if id >= first { screen.lines.get((id - first) as usize) } else { term.history.get(&id) };
             match source {
                 Some(source) => line.clone_from(source),
                 None => *line = Line::blank(screen.cols),
@@ -408,21 +466,21 @@ impl Screens {
         } else {
             view.cursor.row = (cursor_id - top) as u16;
         }
-        if missing && !term.history_asked && term.subscribed.is_some() {
-            let before = term.history.first_key_value().map_or(first, |(id, _)| *id);
-            let count = before.saturating_sub(oldest).min(HISTORY_PAGE);
-            if count > 0 {
-                term.history_asked = true;
-                let generation = Seq(term.mirror.generation);
-                let message = Message::HistoryGet(HistoryGet {
-                    session: session.to_string(),
-                    generation,
-                    before: Seq(before),
-                    count: count as u32,
-                });
-                let id = self.request(Request::History(session.to_string()));
-                out.push(Envelope::new(message).reply_to(Some(id)));
-            }
+        term.view_top = (top < first).then_some(top);
+        if term.history_asked || term.subscribed.is_none() {
+            return Some(());
+        }
+        if let Some((before, count)) = term.wanted(top, rows, ahead) {
+            term.history_asked = true;
+            let generation = Seq(term.mirror.generation);
+            let message = Message::HistoryGet(HistoryGet {
+                session: session.to_string(),
+                generation,
+                before: Seq(before),
+                count: count as u32,
+            });
+            let id = self.request(Request::History(session.to_string()));
+            out.push(Envelope::new(message).reply_to(Some(id)));
         }
         Some(())
     }
@@ -483,11 +541,20 @@ impl Screens {
 
     fn snapshot(&mut self, snapshot: &ScreenSnapshot, out: &mut Vec<Envelope>) {
         let Some(term) = self.terms.get_mut(&snapshot.session) else { return };
+        // Line IDs hold within a generation, while the connection does: a host started again numbers its
+        // generations from the start.
+        let same = (term.mirror.generation, term.stale);
         match term.mirror.apply_snapshot(snapshot) {
             Ok(ScreenApplied::Changed) => {
                 term.resyncing = false;
                 term.stale = false;
-                term.history.clear();
+                // What was kept from before a gap is still right.
+                if same == (term.mirror.generation, false) {
+                    term.trim_history();
+                } else {
+                    term.history.clear();
+                    term.host_oldest = 0;
+                }
                 term.history_asked = false;
                 self.retype(&snapshot.session.clone(), out);
             }
@@ -529,10 +596,14 @@ impl Screens {
         if chunk.generation.0 != term.mirror.generation || chunk.cols != screen.cols {
             return;
         }
+        term.host_oldest = term.host_oldest.max(chunk.oldest.0);
         let Ok(lines) = chunk.decode() else { return };
-        let end = chunk.first.0 + lines.len() as u64;
-        let follows = term.history.first_key_value().map_or(end == screen.first_line, |(first, _)| *first == end);
-        if !follows {
+        let (start, end) = (chunk.first.0, chunk.first.0 + lines.len() as u64);
+        // The lines join the run held where they meet or overlap it, and start one where there is none.
+        let held = term.history.first_key_value().map(|(low, _)| *low);
+        let held = held.zip(term.history.last_key_value().map(|(high, _)| high + 1));
+        let joins = held.is_none_or(|(low, high)| end >= low && start <= high);
+        if !joins || end > screen.first_line {
             return;
         }
         for (i, line) in lines.into_iter().enumerate() {

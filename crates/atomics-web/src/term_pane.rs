@@ -6,11 +6,15 @@
 //! arrives here as a [`TermInput`], is encoded with the screen's latest modes
 //! (`atomics_ui::terminal::encode`) and typed under the lease.
 //!
-//! - **The grid is the desktop's.** The pane pans and zooms it: the font fits the width until the user
-//!   pinches, but on a phone never below a readable size, so a wider grid pans sideways; a grid taller than
-//!   the pane keeps the cursor in view, and the terminal's background fills the rest of the pane. "Fit to
-//!   this screen" is an explicit resize to the pane at that font, shown on the desktop, that lasts as long as
-//!   the lease, which the pane keeps while it shows the terminal.
+//! - **The grid is the desktop's** until this client types. The pane pans it and, on a tablet or a computer, zooms it:
+//!   the font fits the width until the user pinches, but for a finger never below a readable size, so a wider grid pans
+//!   sideways; a grid taller than the pane keeps the cursor in view, and the terminal's background fills the rest of
+//!   the pane. "Fit to this screen" is an explicit resize to the pane at that font, shown on the desktop, that lasts
+//!   as long as the lease, which the pane keeps while it shows the terminal.
+//! - **A phone fits the terminal to itself** whenever it holds the lease ([`TermPane::fit_phone`]), at a readable
+//!   font that a pinch never changes, with no button for it: the pane's width, and the height the pane has with no
+//!   keyboard up, so the keyboard coming and going resizes nothing. While the user types there, the strip over the
+//!   terminal gives it the room.
 //! - **Where there is no desktop** (`RemoteBackend::fits`), a native client gives each terminal its pane's size
 //!   at the desktop's font, as the desktop does with its own panes ([`TermPane::fit`]), and follows the pane as it
 //!   changes. The pane the input goes to and every other keep the same room for the strip saying who types, so
@@ -19,8 +23,8 @@
 //!   ([`Overlay::strip`]), and, where the program takes
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
 //!   only) and pans; a long press selects the word under the finger, with a handle at each end to drag
-//!   and Copy for just that range; a pinch sets the font size. A mouse clicks and drag-selects; its wheel
-//!   scrolls.
+//!   and Copy for just that range; on a tablet a pinch sets the font size, and on a phone it does nothing. A mouse
+//!   clicks and drag-selects; its wheel scrolls.
 //! - **The overlay yields to what lies over it.** It takes the pointer only where egui would give the
 //!   terminal the pointer: a floating window over the terminal is cut out of it ([`Overlay::covered`]), and an
 //!   open menu or popup takes all of it, so a click away closes the popup as it does anywhere else. A click
@@ -51,15 +55,18 @@ use egui::{Align2, Key, LayerId, Modifiers, Order, Pos2, Rect, RichText, Sense, 
 
 use crate::gesture::{Gesture, Kind, Phase, Pointer, Recognizer};
 use crate::remote::RemoteBackend;
-use crate::screens::{Lease, Lost, MAX_WAITING_BYTES, Refused};
+use crate::screens::{Lease, Lost, MAX_WAITING_BYTES, READ_AHEAD, Refused};
 
 /// The font size range a pinch moves in, and the fitted default's.
 pub const MIN_FONT: f32 = 5.0;
 pub const MAX_FONT: f32 = 28.0;
 const FIT_MIN: f32 = 7.0;
 const FIT_MAX: f32 = 14.0;
-/// For a finger the fitted font stays readable: a wider grid pans instead.
+/// For a finger the fitted font stays readable: a wider grid pans instead. A phone fits its grid at this size.
 const PHONE_FIT_MIN: f32 = 13.0;
+/// How much narrower or wider than the room it last had at rest a phone's pane may be and still take that room's grid:
+/// the tile around the terminal and the terminal alone, while typing, differ by their borders.
+const PHONE_SAME_WIDTH: f32 = 16.0;
 const TABLET_FIT_MIN: f32 = 11.0;
 /// Space between the pane's edge and the cells; on a phone the cells keep to the screen's gutter.
 const PAD: f32 = 4.0;
@@ -182,6 +189,12 @@ pub struct TermPane {
     pub fit: Option<f32>,
     /// This client holds the lease with its own size in force.
     sized: bool,
+    /// A phone holding the lease: the grid is the pane's, at [`PHONE_FIT_MIN`].
+    fitting: bool,
+    /// The grid this phone last asked the host for, under the lease it holds.
+    phone_grid: Option<GridSize>,
+    /// The room the cells had the last time nobody typed here, which a phone fits the grid to ([`TermPane::fit_phone`]).
+    resting: Option<Vec2>,
     /// The overlay is to lose the focus at the next draw: the input went to another terminal.
     blur_next: bool,
     /// The overlay is to take the focus at the next draw ([`Overlay::focus`]).
@@ -223,6 +236,9 @@ impl Default for TermPane {
             cramped: false,
             fit: None,
             sized: false,
+            fitting: false,
+            phone_grid: None,
+            resting: None,
             blur_next: false,
             focus_next: false,
             handed: Vec::new(),
@@ -330,8 +346,16 @@ impl TermPane {
             self.held = false;
             self.gestures = Recognizer::default();
             self.inputs.clear();
+            self.fitting = false;
+            self.phone_grid = None;
+            self.resting = None;
             self.let_go();
         }
+    }
+
+    /// The phone's shell: one pane at a time, and no room to spare.
+    fn phone(&self) -> bool {
+        touch::stacks(self.touch)
     }
 
     /// Takes from what the overlay forwarded the keys that are the window's, as the input events they are: the overlay
@@ -457,9 +481,32 @@ impl TermPane {
         }
     }
 
-    /// The strip over the terminal the input goes to, which says who types.
+    /// The strip over the terminal the input goes to, which says who types: none while a phone types there.
     fn header_height(&self) -> f32 {
-        if self.cramped { 0.0 } else { self.touch.map_or(24.0, |touch| touch.target + 8.0) }
+        if self.cramped || (self.phone() && self.focused) {
+            0.0
+        } else {
+            self.touch.map_or(24.0, |touch| touch.target + 8.0)
+        }
+    }
+
+    /// A phone gives the terminal its own grid while it holds the lease: as wide as the pane, and as tall as the pane
+    /// was the last time nobody typed here, so a keyboard coming up keeps the grid and shows its lowest lines with the
+    /// cursor. Asked for once per grid; a new lease asks again.
+    fn fit_phone(&mut self, frame: &Frame, session: &str, remote: &RemoteBackend, lease: &Lease) {
+        if !self.fitting {
+            self.phone_grid = None;
+            return;
+        }
+        let now = frame.rect.size();
+        let room = self.resting.filter(|rest| (rest.x - now.x).abs() <= PHONE_SAME_WIDTH).unwrap_or(now);
+        let grid = fit_size(&Frame { rect: Rect::from_min_size(frame.rect.min, room), ..*frame });
+        let size = remote.with_screen(session, |s| s.map(|(screen, _)| (screen.cols, screen.rows)));
+        if self.phone_grid == Some(grid) || (lease.resized && size == Some((grid.cols, grid.rows))) {
+            return;
+        }
+        self.phone_grid = Some(grid);
+        remote.resize(session, Some(grid));
     }
 
     /// Where this client gives the terminal its size ([`TermPane::fit`]): the grid the pane holds, whenever that
@@ -585,7 +632,7 @@ impl TermPane {
 
         // The lease as it is now (a tap may have asked for it), renewed while the user is at the terminal, and while
         // the size it asked for is in force: the click on "Fit to this screen" takes the keyboard off the terminal,
-        // and the host gives its own size back when the lease ends.
+        // a phone's keyboard goes down, and the host gives its own size back when the lease ends.
         let lease = remote.lease(session);
         self.held = lease.yours;
         self.sized = lease.yours && lease.resized;
@@ -594,7 +641,13 @@ impl TermPane {
             self.active_ms = now_ms;
         }
 
+        self.fitting = self.phone() && lease.yours;
         let frame = self.frame(ui, body, session, remote, p).unwrap_or(frame);
+        // At rest before this frame's inputs and after them: the frame the keyboard goes is still laid out for typing.
+        if !was_focused && !self.focused {
+            self.resting = Some(frame.rect.size());
+        }
+        self.fit_phone(&frame, session, remote, &lease);
         self.refit(&frame, session, remote);
         self.paint(ui, &frame, session, remote, p, lease.yours);
 
@@ -620,7 +673,7 @@ impl TermPane {
             blur: lost || std::mem::take(&mut self.blur_next) || (self.focused && !(writable && typing)),
             focus: std::mem::take(&mut self.focus_next) && writable,
             editor: remote.editors().iter().any(|e| e.terminal == session),
-            strip: (self.touch.is_some() && writable && !self.cramped).then(|| header.with_max_x(buttons)),
+            strip: (self.touch.is_some() && writable && height > 0.0).then(|| header.with_max_x(buttons)),
         };
         if self.overlay.blur {
             self.focused = false;
@@ -683,7 +736,8 @@ impl TermPane {
         if !live || !may_type {
             return;
         }
-        if lease.yours {
+        // A phone fits the terminal by itself while it types there.
+        if lease.yours && !self.phone() {
             if lease.resized {
                 if button(ui, "Computer's size").clicked() {
                     actions.fit = Some(false);
@@ -695,7 +749,7 @@ impl TermPane {
             {
                 actions.fit = Some(true);
             }
-        } else if lease.holder.is_some() {
+        } else if !lease.yours && lease.holder.is_some() {
             let take_over =
                 if nudged { atomics_ui::controls::primary(ui, "Take over", touch, p) } else { button(ui, "Take over") };
             actions.take_over = take_over.clicked();
@@ -719,7 +773,11 @@ impl TermPane {
         };
         let ratio = ui.fonts_mut(|f| f.glyph_width(&p.mono(100.0), 'M')) / 100.0;
         let width_fit = (body.width() - 2.0 * pad.x) / (f32::from(cols) * ratio.max(0.01));
-        let size = self.font.or(self.fit).unwrap_or(width_fit.clamp(fit_min, FIT_MAX)).clamp(MIN_FONT, MAX_FONT);
+        let size = if self.fitting {
+            PHONE_FIT_MIN
+        } else {
+            self.font.or(self.fit).unwrap_or(width_fit.clamp(fit_min, FIT_MAX)).clamp(MIN_FONT, MAX_FONT)
+        };
         let font = p.mono(size);
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font).ceil()));
         let fit_rows = (((body.height() - 2.0 * pad.y) / cell.y).floor().max(1.0)) as u16;
@@ -809,7 +867,9 @@ impl TermPane {
             }
             TermInput::Wheel { delta, at, zoom } => {
                 if zoom {
-                    self.zoom((-delta.y / 200.0).exp(), at, frame);
+                    if !self.phone() {
+                        self.zoom((-delta.y / 200.0).exp(), at, frame);
+                    }
                 } else {
                     self.scroll(-delta.y, at, frame, modes, lease, typed);
                 }
@@ -843,6 +903,8 @@ impl TermPane {
                 self.pan_x -= delta.x;
                 self.scroll(delta.y, frame.rect.center(), frame, modes, lease, typed);
             }
+            // A phone's terminal fits the screen: nothing zooms it.
+            Gesture::Pinch { .. } if self.phone() => {}
             Gesture::Pinch { factor, center } => self.zoom(factor, center, frame),
             Gesture::Select { from, to, word: false, .. } => {
                 self.selection = Some((frame.cell_at(from), frame.cell_at(to)));
@@ -971,7 +1033,9 @@ impl TermPane {
         yours: bool,
     ) {
         self.painted = Some(*frame);
-        remote.fill_screen(session, frame.top, frame.rows, &mut self.view);
+        // Scrolled back, the history around the view is asked for before the view reaches it.
+        let ahead = if self.top.is_some() { READ_AHEAD } else { 0 };
+        remote.fill_screen(session, frame.top, frame.rows, ahead, &mut self.view);
         let metrics = Metrics { font: p.mono(frame.size), cell: frame.cell };
         let inner = Rect::from_min_size(
             frame.origin,
