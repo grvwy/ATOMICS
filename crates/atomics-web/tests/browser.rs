@@ -10,6 +10,9 @@
 //! `an_ipad_draws_the_real_frame_and_works_by_touch`, `an_ipad_approves_by_touch` and
 //! `pairing_shows_its_code_on_a_phone_and_a_tablet` say what they do; their screens are saved in `target/actions-shots/`.
 //!
+//! `the_passkey_glue_seals_and_opens_a_key_in_a_frame` needs no bundle either: the passkey glue and its window, in a
+//! frame on another origin, with Chrome's virtual authenticator.
+//!
 //! `a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases` needs no bundle: the page's input alone, in a
 //! phone's Chrome, under real touches and a soft keyboard's editing commands.
 //!
@@ -858,6 +861,7 @@ fn device_store_recovers_connections_and_preserves_unreadable_keys() {
     assert_eq!(
         checked,
         json!([
+            "storage facts",
             "sealed storage",
             "closed connection",
             "background close",
@@ -872,6 +876,151 @@ fn device_store_recovers_connections_and_preserves_unreadable_keys() {
             "explicit forget",
         ])
     );
+}
+
+/// The value of `expression` in a frame's own context, inside a tap's activation when `gesture`.
+fn in_frame(page: &mut DevTools, context: &serde_json::Value, expression: &str, gesture: bool) -> serde_json::Value {
+    let params = json!({
+        "expression": expression, "contextId": context, "returnByValue": true, "awaitPromise": true, "userGesture": gesture,
+    });
+    page.call("Runtime.evaluate", params)["result"]["value"].clone()
+}
+
+/// The passkey glue (`web/passkey.js`) and its window (`web/enrol.html`) in Chrome, with a virtual authenticator that
+/// has PRF, in a frame on another origin of the same site with the hosting page's sandbox and WebAuthn delegation.
+/// Tapping the page's button: a passkey made in the frame seals a key at once; the record opens again to the same key;
+/// a changed record is refused at the open, not taken for another; a named passkey and whichever the browser offers
+/// both seal; and where the frame makes its passkey in a window of its own, that window tells the frame it is made.
+/// No bundle needed.
+#[test]
+#[ignore = "needs Chrome; no built bundle required"]
+fn the_passkey_glue_seals_and_opens_a_key_in_a_frame() {
+    let bind = || TcpListener::bind("127.0.0.1:0").unwrap();
+    let (client, page_listener) = (bind(), bind());
+    let port = |l: &TcpListener| l.local_addr().unwrap().port();
+    let client_origin = format!("http://localhost:{}", port(&client));
+    let page_origin = format!("http://localhost:{}", port(&page_listener));
+    let csp = format!(
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors {page_origin}; \
+         base-uri 'none'; form-action 'none'; object-src 'none'"
+    );
+    serve(
+        client,
+        Arc::new(move |_, path, _| {
+            let (kind, body) = match path {
+                "/frame.html" => ("text/html", include_str!("browser/passkey.html")),
+                "/checks.js" => ("text/javascript", include_str!("browser/passkey.js")),
+                "/passkey.js" => ("text/javascript", include_str!("../web/passkey.js")),
+                "/enrol.html" => ("text/html", include_str!("../web/enrol.html")),
+                "/enrol.js" => ("text/javascript", include_str!("../web/enrol.js")),
+                "/enrol.css" => ("text/css", include_str!("../web/enrol.css")),
+                _ => return None,
+            };
+            Some(Reply { kind, headers: vec![("Content-Security-Policy", csp.clone())], body: body.into() })
+        }),
+    );
+    let embedding = format!(
+        r#"<!doctype html><title>Passkey checks</title><iframe src="{client_origin}/frame.html"
+        allow="publickey-credentials-get; publickey-credentials-create"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"></iframe>"#
+    );
+    let delegation = format!(
+        r#"publickey-credentials-get=(self "{client_origin}"), publickey-credentials-create=(self "{client_origin}")"#
+    );
+    serve(
+        page_listener,
+        Arc::new(move |_, path, _| {
+            (path == "/").then(|| Reply {
+                kind: "text/html",
+                headers: vec![("Permissions-Policy", delegation.clone())],
+                body: embedding.clone().into(),
+            })
+        }),
+    );
+    let url = format!("{page_origin}/");
+    let log = Arc::new(Log::default());
+    let browser = launch(&[], &url, &log, Duration::from_secs(60));
+    let mut page = DevTools::open(&browser.devtools(), "passkey checks", |t| t["type"] == "page" && t["url"] == url);
+    let authenticator = json!({ "options": {
+        "protocol": "ctap2", "ctap2Version": "ctap2_1", "transport": "internal", "hasResidentKey": true,
+        "hasUserVerification": true, "isUserVerified": true, "hasPrf": true, "automaticPresenceSimulation": true,
+    }});
+    page.call("WebAuthn.enable", json!({ "enableUI": false }));
+    page.call("WebAuthn.addVirtualAuthenticator", authenticator.clone());
+    page.call("Runtime.enable", json!({}));
+    let created = page.event("Runtime.executionContextCreated", |e| {
+        e["params"]["context"]["origin"] == client_origin.as_str()
+            && e["params"]["context"]["auxData"]["isDefault"] == true
+    });
+    let frame = created["params"]["context"]["id"].clone();
+    let deadline = Instant::now() + WAIT;
+    while in_frame(&mut page, &frame, "window.check?.ready === true", false) != json!(true) {
+        assert!(Instant::now() < deadline, "the frame's checks never loaded");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let facts = in_frame(&mut page, &frame, "window.check.facts", false);
+    assert_eq!((&facts["per_session"], &facts["create_in_frame"]), (&json!(false), &json!(true)), "{facts}");
+
+    // Prepares with `setup`, taps the button inside a tap's activation, and returns what came of it.
+    let tap = |page: &mut DevTools, setup: &str| -> serde_json::Value {
+        let before = in_frame(page, &frame, "window.check.results.length", false).as_u64().unwrap();
+        in_frame(page, &frame, setup, false);
+        in_frame(page, &frame, "document.getElementById('atomics-passkey').click()", true);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let results = in_frame(page, &frame, "window.check.results", false);
+            if let Some(result) = results.as_array().and_then(|r| r.get(before as usize)) {
+                return result.clone();
+            }
+            assert!(Instant::now() < deadline, "no answer to {setup}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let made = tap(&mut page, "window.check.keep({})");
+    assert_eq!(made["kind"], "sealed", "{made}");
+    let record = made["record"].clone();
+    assert!(atomics_web::keep::Sealed::read(&record).is_some(), "a record in the contract's shape: {record}");
+    // Seven, sealed: no form of the key is in what came back.
+    assert!(!made.to_string().contains("BwcHBwcH"), "{made}");
+
+    let opened = tap(&mut page, &format!("window.check.unlock({record})"));
+    assert_eq!(opened, json!({ "kind": "unlocked", "same": true }));
+    let mut changed = record.clone();
+    let sealed = record["sealed"].as_str().unwrap();
+    changed["sealed"] = json!(format!("{}{}", if sealed.starts_with('A') { 'B' } else { 'A' }, &sealed[1..]));
+    let refused = tap(&mut page, &format!("window.check.unlock({changed})"));
+    assert_eq!((&refused["kind"], &refused["step"]), (&json!("failed"), &json!("open")), "{refused}");
+
+    let named = tap(&mut page, &format!("window.check.keep({{ credential: {} }})", record["credential"]));
+    assert_eq!(named["kind"], "sealed", "{named}");
+    assert_eq!(named["record"]["credential"], record["credential"], "the passkey asked for");
+    let again = tap(&mut page, &format!("window.check.unlock({})", named["record"]));
+    assert_eq!(again["same"], true);
+    let offered = tap(&mut page, "window.check.keep({ made: true })");
+    assert_eq!(offered["kind"], "sealed", "{offered}");
+
+    // A frame that makes its passkey in a window of its own: the window makes it, and says so.
+    let opening = tap(&mut page, "window.check.keep({ inFrame: false })");
+    assert_eq!(opening["kind"], "enrolling", "{opening}");
+    let mut window = DevTools::open(&browser.devtools(), "the passkey window", |t| {
+        t["type"] == "page" && t["url"].as_str().is_some_and(|u| u.ends_with("/enrol.html"))
+    });
+    window.call("WebAuthn.enable", json!({ "enableUI": false }));
+    window.call("WebAuthn.addVirtualAuthenticator", authenticator);
+    window.wait("the passkey window to load", "document.readyState === 'complete'");
+    let click = json!({ "expression": "document.getElementById('make').click()", "userGesture": true });
+    window.call("Runtime.evaluate", click);
+    let deadline = Instant::now() + WAIT;
+    let enrolled = loop {
+        let results = in_frame(&mut page, &frame, "window.check.results", false);
+        if let Some(last) = results.as_array().and_then(|r| r.last()).filter(|r| r["kind"] != "enrolling") {
+            break last.clone();
+        }
+        assert!(Instant::now() < deadline, "the window never said it made the passkey");
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(enrolled["kind"], "enrolled", "{enrolled}");
+    assert!(enrolled["credential"].as_str().is_some_and(|c| c.len() >= 16), "its credential ID: {enrolled}");
 }
 
 /// What the page's input (`web/terminal.js`, or `ATOMICS_WEB_TERMINAL_JS`) makes of a finger and a soft keyboard, in a
@@ -1404,7 +1553,9 @@ fn the_bundle_works_on_a_phone_by_touch() {
     log.wait("dial ticket-0", 1);
     log.wait("first 97 bytes, kind 1", 1);
     wait_host(&host, "the pairing request", |h| h.named.is_some());
-    assert_eq!(host.lock().unwrap().named.as_deref(), Some("Safari on iPhone"), "the frame has Safari's user agent");
+    // Named from Safari's user agent, with the short form of what its storage held (`crate::storage`).
+    let named = host.lock().unwrap().named.clone().unwrap_or_default();
+    assert!(named.starts_with("Safari on iPhone [new s0 k0 no mark"), "the frame has Safari's user agent: {named}");
     screens.save(&mut page, "pairing", |page| amount(page, p.accent, 24, body) >= 300.0);
     let answer = host.lock().unwrap().confirm();
     pending.lock().unwrap().extend(answer);

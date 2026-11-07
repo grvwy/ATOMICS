@@ -12,6 +12,7 @@ use crate::boot::{self, ParentOrigin};
 use crate::device::Device;
 use crate::driver::{Driver, Output};
 use crate::fake_host::{FakeHost, HOST_ID};
+use crate::keep::{Ask, Sealed};
 
 pub const PARENT: &str = "https://app.example";
 pub const BROKER: &str = "wss://app.example/atomics/tunnel";
@@ -28,6 +29,15 @@ pub struct World {
     /// Codes this client closed sockets with.
     pub closed: Vec<u16>,
     pub now: u64,
+    /// The hosting page keeps sealed records ([`boot::KEEP`]), and those it keeps, by host.
+    pub keeps: bool,
+    pub page: HashMap<String, Sealed>,
+    /// Whether the page answers a keep, and how; `None`: it stays silent.
+    pub page_answers: Option<bool>,
+    /// What `atomics.paired` said each time.
+    pub kept: Vec<bool>,
+    /// What the passkey button was last asked to do.
+    pub ask: Option<Ask>,
 }
 
 impl World {
@@ -42,6 +52,11 @@ impl World {
             dials: Vec::new(),
             closed: Vec::new(),
             now: 1_000_000,
+            keeps: false,
+            page: HashMap::new(),
+            page_answers: Some(true),
+            kept: Vec::new(),
+            ask: None,
         };
         world.driver.tick(world.now);
         world.pump();
@@ -63,6 +78,10 @@ impl World {
             "type": boot::BOOT, "v": 1, "host_id": HOST_ID, "ticket": "ticket-1", "broker": BROKER,
             "display_name": "A Person", "theme": "dark", "scheme": "dark", "locale": "en",
         });
+        if self.keeps {
+            data["keeps"] = json!(true);
+            data["sealed"] = self.page.get(HOST_ID).map_or(Value::Null, Sealed::to_json);
+        }
         if let Some(pairing) = pairing {
             let fragment = pairing.fragment();
             let parts: Vec<&str> = fragment.split('.').collect();
@@ -166,7 +185,27 @@ impl World {
                     }
                     Output::SaveDevice(device) => {
                         self.store.insert(device.host_id.clone(), device);
+                        self.driver.device_saved(Ok(()));
                     }
+                    Output::Paired { kept } => {
+                        self.posted.push(boot::PAIRED);
+                        self.kept.push(kept);
+                    }
+                    Output::Keep(sealed) => {
+                        let host_id = sealed.host_id.clone();
+                        if self.page_answers == Some(true) {
+                            self.page.insert(host_id.clone(), sealed);
+                        }
+                        if let Some(ok) = self.page_answers {
+                            let data = json!({ "type": boot::KEPT, "v": 1, "host_id": host_id, "ok": ok });
+                            self.driver.message(PARENT, true, &data).unwrap();
+                        }
+                    }
+                    Output::Forget(host) => {
+                        self.page.remove(&host);
+                    }
+                    Output::Passkey(Ask::Done) => self.ask = None,
+                    Output::Passkey(ask) => self.ask = Some(ask),
                     Output::ForgetDevice(host) => {
                         self.store.remove(&host);
                     }

@@ -218,3 +218,64 @@ fn brokers_are_secure_or_on_this_machine() {
         assert!(!broker_ok(bad), "{bad}");
     }
 }
+
+fn record(host_id: &str) -> Value {
+    json!({
+        "v": 2, "host_id": host_id, "host_key": Secret::generate().unwrap().public().text(),
+        "credential": "Q3JlZGVudGlhbC1pZC0x", "iv": "A".repeat(16), "sealed": "B".repeat(64), "paired_at": 1,
+    })
+}
+
+#[test]
+fn a_page_that_keeps_copies_says_so_and_sends_this_hosts() {
+    let Ok(FromParent::Boot(plain)) = read(&parent(), PARENT, true, &boot_message()) else { panic!("a boot") };
+    assert!(
+        !plain.keeps && plain.sealed.is_none() && !plain.sealed_unreadable,
+        "a page that says nothing keeps nothing"
+    );
+
+    let mut message = boot_message();
+    message["keeps"] = json!(true);
+    message["sealed"] = record(HOST);
+    let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &message) else { panic!("a boot") };
+    assert!(boot.keeps);
+    assert_eq!(boot.sealed.as_ref().map(|s| s.host_id.as_str()), Some(HOST));
+    assert!(format!("{boot:?}").contains("sealed: true") && !format!("{boot:?}").contains("BBBB"));
+
+    // Another host's record, or one that cannot be read, is left out and noted, never a refused boot.
+    for bad in [record("another-host"), json!({ "v": 2 }), json!("x")] {
+        message["sealed"] = bad;
+        let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &message) else { panic!("still a boot") };
+        assert!(boot.sealed.is_none() && boot.sealed_unreadable);
+    }
+    message["sealed"] = Value::Null;
+    let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &message) else { panic!("a boot") };
+    assert!(boot.keeps && boot.sealed.is_none() && !boot.sealed_unreadable);
+
+    // A record from a page that does not say it keeps them is not taken.
+    message["keeps"] = json!(false);
+    message["sealed"] = record(HOST);
+    let Ok(FromParent::Boot(boot)) = read(&parent(), PARENT, true, &message) else { panic!("a boot") };
+    assert!(!boot.keeps && boot.sealed.is_none());
+}
+
+#[test]
+fn the_page_answers_a_keep_for_its_host() {
+    let message = json!({ "type": KEPT, "v": 1, "host_id": HOST, "ok": true });
+    let Ok(FromParent::Kept { host_id, ok }) = read(&parent(), PARENT, true, &message) else { panic!("an answer") };
+    assert_eq!((host_id.as_str(), ok), (HOST, true));
+    let mut bad = message.clone();
+    bad["ok"] = json!("yes");
+    assert_eq!(read(&parent(), PARENT, true, &bad).unwrap_err(), Refused::Field("ok"));
+    assert_eq!(read(&parent(), PARENT, false, &message).unwrap_err(), Refused::Window);
+}
+
+#[test]
+fn the_frame_says_paired_keep_and_forget_with_their_fields() {
+    assert_eq!(say_paired(true), json!({ "type": PAIRED, "v": 1, "kept": true }));
+    assert_eq!(say_forget(HOST), json!({ "type": FORGET, "v": 1, "host_id": HOST }));
+    let sealed = crate::keep::Sealed::read(&record(HOST)).unwrap();
+    let keep = say_keep(&sealed);
+    assert_eq!((keep["type"].as_str(), keep["host_id"].as_str()), (Some(KEEP), Some(HOST)));
+    assert_eq!(keep["record"], sealed.to_json());
+}

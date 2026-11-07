@@ -1,5 +1,5 @@
 // Real IndexedDB and WebCrypto, with faults at the browser API boundary. No bundle or broker needed.
-import { saveDevice, loadDevice, forgetDevice, requestPersistence } from '/device-store.js';
+import { saveDevice, loadDevice, forgetDevice, requestPersistence, storageFacts } from '/device-store.js';
 
 const assert = (ok, message) => { if (!ok) throw new Error(message); };
 const rejected = async action => {
@@ -35,15 +35,28 @@ export async function check() {
     device.secret.fill(0);
   };
   try {
+    let facts = await storageFacts('host');
+    assert(facts.read === 'not-run' && facts.save === 'not-run' && facts.mark === 'none', 'Nothing is known before a read');
     assert(await loadDevice('host') === null, 'An absent record means no device');
+    facts = await storageFacts('host');
+    assert(facts.open === 'new' && facts.read === 'none', `A fresh profile makes the database: ${JSON.stringify(facts)}`);
+    assert(facts.seal === 'absent' && facts.records === 0, `An empty database is counted: ${JSON.stringify(facts)}`);
     await saveDevice('host', 'public-host-key', plain);
+    facts = await storageFacts('host');
+    assert(facts.seal === 'made' && facts.save === 'confirmed', `A save is read back: ${JSON.stringify(facts)}`);
+    assert(/^saved \d{4}-\d\d-\d\dT/.test(facts.mark), `A confirmed save is marked: ${facts.mark}`);
     await sameDevice();
+    facts = await storageFacts('host');
+    assert(facts.read === 'found' && facts.seal === 'present' && facts.records === 1, `A read finds it: ${JSON.stringify(facts)}`);
+    assert(!JSON.stringify(facts).includes('23,23'), 'The facts carry no key bytes');
+    checked.push('storage facts');
     const seal = await transaction(current, 'keys', 'readonly', s => s.get('seal'));
     assert(seal.extractable === false, 'The sealing key must remain non-extractable');
     assert(await rejected(() => crypto.subtle.exportKey('raw', seal)), 'The sealing key must not be exported');
     const record = await transaction(current, 'devices', 'readonly', s => s.get('host'));
     assert(record.sealed instanceof ArrayBuffer && !('secret' in record), 'Only ciphertext is stored');
-    assert(localStorage.length === 0, 'No key belongs in localStorage');
+    assert(Object.keys(localStorage).join() === 'atomics-device-marks', 'Only the save marks belong in localStorage');
+    assert(/^\{"host":\{"saved":"[0-9TZ:.-]+"\}\}$/.test(localStorage.getItem('atomics-device-marks')), 'A mark is a time');
     checked.push('sealed storage');
 
     let before = opens;
@@ -164,6 +177,7 @@ export async function check() {
 
     await forgetDevice('host');
     assert(await loadDevice('host') === null, 'Explicit forget removes the device');
+    assert((await storageFacts('host')).mark.startsWith('forgot '), 'A forget is marked');
     checked.push('explicit forget');
     return checked;
   } finally {

@@ -29,8 +29,10 @@ use crate::boot::{self, ParentOrigin};
 use crate::desk;
 use crate::device::{self, Device};
 use crate::driver::{DeviceReadError, Driver, Output};
+use crate::keep::{Answer, Ask, Failure, Passkeys, Sealed};
 use crate::layout;
 use crate::page::{self, PageEvent};
+use crate::storage::Storage;
 use crate::term_pane::{self, Overlay};
 use crate::views::{self, BundledFonts, Tab, View};
 
@@ -47,6 +49,24 @@ extern "C" {
     async fn forget_device(host_id: &str) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(js_name = requestPersistence)]
     async fn request_persistence() -> JsValue;
+    #[wasm_bindgen(js_name = storageFacts)]
+    async fn storage_facts(host_id: &str) -> JsValue;
+}
+
+#[wasm_bindgen(module = "/web/passkey.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = passkeyFacts)]
+    async fn passkey_facts() -> JsValue;
+    #[wasm_bindgen(js_name = installPasskey)]
+    fn install_passkey(callback: &Closure<dyn FnMut(JsValue)>);
+    #[wasm_bindgen(js_name = preparePasskey)]
+    fn prepare_passkey(op: &str, secret: &[u8]);
+    #[wasm_bindgen(js_name = clearPasskey)]
+    fn clear_passkey();
+    #[wasm_bindgen(js_name = placePasskey)]
+    fn place_passkey(x: f32, y: f32, width: f32, height: f32, label: &str);
+    #[wasm_bindgen(js_name = hidePasskey)]
+    fn hide_passkey();
 }
 
 #[wasm_bindgen(module = "/web/terminal.js")]
@@ -95,6 +115,56 @@ fn theme_colors(p: &Palette) -> String {
     .to_string()
 }
 
+/// What the device store knows about its storage for `host`, also written to the console for a remote
+/// inspector. Facts only, never key material.
+async fn storage_report(host: &str) -> Storage {
+    let storage = Storage::read(&value(&storage_facts(host).await));
+    web_sys::console::info_1(&JsValue::from_str(&storage.line()));
+    storage
+}
+
+/// A JavaScript value as JSON, or null.
+fn value(js: &JsValue) -> serde_json::Value {
+    JSON::stringify(js)
+        .ok()
+        .and_then(|text| serde_json::from_str(&String::from(text)).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// What `web/passkey.js` said came of a tap. An unlocked key is copied out of its array and the array zeroed; it
+/// is never turned into text.
+fn passkey_answer(js: &JsValue) -> Option<Answer> {
+    let kind = Reflect::get(js, &JsValue::from_str("kind")).ok()?.as_string()?;
+    let failed = |step: &str, detail: &str| {
+        Answer::Failed(Failure { step: step.into(), name: "DataError".into(), detail: detail.into() })
+    };
+    if kind == "unlocked" {
+        let secret = Reflect::get(js, &JsValue::from_str("secret")).ok()?.dyn_into::<Uint8Array>().ok()?;
+        let mut bytes = Zeroizing::new([0u8; KEY_BYTES]);
+        let whole = secret.length() as usize == KEY_BYTES;
+        if whole {
+            secret.copy_to(&mut bytes[..]);
+        }
+        secret.fill(0, 0, secret.length());
+        return Some(if whole {
+            Answer::Unlocked(Secret::from_bytes(&bytes))
+        } else {
+            failed("open", "not a device key")
+        });
+    }
+    let data = value(js);
+    Some(match kind.as_str() {
+        "sealed" => {
+            Sealed::read(&data["record"]).map_or_else(|| failed("seal", "the record was malformed"), Answer::Sealed)
+        }
+        "enrolling" => Answer::Enrolling,
+        "enrolled" => Answer::Enrolled(data["credential"].as_str().map(str::to_string)),
+        "no-prf" => Answer::NoPrf,
+        "failed" => Answer::Failed(Failure::read(&data)),
+        _ => return None,
+    })
+}
+
 /// A clock for gestures: the page's, which its events are stamped with.
 fn page_now() -> f64 {
     web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())
@@ -107,8 +177,12 @@ enum Input {
     Data { socket: u64, bytes: Vec<u8> },
     Closed { socket: u64, code: u16 },
     Device(Result<Option<Device>, DeviceReadError>),
+    Saved(Result<(), String>),
+    Storage(Storage),
+    Passkeys(Passkeys),
+    Answer(Answer),
     Resumed { hidden_ms: u64 },
-    Note(&'static str),
+    Note(String),
     Page(PageEvent),
 }
 
@@ -159,6 +233,9 @@ struct App {
     _listener: Closure<dyn FnMut(MessageEvent)>,
     _page: Closure<dyn FnMut(JsValue)>,
     _visibility: Closure<dyn FnMut()>,
+    _passkey: Closure<dyn FnMut(JsValue)>,
+    /// Where the passkey button was last laid, and what it said.
+    passkey_placed: Option<(egui::Rect, String)>,
     /// What the overlay was last set to.
     applied: Overlay,
     /// The text boxes the page was last told of.
@@ -231,6 +308,22 @@ impl App {
         wasm_bindgen_futures::spawn_local(async {
             let _ = request_persistence().await;
         });
+        {
+            let (inbox, ctx) = (inbox.clone(), ctx.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let passkeys = Passkeys::read(&value(&passkey_facts().await));
+                push(&inbox, &ctx, Input::Passkeys(passkeys));
+            });
+        }
+        let passkey = {
+            let (inbox, ctx) = (inbox.clone(), ctx.clone());
+            Closure::<dyn FnMut(JsValue)>::new(move |answer: JsValue| {
+                if let Some(answer) = passkey_answer(&answer) {
+                    push(&inbox, &ctx, Input::Answer(answer));
+                }
+            })
+        };
+        install_passkey(&passkey);
         let visibility = {
             let (inbox, ctx) = (inbox.clone(), ctx.clone());
             let document = window.document().expect("a document");
@@ -299,6 +392,8 @@ impl App {
             _listener: listener,
             _page: page,
             _visibility: visibility,
+            _passkey: passkey,
+            passkey_placed: None,
             applied: Overlay::default(),
             applied_boxes: Vec::new(),
             saved_view,
@@ -352,9 +447,32 @@ impl App {
     }
 
     fn post(&self, kind: &str) {
+        self.post_value(&boot::say(kind));
+    }
+
+    /// Post to the parent, at the parent origin exactly.
+    fn post_value(&self, message: &serde_json::Value) {
         if let Some((framer, origin)) = &self.parent {
-            let _ = framer.post_message(&json(&boot::say(kind)), origin.as_str());
+            let _ = framer.post_message(&json(message), origin.as_str());
         }
+    }
+
+    /// Lay the passkey button where this frame's screen put its place ([`crate::views::keep::button_id`]), or take it
+    /// away, telling the page only what changed.
+    fn apply_passkey(&mut self) {
+        let id = crate::views::keep::button_id();
+        let placed = self.ctx.data_mut(|d| d.remove_temp::<Option<(egui::Rect, String)>>(id)).flatten();
+        if placed == self.passkey_placed {
+            return;
+        }
+        match &placed {
+            Some((r, label)) => {
+                let zoom = self.ctx.zoom_factor();
+                place_passkey(r.left() * zoom, r.top() * zoom, r.width() * zoom, r.height() * zoom, label);
+            }
+            None => hide_passkey(),
+        }
+        self.passkey_placed = placed;
     }
 
     fn dial(&mut self, socket: u64, url: &str, protocols: &[Zeroizing<String>]) {
@@ -412,6 +530,8 @@ impl App {
                         Ok(stored) => stored_device(&host, &stored),
                         Err(_) => Err(DeviceReadError),
                     };
+                    // Before the answer, so a pairing it leads to names what storage held.
+                    push(&inbox, &ctx, Input::Storage(storage_report(&host).await));
                     push(&inbox, &ctx, Input::Device(device));
                 });
             }
@@ -419,18 +539,45 @@ impl App {
                 let (inbox, ctx) = (self.inbox.clone(), self.ctx.clone());
                 wasm_bindgen_futures::spawn_local(async move {
                     let key = device.host_key.text();
-                    if save_device(&device.host_id, &key, device.secret.as_bytes()).await.is_err() {
-                        let note =
-                            "This browser could not save its pairing. Reopening this page may require pairing again.";
-                        push(&inbox, &ctx, Input::Note(note));
-                    } else {
+                    let saved = save_device(&device.host_id, &key, device.secret.as_bytes()).await.is_ok();
+                    if saved {
                         let _ = request_persistence().await;
                     }
+                    let storage = storage_report(&device.host_id).await;
+                    if !saved {
+                        let note = format!(
+                            "This browser could not save its pairing ({}). Reopening this page may require pairing again.",
+                            storage.save
+                        );
+                        push(&inbox, &ctx, Input::Note(note));
+                    }
+                    let result = if saved { Ok(()) } else { Err(storage.save.clone()) };
+                    push(&inbox, &ctx, Input::Storage(storage));
+                    push(&inbox, &ctx, Input::Saved(result));
                 });
             }
+            Output::Paired { kept } => self.post_value(&boot::say_paired(kept)),
+            Output::Keep(sealed) => self.post_value(&boot::say_keep(&sealed)),
+            Output::Forget(host) => self.post_value(&boot::say_forget(&host)),
+            Output::Passkey(Ask::Keep { device, credential, made, create_in_frame }) => {
+                let op = serde_json::json!({
+                    "kind": "keep", "hostId": device.host_id, "hostKey": device.host_key.text(),
+                    "credential": credential, "made": made, "inFrame": create_in_frame,
+                });
+                prepare_passkey(&op.to_string(), device.secret.as_bytes());
+            }
+            Output::Passkey(Ask::Unlock(sealed)) => {
+                prepare_passkey(&serde_json::json!({ "kind": "unlock", "record": sealed.to_json() }).to_string(), &[]);
+            }
+            Output::Passkey(Ask::Done) => {
+                clear_passkey();
+                self.passkey_placed = None;
+            }
             Output::ForgetDevice(host) => {
+                let (inbox, ctx) = (self.inbox.clone(), self.ctx.clone());
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ = forget_device(&host).await;
+                    push(&inbox, &ctx, Input::Storage(storage_report(&host).await));
                 });
             }
         }
@@ -497,6 +644,10 @@ impl eframe::App for App {
                     self.driver.socket_closed(socket, code);
                 }
                 Input::Device(device) => self.driver.device_loaded(device),
+                Input::Saved(saved) => self.driver.device_saved(saved),
+                Input::Storage(storage) => self.driver.storage_noted(storage),
+                Input::Passkeys(passkeys) => self.driver.passkeys_noted(passkeys),
+                Input::Answer(answer) => self.driver.passkey_answered(answer),
                 Input::Resumed { hidden_ms } => self.driver.resumed(hidden_ms),
                 Input::Note(note) => self.driver.remote.say(note),
                 Input::Page(PageEvent::Term(input)) => self.view.term.inputs.push(input),
@@ -528,6 +679,7 @@ impl eframe::App for App {
         views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
         self.run_outputs();
         self.apply_overlay();
+        self.apply_passkey();
         if self.view.desk.panel != self.saved_view {
             save_view(desk::view_name(self.view.desk.panel));
             self.saved_view = self.view.desk.panel;

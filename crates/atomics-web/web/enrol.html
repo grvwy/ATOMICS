@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="referrer" content="no-referrer">
+  <title>A passkey for ATOMICS</title>
+  <!-- The client's window for making its passkey, at top level on its own origin: a frame on another origin may not
+       make one in WebKit (web/passkey.js). No inline script or style: the origin's CSP allows none. -->
+  <link rel="stylesheet" href="enrol.css">
+</head>
+<body>
+  <main>
+    <h1>A passkey for ATOMICS</h1>
+    <p>It keeps this browser's pairings with your computers when the browser closes. Face ID, Touch ID or this
+      device's lock opens them again.</p>
+    <button type="button" id="make">Make the passkey</button>
+    <p id="state" role="status" aria-live="polite"></p>
+  </main>
+  <script type="module" src="enrol.js"></script>
+</body>
+</html>
