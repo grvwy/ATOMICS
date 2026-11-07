@@ -3490,8 +3490,11 @@ fn keep_fit(page: &mut DevTools, name: &str) {
     eprintln!("fit: {}", out.display());
 }
 
+/// A phone: its name, its upright size, and the keyboard's height upright and sideways.
+type Phone = (&'static str, (f32, f32), (f32, f32));
+
 /// The phones of the pass, in CSS pixels upright, and how much of each a soft keyboard takes upright and sideways.
-const PHONES: [(&str, (f32, f32), (f32, f32)); 2] =
+const PHONES: [Phone; 2] =
     [("iphone16pro", (402.0, 874.0), (336.0, 200.0)), ("iphonese", (375.0, 667.0), (260.0, 175.0))];
 
 /// The soft keyboard up, `covered` CSS pixels of it, as the hosting page shows it to the client: the frame ends above it
