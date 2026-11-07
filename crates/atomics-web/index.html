@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- An app's screen, which never zooms: where this page is the top one, its viewport says so. In a frame the hosting
+       page's viewport is the one that counts, and web/terminal.js refuses a zoom where it starts. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
   <title>ATOMICS</title>
   <!-- No inline script or style: the client's origin has a strict CSP (docs/daemon.md, "The browser

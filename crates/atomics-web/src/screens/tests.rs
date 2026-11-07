@@ -5,7 +5,9 @@ use atomics_core::noise::Access;
 use atomics_core::screen::Screen;
 use atomics_core::wire::{Message, Topic};
 
-use super::{Lost, MAX_REQUESTS, MAX_TYPED_BYTES, MAX_WAITING_BYTES, Refused};
+use super::{
+    HISTORY_PAGE, Lost, MAX_HISTORY_KEPT, MAX_REQUESTS, MAX_TYPED_BYTES, MAX_WAITING_BYTES, READ_AHEAD, Refused,
+};
 use crate::driver::Status;
 use crate::fake_host;
 use crate::world::World;
@@ -385,7 +387,7 @@ fn history_is_kept_as_lines_scroll_off_and_fetched_when_the_view_reaches_it() {
     }
     let first = world.driver.remote.with_screen("s1", |s| s.unwrap().0.first_line);
     let mut view = Screen::blank(0, 0);
-    assert!(world.driver.remote.fill_screen("s1", first - 3, 3, &mut view));
+    assert!(world.driver.remote.fill_screen("s1", first - 3, 3, 0, &mut view));
     assert_eq!(view.text(), "line 17\nline 18\nline 19", "kept as they scrolled off");
     assert!(!world.sent().iter().any(|m| matches!(m, Message::HistoryGet(_))));
 
@@ -395,12 +397,170 @@ fn history_is_kept_as_lines_scroll_off_and_fetched_when_the_view_reaches_it() {
     world.ticket("ticket-2");
     show(&mut world, "s1");
     let first = world.driver.remote.with_screen("s1", |s| s.unwrap().0.first_line);
-    world.driver.remote.fill_screen("s1", first - 2, 4, &mut view);
+    world.driver.remote.fill_screen("s1", first - 2, 4, 0, &mut view);
     world.driver.flush();
     world.pump();
     assert!(world.sent().iter().any(|m| matches!(m, Message::HistoryGet(h) if h.before.0 == first)));
-    world.driver.remote.fill_screen("s1", first - 2, 4, &mut view);
+    world.driver.remote.fill_screen("s1", first - 2, 4, 0, &mut view);
     assert_eq!(view.text(), "line 18\nline 19\nline 20\nline 21");
+}
+
+/// `lines` lines of output, then a new connection: its snapshot is the screen alone, with none of the history held.
+fn reconnected_after(lines: u64) -> World {
+    let mut world = live();
+    show(&mut world, "s1");
+    let text: String = (1..=lines).map(|n| format!("line {n}\r")).collect();
+    let output = world.host.output("s1", &text);
+    world.deliver(output);
+    world.drop_socket(1006);
+    world.advance(world.driver.wake_in().expect("a retry is due"));
+    world.ticket("ticket-2");
+    show(&mut world, "s1");
+    world
+}
+
+/// The history pages asked for so far, as `(before, count)`.
+fn pages(world: &World) -> Vec<(u64, u32)> {
+    world
+        .sent()
+        .iter()
+        .filter_map(|m| match m {
+            Message::HistoryGet(h) => Some((h.before.0, h.count)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One frame of a view `rows` lines high from line `top`, scrolled back (it reads ahead), and the host's answers.
+fn look(world: &mut World, top: u64, rows: u16, view: &mut Screen) {
+    world.driver.remote.fill_screen("s1", top, rows, READ_AHEAD, view);
+    world.driver.flush();
+    world.pump();
+}
+
+/// Whether every line of the view came from the host: the fake host's history lines all have text.
+fn whole(view: &Screen) -> bool {
+    view.lines.iter().all(|line| !line.text().is_empty())
+}
+
+fn held(world: &World) -> (usize, Option<u64>, Option<u64>) {
+    world.driver.remote.with_screens(|s| {
+        let history = &s.terms["s1"].history;
+        (history.len(), history.first_key_value().map(|(id, _)| *id), history.last_key_value().map(|(id, _)| *id))
+    })
+}
+
+#[test]
+fn scrolling_back_after_a_reconnect_reads_ahead_a_page_at_a_time_as_far_as_the_host_keeps() {
+    let mut world = reconnected_after(3000);
+    let asked = pages(&world).len();
+    let (first, oldest) = world.driver.remote.with_screen("s1", |s| {
+        let screen = s.unwrap().0;
+        (screen.first_line, screen.oldest_line())
+    });
+    assert!(first - oldest >= 2900, "the host keeps it all, but for the screen's lines: {oldest}..{first}");
+    // Following the live screen asks for nothing more than its snapshot.
+    let mut view = Screen::blank(0, 0);
+    world.driver.remote.fill_screen("s1", first, 20, 0, &mut view);
+    world.driver.flush();
+    world.pump();
+    assert_eq!(pages(&world).len(), asked, "the first attach is the snapshot alone");
+
+    // The first look back waits one round trip for its page; from then on every look finds its lines there, at a
+    // finger's pace of a screen a frame, up to the oldest line the host has.
+    let rows = 20;
+    let mut top = first - 40;
+    look(&mut world, top, rows, &mut view);
+    assert_eq!(pages(&world)[asked..], [(first, HISTORY_PAGE as u32)], "one page, ending at the screen");
+    look(&mut world, top, rows, &mut view);
+    assert!(whole(&view), "the page came: {}", view.text());
+    let mut blank = Vec::new();
+    while top > oldest {
+        top = top.saturating_sub(u64::from(rows)).max(oldest);
+        look(&mut world, top, rows, &mut view);
+        if !whole(&view) {
+            blank.push(top);
+        }
+    }
+    assert_eq!(blank, Vec::<u64>::new(), "read ahead of the view");
+    assert!(view.lines[0].text().ends_with("line 1"), "the oldest line the host has: {}", view.text());
+    let asked: Vec<(u64, u32)> = pages(&world)[asked..].to_vec();
+    assert!(asked.len() <= 3000 / HISTORY_PAGE as usize + 2, "a page at a time: {asked:?}");
+    assert!(asked.windows(2).all(|w| w[1].0 < w[0].0), "never the same lines twice: {asked:?}");
+}
+
+#[test]
+fn a_history_longer_than_is_kept_stays_around_the_view_and_comes_back_on_the_way_down() {
+    let lines = MAX_HISTORY_KEPT as u64 + 2000;
+    let mut world = reconnected_after(lines);
+    let (first, oldest) = world.driver.remote.with_screen("s1", |s| {
+        let screen = s.unwrap().0;
+        (screen.first_line, screen.oldest_line())
+    });
+    let rows = 30;
+    let mut view = Screen::blank(0, 0);
+    let mut top = first - u64::from(rows);
+    // All the way up, a screen at a time: what is held stays bounded, and the view's lines are always there.
+    let mut steps = 0;
+    while top > oldest {
+        top = top.saturating_sub(u64::from(rows)).max(oldest);
+        look(&mut world, top, rows, &mut view);
+        look(&mut world, top, rows, &mut view);
+        assert!(whole(&view), "{top}: {}", view.text());
+        assert!(held(&world).0 <= MAX_HISTORY_KEPT, "{top}: {:?}", held(&world));
+        steps += 1;
+    }
+    assert!(steps > 100);
+    assert!(view.lines[0].text().ends_with("line 1"), "the oldest line the host has: {}", view.text());
+    let (_, _, newest) = held(&world);
+    assert!(newest.unwrap() + 1 < first, "the newest lines went to keep the run around the view: {:?}", held(&world));
+
+    // Back down: the lines let go of are asked for again before the view reaches them.
+    let mut blank = Vec::new();
+    while top + u64::from(rows) < first {
+        top = (top + u64::from(rows)).min(first - u64::from(rows));
+        look(&mut world, top, rows, &mut view);
+        if !whole(&view) {
+            blank.push(top);
+        }
+        assert!(held(&world).0 <= MAX_HISTORY_KEPT);
+    }
+    assert_eq!(blank, Vec::<u64>::new(), "read ahead on the way down too");
+    let newest = world.host.terminals["s1"].history.last().unwrap().text();
+    assert_eq!(view.lines.last().unwrap().text(), newest, "down to the screen: {}", view.text());
+}
+
+#[test]
+fn a_snapshot_after_a_gap_keeps_the_history_held_and_a_new_generation_starts_over() {
+    let mut world = live();
+    show(&mut world, "s1");
+    for start in [1, 11, 21] {
+        let lines: String = (start..start + 10).map(|n| format!("line {n}\r")).collect();
+        let output = world.host.output("s1", &lines);
+        world.deliver(output);
+    }
+    let kept = held(&world);
+    assert!(kept.0 > 0, "{kept:?}");
+    // The host's slot for this screen overflowed: the screen comes again, as a snapshot of the same generation.
+    let output = world.host.output("s1", "line 31\r");
+    world.deliver(output);
+    let kept = held(&world);
+    let snapshot = world.host.overflow("s1");
+    world.deliver(snapshot);
+    assert!(screen_text(&world, "s1").contains("line 31"), "the snapshot came");
+    assert_eq!(held(&world), kept, "the same generation: its lines are still right");
+    let first = world.driver.remote.with_screen("s1", |s| s.unwrap().0.first_line);
+    let mut view = Screen::blank(0, 0);
+    world.driver.remote.fill_screen("s1", kept.2.unwrap() - 2, 3, 0, &mut view);
+    assert!(whole(&view), "{}", view.text());
+    assert!(kept.2.unwrap() < first);
+
+    // A resize is a new generation, with new line IDs: what was held goes.
+    acquire(&mut world, "s1", false);
+    world.driver.remote.resize("s1", Some(GridSize::new(30, 10)));
+    world.driver.flush();
+    world.pump();
+    assert_eq!(held(&world).0, 0);
 }
 
 #[test]

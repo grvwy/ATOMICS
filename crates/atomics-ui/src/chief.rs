@@ -314,54 +314,57 @@ pub fn window(ctx: &egui::Context, palette: &Palette, fills: Option<Rect>, add_c
     window.show(ctx, add_contents);
 }
 
-/// The chief's header, terminal and shared trace lane. Nothing is drawn without a chief.
+/// The chief's header, terminal and shared trace lane. Nothing is drawn without a chief. A phone has no header: its
+/// chief button opened this, which says whose it is, and the terminal takes the room.
 pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, terminals: &mut dyn TerminalSurface) {
     let chief = backend.chief();
     let Some(index) = chief.session else { return };
     let Some(session) = backend.session_row(index) else { return };
     let p = client.palette.clone();
     let touch = client.touch;
-    // A phone keeps the header off the screen's sides; the terminal keeps to them itself.
-    let gutter = touch.map_or(0.0, |touch| touch.gutter);
-    ui.horizontal(|ui| {
-        if gutter > 0.0 {
-            ui.add_space(gutter);
-        }
-        ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    if !touch::stacks(touch) {
+        // A tablet keeps the header off the screen's sides; the terminal keeps to them itself.
+        let gutter = touch.map_or(0.0, |touch| touch.gutter);
+        ui.horizontal(|ui| {
             if gutter > 0.0 {
                 ui.add_space(gutter);
             }
-            if backend.available(&Command::HideChief)
-                && shortcut_tip(touch::button(ui, touch, "Minimize"), backend, |keys| &keys.toggle_chief).clicked()
-            {
-                client.send(Command::HideChief);
-            }
-            let (label, hover) = if chief.dock == ChiefDock::Floating {
-                ("Dock", "Keep the chief in a column beside the agents")
-            } else {
-                ("Float", "Float the chief in a window over the agents")
-            };
-            // A finger's chief sits beside the agents where it fits, and takes the room where it does not.
-            if touch.is_none()
-                && backend.available(&Command::SetChiefDock(chief.dock))
-                && touch::button(ui, touch, label).on_hover_text(hover).clicked()
-            {
-                client.send(Command::SetChiefDock(if chief.dock == ChiefDock::Floating {
-                    ChiefDock::Docked
+            ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if gutter > 0.0 {
+                    ui.add_space(gutter);
+                }
+                if backend.available(&Command::HideChief)
+                    && shortcut_tip(touch::button(ui, touch, "Minimize"), backend, |keys| &keys.toggle_chief).clicked()
+                {
+                    client.send(Command::HideChief);
+                }
+                let (label, hover) = if chief.dock == ChiefDock::Floating {
+                    ("Dock", "Keep the chief in a column beside the agents")
                 } else {
-                    ChiefDock::Floating
-                }));
-            }
+                    ("Float", "Float the chief in a window over the agents")
+                };
+                // A finger's chief sits beside the agents where it fits, and takes the room where it does not.
+                if touch.is_none()
+                    && backend.available(&Command::SetChiefDock(chief.dock))
+                    && touch::button(ui, touch, label).on_hover_text(hover).clicked()
+                {
+                    client.send(Command::SetChiefDock(if chief.dock == ChiefDock::Floating {
+                        ChiefDock::Docked
+                    } else {
+                        ChiefDock::Floating
+                    }));
+                }
+            });
         });
-    });
-    ui.separator();
+        ui.separator();
+    }
     let metrics = Metrics::new(ui, &p, backend.ui_config().font.size);
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, Sense::hover());
     let data = backend.trace();
     crate::trace_lane::shortcuts(ui.ctx(), client, &data);
-    let lane_height = client.lane.height(&data, rect.height());
+    let lane_height = client.lane.height(&data, rect.height(), client.touch);
     let lane = (lane_height > 0.0).then(|| rect.with_min_y(rect.bottom() - lane_height));
     let rect = lane.map_or(rect, |lane| rect.with_max_y(lane.top()));
     if !session.outside {

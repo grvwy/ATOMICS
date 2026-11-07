@@ -5,7 +5,11 @@ body {
   overflow: hidden;
   /* An installed app's page does not bounce or take a finger's scroll: everything in it is the app's. */
   overscroll-behavior: none;
+  /* Nor does it zoom, by a pinch or a double tap anywhere on it (web/terminal.js, lockZoom), and the text keeps its size
+     when the phone turns. */
+  touch-action: none;
   -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
   background: #1f1e1d;
   color: #d8d4cc;
   /* The app selects terminal text itself (a long press, its handles, Copy); the browser's own selection
@@ -91,13 +95,16 @@ body {
   transform-origin: 0 0;
   background: var(--atomics-bar, #2a2826);
   border-top: 1px solid var(--atomics-border, #3d3a36);
+  touch-action: none;
 }
 
+/* A row too long for the screen scrolls sideways, and only that: no pinch or double tap zooms the page from it. */
 .atomics-keyrow {
   display: flex;
   gap: 2px;
   overflow-x: auto;
   scrollbar-width: none;
+  touch-action: pan-x;
 }
 
 .atomics-keyrow::-webkit-scrollbar {
@@ -132,6 +139,7 @@ body {
   flex-direction: row;
   overflow-x: auto;
   scrollbar-width: none;
+  touch-action: pan-x;
 }
 
 #atomics-keybar.one-row::-webkit-scrollbar {

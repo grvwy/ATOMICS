@@ -239,8 +239,11 @@ impl FakeTerminal {
         if (cols, rows) == (self.screen.cols, self.screen.rows) {
             return Vec::new();
         }
+        // The program's modes, title and colours stay, as an emulator's do.
         let mut screen = Screen::blank(cols, rows);
         screen.palette = self.screen.palette.clone();
+        screen.modes = self.screen.modes;
+        screen.title.clone_from(&self.screen.title);
         for (to, from) in screen.lines.iter_mut().zip(&self.screen.lines) {
             for (cell, old) in to.cells.iter_mut().zip(&from.cells) {
                 *cell = old.clone();
@@ -376,6 +379,14 @@ impl FakeHost {
         let terminal = self.terminals.get_mut(session).expect("a terminal");
         let out = terminal.change(session, |t| t.write(text));
         self.send(out)
+    }
+
+    /// The browser's slot for `session`'s screen overflowed, as the real host's does under a burst: it gets the screen's
+    /// current snapshot instead of the deltas, in the same generation.
+    pub fn overflow(&mut self, session: &str) -> Vec<Vec<u8>> {
+        let terminal = &self.terminals[session];
+        let snapshot = if terminal.followed { terminal.snapshot(session) } else { Vec::new() };
+        self.send(snapshot)
     }
 
     pub fn publish_trace(&mut self, data: atomics_core::trace_feed::TraceData) -> Vec<Vec<u8>> {

@@ -7,6 +7,7 @@
 //! Keys, with the lane focused (click it): Shift+↓/↑ step card by card, PageUp/PageDown
 //! scroll, Enter expands a card or opens its ticket in the Tickets panel, Escape returns to the terminal.
 use crate::theme::{Palette, lerp};
+use crate::touch::Touch;
 use crate::{Backend, Client, Command, panel_nav};
 use atomics_core::tickets::TicketCard;
 use atomics_core::trace::{TraceEntry, TraceOp, TraceState};
@@ -349,14 +350,20 @@ fn ticket_row(
     }
 }
 
+/// The lane's header, with room for its buttons: a finger's are taller than a mouse's.
+fn head(touch: Option<Touch>) -> f32 {
+    touch.map_or(HEAD_H, |touch| HEAD_H.max(touch.target + 4.0))
+}
+
 impl Lane {
-    /// Height the lane takes in a column `available` tall, 0 when the chief has no trace in view.
-    pub fn height(&self, data: &TraceData, available: f32) -> f32 {
+    /// Height the lane takes in a column `available` tall, 0 when the chief has no trace in view. Folded, it is its
+    /// header, which under `touch` holds a finger's buttons.
+    pub fn height(&self, data: &TraceData, available: f32, touch: Option<Touch>) -> f32 {
         if self.entries(data).is_empty() {
             return 0.0;
         }
         if self.collapsed {
-            return HEAD_H + 4.0;
+            return head(touch) + 4.0;
         }
         self.height.unwrap_or(DEFAULT_H).clamp(MIN_H, (available * 0.7).max(MIN_H))
     }
@@ -365,6 +372,7 @@ impl Lane {
 /// Draws the same trace lane on the desktop, connected native client and web.
 pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, client: &mut Client, data: &TraceData) {
     let p = client.palette.clone();
+    let head = head(client.touch);
     let now = backend.trace_now_ms();
     let time = ui.input(|i| i.time);
     let mut acts: Vec<Act> = Vec::new();
@@ -379,7 +387,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
     let focused = ui.memory(|m| m.has_focus(focus_id()));
     lane.had_focus = focused;
     ui.horizontal(|ui| {
-        ui.set_height(HEAD_H - 2.0);
+        ui.set_height(head - 2.0);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         let plan = entries.iter().rev().find_map(|entry| entry.plan_id.clone());
         let label = plan.map_or("TRACE".to_string(), |plan| format!("TRACE · plan {plan}"));
@@ -406,7 +414,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
         });
     });
     if !lane.collapsed {
-        let body = Rect::from_min_max(pos2(rect.left(), rect.top() + HEAD_H), rect.right_bottom());
+        let body = Rect::from_min_max(pos2(rect.left(), rect.top() + head), rect.right_bottom());
         let focus = ui.interact(body, focus_id(), Sense::click());
         if focus.clicked() {
             acts.push(Act::Focus);

@@ -161,6 +161,21 @@ function watchCanvas() {
   });
 }
 
+// The page never zooms, wherever a finger lands: the canvas, the input, the key bar or a gap between its keys. Safari
+// leaves out the viewport's own limits (and in a frame they are the hosting page's), but not a pinch's gesture events
+// refused, nor two fingers' moves, nor a double tap's dblclick; the style sheet's touch-action does the rest. A pinch
+// still reaches the app as pointers, which on a phone zoom nothing either (`term_pane`).
+function lockZoom() {
+  const refuse = (e) => {
+    if (e.cancelable) e.preventDefault();
+  };
+  const options = { capture: true, passive: false };
+  for (const type of ["gesturestart", "gesturechange", "gestureend", "dblclick"]) addEventListener(type, refuse, options);
+  addEventListener("touchmove", (e) => {
+    if (e.touches.length > 1) refuse(e);
+  }, options);
+}
+
 // Letting go of the input leaves the keyboard on the canvas, so the app keeps reading keys there.
 function leaveInput() {
   ta.blur();
@@ -428,6 +443,7 @@ export function install(keys, command, callback) {
   report = callback;
   commandChords = command;
   addEventListener("keydown", windowKeys, true);
+  lockZoom();
   probe = document.createElement("div");
   probe.id = "atomics-insets";
   document.body.append(probe);

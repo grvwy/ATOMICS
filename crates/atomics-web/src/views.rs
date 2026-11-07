@@ -9,7 +9,8 @@
 //!   sizes inside the part of the screen the user sees, the sidebar becoming a drawer where it does not fit.
 //! - **The phone's shell**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
 //!   current plan's board under a picker of the others, the approval banners, a worktree's diff panel, an
-//!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
+//!   agent's fleet tile at full size and the chief's window, which opens on its terminal with the trace's calls
+//!   folded. While the user types, a terminal has the pane to itself. It draws inside the part of the viewport the user
 //!   sees, in the phone's look ([`Looks`]): the theme's colours with proportional UI text, zoomed, spaced for a
 //!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]). Its top bar's ⋯ menu has the host's workspace,
 //!   account usage and load.
@@ -31,6 +32,7 @@ use atomics_core::theme::ThemeTokens;
 use atomics_core::wire::Role;
 use atomics_ui::chief::PillSize;
 use atomics_ui::shell::{self, Platform};
+use atomics_ui::status::Mark;
 use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
 use atomics_ui::touch::{self, Touch};
@@ -140,6 +142,8 @@ pub struct View {
     pub looks: Looks,
     /// The chief's window was given its first place: a finger's first look is not at a window over everything.
     chief_placed: bool,
+    /// The phone's chief pane has shown, its trace's calls folded the first time.
+    lane_folded: bool,
     /// A native client's word on where its host's agents run, shown in the top bar ([`Place`]).
     pub place: Option<Place>,
     /// The place's action was clicked this frame; the native client takes it.
@@ -991,9 +995,16 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let backend: &dyn Backend = &driver.remote;
             atomics_ui::update::countdown(ui.ctx(), backend, client);
-            // The phone's ⋯ menu also carries the host's usage and governor details.
+            // The phone's ⋯ menu also carries the host's usage and governor details. Its dots are painted: the
+            // phone's proportional font has no ⋯.
             let (shown, mut clicked) = (view.place.clone(), false);
-            let dots = egui::Button::new("⋯").min_size(vec2(layout::TOUCH, layout::TOUCH));
+            let color = p.foreground;
+            let more = egui::Atom::paint(vec2(16.0, 6.0), move |ui: &egui::Ui, args: egui::AtomPaintArgs| {
+                for dx in [-5.0, 0.0, 5.0] {
+                    ui.painter().circle_filled(args.rect.center() + vec2(dx, 0.0), 1.6, color);
+                }
+            });
+            let dots = egui::Button::new(more).min_size(vec2(layout::TOUCH, layout::TOUCH));
             egui::containers::menu::MenuButton::from_button(dots).ui(ui, |ui| {
                 // No wider than it has to be, and it scrolls on a phone held sideways.
                 let room = ui.ctx().content_rect();
@@ -1024,8 +1035,17 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
             });
             view.place_clicked |= clicked;
             if approvals > 0 {
-                // Selected while the approvals show, as a pane is in the bar.
-                let badge = RichText::new(format!("◆ {approvals}")).color(p.warning).strong();
+                // Selected while the approvals show, as a pane is in the bar. The diamond is painted, as the
+                // desktop's Boards button paints it.
+                let warning = p.warning;
+                let mut badge = egui::Atoms::default();
+                badge.push_right(egui::Atom::paint(
+                    vec2(10.0, 10.0),
+                    move |ui: &egui::Ui, args: egui::AtomPaintArgs| {
+                        atomics_ui::status::paint_mark(ui.painter(), args.rect.center(), Mark::Diamond, warning);
+                    },
+                ));
+                badge.push_right(RichText::new(approvals.to_string()).color(warning).strong());
                 let open = view.tab == Tab::Approvals;
                 let button = egui::Button::new(badge).selected(open).min_size(vec2(layout::TOUCH, layout::TOUCH));
                 if ui.add(button).on_hover_text("Approvals").clicked() {
@@ -1384,7 +1404,8 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
     let active = view.desk.active.as_deref();
     let index = agents.iter().copied().find(|&i| Some(sessions[i].id.as_str()) == active).unwrap_or(first);
     view.target = Some(sessions[index].id.clone());
-    if view.term.cramped {
+    // Typing, the terminal takes the pane: the tile's header and the strip give way.
+    if view.term.cramped || view.term.typing() {
         return terminal_alone(ui, driver, client, view, index, &sessions[index].id);
     }
     let grid = Grid {
@@ -1404,7 +1425,8 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
     });
 }
 
-/// The chief's window at the pane's size: its header, the permission request it waits on and its terminal.
+/// The chief's window at the pane's size: the permission request it waits on, its terminal and the trace. The button
+/// that opened it says whose it is, so it has no header.
 fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
     let Some(chief) = driver.remote.session_list().into_iter().find(|s| s.chief) else {
         empty(ui, client, "No chief is running on this computer.");
@@ -1414,7 +1436,11 @@ fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
         return;
     };
     view.target = Some(chief.id.clone());
-    if view.term.cramped {
+    // The chief opens on its terminal: the trace's calls stay folded until the user shows them.
+    if !std::mem::replace(&mut view.lane_folded, true) {
+        client.lane.collapsed = true;
+    }
+    if view.term.cramped || view.term.typing() {
         let index = driver.remote.session_list().iter().position(|s| s.chief).unwrap_or_default();
         return terminal_alone(ui, driver, client, view, index, &chief.id);
     }

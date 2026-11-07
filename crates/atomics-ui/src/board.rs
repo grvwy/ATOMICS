@@ -10,7 +10,7 @@ use crate::status::{status_color, task_color};
 use crate::text::truncate;
 use crate::theme::{Palette, lerp};
 use crate::touch::{self, Touch};
-use crate::{Backend, Client, Command, controls};
+use crate::{Backend, BoardView, Client, Command, controls};
 
 /// The least width of a status's column on a board laid out in columns.
 const MIN_COLUMN: f32 = 240.0;
@@ -263,6 +263,24 @@ pub(crate) fn task_result_for(
     when_drawn(ui, egui::Layout::top_down(egui::Align::Min), None, result)
 }
 
+/// `text` after a dot in `color`: the font's ● where it has one, else a painted dot, as for a phone's proportional
+/// text, which has none.
+fn dotted(ui: &mut egui::Ui, text: String, color: egui::Color32, size: f32) {
+    let family = ui.style().text_styles.get(&egui::TextStyle::Body).map(|font| font.family.clone()).unwrap_or_default();
+    let font = egui::FontId::new(size, family);
+    if ui.fonts_mut(|fonts| fonts.has_glyph(&font, '●')) {
+        ui.label(RichText::new(format!("● {text}")).color(color).size(size));
+        return;
+    }
+    // A line of text high, as the label is, the dot in the middle of its first row.
+    let (dot, gap) = (size * 0.6, size * 0.35);
+    let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
+    let galley = ui.painter().layout(text, font, color, (ui.available_width() - dot - gap).max(dot));
+    let (rect, _) = ui.allocate_exact_size(vec2(dot + gap + galley.size().x, galley.size().y), Sense::hover());
+    ui.painter().circle_filled(egui::pos2(rect.left() + dot / 2.0, rect.top() + row / 2.0), size * 0.3, color);
+    ui.painter().galley(egui::pos2(rect.left() + dot + gap, rect.top()), galley, color);
+}
+
 /// `add` in a child of `layout`, its rows `row` high if given, that takes room only once something is drawn
 /// in it, so that a card keeps no gap for a part it has nothing of.
 fn when_drawn<R>(ui: &mut egui::Ui, layout: egui::Layout, row: Option<f32>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -280,18 +298,32 @@ fn when_drawn<R>(ui: &mut egui::Ui, layout: egui::Layout, row: Option<f32>, add:
 }
 
 /// The board of the plan at `index` of [`Backend::plan_list`]: its header, then the kanban columns, drawn
-/// from the plan's [`BoardView`](crate::BoardView), read once per frame.
+/// from the plan's [`BoardView`](crate::BoardView), read once per frame. A phone's board is one surface that
+/// scrolls, its header going up with the cards under it.
 pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let touch = client.touch;
     ui.painter().rect_filled(rect, 0.0, p.background);
-    let Some(mut board) = backend.board(index) else { return };
-    let now = board.now;
-    let plan = &board.plan;
+    let Some(board) = backend.board(index) else { return };
     let margin = touch.map_or(vec2(12.0, 8.0), |touch| vec2(touch.gutter, 8.0));
     let mut child =
-        ui.new_child(egui::UiBuilder::new().id_salt(("plan-panel", &plan.id)).max_rect(rect.shrink2(margin)));
-    let ui = &mut child;
+        ui.new_child(egui::UiBuilder::new().id_salt(("plan-panel", &board.plan.id)).max_rect(rect.shrink2(margin)));
+    if touch::stacks(touch) {
+        egui::ScrollArea::vertical()
+            .id_salt(("plan-board", board.plan.id.clone()))
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| contents(ui, index, board, backend, client));
+    } else {
+        contents(&mut child, index, board, backend, client);
+    }
+}
+
+/// The board's header, then its columns, or on a phone its statuses one under the other.
+fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let touch = client.touch;
+    let now = board.now;
+    let plan = &board.plan;
     let read_only = plan.status != PlanStatus::Open;
     let mut reopen = false;
     let mut archive = false;
@@ -580,11 +612,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                             );
                         }
                         if let Some((title, agent_status)) = task.session.as_ref().and_then(|s| sessions.get(s)) {
-                            ui.label(
-                                RichText::new(format!("● {title} · {}", agent_status.label()))
-                                    .color(status_color(*agent_status, &p))
-                                    .size(11.0),
-                            );
+                            let color = status_color(*agent_status, &p);
+                            dotted(ui, format!("{title} · {}", agent_status.label()), color, 11.0);
                         }
                         let status = task.session.as_ref().and_then(|s| sessions.get(s)).map(|(_, s)| *s);
                         if let Some(action) = task_result_for(
@@ -775,8 +804,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
         });
     } else if !tasks.is_empty() {
         // A phone, or a panel too narrow for one column, stacks the statuses that have tasks, one under the
-        // other, each card the panel's width.
-        egui::ScrollArea::vertical().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
+        // other, each card the panel's width. A phone's whole board scrolls already; a panel's statuses scroll here.
+        let mut statuses = |ui: &mut egui::Ui| {
             for status in TaskStatus::ALL {
                 let count = tasks.iter().filter(|t| t.status == status).count();
                 if count == 0 {
@@ -790,7 +819,15 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                     ui.add_space(8.0);
                 }
             }
-        });
+        };
+        if touch::stacks(touch) {
+            statuses(ui);
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt(("plan-board", &plan_id))
+                .auto_shrink([false, false])
+                .show(ui, |ui| statuses(ui));
+        }
     }
 
     if editing {

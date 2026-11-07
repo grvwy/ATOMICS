@@ -811,6 +811,128 @@ fn a_chiefs_permission_request_is_answered_in_its_window() {
 }
 
 #[test]
+fn a_phones_chief_opens_on_its_terminal_with_no_header_and_the_traces_calls_folded() {
+    let mut host = fake_host::host();
+    host.trace = fake_host::trace_data();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let pill = on(&settled(&ctx, &mut world, &mut client, &mut view, PHONE), "CHIEF");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.tab, Tab::Chief);
+    for absent in ["◆ CHIEF AGENT", "Minimize", "Float"] {
+        assert!(!has(&shown, absent), "{absent}: the chief's button said whose pane this is: {shown:?}");
+    }
+    assert!(client.lane.collapsed && has(&shown, "TRACE") && has(&shown, "Show"), "folded, with Show: {shown:?}");
+    // The terminal right under the top bar and the strip over it.
+    let cells = view.term.overlay.rect.expect("the chief's terminal");
+    assert!(cells.top() <= layout::TOP_BAR + layout::TOUCH + 8.0 + 1.0, "{cells:?}");
+    // Shown, the trace stays so when the user comes back to the chief.
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Show");
+    assert!(!client.lane.collapsed && has(&shown, "Hide"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_ne!(view.tab, Tab::Chief);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(pill));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(view.tab == Tab::Chief && !client.lane.collapsed);
+}
+
+#[test]
+fn a_phones_board_scrolls_as_one_surface_its_header_with_its_cards() {
+    // More tasks than an iPhone SE's screen holds.
+    let mut host = fake_host::working();
+    let more: Vec<_> = (7..=12)
+        .map(|n| {
+            let mut task = host.board.plans[0].tasks[2].clone();
+            (task.id, task.title) = (format!("t{n}"), format!("Task t{n}"));
+            task
+        })
+        .collect();
+    host.board.plans[0].tasks.extend(more);
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    view.tab = Tab::Board;
+    // An iPhone SE's screen, in the points this headless frame is given.
+    const SE: (f32, f32) = (375.0, 667.0);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, SE);
+    let plan = on(&shown, "PLAN");
+    let cards = shown.iter().filter(|(text, _)| text.starts_with("Task ")).count();
+    assert!(cards < 12, "more cards than the screen holds: {cards} of 12 drawn");
+    let wheel = |at: egui::Pos2| {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                delta: vec2(0.0, -200.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    };
+    // Scrolled from over the plan's header, the whole board goes up: the header and the cards together.
+    drawn(&ctx, &mut world, &mut client, &mut view, SE, wheel(plan));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, SE);
+    let moved = plan.y - shown.iter().find(|(text, _)| text == "PLAN").map_or(f32::NEG_INFINITY, |(_, r)| r.center().y);
+    let task = |shown: &[(String, Rect)]| shown.iter().find(|(text, _)| text == "Task t3").map(|(_, r)| r.center().y);
+    assert!(moved > 100.0, "the header scrolled up by {moved}: {shown:?}");
+    let before = task(&settled(&ctx, &mut world, &mut client, &mut view, SE)).expect("a card");
+    drawn(&ctx, &mut world, &mut client, &mut view, SE, wheel(pos2(SE.0 / 2.0, before)));
+    let after = task(&settled(&ctx, &mut world, &mut client, &mut view, SE));
+    assert!(after.is_none_or(|after| after < before - 100.0), "from over a card too: {before} to {after:?}");
+
+    // A finger's drag, as the page hands it over: pressed on a card, moved up, lifted. Back to the top first.
+    for _ in 0..6 {
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, SE);
+        if has(&shown, "PLAN") {
+            break;
+        }
+        let mut up = wheel(pos2(SE.0 / 2.0, SE.1 / 2.0));
+        if let egui::Event::MouseWheel { delta, .. } = &mut up[1] {
+            *delta = vec2(0.0, 400.0);
+        }
+        drawn(&ctx, &mut world, &mut client, &mut view, SE, up);
+    }
+    let start = task(&settled(&ctx, &mut world, &mut client, &mut view, SE)).expect("a card at the top again");
+    // eframe hands a finger over as the pointer and as a touch, which is what lets a scroll area be dragged.
+    let finger = |pos, phase| {
+        let pointer = match phase {
+            egui::TouchPhase::Start => egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::TouchPhase::End => egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            _ => egui::Event::PointerMoved(pos),
+        };
+        let touch =
+            egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(1), phase, pos, force: None };
+        vec![egui::Event::PointerMoved(pos), pointer, touch]
+    };
+    // egui lets a finger drag a list once it has seen a touch: the page's first touch only taps, as on the Board pane.
+    let board = egui::pos2(SE.0 * 3.0 / 8.0, SE.1 - layout::BOTTOM_BAR / 2.0);
+    drawn(&ctx, &mut world, &mut client, &mut view, SE, finger(board, egui::TouchPhase::Start));
+    drawn(&ctx, &mut world, &mut client, &mut view, SE, finger(board, egui::TouchPhase::End));
+    settled(&ctx, &mut world, &mut client, &mut view, SE);
+    assert_eq!(view.tab, Tab::Board);
+    let from = pos2(SE.0 / 2.0, start);
+    let to = from - vec2(0.0, 120.0);
+    drawn(&ctx, &mut world, &mut client, &mut view, SE, finger(from, egui::TouchPhase::Start));
+    for step in 1..=6 {
+        let at = from + (to - from) * (step as f32 / 6.0);
+        drawn(&ctx, &mut world, &mut client, &mut view, SE, finger(at, egui::TouchPhase::Move));
+    }
+    drawn(&ctx, &mut world, &mut client, &mut view, SE, finger(to, egui::TouchPhase::End));
+    let dragged = task(&settled(&ctx, &mut world, &mut client, &mut view, SE));
+    assert!(dragged.is_none_or(|y| y < start - 80.0), "a drag scrolls the board: {start} to {dragged:?}");
+}
+
+#[test]
 fn a_phones_chief_pane_answers_its_permission_request_and_the_bar_says_it_waits() {
     let mut host = fake_host::host();
     chief_waits(&mut host);
@@ -951,6 +1073,14 @@ fn click_on(
     let shown = settled(ctx, world, client, view, size);
     drawn(ctx, world, client, view, size, click(on(&shown, label)));
     settled(ctx, world, client, view, size)
+}
+
+/// Opens the phone's ⋯ menu, at the top bar's end, whose dots are painted; the text the menu shows.
+fn open_more(ctx: &egui::Context, world: &mut World, client: &mut Client, view: &mut View) -> Vec<(String, Rect)> {
+    settled(ctx, world, client, view, PHONE);
+    let at = egui::pos2(ctx.content_rect().right() - layout::GUTTER - layout::TOUCH / 2.0, layout::TOP_BAR / 2.0);
+    drawn(ctx, world, client, view, PHONE, click(at));
+    settled(ctx, world, client, view, PHONE)
 }
 
 #[test]
@@ -2751,7 +2881,7 @@ fn a_viewer_sees_where_the_sign_in_stands_and_nothing_to_press() {
     }
     // The phone's menu has no workspace for it either.
     let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(SignInState::SignedIn));
-    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    let menu = open_more(&ctx, &mut world, &mut client, &mut view);
     assert!(!has(&menu, "Workspace") && !has(&menu, "No workspace"), "{menu:?}");
 
     let (ctx, mut world, mut client, mut view) = viewing(fake_host::tickets(SignInState::SigningIn));
@@ -2933,18 +3063,18 @@ fn the_workspace_item_names_the_hosts_workspace_and_opens_another() {
 #[test]
 fn a_phones_menu_has_the_hosts_workspace() {
     let (ctx, mut world, mut client, mut view) = live();
-    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    let menu = open_more(&ctx, &mut world, &mut client, &mut view);
     assert!(has(&menu, "Machine") && !has(&menu, "Workspace") && !has(&menu, "No workspace"), "none saved: {menu:?}");
 
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::tickets(SignInState::SignedIn));
-    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    let menu = open_more(&ctx, &mut world, &mut client, &mut view);
     assert!(view.compact && has(&menu, "Machine") && has(&menu, "Workspace: team"), "{menu:?}");
     let submenu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Workspace: team");
     assert!(has(&submenu, "team is open") && has(&submenu, "daily"), "{submenu:?}");
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "daily");
     assert_eq!(world.host.host_commands, [HostAction::OpenWorkspace { name: "daily".into() }]);
     assert!(!has(&shown, "Machine"), "the menu closes: {shown:?}");
-    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    let menu = open_more(&ctx, &mut world, &mut client, &mut view);
     assert!(has(&menu, "Workspace: daily"), "{menu:?}");
 }
 
@@ -3446,7 +3576,11 @@ fn trace_lane_draws_and_navigates_in_the_desktop_frame_and_phone_chief() {
     let (ctx, mut world, mut client, mut view) = live_with(host);
     for size in [WIDE, PHONE] {
         if size == PHONE {
+            // A phone's chief opens on its terminal, the calls folded under it until Show.
             view.tab = Tab::Chief;
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(client.lane.collapsed && has(&shown, "TRACE") && !has(&shown, "search"), "{shown:?}");
+            click_on(&ctx, &mut world, &mut client, &mut view, size, "Show");
         }
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         let text = shown.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n");
@@ -3486,7 +3620,7 @@ fn usage_and_load_reach_the_wide_frame_and_the_phones_overflow_and_update_live()
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         let shown = if size == PHONE {
             assert!(!has(&shown, "USAGE") && !has(&shown, "load "), "under overflow: {shown:?}");
-            click_on(&ctx, &mut world, &mut client, &mut view, size, "⋯");
+            open_more(&ctx, &mut world, &mut client, &mut view);
             // The menu's scrolling part has its size from the next frame on.
             settled(&ctx, &mut world, &mut client, &mut view, size)
         } else {
@@ -3536,7 +3670,7 @@ fn an_older_host_without_resources_draws_neither_usage_nor_load() {
     let (ctx, mut world, mut client, mut view) = live_with(host);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
     assert!(!has(&shown, "USAGE") && !has(&shown, "load "));
-    let menu = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "⋯");
+    let menu = open_more(&ctx, &mut world, &mut client, &mut view);
     assert!(!has(&menu, "USAGE") && !has(&menu, "load "));
 }
 
@@ -3591,7 +3725,11 @@ fn host_panels_draw_in_both_layouts_and_editor_input_uses_its_own_terminal() {
         }
         client.pr_view = None;
         if view.compact {
+            // A phone's chief opens with the calls folded, Show at hand.
             view.tab = Tab::Chief;
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+            assert!(has(&shown, "TRACE") && !has(&shown, "example: lookup"), "{size:?}: {shown:?}");
+            click_on(&ctx, &mut world, &mut client, &mut view, size, "Show");
         }
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(has(&shown, "TRACE") && has(&shown, "example: lookup"), "{size:?}: {shown:?}");

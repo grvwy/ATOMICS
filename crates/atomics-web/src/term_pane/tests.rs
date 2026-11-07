@@ -24,6 +24,8 @@ fn frame(ctx: &egui::Context, world: &mut World, client: &mut Client, view: &mut
 }
 
 const PHONE: (f32, f32) = (390.0, 844.0);
+/// An iPad's screen, which draws the desktop's frame for a finger.
+const TABLET: (f32, f32) = (1180.0, 820.0);
 
 fn terminal(prepare: impl FnOnce(&mut fake_host::FakeHost)) -> (egui::Context, World, Client, View) {
     let mut host = fake_host::host();
@@ -39,8 +41,19 @@ fn terminal(prepare: impl FnOnce(&mut fake_host::FakeHost)) -> (egui::Context, W
 }
 
 fn send(ctx: &egui::Context, world: &mut World, client: &mut Client, view: &mut View, inputs: Vec<TermInput>) {
+    send_at(ctx, world, client, view, PHONE, inputs);
+}
+
+fn send_at(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+    inputs: Vec<TermInput>,
+) {
     view.term.inputs.extend(inputs);
-    frame(ctx, world, client, view, PHONE);
+    frame(ctx, world, client, view, size);
 }
 
 fn typed(world: &World) -> String {
@@ -100,69 +113,122 @@ fn what_the_overlay_forwards_is_typed_with_the_screens_modes() {
     assert!(typed(&world).ends_with("日本"));
 }
 
+/// The terminal resize requests this client sent.
+fn resizes(world: &World) -> Vec<Option<GridSize>> {
+    world
+        .sent()
+        .iter()
+        .filter_map(|m| match m {
+            Message::TerminalResize { size, .. } => Some(*size),
+            _ => None,
+        })
+        .collect()
+}
+
+fn pinch(at: Pos2) -> Vec<TermInput> {
+    vec![
+        touch(1, Phase::Down, at - vec2(40.0, 0.0), 0.0),
+        touch(2, Phase::Down, at + vec2(40.0, 0.0), 5.0),
+        touch(2, Phase::Move, at + vec2(120.0, 0.0), 20.0),
+        touch(1, Phase::Up, at, 30.0),
+        touch(2, Phase::Up, at, 31.0),
+    ]
+}
+
 #[test]
-fn the_phone_shows_the_desktops_grid_and_resizes_only_when_asked() {
+fn a_phone_shows_the_desktops_grid_until_it_types_there_and_then_fits_the_grid_to_itself() {
     let (ctx, mut world, mut client, mut view) = terminal(|_| {});
     let rect = view.term.overlay.rect.expect("the overlay's place");
     assert_eq!((rect.left(), rect.width()), (0.0, PHONE.0), "the terminal fills the width");
-    let resized = |world: &World| world.sent().iter().any(|m| matches!(m, Message::TerminalResize { .. }));
+    // A pinch zooms nothing on a phone, and looking resizes nothing.
+    send(&ctx, &mut world, &mut client, &mut view, pinch(rect.center()));
+    assert_eq!(view.term.font, None, "a pinch does not zoom");
+    assert_eq!((resizes(&world).len(), world.host.terminals["s1"].screen.cols), (0, 80));
+    let resting = view.term.painted.expect("painted").rect;
+
+    // A tap to type: the grid becomes the phone's at a readable font, with no button for it, and every column shows.
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("x".into())]);
-    // Pinching zooms; nothing is resized by it.
-    let at = rect.center();
-    send(
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    let painted = view.term.painted.expect("painted");
+    let screen = &world.host.terminals["s1"].screen;
+    assert_eq!(painted.size, PHONE_FIT_MIN);
+    assert_eq!(
+        resizes(&world),
+        [Some(fit_size(&Frame { rect: resting, ..painted }))],
+        "asked once, for the room at rest"
+    );
+    assert!(screen.cols < 80 && painted.cols == screen.cols, "{} columns", screen.cols);
+    assert!(f32::from(painted.cols) * painted.cell.x <= painted.rect.width() - 2.0 * painted.pad.x, "nothing to pan");
+    assert!(world.driver.remote.lease("s1").resized);
+    // Typing, the strip and the tile's header give the terminal their room.
+    let typing = view.term.overlay.rect.expect("the terminal");
+    assert!(typing.top() < rect.top() - 40.0, "{typing:?} under {rect:?}");
+    assert_eq!(view.term.overlay.strip, None);
+    // Still no zoom, and a keyboard taking half the screen keeps the grid.
+    send(&ctx, &mut world, &mut client, &mut view, pinch(typing.center()));
+    assert_eq!(view.term.font, None);
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, (PHONE.0, PHONE.1 / 2.0));
+    }
+    assert_eq!(resizes(&world).len(), 1, "the keyboard resizes nothing");
+    assert_eq!(view.term.painted.unwrap().size, PHONE_FIT_MIN);
+
+    // The desktop takes it back, with its own size, and the phone shows that again.
+    let back = world.host.desktop_types("s1", "y");
+    world.deliver(back);
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    assert_eq!(world.host.terminals["s1"].screen.cols, 80, "the desktop's size when it takes the lease back");
+    assert_eq!(resizes(&world).len(), 1, "no lease, no fit");
+    // Typing again fits it again.
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true)]);
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    assert_eq!(resizes(&world).len(), 2);
+    assert!(world.host.terminals["s1"].screen.cols < 80);
+}
+
+#[test]
+fn a_tablet_pinches_its_font_and_fits_only_when_asked() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    view.viewport.coarse = true;
+    view.tab = Tab::Terminal;
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, TABLET);
+    }
+    let rect = view.term.overlay.rect.expect("the agent's terminal");
+    send_at(
         &ctx,
         &mut world,
         &mut client,
         &mut view,
-        vec![
-            touch(1, Phase::Down, at - vec2(40.0, 0.0), 0.0),
-            touch(2, Phase::Down, at + vec2(40.0, 0.0), 5.0),
-            touch(2, Phase::Move, at + vec2(120.0, 0.0), 20.0),
-            touch(1, Phase::Up, at, 30.0),
-            touch(2, Phase::Up, at, 31.0),
-        ],
+        TABLET,
+        vec![TermInput::Focus(true), TermInput::Text("x".into())],
     );
+    send_at(&ctx, &mut world, &mut client, &mut view, TABLET, pinch(rect.center()));
     let font = view.term.font.expect("the pinched size");
     assert!(font > 10.0, "zoomed in to {font}");
-    assert!(!resized(&world), "looking at the grid never resizes it");
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, TABLET);
+    }
+    assert_eq!(resizes(&world).len(), 0, "a tablet types into the desktop's grid");
     assert_eq!(world.host.terminals["s1"].screen.cols, 80);
-
-    // Fit to this screen is the explicit resize, and lasts until the desktop types.
-    let frame_rect = view.term.overlay.rect.unwrap();
-    let fit = fit_size(&Frame {
-        rect: frame_rect,
-        pad: vec2(PAD, PAD),
-        origin: frame_rect.min,
-        size: font,
-        cell: vec2(1.0, 1.0),
-        first: 0,
-        top: 0,
-        rows: 1,
-        cols: 1,
-        live_top: 0,
-        oldest: 0,
-    });
-    assert!(fit.cols > 80 && fit.cell_width == Some(1), "the grid that fits: {fit:?}");
-    world.driver.remote.resize("s1", Some(GridSize::new(30, 20)));
-    world.driver.flush();
-    world.pump();
-    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
-    assert_eq!(world.host.terminals["s1"].screen.cols, 30);
-    let back = world.host.desktop_types("s1", "y");
-    world.deliver(back);
-    assert_eq!(world.host.terminals["s1"].screen.cols, 80, "the desktop's size when it takes the lease back");
 }
 
 #[test]
-fn a_fitted_terminal_stays_fitted_while_it_shows_though_the_click_on_fit_took_the_keyboard() {
+fn a_phones_fitted_terminal_stays_fitted_while_it_shows_though_the_keyboard_went_down() {
     let (ctx, mut world, mut client, mut view) = terminal(|_| {});
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("x".into())]);
-    // "Fit to this screen" lies outside the overlay, so the click on it takes the keyboard off the terminal.
-    world.driver.remote.resize("s1", Some(GridSize::new(30, 20)));
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let cols = world.host.terminals["s1"].screen.cols;
+    assert!(cols < 80);
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(false)]);
     assert!(!view.term.typing());
     assert!(world.driver.remote.lease("s1").resized);
-    assert_eq!(world.host.terminals["s1"].screen.cols, 30);
     // The host ends a lease 30 s after its last input, resize or renew, and the terminal's own size comes back with
     // that. While the pane shows the terminal, it keeps the lease, and the size with it.
     let renews = |world: &World| world.sent().iter().filter(|m| matches!(m, Message::LeaseRenew { .. })).count();
@@ -174,7 +240,8 @@ fn a_fitted_terminal_stays_fitted_while_it_shows_though_the_click_on_fit_took_th
     assert!(renews(&world) >= 3, "renewed {} times in 31 s: the host would have ended the fit", renews(&world));
     assert!(view.term.due_ms().is_some(), "the next renew wakes the page");
     assert!(world.driver.remote.lease("s1").yours && world.driver.remote.lease("s1").resized);
-    assert_eq!(world.host.terminals["s1"].screen.cols, 30);
+    assert_eq!(world.host.terminals["s1"].screen.cols, cols);
+    assert_eq!(resizes(&world).len(), 1, "the strip coming back resizes nothing");
 }
 
 #[test]
@@ -236,11 +303,34 @@ fn a_finger_may_tap_the_words_on_the_strip_and_its_buttons_stay_buttons() {
     assert_eq!((strip.bottom(), strip.left()), (cells.top(), cells.left()), "the strip lies right over the terminal");
     let whole = strip.width();
 
-    // Typing, a button stands at its end, and the strip's words stop short of it.
+    // Typing on a phone, the strip gives the terminal its room.
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true)]);
     frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.term.overlay.strip, None);
+
+    // Scrolled back with the keyboard down, ↓ Live stands at its end, and the strip's words stop short of it.
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(false)]);
+    let lines: String = (1..=60).map(|n| format!("line {n}\r")).collect();
+    let output = world.host.output("s1", &lines);
+    world.deliver(output);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let at = view.term.overlay.rect.expect("the terminal").center();
+    let down = |dy: f32, t: f64| touch(1, Phase::Move, at + vec2(0.0, dy), t);
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            touch(1, Phase::Down, at, 0.0),
+            down(40.0, 30.0),
+            down(120.0, 60.0),
+            touch(1, Phase::Up, at + vec2(0.0, 120.0), 90.0),
+        ],
+    );
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
     let short = view.term.overlay.strip.expect("still a terminal to type in");
-    assert!(short.width() < whole - 40.0, "Fit to this screen is a button: {short:?} of {whole}");
+    assert!(short.width() < whole - 40.0, "↓ Live is a button: {short:?} of {whole}");
 
     // Someone else types, so a tap there would type nowhere.
     let taken = world.host.other_takes("s1", "Firefox on Linux");
@@ -429,6 +519,10 @@ fn a_drag_scrolls_this_views_history_and_a_tap_clicks_where_the_program_asked() 
     world.deliver(modes);
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("q".into())]);
     assert_eq!(view.term.top, None);
+    // Typing, the phone fits the grid to itself: the cells move up into the room the strip had.
+    for _ in 0..2 {
+        frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
     let rect = view.term.overlay.rect.unwrap();
     send(
         &ctx,
