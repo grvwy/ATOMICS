@@ -311,7 +311,13 @@ impl TestClient {
     }
 
     pub(crate) fn send_text(&mut self, text: &str) {
-        self.ws.send(tungstenite::Message::text(text)).expect("send");
+        self.try_send_text(text).expect("send");
+    }
+
+    /// Like [`Self::send_text`], for a test that expects the host to hang up mid-way: a send after
+    /// the host closed fails (broken pipe) instead of panicking.
+    pub(crate) fn try_send_text(&mut self, text: &str) -> tungstenite::Result<()> {
+        self.ws.send(tungstenite::Message::text(text))
     }
 
     /// The next text frame, or `None` on close, error or timeout. Each of those says so on stderr,
@@ -632,8 +638,11 @@ fn a_client_that_keeps_sending_garbage_is_disconnected() {
     let mut client = TestClient::connect(f.server.addr(), f.server.token());
     client.hello();
     client.sync_until(|m| m.cursor > 0);
+    // The host hangs up after a few errors, so a later send may find the socket closed.
     for _ in 0..20 {
-        client.send_text("garbage");
+        if client.try_send_text("garbage").is_err() {
+            break;
+        }
     }
     let mut errors = 0;
     while let Some(envelope) = client.next() {
