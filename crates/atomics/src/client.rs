@@ -456,9 +456,17 @@ impl ClientApp {
                             self.previews = Default::default();
                         }
                     }
-                    // A direct client has no hosting page and no stored device.
+                    // A direct client has no hosting page, no stored device and no passkey, so the driver never
+                    // asks it to keep, forget or unlock a sealed copy.
                     Output::Dial { socket, .. } => self.driver.socket_closed(socket, 1006),
-                    Output::Post(_) | Output::LoadDevice(_) | Output::SaveDevice(_) | Output::ForgetDevice(_) => {}
+                    Output::Post(_)
+                    | Output::LoadDevice(_)
+                    | Output::SaveDevice(_)
+                    | Output::ForgetDevice(_)
+                    | Output::Paired { .. }
+                    | Output::Keep(_)
+                    | Output::Forget(_)
+                    | Output::Passkey(_) => {}
                 }
             }
         }
