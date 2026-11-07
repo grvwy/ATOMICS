@@ -877,6 +877,9 @@ fn note(ctx: &egui::Context, driver: &Driver, client: &Client) {
 /// The board is not in: pairing, confirming a new pairing, connected before the host's first snapshot, or no
 /// board yet while connecting or stopped.
 fn waiting_room(driver: &Driver) -> bool {
+    if driver.keep_prompt().is_some() {
+        return true;
+    }
     let (has_board, snapshot) =
         driver.remote.with_mirror(|m| (!m.plans.is_empty() || !m.sessions.is_empty(), m.epoch.is_some()));
     match driver.status() {
@@ -1151,6 +1154,7 @@ fn status_line(driver: &Driver) -> (String, Option<bool>) {
         Status::Waiting => ("Waiting for the page".into(), None),
         Status::Connecting => ("Connecting".into(), None),
         Status::Pairing { .. } | Status::ConfirmRepair => ("Pairing".into(), None),
+        Status::Stopped(crate::driver::Stop::Locked) => ("Locked".into(), None),
         Status::Live => match driver.remote.welcome() {
             Some(welcome) if welcome.role == Role::Viewer => ("Connected · view only".into(), Some(true)),
             Some(_) => ("Connected".into(), Some(true)),
@@ -1271,12 +1275,18 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
     if !waiting_room(driver) {
         return false;
     }
+    if keep::screen(ui, driver, client, gutter) {
+        return true;
+    }
     match driver.status().clone() {
         Status::Pairing { code } => padded(ui, gutter, |ui| {
             centred(ui, |ui| {
                 ui.label(RichText::new("Pairing this browser with your computer").size(18.0));
                 if let Some(reason) = driver.pairing_reason() {
                     ui.label(RichText::new(reason).small().color(p.muted));
+                }
+                if let Some(storage) = driver.storage_reason() {
+                    ui.label(RichText::new(storage).small().color(p.muted));
                 }
                 ui.add_space(16.0);
                 match code {
@@ -1301,6 +1311,9 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
                 if let Some(reason) = driver.pairing_reason() {
                     ui.label(RichText::new(reason).small().color(p.muted));
                 }
+                if let Some(storage) = driver.storage_reason() {
+                    ui.label(RichText::new(storage).small().color(p.muted));
+                }
                 ui.add_space(16.0);
                 ui.label(
                     "This browser is already paired with this computer, under another key. Pairing again \
@@ -1324,6 +1337,9 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
                 ui.label(stop.message());
                 if let Some(reason) = driver.pairing_reason() {
                     ui.label(RichText::new(reason).small().color(p.muted));
+                }
+                if let Some(storage) = driver.storage_reason() {
+                    ui.label(RichText::new(storage).small().color(p.muted));
                 }
                 if matches!(
                     stop,
@@ -1663,5 +1679,6 @@ fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     });
 }
 
+pub mod keep;
 #[cfg(test)]
 mod tests;

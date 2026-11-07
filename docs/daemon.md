@@ -1040,9 +1040,11 @@ clipboard could not be read, and pasting with the keyboard still works.
 | `atomics.ready` | Once, as soon as the frame listens: send the boot |
 | `atomics.booted` | The boot was taken |
 | `atomics.ticket` | The frame needs a fresh connect ticket, to reconnect. Asked again every 15 s until one comes |
-| `atomics.paired` | The host accepted this device: the codes matched |
+| `atomics.paired` | The host accepted this device: the codes matched. `kept`: whether the page keeps a sealed copy of its key (below). Sent once that is settled |
+| `atomics.keep` | `{host_id, record}`: keep this sealed record for the host, replacing any before it. Only to a page whose boot said `keeps` |
+| `atomics.forget` | `{host_id}`: forget the host's sealed record. Only after the host's own sealed refusal |
 
-**Parent to frame.** Both messages carry `v: 1`; any other version or `type` is ignored.
+**Parent to frame.** Every message carries `v: 1`; any other version or `type` is ignored.
 
 `atomics.embed.boot`, once per page load (to boot again, load the frame again):
 
@@ -1059,9 +1061,14 @@ clipboard could not be read, and pasting with the keyboard still works.
 | `ticket_key` | no | A ticket's key (`docs/tickets.md`; its id where it has no key): opens the plan that follows it, else one with a task for it (open plans first, keys compared without regard to ASCII case), or the board when none does. Wins over `view`. A text like the others; empty is ignored. (`ticket` is the connect ticket.) |
 | `mode` | no | Absent, or `pair` on a pairing page |
 | `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk, age_ms}`: the pairing link's fields, each key 43 characters of unpadded base64url, and optionally `age_ms`, how many milliseconds before this boot the page got the link (opened, scanned or pasted). The link's five minutes run from then; without it, or with anything but a number of at least 0, from the boot |
+| `keeps` | no | `true`: the page keeps sealed records (`atomics.keep`) in its own storage |
+| `sealed` | no | With `keeps`: the record the page keeps for `host_id`, or null. One that cannot be read, or names another host, is ignored and noted on the Storage line, never a refused boot |
 
 A boot with a malformed required field, an unknown `mode` or a malformed `pair` is ignored. Texts are trimmed,
 stripped of control characters and cut at 200 characters.
+
+`atomics.embed.kept`, answering `atomics.keep`: `{type, v: 1, host_id, ok}`, once the page stored the record and
+read it back (`ok: true`) or could not (`false`).
 
 `atomics.embed.ticket`, answering `atomics.ticket`: `{type, v: 1, host_id, ticket}`, for the booted host. A ticket
 the frame did not ask for is dropped.
@@ -1071,7 +1078,8 @@ bare tunnel body; the broker must answer `atomics.rendezvous.v1` or the frame cl
 used once. Then the Noise channel (H5b): on a pairing boot the frame first reads storage and reuses the device
 key it holds for this host, making a fresh key only after a successful read finds none. It pairs with
 `Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the six-digit code until the host
-answers, and on `paired` keeps the key and posts `atomics.paired`; the channel goes on as the session. When the
+answers, and on `paired` keeps the key and posts `atomics.paired` once it is saved (and, where it helps, sealed and
+kept by the page; below); the channel goes on as the session. When the
 boot names a host this browser already holds another host key for, the frame first asks "Pair this browser
 again?": pairing replaces that key once the host accepts the device, and "Keep the current pairing" connects with
 the key it holds. Confirming the changed host key also reuses the device key; only the trusted host key is
@@ -1088,10 +1096,50 @@ client gets an origin of its own (design §4.2, §6.2). Nothing stores the raw d
 it to the hosting page or a server.
 
 A closed or interrupted IndexedDB connection is discarded and the operation retried once on a new connection;
-failed opens are not cached, and writes wait for transaction completion. Only an absent device record means
+failed opens are not cached, and a save counts once its transaction completed and a new transaction reads the
+record back. Only an absent device record means
 "no key". A failed read, malformed record, missing sealing key or failed decryption says "could not read the
 stored key" and offers **Try again**. It never starts pairing or replaces or deletes the record. A retry reads
 storage again, including when the frame was booted with a pairing link.
+
+**What storage did.** The store keeps facts, never key material: whether the database existed when the page
+opened it or was made anew, whether it holds a sealing key and how many devices, what the last read and save
+found (a failed save names its step: seal, encrypt, write or read back), `persisted()`, `hasStorageAccess()`,
+and, in localStorage beside the database, when this browser last saved or forgot each host's device (a time,
+nothing else). The pairing screens show them as a `Storage:` line under the reason, then a `Key:` part: where the
+key came from on this page (the frame's store, the page's sealed copy unsealed with the passkey, or no passkey to
+open it with, and why), what this browser offers for passkeys, and what the page keeps; the last unlock's failure
+too. The console gets the store's line. A pairing adds a short form to the name the host records, `Safari on iPhone
+[new s0 k0 no mark p0 c0 a1]` (database new or kept, sealing key, devices kept, last mark, persisted, the page's
+copy for this host, `-` for a page that keeps none, and a usable passkey), so the host's device list says what each
+pairing found. A database made anew means the browser dropped the storage; one kept without a sealing key, that no
+save got that far; a mark with no record, that a confirmed save was lost.
+
+**The sealed copy** (`src/keep.rs`, `web/passkey.js`; decision record `2026-11-07-passkey-sealed-device-key.md`).
+WebKit gives a frame whose origin differs from the top-level one storage that lasts only while the browser runs,
+same site or not, so in Safari and every iOS browser the frame's store forgets its pairings when the browser
+closes. There, with a page that `keeps` and a passkey with PRF, the device key is also sealed and kept by the page:
+
+- **The passkey**: one per browser, discoverable, user verification required, its RP ID the client origin's host,
+  never its registrable domain, so the page on another host can neither use it nor open what it seals. WebKit
+  refuses `create()` in such a frame, so the first keep opens `enrol.html` (beside `index.html`) in a window of its
+  own, which makes the passkey and tells the frame its credential ID. Where a frame may make one, it does so itself.
+- **The seal**: PRF input `atomics-device-seal-v1`, a newline and the host id; HKDF-SHA256 to a non-extractable
+  AES-GCM key; the device key sealed with the host id, host key and credential ID as additional data. The record,
+  `{v: 2, host_id, host_key, credential, iv, sealed, paired_at}`, is public data and ciphertext only.
+- **One real button.** A passkey needs its tap's own activation, which egui's frame comes too late for, so the
+  passkey screens leave a place that `web/passkey.js` lays a real button over.
+- **After a pairing**, the save to the frame's store is confirmed first; then, where the copy can help, *Keep this
+  pairing on this browser* asks for one tap (the first one makes the passkey), seals, sends `atomics.keep`, and
+  waits for `atomics.embed.kept`. Only then does `atomics.paired {kept: true}` go out. "Not now", a failure or a
+  page that does not answer within 15 seconds report `kept: false`; the session goes on either way.
+- **A cold start** that finds the frame's store empty but the boot's `sealed` there shows *Unlock this pairing*:
+  one tap, the passkey (only the record's credential is asked for), the key unsealed, saved back into the frame's
+  store for this run, and a fresh ticket asked for before dialing. A failed unlock forgets nothing: it says why
+  and offers the tap again. Only the host's sealed `not_paired` forgets both copies (`atomics.forget`).
+- **Elsewhere nothing changes**: a page without `keeps`, a browser whose frame storage persists (Chrome, Firefox,
+  Edge), or no passkey with PRF: no passkey is asked for, the pairing is reported once saved, and a cold start
+  without a key says *no key stored*, with the reason on the `Key:` line.
 
 **Why pairing or recovery appears.** The frame shows a short reason without key material:
 
@@ -1107,7 +1155,8 @@ receives.
 
 | Path | Meaning and retained state |
 | --- | --- |
-| Successful read finds no record for this host | No key stored in this origin and browser storage context. First use, cleared or evicted storage, a different profile, origin or storage partition can look alike; the client cannot infer which happened. |
+| Successful read finds no record for this host | No key stored in this origin and browser storage context. First use, cleared or evicted storage, a different profile, origin or storage partition can look alike; the `Storage:` line tells a database made anew from a kept one and shows the last save mark. With the page's sealed copy and a passkey here, the frame asks to unlock it instead. |
+| A failed unlock of the page's sealed copy | Cancelled, no PRF, or a record the passkey does not open: said on the screen and the `Key:` line. Both copies are kept; tap again, or pair again. |
 | Storage open, read or decryption fails | A false loss: storage is unreadable, not evidence of an absent key. Try again; no pairing or replacement. |
 | The hosting page explicitly boots a pairing link | A requested pairing, not evidence of a lost key. Reuse a readable device key; the host still compares the codes. |
 | A pairing link names a different host key | Ask before replacing the trusted host key. Keep the existing device key and record until acceptance. |

@@ -7,6 +7,8 @@
 //! - [`remote`]: the UI's `Backend` over `atomics.v1`, on `atomics_core::mirror`.
 //! - [`screens`]: terminals: following screens, the lease and typing, history.
 //! - [`driver`]: the frame's life with its host, reconnecting included, as a state machine.
+//! - [`storage`]: what the browser's storage did with the device key, for the pairing screens.
+//! - [`keep`]: the key's sealed copy on the hosting page, for browsers whose frame storage ends with them.
 //! - [`views`]: the screens, drawn with atomics-ui's views: the desktop's own frame when the window is
 //!   wide, a shared widget a pane on a phone ([`layout`]); what the page shows of its host is its [`desk`];
 //!   terminals in a [`term_pane`], touched through [`gesture`]s; what asks the user first in [`dialogs`].
@@ -21,12 +23,14 @@ pub mod device;
 pub mod dialogs;
 pub mod driver;
 pub mod gesture;
+pub mod keep;
 pub mod layout;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod manifest;
 pub mod page;
 pub mod remote;
 pub mod screens;
+pub mod storage;
 pub mod term_pane;
 pub mod views;
 #[cfg(target_arch = "wasm32")]

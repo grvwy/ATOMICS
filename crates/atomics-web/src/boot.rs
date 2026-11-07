@@ -13,6 +13,8 @@ use atomics_core::theme::{ThemeMode, ThemeTokens};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use crate::keep::Sealed;
+
 /// The embed protocol's version, every message's `v`.
 pub const VERSION: u64 = 1;
 /// Frame to parent: the frame has loaded and listens; it asks for its boot.
@@ -27,6 +29,12 @@ pub const PAIRED: &str = "atomics.paired";
 pub const BOOT: &str = "atomics.embed.boot";
 /// Parent to frame: a fresh connect ticket, the answer to [`WANTS_TICKET`].
 pub const TICKET: &str = "atomics.embed.ticket";
+/// Frame to parent: keep this sealed record for its host, replacing any before it (`crate::keep`).
+pub const KEEP: &str = "atomics.keep";
+/// Parent to frame: the answer to [`KEEP`], once the record was stored and read back, or could not be.
+pub const KEPT: &str = "atomics.embed.kept";
+/// Frame to parent: forget the sealed record for this host; only after the host's own sealed refusal.
+pub const FORGET: &str = "atomics.forget";
 /// The global a hosting page's config script sets to its exact origin.
 pub const PARENT_ORIGIN_GLOBAL: &str = "ATOMICS_PARENT_ORIGIN";
 /// A browser offers its connect ticket to the broker as a second subprotocol: this, then the ticket.
@@ -184,6 +192,12 @@ pub struct Boot {
     /// On a pairing boot, how long before the boot the hosting page got the link (`pair.age_ms`):
     /// the link's lifetime runs from then. 0 when the page did not say.
     pub pairing_age_ms: u64,
+    /// The hosting page keeps sealed records ([`KEEP`]).
+    pub keeps: bool,
+    /// The sealed record the hosting page keeps for this host.
+    pub sealed: Option<Sealed>,
+    /// The page sent a record for this host that could not be read: it is ignored, not refused.
+    pub sealed_unreadable: bool,
 }
 
 impl fmt::Debug for Boot {
@@ -197,6 +211,8 @@ impl fmt::Debug for Boot {
             .field("view", &self.view)
             .field("pairing", &self.pairing.is_some())
             .field("pairing_age_ms", &self.pairing_age_ms)
+            .field("keeps", &self.keeps)
+            .field("sealed", &self.sealed.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -221,7 +237,15 @@ impl Boot {
 #[derive(Debug, Clone)]
 pub enum FromParent {
     Boot(Box<Boot>),
-    Ticket { host_id: String, ticket: Ticket },
+    Ticket {
+        host_id: String,
+        ticket: Ticket,
+    },
+    /// The answer to [`KEEP`].
+    Kept {
+        host_id: String,
+        ok: bool,
+    },
 }
 
 /// Why a message was not taken. It names a field at most, never a value.
@@ -256,13 +280,33 @@ pub fn read(parent: &ParentOrigin, origin: &str, from_parent: bool, data: &Value
             let ticket = Ticket::parse(data.get("ticket")).ok_or(Refused::Field("ticket"))?;
             Ok(FromParent::Ticket { host_id, ticket })
         }
+        KEPT => {
+            let host_id = host_id(data)?;
+            let ok = data.get("ok").and_then(Value::as_bool).ok_or(Refused::Field("ok"))?;
+            Ok(FromParent::Kept { host_id, ok })
+        }
         _ => Err(Refused::Unknown),
     }
 }
 
-/// The frame's own message of `kind` ([`READY`], [`BOOTED`], [`WANTS_TICKET`], [`PAIRED`]).
+/// The frame's own message of `kind` ([`READY`], [`BOOTED`], [`WANTS_TICKET`]).
 pub fn say(kind: &str) -> Value {
     json!({ "type": kind, "v": VERSION })
+}
+
+/// [`PAIRED`]: the host accepted this device; `kept`, whether the hosting page keeps a sealed copy of its key.
+pub fn say_paired(kept: bool) -> Value {
+    json!({ "type": PAIRED, "v": VERSION, "kept": kept })
+}
+
+/// [`KEEP`]: the record, which is public data and ciphertext only.
+pub fn say_keep(sealed: &Sealed) -> Value {
+    json!({ "type": KEEP, "v": VERSION, "host_id": sealed.host_id, "record": sealed.to_json() })
+}
+
+/// [`FORGET`].
+pub fn say_forget(host_id: &str) -> Value {
+    json!({ "type": FORGET, "v": VERSION, "host_id": host_id })
 }
 
 fn host_id(data: &Value) -> Result<String, Refused> {
@@ -303,7 +347,14 @@ fn boot(data: &Value) -> Result<Boot, Refused> {
         Some(Value::String(mode)) if mode == "pair" => Some(pairing(data, &host_id)?),
         Some(_) => return Err(Refused::Field("mode")),
     };
+    // Only a page that keeps records sends one, and a record it cannot have meant is left out, never refused.
+    let keeps = data.get("keeps").and_then(Value::as_bool) == Some(true);
+    let sent = data.get("sealed").filter(|record| keeps && !record.is_null());
+    let sealed = sent.and_then(Sealed::read).filter(|record| record.host_id == host_id);
     Ok(Boot {
+        keeps,
+        sealed_unreadable: sent.is_some() && sealed.is_none(),
+        sealed,
         ticket,
         broker,
         display_name: text(data, "display_name"),

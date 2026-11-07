@@ -9,6 +9,7 @@ use atomics_ui::{Backend, Command};
 
 use super::*;
 use crate::fake_host::{self, HOST_ID, WORKTREE};
+use crate::keep::Failure;
 use crate::world::{BROKER, PARENT, World};
 
 #[test]
@@ -812,4 +813,241 @@ fn device_dates_include_pairing_and_work_with_older_hosts() {
     assert_eq!(info.dates(), ("unknown".into(), "2026-11-05 00:00 UTC".into()));
     info.paired_ms = 1_793_750_400_000;
     assert_eq!(info.dates().0, "2026-11-04 00:00 UTC");
+}
+
+#[test]
+fn a_missing_key_says_what_storage_held_on_screen_and_to_the_host() {
+    let facts = serde_json::json!({
+        "open": "existing", "seal": "present", "records": 0, "read": "none", "save": "not-run",
+        "mark": "saved 2026-11-07T10:18:08.123Z", "persisted": false, "access": true,
+    });
+    let mut world = World::new(fake_host::host());
+    world.driver.storage_noted(Storage::read(&facts));
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotHere));
+    let line = world.driver.storage_reason().expect("under the reason");
+    assert!(line.starts_with("Storage: database existing, sealing key present, 0 saved; read none;"), "{line}");
+
+    let mut host = fake_host::host();
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let mut world = World::new(host);
+    world.driver.storage_noted(Storage::read(&facts));
+    world.boot(Some(&pairing));
+    assert_eq!(
+        world.host.named.as_deref(),
+        Some("Safari on iPhone [kept s1 k0 saved 11-07 10:18Z p0 c- a?]"),
+        "the host's device list says what this pairing found"
+    );
+    let answer = world.host.confirm();
+    world.deliver(answer);
+    assert_eq!(world.driver.status(), &Status::Live);
+    assert_eq!(world.driver.storage_reason(), None, "a live board shows no storage line");
+}
+
+fn safari() -> Passkeys {
+    Passkeys::read(&serde_json::json!({ "available": true, "per_session": true, "create_in_frame": false }))
+}
+
+/// What a passkey seals, as `web/passkey.js` would hand it back: the device's host, and ciphertext.
+fn sealed_for(device: &Device) -> Sealed {
+    Sealed {
+        host_id: device.host_id.clone(),
+        host_key: device.host_key,
+        credential: "Q3JlZGVudGlhbC1pZC0x".into(),
+        iv: "A".repeat(16),
+        sealed: "B".repeat(64),
+        paired_at: 1_762_510_688_000,
+    }
+}
+
+#[test]
+fn where_no_copy_can_help_a_pairing_is_reported_once_saved_and_nothing_asks() {
+    // A page that keeps nothing, as before; and one that keeps copies, in a browser that keeps the frame's storage.
+    for (keeps, chrome) in [(false, false), (true, true)] {
+        let mut host = fake_host::host();
+        host.hold = true;
+        let pairing = host.open_pairing();
+        let mut world = World::new(host);
+        world.keeps = keeps;
+        if chrome {
+            world
+                .driver
+                .passkeys_noted(Passkeys::read(&serde_json::json!({ "available": true, "create_in_frame": true })));
+        }
+        world.boot(Some(&pairing));
+        let answer = world.host.confirm();
+        world.deliver(answer);
+        assert_eq!(world.driver.status(), &Status::Live);
+        assert_eq!((world.posted.last(), world.kept.as_slice()), (Some(&boot::PAIRED), &[false][..]));
+        assert!(world.ask.is_none() && world.driver.keep_prompt().is_none(), "no passkey is asked for");
+        let why = if keeps { "this browser keeps the frame's storage" } else { "the page keeps no copies" };
+        assert!(world.driver.key_line().contains(why), "{}", world.driver.key_line());
+    }
+}
+
+#[test]
+fn a_pairing_in_safari_is_kept_by_the_page_before_it_is_reported() {
+    let mut host = fake_host::host();
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let mut world = World::new(host);
+    world.keeps = true;
+    world.driver.passkeys_noted(safari());
+    world.boot(Some(&pairing));
+    let answer = world.host.confirm();
+    world.deliver(answer);
+    assert_eq!(world.driver.status(), &Status::Live, "the session goes on meanwhile");
+    assert!(!world.posted.contains(&boot::PAIRED), "paired waits for the copy");
+    assert_eq!(
+        world.driver.keep_prompt(),
+        Some(KeepPrompt::Ask { first: true, failed: None, another: false }),
+        "the first tap makes the passkey"
+    );
+    let Some(Ask::Keep { credential: None, made: false, create_in_frame: false, .. }) = &world.ask else {
+        panic!("a keep that makes the passkey in its own window: {:?}", world.ask)
+    };
+
+    // The window opens, and closes without a word: whichever passkey the browser offers will do.
+    world.driver.passkey_answered(Answer::Enrolling);
+    assert_eq!(world.driver.keep_prompt(), Some(KeepPrompt::Enrolling));
+    world.driver.enrolled_elsewhere(true);
+    world.pump();
+    let Some(Ask::Keep { made: true, .. }) = &world.ask else { panic!("a keep with any passkey: {:?}", world.ask) };
+
+    // A cancelled tap says why and asks again.
+    let cancelled = Failure { step: "get".into(), name: "NotAllowedError".into(), detail: String::new() };
+    world.driver.passkey_answered(Answer::Failed(cancelled));
+    let Some(KeepPrompt::Ask { failed: Some(why), .. }) = world.driver.keep_prompt() else { panic!("asks again") };
+    assert!(why.starts_with("cancelled"), "{why}");
+
+    let device = world.store.get(HOST_ID).cloned().expect("the frame's store has it");
+    world.driver.passkey_answered(Answer::Sealed(sealed_for(&device)));
+    world.pump();
+    assert_eq!(world.kept, [true], "reported once the page keeps the copy");
+    assert_eq!(world.page.get(HOST_ID).map(|s| s.host_key), Some(device.host_key));
+    assert!(world.ask.is_none() && world.driver.keep_prompt().is_none(), "the button goes");
+    assert!(
+        world.driver.key_line().starts_with("Key: paired, sealed copy kept by the page"),
+        "{}",
+        world.driver.key_line()
+    );
+}
+
+#[test]
+fn a_page_that_does_not_keep_the_copy_leaves_the_pairing_reported_and_working() {
+    let mut host = fake_host::host();
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let mut world = World::new(host);
+    world.keeps = true;
+    world.page_answers = Some(false);
+    world.driver.passkeys_noted(safari());
+    world.boot(Some(&pairing));
+    let answer = world.host.confirm();
+    world.deliver(answer);
+    let device = world.store.get(HOST_ID).cloned().unwrap();
+    world.driver.passkey_answered(Answer::Sealed(sealed_for(&device)));
+    world.pump();
+    let Some(KeepPrompt::Ask { failed: Some(why), another: true, .. }) = world.driver.keep_prompt() else {
+        panic!("asks again: {:?}", world.driver.keep_prompt())
+    };
+    assert!(why.contains("could not keep"), "{why}");
+
+    // Silent this time: the wait ends, and the pairing is reported as not kept.
+    world.page_answers = None;
+    world.driver.passkey_answered(Answer::Sealed(sealed_for(&device)));
+    world.pump();
+    assert_eq!(world.driver.keep_prompt(), Some(KeepPrompt::Handing));
+    world.advance(KEEP_WAIT_MS);
+    assert_eq!(world.kept, [false]);
+    assert!(world.driver.key_line().contains("the page did not answer"), "{}", world.driver.key_line());
+    assert_eq!(world.driver.status(), &Status::Live);
+
+    // "Not now" on another pairing reports it at once.
+    let mut host = fake_host::host();
+    host.hold = true;
+    let pairing = host.open_pairing();
+    let mut world = World::new(host);
+    world.keeps = true;
+    world.driver.passkeys_noted(safari());
+    world.boot(Some(&pairing));
+    let answer = world.host.confirm();
+    world.deliver(answer);
+    world.driver.keep_declined();
+    world.pump();
+    assert_eq!((world.kept.as_slice(), world.ask.is_none()), (&[false][..], true));
+}
+
+#[test]
+fn a_cold_start_in_safari_unlocks_the_pages_copy_and_dials_with_a_fresh_ticket() {
+    let mut world = World::paired(fake_host::host());
+    let device = world.store.remove(HOST_ID).expect("paired earlier");
+    world.keeps = true;
+    world.page.insert(HOST_ID.into(), sealed_for(&device));
+    world.driver.passkeys_noted(safari());
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::Locked));
+    assert!(matches!(&world.ask, Some(Ask::Unlock(sealed)) if sealed.host_key == device.host_key));
+    assert!(world.dials.is_empty(), "nothing dials before the unlock");
+    let line = world.driver.storage_reason().expect("the locked screen says why");
+    assert!(
+        line.contains("Key: sealed copy, waiting for the passkey")
+            && line.contains("page keeps a sealed copy from 2025-"),
+        "{line}"
+    );
+
+    // A failed unlock forgets nothing.
+    let open = Failure { step: "open".into(), name: "OperationError".into(), detail: String::new() };
+    world.driver.passkey_answered(Answer::Failed(open));
+    world.pump();
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::Locked));
+    assert!(world.driver.unlock_failed().is_some_and(|why| why.contains("did not open")));
+    assert!(world.page.contains_key(HOST_ID) && world.ask.is_some(), "the copy and the button stay");
+
+    world.driver.passkey_answered(Answer::Unlocked(Secret::from_bytes(device.secret.as_bytes())));
+    world.pump();
+    assert_eq!(world.posted.last(), Some(&boot::WANTS_TICKET), "the boot's ticket may have expired");
+    world.ticket("ticket-2");
+    assert_eq!(world.driver.status(), &Status::Live);
+    assert_eq!(world.dials.last().map(|d| d[1].as_str()), Some("atomics.ticket.ticket-2"));
+    assert!(world.store.contains_key(HOST_ID), "back in the frame's store for this browser's run");
+    assert!(world.ask.is_none());
+    assert!(world.driver.key_line().starts_with("Key: unsealed with the passkey"));
+}
+
+#[test]
+fn without_a_passkey_a_kept_copy_changes_nothing() {
+    let mut world = World::paired(fake_host::host());
+    let device = world.store.remove(HOST_ID).unwrap();
+    world.keeps = true;
+    world.page.insert(HOST_ID.into(), sealed_for(&device));
+    world.driver.passkeys_noted(Passkeys::read(&serde_json::json!({ "available": false, "per_session": true })));
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotHere));
+    assert!(world.ask.is_none());
+    assert!(world.driver.key_line().contains("no passkey (no passkey with user verification here)"));
+
+    // Locked first, then the browser says it has none: as before, with the reason.
+    let mut world = World::paired(fake_host::host());
+    let device = world.store.remove(HOST_ID).unwrap();
+    world.keeps = true;
+    world.page.insert(HOST_ID.into(), sealed_for(&device));
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::Locked));
+    world.driver.passkeys_noted(Passkeys::read(&serde_json::json!({ "available": true, "prf": false })));
+    world.pump();
+    assert_eq!((world.driver.status(), world.ask.is_none()), (&Status::Stopped(Stop::NotHere), true));
+}
+
+#[test]
+fn the_hosts_sealed_refusal_forgets_both_copies() {
+    let mut world = World::paired(fake_host::host());
+    let device = world.store.get(HOST_ID).cloned().unwrap();
+    world.keeps = true;
+    world.page.insert(HOST_ID.into(), sealed_for(&device));
+    world.host.allowed.clear();
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Stopped(Stop::NotPaired));
+    assert!(world.store.is_empty() && world.page.is_empty());
 }
