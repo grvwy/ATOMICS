@@ -21,8 +21,11 @@
     window.input = input;
     window.reports = [];
     window.calls = [];
-    const kept = (e) => e.kind === "pointer" || e.kind === "viewport" ? null : e.kind === "key" ? `key:${e.text}` : e.kind === "focus" ? `focus:${e.on}` : `${e.kind}:${e.text}`;
-    input.install(JSON.stringify([[{ label: "Esc", name: "Escape", kind: "key", value: "Escape", wide: false }]]), false, (e) => {
+    const kept = (e) => e.kind === "pointer" || e.kind === "viewport" ? null : e.kind === "key" ? `key:${e.text}` : e.kind === "focus" ? `focus:${e.on}` : e.kind === "back" ? "back" : `${e.kind}:${e.text}`;
+    // The app's own rows where the test serves them, else one key.
+    const served = await fetch("/keys.json").then((r) => (r.ok ? r.text() : null), () => null);
+    const keys = served || JSON.stringify([[{ label: "Esc", name: "Escape", kind: "key", value: "Escape", wide: false }]]);
+    input.install(keys, false, (e) => {
       const seen = kept(e);
       if (seen) window.reports.push(seen);
     });

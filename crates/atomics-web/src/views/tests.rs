@@ -2299,7 +2299,7 @@ fn where_the_sidebar_does_not_fit_a_finger_opens_it_as_a_drawer() {
     assert!(!has(&shown, "AGENTS"), "{shown:?}");
 
     sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(button));
-    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    let shown = slid(&ctx, &mut world, &mut client, &mut view, IPAD);
     assert!(client.drawer && has(&shown, "AGENTS"), "{shown:?}");
     assert_eq!(view.term.overlay.covered, [view.term.overlay.rect.unwrap()], "it takes the terminal's pointer");
 
@@ -2313,7 +2313,7 @@ fn where_the_sidebar_does_not_fit_a_finger_opens_it_as_a_drawer() {
 
     // Picking an agent in it closes it too.
     sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(button));
-    let shown = settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    let shown = slid(&ctx, &mut world, &mut client, &mut view, IPAD);
     // The last drawn of that name: the tile's lies under the drawer.
     let row = shown.iter().rfind(|(text, _)| text == "Fix the parser").expect("the agent's row");
     sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(row.1.center()));
@@ -2327,6 +2327,130 @@ fn where_the_sidebar_does_not_fit_a_finger_opens_it_as_a_drawer() {
     sized(&ctx, &mut world, &mut client, &mut view, IPAD, click(button));
     settled(&ctx, &mut world, &mut client, &mut view, IPAD);
     assert!(!client.drawer && client.touch.is_none());
+}
+
+/// The drawer's button: first in the top bar, a finger's size.
+const DRAWER_BUTTON: egui::Pos2 = egui::pos2(10.0 + layout::TABLET_TOUCH / 2.0, 26.0);
+
+/// A tap on the drawer's button at `size`, and frames until it is all the way in: whether it slid in from the side, its
+/// left edge well left of where it ends in its first frames.
+fn opens_sliding(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+) -> bool {
+    let left = || ctx.memory(|m| m.area_rect(egui::Id::NULL.with("drawer"))).map(|rect| rect.left());
+    drawn(ctx, world, client, view, size, click(DRAWER_BUTTON));
+    let mut first = left();
+    for _ in 0..2 {
+        drawn(ctx, world, client, view, size, Vec::new());
+        first = first.into_iter().chain(left()).reduce(f32::min);
+    }
+    let shown = slid(ctx, world, client, view, size);
+    assert!(client.drawer && has(&shown, "AGENTS"), "{shown:?}");
+    first.zip(left()).is_some_and(|(first, last)| first < last - 100.0)
+}
+
+/// Frames for the drawer to slide all the way in or out; the text of the last.
+fn slid(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+) -> Vec<(String, Rect)> {
+    for _ in 0..15 {
+        drawn(ctx, world, client, view, size, Vec::new());
+    }
+    drawn(ctx, world, client, view, size, Vec::new())
+}
+
+fn key(key: egui::Key) -> Vec<egui::Event> {
+    vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]
+}
+
+#[test]
+fn the_drawer_holds_the_keyboard_closes_on_escape_and_back_and_slides_in_however_it_closed() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    tablet(&mut view, IPAD);
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    // The terminal has the keyboard as the drawer opens: it lets go of it.
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(view.term.typing());
+    assert!(opens_sliding(&ctx, &mut world, &mut client, &mut view, IPAD), "the first time");
+    assert!(!view.term.typing(), "the terminal let go of the keyboard: {:?}", view.term.overlay);
+
+    // Tab and Shift+Tab walk what is in the drawer and nothing behind it.
+    let drawer = egui::Id::NULL.with("drawer");
+    let mut walked = Vec::new();
+    for shift in [false, false, false, false, true, true] {
+        let mut events = key(egui::Key::Tab);
+        if let egui::Event::Key { modifiers, .. } = &mut events[0] {
+            modifiers.shift = shift;
+        }
+        drawn(&ctx, &mut world, &mut client, &mut view, IPAD, events);
+        drawn(&ctx, &mut world, &mut client, &mut view, IPAD, Vec::new());
+        let focused = ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id));
+        walked.push(focused.map(|r| r.layer_id.id));
+    }
+    assert!(walked.iter().all(|layer| *layer == Some(drawer)), "the focus stays in the drawer: {walked:?}");
+
+    // Escape closes it.
+    drawn(&ctx, &mut world, &mut client, &mut view, IPAD, key(egui::Key::Escape));
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!client.drawer, "Escape closes it");
+    assert!(opens_sliding(&ctx, &mut world, &mut client, &mut view, IPAD), "after Escape");
+
+    // The browser's Back closes it.
+    view.back = true;
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!client.drawer, "Back closes it");
+    assert!(opens_sliding(&ctx, &mut world, &mut client, &mut view, IPAD), "after Back");
+
+    // A tap on its button's place closes it, as anywhere beside it does.
+    drawn(&ctx, &mut world, &mut client, &mut view, IPAD, click(DRAWER_BUTTON));
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(!client.drawer, "its button closes it");
+    assert!(opens_sliding(&ctx, &mut world, &mut client, &mut view, IPAD), "after its button");
+
+    // Turned to where the sidebar fits (a 12.9-inch iPad's width sideways), the drawer goes; back to where it does not,
+    // it opens from the side as before.
+    let wider = (1366.0, 1024.0);
+    tablet(&mut view, wider);
+    settled(&ctx, &mut world, &mut client, &mut view, wider);
+    assert!(!client.drawer && !client.sidebar_hidden, "the sidebar shows, and the drawer goes");
+    tablet(&mut view, IPAD);
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert!(opens_sliding(&ctx, &mut world, &mut client, &mut view, IPAD), "after a rotation");
+}
+
+#[test]
+fn reduced_motion_takes_the_time_out_of_eguis_own_animations_in_every_look() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    let default = egui::Style::default();
+    let calm = |ctx: &egui::Context| {
+        let style = ctx.global_style();
+        (style.animation_time, style.scroll_animation)
+    };
+    tablet(&mut view, IPAD);
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert_eq!(calm(&ctx), (default.animation_time, default.scroll_animation));
+    view.viewport.reduce_motion = true;
+    let none = (0.0, egui::style::ScrollAnimation::none());
+    settled(&ctx, &mut world, &mut client, &mut view, IPAD);
+    assert_eq!(calm(&ctx), none, "a tablet");
+    // A phone's look, put on anew, keeps it.
+    tablet(&mut view, PHONE);
+    view.viewport.reduce_motion = true;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(view.compact);
+    assert_eq!(calm(&ctx), none, "a phone");
+    view.viewport.reduce_motion = false;
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(calm(&ctx), (default.animation_time, default.scroll_animation), "and back");
 }
 
 /// What a finger can tap on this frame that is smaller than `target` either way, named by the text in it.

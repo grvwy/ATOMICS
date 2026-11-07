@@ -423,6 +423,12 @@ impl TermPane {
             if self.overlay.strip.is_some_and(|strip| !covered(ctx, self.layer, strip).is_empty()) {
                 self.overlay.strip = None;
             }
+            // A modal layer over the terminal (the drawer) holds the keyboard: the overlay lets go of it. Typing again
+            // is a tap once it has gone.
+            if self.focused && !ctx.memory(|m| m.is_above_modal_layer(self.layer)) {
+                self.focused = false;
+                self.overlay.blur = true;
+            }
             // The keyboard is in a text box the page draws or in the panel: another browser would see the lease held
             // until it expires, by someone who has moved on. A click back asks again.
             let elsewhere = ctx.output(|output| output.ime.is_some())

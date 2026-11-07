@@ -22,8 +22,11 @@
 //!   `history_get`, a page at a time, before it reaches them ([`READ_AHEAD`]), as far back as the host keeps
 //!   them; nothing is asked for until the user scrolls back, so following a screen costs no more than its snapshot.
 //!   What is kept is one run of lines around the view, at most [`MAX_HISTORY_KEPT`]: a view far back drops the
-//!   newest, which are asked for again on the way down. A snapshot starts the history over, but for one of the same
-//!   generation after a gap on the same connection: line IDs hold within a generation. Unsubscribing frees it.
+//!   newest, which are asked for again on the way down. The host halves a page that does not fit one frame, keeping
+//!   its newest lines; on the way down those start past the end of the run, so they are let go and the pages down ask
+//!   for no more lines than came, from that end ([`Term::down_page`]). A snapshot starts the history over, but for one
+//!   of the same generation after a gap on the same connection: line IDs hold within a generation. Unsubscribing frees
+//!   it.
 //! - **Requests.** Every frame a refusal can answer carries a request ID. The IDs kept to match refusals
 //!   are bounded: applied input and answered requests are forgotten, and past [`MAX_REQUESTS`] the
 //!   oldest go.
@@ -47,7 +50,8 @@ pub const MAX_REQUESTS: usize = 1024;
 const REQUEST_PREFIX: &str = "t-";
 /// History lines kept per terminal, around the view: the end farther from it goes first.
 pub const MAX_HISTORY_KEPT: usize = 5000;
-/// Lines one `history_get` asks for; the host sends the newest of them that fit one frame.
+/// Lines one `history_get` asks for; the host sends the newest of them that fit one frame. On the way down, once the
+/// host has had to trim one, a page is no more than it sent then.
 pub const HISTORY_PAGE: u64 = 500;
 /// How many lines on either side of a view scrolled back are asked for before it reaches them: a page, so
 /// scrolling on finds them there, one round trip ahead.
@@ -102,7 +106,11 @@ enum Request {
     /// A renew, a release, a resize or a fit. Refused, it changes nothing here: the lease or its terminal
     /// had ended, and the lease state the host sends says so.
     Lease,
-    History(String),
+    /// A page of history, and the first line it asked for.
+    History {
+        session: String,
+        from: u64,
+    },
     /// Following a screen.
     Subscribe(String),
 }
@@ -138,6 +146,10 @@ struct Term {
     view_top: Option<u64>,
     /// The oldest line the host said it still has, in this generation: older are gone for good.
     host_oldest: u64,
+    /// The lines the host sent of a page down it had to trim to fit its frame, in this generation. A trimmed page
+    /// keeps its newest lines, which start past the end of the run and cannot join it; the next pages down ask for
+    /// no more than this, from that end, so each one joins.
+    down_page: Option<u64>,
 }
 
 impl Term {
@@ -210,7 +222,7 @@ impl Term {
             }
             Some((low, _)) if from < low => page(low),
             Some((_, high)) if to > high => {
-                let before = (high + HISTORY_PAGE).min(first);
+                let before = (high + self.down_page.unwrap_or(HISTORY_PAGE)).min(first);
                 (before, before - high)
             }
             Some(_) => return None,
@@ -289,6 +301,7 @@ impl Screens {
                 term.history = BTreeMap::new();
                 term.history_asked = false;
                 term.view_top = None;
+                term.down_page = None;
                 let topics = vec![Topic::Screen { session: session.clone(), focused: false }];
                 frames.push(Message::Unsubscribe { topics });
             }
@@ -479,7 +492,7 @@ impl Screens {
                 before: Seq(before),
                 count: count as u32,
             });
-            let id = self.request(Request::History(session.to_string()));
+            let id = self.request(Request::History { session: session.to_string(), from: before - count });
             out.push(Envelope::new(message).reply_to(Some(id)));
         }
         Some(())
@@ -508,8 +521,11 @@ impl Screens {
             Message::ScreenSnapshot(snapshot) => self.snapshot(snapshot, out),
             Message::ScreenDelta(delta) => self.delta(delta, out),
             Message::HistoryChunk(chunk) => {
-                self.answered(envelope.request_id.as_deref());
-                self.chunk(chunk);
+                let asked = match self.answered(envelope.request_id.as_deref()) {
+                    Some(Request::History { session, from }) if session == chunk.session => Some(from),
+                    _ => None,
+                };
+                self.chunk(chunk, asked);
             }
             Message::LeaseState(state) => {
                 let answer = self.answered(envelope.request_id.as_deref());
@@ -554,6 +570,7 @@ impl Screens {
                 } else {
                     term.history.clear();
                     term.host_oldest = 0;
+                    term.down_page = None;
                 }
                 term.history_asked = false;
                 self.retype(&snapshot.session.clone(), out);
@@ -589,7 +606,8 @@ impl Screens {
         }
     }
 
-    fn chunk(&mut self, chunk: &HistoryChunk) {
+    /// A page of history, `asked` from that line on.
+    fn chunk(&mut self, chunk: &HistoryChunk, asked: Option<u64>) {
         let Some(term) = self.terms.get_mut(&chunk.session) else { return };
         term.history_asked = false;
         let Some(screen) = term.mirror.screen.as_ref() else { return };
@@ -604,6 +622,10 @@ impl Screens {
         let held = held.zip(term.history.last_key_value().map(|(high, _)| high + 1));
         let joins = held.is_none_or(|(low, high)| end >= low && start <= high);
         if !joins || end > screen.first_line {
+            // A page down the host trimmed: its newest lines, past the end of the run. The next asks for as many.
+            if !joins && asked.is_some_and(|from| start > from.max(chunk.oldest.0)) {
+                term.down_page = Some((lines.len() as u64).max(1));
+            }
             return;
         }
         for (i, line) in lines.into_iter().enumerate() {
@@ -692,7 +714,7 @@ impl Screens {
                     term.refused = true;
                 }
             }
-            Request::History(session) => {
+            Request::History { session, .. } => {
                 if let Some(term) = self.terms.get_mut(&session) {
                     term.history_asked = false;
                 }

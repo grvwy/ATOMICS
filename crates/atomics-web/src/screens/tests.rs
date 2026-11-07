@@ -531,6 +531,53 @@ fn a_history_longer_than_is_kept_stays_around_the_view_and_comes_back_on_the_way
 }
 
 #[test]
+fn scrolling_down_through_pages_the_host_trims_to_fit_a_frame_fills_every_line_and_stops_asking() {
+    let mut world = reconnected_after(3000);
+    // A frame holds far fewer of these lines than a page: the host halves each page until it fits, keeping its
+    // newest lines, so a page down from the end of what is held comes back starting past that end.
+    world.host.history_budget = 4 * 1024;
+    let (first, oldest) = world.driver.remote.with_screen("s1", |s| {
+        let screen = s.unwrap().0;
+        (screen.first_line, screen.oldest_line())
+    });
+    let rows = 20;
+    let mut view = Screen::blank(0, 0);
+    // Straight to the oldest line (a drag of the scroll bar, say), which takes a few round trips to fill.
+    let mut top = oldest;
+    for _ in 0..20 {
+        look(&mut world, top, rows, &mut view);
+        if whole(&view) {
+            break;
+        }
+    }
+    assert!(whole(&view), "the oldest lines came: {}", view.text());
+    let before_down = pages(&world).len();
+
+    // Then down a screen at a time, to the live screen.
+    let mut blank = Vec::new();
+    while top + u64::from(rows) < first {
+        top = (top + u64::from(rows)).min(first - u64::from(rows));
+        look(&mut world, top, rows, &mut view);
+        if !whole(&view) {
+            blank.push(top);
+        }
+    }
+    assert_eq!(blank, Vec::<u64>::new(), "every line filled on the way down");
+    let newest = world.host.terminals["s1"].history.last().unwrap().text();
+    assert_eq!(view.lines.last().unwrap().text(), newest, "down to the screen: {}", view.text());
+
+    // At the screen, everything the view wants is held: nothing more is asked for.
+    let at_bottom = pages(&world).len();
+    for _ in 0..10 {
+        look(&mut world, top, rows, &mut view);
+    }
+    assert_eq!(pages(&world)[at_bottom..], [], "stops asking");
+    let down = &pages(&world)[before_down..];
+    assert!(down.windows(2).all(|w| w[0] != w[1]), "never the same page twice in a row: {down:?}");
+    assert!(down.len() <= 2 * 3000 / 100, "pages that make progress: {down:?}");
+}
+
+#[test]
 fn a_snapshot_after_a_gap_keeps_the_history_held_and_a_new_generation_starts_over() {
     let mut world = live();
     show(&mut world, "s1");

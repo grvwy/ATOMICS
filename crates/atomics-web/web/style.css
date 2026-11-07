@@ -72,6 +72,11 @@ body {
   -webkit-touch-callout: none;
 }
 
+#atomics-strip:focus-visible {
+  outline: 2px solid var(--atomics-accent, #d97757);
+  outline-offset: -2px;
+}
+
 #atomics-input[hidden],
 #atomics-strip[hidden],
 #atomics-keybar[hidden],
@@ -121,6 +126,8 @@ body {
   -webkit-user-select: none;
   user-select: none;
   -webkit-tap-highlight-color: transparent;
+  /* A touch on them is not cancelled at its start, so the row can scroll under a swipe: no long press's callout. */
+  -webkit-touch-callout: none;
 }
 
 #atomics-keybar button {

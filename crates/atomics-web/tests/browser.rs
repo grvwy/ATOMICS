@@ -16,6 +16,11 @@
 //! `a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases` needs no bundle: the page's input alone, in a
 //! phone's Chrome, under real touches and a soft keyboard's editing commands.
 //!
+//! The page's input alone also: `a_swipe_scrolls_the_one_row_key_bar_and_a_tap_types_its_key`, on an iPhone SE with its
+//! keyboard up (375 × 380 CSS pixels in view), with the app's own keys; its screens go to `target/keybar-shots/`.
+//! `a_key_bar_a_real_keyboard_hid_comes_back_with_a_soft_one_in_a_frame` and
+//! `back_closes_the_drawer_and_a_drawer_closed_otherwise_takes_its_step_back` say what they do.
+//!
 //! `the_bundle_pairs_reconnects_and_reloads_in_a_browser`: a page on another origin frames the bundle and
 //! boots it over `postMessage`, a third origin's frame keeps posting a boot of its own, and the browser pairs
 //! (keeping its key in IndexedDB), says `hello`, reconnects with a fresh ticket and resumes, and after a
@@ -1087,6 +1092,20 @@ fn a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases() {
     check("a tap leaves a word under way", page.eval(calls), json!([]));
     page.eval("window.ta.dispatchEvent(new CompositionEvent('compositionend', { data: 'é' })); true");
     check("which then is typed", page.eval(take), json!(["preedit:", "text:é"]));
+    // A keyboard that composes the word before the caret again takes in what keeps the field from being empty: an IME
+    // composing over it, then committing.
+    let composed = json!({
+        "text": "\u{200b}é", "selectionStart": 2, "selectionEnd": 2, "replacementStart": 0, "replacementEnd": 1,
+    });
+    page.call("Input.imeSetComposition", composed);
+    page.call("Input.insertText", json!({ "text": "\u{200b}é" }));
+    let typed: Vec<String> = serde_json::from_value(page.eval(take)).unwrap();
+    check(
+        "composed text carries no zero-width space",
+        json!(typed.iter().any(|r| r.contains('\u{200b}'))),
+        json!(false),
+    );
+    check("and is typed", json!(typed.iter().any(|r| r == "text:é")), json!(true));
 
     // Erasing, as a soft keyboard does it: its key has no name, and it only deletes where there is something to delete.
     soft(&mut page, "deleteBackward");
@@ -1162,6 +1181,200 @@ fn a_finger_opens_the_keyboard_on_every_tap_and_a_soft_keyboard_erases() {
     check("dragging from one, nothing", page.eval(calls), json!([]));
 
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+#[ignore = "needs Chrome; no built bundle required"]
+fn a_swipe_scrolls_the_one_row_key_bar_and_a_tap_types_its_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let script = std::env::var("ATOMICS_WEB_TERMINAL_JS")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/web/terminal.js").to_string());
+    let script = std::fs::read_to_string(script).expect("the page's input");
+    let keys = layout::keybar_json().to_string();
+    serve(
+        listener,
+        Arc::new(move |_, path, _| match path {
+            "/" => Some(Reply::new("text/html", include_str!("browser/terminal-input.html"))),
+            "/terminal.js" => Some(Reply::new("text/javascript", script.clone())),
+            "/style.css" => Some(Reply::new("text/css", include_str!("../web/style.css"))),
+            "/keys.json" => Some(Reply::new("application/json", keys.clone())),
+            _ => None,
+        }),
+    );
+    // An iPhone SE with its keyboard up: 375 CSS pixels wide, about 380 of its height in view, which keeps the key bar
+    // to one row.
+    let (width, height) = (375.0, 380.0);
+    let log = Arc::new(Log::default());
+    let browser = launch(&[format!("--window-size={width},{height}")], &url, &log, Duration::from_secs(90));
+    let mut page = DevTools::open(&browser.devtools(), "the input", |t| t["type"] == "page" && t["url"] == url);
+    let metrics = json!({ "width": width, "height": height, "deviceScaleFactor": 2, "mobile": true });
+    page.call("Emulation.setDeviceMetricsOverride", metrics);
+    page.call("Emulation.setTouchEmulationEnabled", json!({ "enabled": true, "maxTouchPoints": 5 }));
+    page.wait("the module", "window.ready === true && matchMedia('(pointer: coarse)').matches");
+    let dir = target().join("keybar-shots");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shot = |page: &mut DevTools, name: &str| {
+        let data = page.call("Page.captureScreenshot", json!({ "format": "png" }));
+        std::fs::write(dir.join(format!("{name}.png")), base64(data["data"].as_str().unwrap())).unwrap();
+    };
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut check = |what: &str, got: serde_json::Value, want: serde_json::Value| {
+        if got != want {
+            failed.push(format!("{what}: got {got}, wanted {want}"));
+        }
+    };
+    let take = "window.reports.splice(0)";
+    let focused = "document.activeElement === window.ta";
+    let scrolled = "document.getElementById('atomics-keybar').scrollLeft";
+    // The centre of the key named `name`, where the page has it now.
+    let key = |page: &mut DevTools, name: &str| {
+        let rect = page.eval(&format!(
+            "(() => {{ const b = [...document.querySelectorAll('#atomics-keybar button')]
+                .find((b) => b.getAttribute('aria-label') === {name:?}).getBoundingClientRect();
+                return [b.x + b.width / 2, b.y + b.height / 2]; }})()"
+        ));
+        pos2(rect[0].as_f64().unwrap() as f32, rect[1].as_f64().unwrap() as f32)
+    };
+
+    // A tap types in the terminal, and the key bar comes, all on one row.
+    page.tap(pos2(180.0, 200.0));
+    check("a tap focuses", page.eval(focused), json!(true));
+    page.wait("the key bar", "!document.getElementById('atomics-keybar').hidden");
+    check("one row", page.eval("document.getElementById('atomics-keybar').classList.contains('one-row')"), json!(true));
+    page.eval("window.reports.length = 0; window.calls.length = 0; true");
+    shot(&mut page, "1-one-row");
+    let pipe = key(&mut page, "Pipe");
+    check("the pipe is past the screen's edge", json!(pipe.x > width), json!(true));
+
+    // A swipe from Tab to the left scrolls the row and types nothing.
+    let tab = key(&mut page, "Tab");
+    page.drag(tab, tab - vec2(260.0, 0.0));
+    thread::sleep(Duration::from_millis(300));
+    let moved = page.eval(scrolled).as_f64().unwrap_or(0.0);
+    check("the row scrolled", json!(moved > 100.0), json!(true));
+    check("a swipe types nothing", page.eval(take), json!([]));
+    check("and the terminal keeps the keyboard", page.eval(focused), json!(true));
+    shot(&mut page, "2-swiped");
+
+    // The keys it brings on screen type on a tap, and the focus stays where it was. Those still past the edge are a
+    // second swipe away.
+    for (name, typed) in [("Pipe", "text:|"), ("Page up", "key:PageUp"), ("Slash", "text:/"), ("Dash", "text:-")] {
+        let mut at = key(&mut page, name);
+        if at.x > width - 30.0 {
+            let from = pos2(width - 40.0, at.y);
+            page.drag(from, from - vec2(200.0, 0.0));
+            thread::sleep(Duration::from_millis(300));
+            check(&format!("a swipe to {name} types nothing"), page.eval(take), json!([]));
+            at = key(&mut page, name);
+        }
+        check(&format!("{name} is on screen"), json!(at.x > 0.0 && at.x < width), json!(true));
+        page.tap(at);
+        check(&format!("a tap on {name}"), page.eval(take), json!([typed]));
+        check(&format!("{name} leaves the focus"), page.eval(focused), json!(true));
+    }
+    // A finger's wobble is still a tap.
+    let dash = key(&mut page, "Dash");
+    page.touch("touchStart", &[dash]);
+    thread::sleep(Duration::from_millis(40));
+    page.touch("touchMove", &[dash + vec2(6.0, 2.0)]);
+    thread::sleep(Duration::from_millis(40));
+    page.touch("touchEnd", &[]);
+    check("a wobble types", page.eval(take), json!(["text:-"]));
+    // Paste acts on its tap: headless Chrome lets the page read no clipboard, and says so.
+    let paste = key(&mut page, "Paste");
+    page.tap(paste);
+    thread::sleep(Duration::from_millis(300));
+    let pasted = page.eval(take);
+    check("Paste answers its tap", json!(pasted.as_array().is_some_and(|r| r.len() == 1)), json!(true));
+    check("nothing took the focus", page.eval("window.calls.splice(0)"), json!([]));
+    check("the terminal still has it", page.eval(focused), json!(true));
+    shot(&mut page, "3-typed");
+
+    assert!(failed.is_empty(), "{}\nscreens in {}", failed.join("\n"), dir.display());
+}
+
+#[test]
+#[ignore = "needs Chrome; no built bundle required"]
+fn a_key_bar_a_real_keyboard_hid_comes_back_with_a_soft_one_in_a_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let script = std::env::var("ATOMICS_WEB_TERMINAL_JS")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/web/terminal.js").to_string());
+    let script = std::fs::read_to_string(script).expect("the page's input");
+    serve(
+        listener,
+        Arc::new(move |_, path, _| match path {
+            "/" => Some(Reply::new("text/html", include_str!("browser/terminal-input.html"))),
+            "/terminal.js" => Some(Reply::new("text/javascript", script.clone())),
+            "/style.css" => Some(Reply::new("text/css", include_str!("../web/style.css"))),
+            _ => None,
+        }),
+    );
+    let log = Arc::new(Log::default());
+    let browser = launch(&["--window-size=402,874".into()], &url, &log, Duration::from_secs(90));
+    let mut page = DevTools::open(&browser.devtools(), "the input", |t| t["type"] == "page" && t["url"] == url);
+    let metrics = |height: u32| json!({ "width": 402, "height": height, "deviceScaleFactor": 1, "mobile": true });
+    page.call("Emulation.setDeviceMetricsOverride", metrics(874));
+    page.call("Emulation.setTouchEmulationEnabled", json!({ "enabled": true, "maxTouchPoints": 5 }));
+    page.wait("the module", "window.ready === true && matchMedia('(pointer: coarse)').matches");
+    let bar = "!document.getElementById('atomics-keybar').hidden";
+
+    page.tap(pos2(200.0, 300.0));
+    page.wait("the key bar", bar);
+    // A key with a modifier: a real keyboard is there, and the bar goes.
+    page.chord(2, "b", "KeyB", 66);
+    assert_eq!(page.eval(bar), json!(false), "a real keyboard hides the bar");
+    // A soft keyboard comes up, as a hosting page shows it to a frame: the frame ends above it, so the frame's own
+    // viewport is as tall as the frame, and only the frame's height says so.
+    page.call("Emulation.setDeviceMetricsOverride", metrics(520));
+    page.wait("the bar back with the soft keyboard", bar);
+    assert_eq!(page.eval("document.activeElement === window.ta"), json!(true), "the terminal kept the keyboard");
+}
+
+#[test]
+#[ignore = "needs Chrome; no built bundle required"]
+fn back_closes_the_drawer_and_a_drawer_closed_otherwise_takes_its_step_back() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let script = std::env::var("ATOMICS_WEB_TERMINAL_JS")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/web/terminal.js").to_string());
+    let script = std::fs::read_to_string(script).expect("the page's input");
+    serve(
+        listener,
+        Arc::new(move |_, path, _| match path {
+            "/" => Some(Reply::new("text/html", include_str!("browser/terminal-input.html"))),
+            "/terminal.js" => Some(Reply::new("text/javascript", script.clone())),
+            "/style.css" => Some(Reply::new("text/css", include_str!("../web/style.css"))),
+            _ => None,
+        }),
+    );
+    let log = Arc::new(Log::default());
+    let browser = launch(&["--window-size=820,1180".into()], &url, &log, Duration::from_secs(90));
+    let mut page = DevTools::open(&browser.devtools(), "the input", |t| t["type"] == "page" && t["url"] == url);
+    page.wait("the module", "window.ready === true");
+    let length = |page: &mut DevTools| page.eval("history.length").as_u64().unwrap();
+    let start = length(&mut page);
+
+    // Open, the drawer is a step in the history, and the browser's Back takes it: the app is told to close it.
+    page.eval("window.input.setDrawer(true); true");
+    assert_eq!(length(&mut page), start + 1, "a step for the drawer");
+    page.eval("window.reports.length = 0; history.back(); true");
+    page.wait("Back told to the app", "window.reports.includes('back')");
+    // The app closes it, and says so: nothing more happens to the history.
+    page.eval("window.input.setDrawer(false); true");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(page.eval("window.reports.splice(0)"), json!(["back"]));
+
+    // Closed some other way (a tap beside it, Escape, going somewhere), it takes its own step back, and no Back is told.
+    page.eval("window.input.setDrawer(true); true");
+    page.wait("the drawer's step", "history.state !== null && history.state.atomicsDrawer === true");
+    page.eval("window.input.setDrawer(false); true");
+    page.wait("its step taken back", "history.state === null");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(page.eval("window.reports.splice(0)"), json!([]), "the app closed it itself");
 }
 
 #[test]

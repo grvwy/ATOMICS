@@ -16,6 +16,8 @@ pub enum PageEvent {
     Viewport(Viewport),
     /// Something to tell the user (the clipboard could not be read, say).
     Note(String),
+    /// The browser's Back took the step the open drawer has in the tab's history: it closes.
+    Back,
 }
 
 /// The modifier bits the script sends: 1 Shift, 2 Alt, 4 Ctrl, 8 Meta.
@@ -82,6 +84,7 @@ pub fn read(event: &Value, zoom: f32) -> Option<PageEvent> {
             }))
         }
         "note" => Some(PageEvent::Note(text("text")?.chars().filter(|c| !c.is_control()).take(200).collect())),
+        "back" => Some(PageEvent::Back),
         _ => None,
     }
 }
@@ -125,6 +128,7 @@ mod tests {
             input(json!({ "kind": "wheel", "dx": 0, "dy": -40, "x": 10, "y": 10, "zoom": true })),
             TermInput::Wheel { delta: vec2(0.0, -20.0), at: pos2(5.0, 5.0), zoom: true }
         );
+        assert_eq!(read(&json!({ "kind": "back" }), 1.0), Some(PageEvent::Back));
         for bad in [
             json!({ "kind": "text" }),
             json!({ "kind": "pointer", "phase": "hover", "id": 1, "x": 0, "y": 0, "t": 0 }),
