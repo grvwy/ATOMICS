@@ -1288,7 +1288,7 @@ CSS size), with proportional UI text and monospace only for code, terminals and 
 keeps a 16 px gutter from the sides. Under a finger text is not selectable, so a press on it scrolls what it is in. With no
 board yet, while pairing or connecting, the shell is the name, the connection's state and what it has to say, with no
 panes to go to. The line over the pane on screen glides to the next one, and the tablet's drawer slides in, unless the
-system asks for reduced motion. The shared views fit it through
+system asks for reduced motion, which also takes the time out of egui's own animations and scrolls. The shared views fit it through
 `Client::touch` (`atomics_ui::touch`), which the desktop never sets: the board stacks the statuses that have tasks
 with full-width cards under its header and buttons, all of it one surface that scrolls; a tile fills the pane to its sides with a finger-sized header;
 the diff header stacks the title, then the branch and counts, then its buttons in a row that wraps with Close last,
@@ -1300,7 +1300,10 @@ A tablet (a finger on any larger screen, an iPad in both orientations) gets the 
 has a shell of its own. It keeps the desktop's text and look at 1 point a CSS pixel, with every control 44 CSS pixels
 tall (`Touch::stack` false: what sits side by side stays so), and draws inside what the user sees, above the key bar;
 windows, menus and dialogs keep to the same part of the screen, through egui's safe-area insets. The sidebar opens as a
-drawer from the top bar where it does not fit, closing on a tap beside it or on going somewhere from it. The chief starts
+drawer from the top bar where it does not fit, closing on a tap anywhere beside it (its button's place too, under the
+shade), on Escape, on the browser's Back (an open drawer is one step in the tab's history, which it takes back itself
+when it closes another way) or on going somewhere from it. While it is open the keyboard stays in it: the terminal's
+input lets go as it opens, and Tab reaches nothing behind it. The chief starts
 closed unless it fits beside the agents, and where it does not, its pill opens it over the area under the top bar. While
 a finger types, a keyboard that leaves room for only one of the panel and the terminal hides the panel, since a hidden
 terminal would take the keyboard with it. A mouse at any size draws as the desktop does.
@@ -1322,12 +1325,14 @@ without the renew the host ended the lease, and the size, 30 s later.
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
   from `keydown` (Ctrl+V and Cmd stay the browser's), a soft keyboard's Return and Backspace from `beforeinput`
   where its `keydown` names no key, and pastes. The field is never quite empty: one zero-width character stays before
-  the caret, because some soft keyboards raise nothing for a Backspace with nothing to delete. The keys that move
+  the caret, because some soft keyboards raise nothing for a Backspace with nothing to delete; a keyboard that composes
+  the word before the caret again takes it in, so it is left out of what is composed. The keys that move
   around the window (docs/navigation.md) go to the app instead, wherever the keyboard is on the page. The field has
   autocorrect, autocapitalisation, autocomplete and spellcheck off. A touch on it is handled by the client: a tap
   focuses it from the touch's own handler (which opens the keyboard), and the browser's loupe, callout and page zoom
   never start. A field that kept the focus while the keyboard was put away takes it again on a tap, quietly, so the
-  lease and the key bar do not change. The strip's words count as the terminal for a finger, its buttons do not. It takes the pointer only where
+  lease and the key bar do not change. The strip's words count as the terminal for a finger, its buttons do not; for a
+  screen reader, a mouse or the keyboard the words are a button that types there. It takes the pointer only where
   egui would give the terminal the pointer: a floating window over the terminal is cut out of it with a `clip-path`,
   so the browser sends that part's pointer to the canvas, and all of it goes while a menu or popup is open, so a click
   away closes the popup as it does anywhere else. A click on a text box the page draws, the steer bar or a comment
@@ -1338,16 +1343,20 @@ without the renew the host ended the lease, and the size, 30 s later.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
   while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
   safe area's sides, and takes the bottom bar's place. A key pressed with a modifier means a real keyboard is there, and
-  the bar goes until a soft keyboard comes up. With under 420 CSS pixels of the screen in view, on a phone held sideways,
-  its keys keep to one row that scrolls; and where a keyboard leaves under 240 for the phone's body, only the terminal
+  the bar goes until a soft keyboard comes up: the visual viewport short of the page, or in a frame, whose hosting page
+  ends it above the keyboard, the frame shorter than it was at that width. With under 420 CSS pixels of the screen in
+  view, on a phone held sideways or with its keyboard up, its keys keep to one row that scrolls; and where a keyboard leaves under 240 for the phone's body, only the terminal
   shows, with no top bar, header or strip, until the typing ends. Its keys are at least 44 CSS pixels each way (a screen
-  narrower than 375 scrolls a row) and never take the focus; Paste reads the clipboard on the touch's end.
+  narrower than 375 scrolls a row) and never take the focus, nor does a gap between them. A key acts on a tap's end
+  (Paste reads the clipboard then); a swipe along a row scrolls it and types nothing.
 - **Touch and mouse.** A finger may wobble 12 CSS pixels and still tap, on a terminal and on any other control (a
   mouse keeps its 6 points to click and 8 to select). A tap clicks the cell (press and release) where the program
   asked for mouse reports and this client types; a tap where someone else types shows up **Take over**; a one-finger drag scrolls this client's own history and pans. New
   output does not move a view scrolled back. Following a screen costs its snapshot alone; once the view is scrolled
   back it asks for `history_get` pages of 500 lines, one round trip ahead of it in either direction, as far back as the
   host keeps lines, and holds at most 5000 of them around the view (going back down asks again for those it let go).
+  A page the host trims to fit one frame keeps its newest lines; going down, those do not meet the lines held, so the
+  pages down from then on ask for only as many as came, which do.
   A snapshot of the same generation after a gap keeps what is held; one after a reconnect starts over. A long press (450 ms) selects the word under the finger
   (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
   each end to drag; a **Copy** chip, above the selection or below it where there is no room in the terminal, copies

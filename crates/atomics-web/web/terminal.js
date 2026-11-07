@@ -113,9 +113,22 @@ function emptyField() {
   if (document.activeElement === ta) ta.setSelectionRange(1, 1);
 }
 
-// Whether a soft keyboard plainly takes part of the screen. Where it shrinks the page too, or the page is in a frame,
-// this does not see it.
-const softKeyboardUp = () => vv !== undefined && vv !== null && innerHeight - vv.height > 120;
+// The tallest the page has been at its width. In a frame the hosting page ends the frame above a soft keyboard, so the
+// frame's own visual viewport never shows it: the frame grows shorter instead.
+let tallest = { width: 0, height: 0 };
+
+// Whether a soft keyboard plainly takes part of the screen: the visual viewport is short of the page, or the page is
+// short of what it was at this width.
+function softKeyboardUp() {
+  if (innerWidth !== tallest.width) tallest = { width: innerWidth, height: innerHeight };
+  tallest.height = Math.max(tallest.height, innerHeight);
+  const view = vv ? vv.height : innerHeight;
+  return innerHeight - view > 120 || tallest.height - view > 120;
+}
+
+// Composed text without the character that keeps the field from being empty: a keyboard that composes the word before
+// the caret again takes it in.
+const plain = (text) => (text || "").split(KEEP).join("");
 
 // A finger asks to type: this has to run in the touch's own handler, or iOS opens no keyboard. A field that kept the
 // focus while the keyboard was put away takes it again, quietly: focus alone would do nothing, and neither the lease
@@ -215,14 +228,31 @@ function showBar(on) {
   viewport();
 }
 
-// Pressing a key, the chip or the bar must not move the focus, or the soft keyboard closes. A touch acts
-// on touchend: the event that lets a page use the clipboard.
-function noFocus(el, act) {
+// Pressing a key, the chip or a gap in the bar must not move the focus, or the soft keyboard closes: no press of
+// theirs makes the mouse events that move it, and no touch a click or a long press's menu.
+function keepFocus(el) {
   el.addEventListener("pointerdown", (e) => e.preventDefault());
   el.addEventListener("mousedown", (e) => e.preventDefault());
-  el.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
-  el.addEventListener("touchend", (e) => { e.preventDefault(); act(); }, { passive: false });
-  el.addEventListener("click", act); // a mouse; a prevented touch makes no click
+  el.addEventListener("touchend", (e) => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+  el.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
+// How far the key bar's rows have scrolled, together.
+const scrolled = () => (bar ? [bar, ...bar.children].reduce((sum, el) => sum + el.scrollLeft, 0) : 0);
+
+// A key or the chip acts on a tap's end, the event that lets a page use the clipboard. A finger that moves on, or a
+// row that scrolls under it, is a swipe: the browser scrolls the row (its touch-action), and nothing is typed. A
+// mouse clicks; a touch makes no click (keepFocus).
+function onTap(el, act) {
+  const tap = tapTracker();
+  let from = 0;
+  el.addEventListener("touchstart", (e) => { tap.start(e); from = scrolled(); }, { passive: true });
+  el.addEventListener("touchmove", (e) => tap.move(e), { passive: true });
+  el.addEventListener("touchcancel", (e) => tap.end(e, 0));
+  el.addEventListener("touchend", (e) => {
+    if (tap.end(e, Infinity) && scrolled() === from) act();
+  });
+  el.addEventListener("click", act);
 }
 
 function paste() {
@@ -270,6 +300,7 @@ function buildBar(rows) {
   bar.setAttribute("role", "toolbar");
   bar.setAttribute("aria-label", "Terminal keys");
   bar.hidden = true;
+  keepFocus(bar);
   for (const row of rows) {
     const line = document.createElement("div");
     line.className = "atomics-keyrow";
@@ -283,7 +314,7 @@ function buildBar(rows) {
       button.dataset.value = key.value;
       if (key.wide) button.classList.add("wide");
       if (key.value === "Ctrl" || key.value === "Alt") button.setAttribute("aria-pressed", "false");
-      noFocus(button, () => {
+      onTap(button, () => {
         if (key.kind === "key") send({ kind: "key", text: key.value, mods: 0 });
         else if (key.kind === "text") send({ kind: "text", text: key.value });
         else paste();
@@ -306,14 +337,22 @@ function tapOpensKeyboard(el) {
   }, { passive: false });
 }
 
-// The strip over the terminal says to tap the terminal, so a tap on the words themselves counts too.
+// The strip over the terminal says to tap the terminal, so a tap on the words themselves counts too. It is a button
+// for a screen reader, a mouse and the keyboard as well: activated, it types in the terminal.
 function buildStrip() {
   strip = document.createElement("div");
   strip.id = "atomics-strip";
   strip.hidden = true;
+  strip.tabIndex = 0;
   strip.setAttribute("role", "button");
   strip.setAttribute("aria-label", "Type in this terminal");
   tapOpensKeyboard(strip);
+  strip.addEventListener("click", openKeyboard);
+  strip.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    openKeyboard();
+  });
   document.body.append(strip);
 }
 
@@ -347,11 +386,12 @@ function buildOverlay() {
     showBar(false);
   });
   ta.addEventListener("compositionstart", () => { composing = true; });
-  ta.addEventListener("compositionupdate", (e) => send({ kind: "preedit", text: e.data || "" }));
+  ta.addEventListener("compositionupdate", (e) => send({ kind: "preedit", text: plain(e.data) }));
   ta.addEventListener("compositionend", (e) => {
     composing = false;
     send({ kind: "preedit", text: "" });
-    if (e.data) send({ kind: "text", text: e.data });
+    const text = plain(e.data);
+    if (text) send({ kind: "text", text });
     emptyField();
   });
   ta.addEventListener("beforeinput", (e) => {
@@ -437,6 +477,34 @@ function buildOverlay() {
   for (const type of ["gesturestart", "gesturechange", "gestureend"]) ta.addEventListener(type, (e) => e.preventDefault());
 }
 
+// The drawer is one step in the tab's history while it is open, so Back (a browser's, a phone's or a tablet's) closes it.
+// Closed some other way, it takes its step back itself, so Back then goes where it went before. In a frame the step is in
+// the hosting page's history too, and its Back closes the drawer the same way.
+let drawerStep = false;
+const onDrawerStep = () => history.state !== null && typeof history.state === "object" && history.state.atomicsDrawer === true;
+
+function watchBack() {
+  try {
+    // A reload while the drawer was open comes back to its step, with no drawer: it is an ordinary place again.
+    if (onDrawerStep()) history.replaceState(null, "");
+  } catch (_) { /* a page whose history cannot be written */ }
+  addEventListener("popstate", () => {
+    if (!drawerStep || onDrawerStep()) return;
+    drawerStep = false;
+    send({ kind: "back" });
+  });
+}
+
+/** The drawer opened or closed: give it its step in the tab's history, or take that step back. */
+export function setDrawer(open) {
+  if (open === drawerStep) return;
+  drawerStep = open;
+  try {
+    if (open) history.pushState({ atomicsDrawer: true }, "");
+    else if (onDrawerStep()) history.back();
+  } catch (_) { /* a page whose history cannot be written */ }
+}
+
 /** Build the overlay and the key bar (`keys`: the app's rows, as JSON) and report to `callback`. The agent chords use
     Command when `command`, else Ctrl. */
 export function install(keys, command, callback) {
@@ -444,6 +512,7 @@ export function install(keys, command, callback) {
   commandChords = command;
   addEventListener("keydown", windowKeys, true);
   lockZoom();
+  watchBack();
   probe = document.createElement("div");
   probe.id = "atomics-insets";
   document.body.append(probe);
@@ -457,11 +526,14 @@ export function install(keys, command, callback) {
   chip.tabIndex = -1;
   chip.textContent = "Copy";
   chip.hidden = true;
-  noFocus(chip, copy);
+  keepFocus(chip);
+  onTap(chip, copy);
   document.body.append(chip);
   const changed = () => {
-    // The soft keyboard came up after all, so its bar is wanted again.
-    if (hardKeyboard && softKeyboardUp()) {
+    // The soft keyboard came up after all, so its bar is wanted again. Asked every time, so the page's height at its
+    // width is known before a keyboard comes.
+    const soft = softKeyboardUp();
+    if (hardKeyboard && soft) {
       hardKeyboard = false;
       if (document.activeElement === ta) showBar(true);
     }
@@ -475,6 +547,7 @@ export function install(keys, command, callback) {
   addEventListener("resize", changed);
   coarse.addEventListener("change", changed);
   calm.addEventListener("change", changed);
+  softKeyboardUp();
   viewport();
 }
 

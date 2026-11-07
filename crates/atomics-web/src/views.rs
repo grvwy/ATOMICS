@@ -153,6 +153,9 @@ pub struct View {
     /// A native client gives the terminals it draws their panes' sizes where the host has no desktop of its own
     /// ([`RemoteBackend::fits`]), as the desktop does; a browser shows the host's grid as it is.
     pub fit_terminals: bool,
+    /// The browser's Back came while the drawer was open (the page gives the drawer a step in the tab's history): the
+    /// next frame closes it.
+    pub back: bool,
     /// The terminal the page's input goes to, by session id, as the pane on screen says.
     target: Option<String>,
     /// The note on the notice line and when it first showed there.
@@ -308,6 +311,10 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     view.term.touch = client.touch;
     client.typing = client.touch.is_some() && view.term.typing();
     client.reduce_motion = view.viewport.reduce_motion;
+    calm(ui.ctx(), view.viewport.reduce_motion);
+    if std::mem::take(&mut view.back) {
+        client.drawer = false;
+    }
     click_distance(ui.ctx(), view.viewport.coarse);
     sync(ui.ctx(), driver, client, view);
     window_keys(ui.ctx(), driver, client, view);
@@ -328,6 +335,24 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     driver.flush();
     atomics_ui::panel_nav::settle_focus(ui.ctx());
     view.text_boxes = text_boxes(ui.ctx(), view.viewport.coarse);
+}
+
+/// Under reduced motion egui's own animations take no time, a scroll to a place jumps there, and windows and menus
+/// show at once; otherwise egui's own.
+fn calm(ctx: &egui::Context, reduce: bool) {
+    let default = egui::Style::default();
+    let (time, scroll) = if reduce {
+        (0.0, egui::style::ScrollAnimation::none())
+    } else {
+        (default.animation_time, default.scroll_animation)
+    };
+    let style = ctx.global_style();
+    if style.animation_time != time || style.scroll_animation != scroll {
+        ctx.all_styles_mut(|s| {
+            s.animation_time = time;
+            s.scroll_animation = scroll;
+        });
+    }
 }
 
 /// What a soft keyboard, a notch and the key bar cover, for what egui places itself: windows, menus and dialogs. A mouse's

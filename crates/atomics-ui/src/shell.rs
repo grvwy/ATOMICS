@@ -220,6 +220,8 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     }
     if read(platform, |_, client| client.drawer) {
         drawer(ui.ctx(), area, platform, &p);
+    } else {
+        drawer_closed(ui.ctx());
     }
 }
 
@@ -227,23 +229,40 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
 const DRAWER_WIDTH: f32 = 320.0;
 const DRAWER_TIME: f32 = 0.16;
 
-/// For a finger, the sidebar where it does not fit: over the rest, opened from the top bar. A tap beside it closes it, and
-/// so does going somewhere from it ([`Client::send`]).
+/// For a finger, the sidebar where it does not fit: over the rest, opened from the top bar. A tap anywhere beside it
+/// closes it (its button's place in the top bar too, under the shade), and so do Escape (a menu open in it takes Escape
+/// first), the platform's Back, and going somewhere from it ([`Client::send`]). While it is open the keyboard's focus
+/// stays in it: what had the focus behind it lets go as it opens, and nothing behind the shade can take the focus (a
+/// modal layer).
 fn drawer(ctx: &egui::Context, area: Rect, platform: &mut impl Platform, p: &crate::theme::Palette) {
     let width = DRAWER_WIDTH.min(area.width() * 0.85);
+    let opening = ctx.data_mut(|d| !std::mem::replace(d.get_temp_mut_or_default::<bool>(drawer_id("open")), true));
+    if opening {
+        ctx.memory_mut(|m| {
+            if let Some(focused) = m.focused() {
+                m.surrender_focus(focused);
+            }
+        });
+    }
     let time = if read(platform, |_, client| client.reduce_motion) { 0.0 } else { DRAWER_TIME };
-    let out = ctx.animate_bool_with_time(egui::Id::NULL.with("drawer-out"), true, time);
+    let out = ctx.animate_bool_with_time(drawer_id("out"), true, time);
+    let screen = ctx.viewport_rect();
     let shade = egui::Area::new(egui::Id::NULL.with("drawer-shade"))
         .order(egui::Order::Foreground)
-        .fixed_pos(area.min)
+        .fixed_pos(screen.min)
         .show(ctx, |ui| {
-            let (rect, response) = ui.allocate_exact_size(area.size(), Sense::click());
+            // A tap's, not a stop for Tab.
+            let (rect, response) = ui.allocate_exact_size(screen.size(), Sense::CLICK);
             ui.painter().rect_filled(rect, 0.0, p.background.gamma_multiply(0.6 * out));
             response.clicked()
         });
     let at = area.min - vec2(width * (1.0 - out), 0.0);
-    let shown =
-        egui::Area::new(egui::Id::NULL.with("drawer")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+    // Off the screen's edge while it slides in: egui would otherwise keep the area on screen, and nothing would move.
+    let shown = egui::Area::new(egui::Id::NULL.with("drawer"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(at)
+        .constrain(false)
+        .show(ctx, |ui| {
             egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
                 ui.set_width(width - 20.0);
                 ui.set_height(area.height() - 8.0);
@@ -251,13 +270,26 @@ fn drawer(ctx: &egui::Context, area: Rect, platform: &mut impl Platform, p: &cra
             });
         });
     ctx.move_to_top(shown.response.layer_id);
-    if shade.inner {
+    ctx.memory_mut(|m| m.set_modal_layer(shade.response.layer_id));
+    let escape =
+        !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    if shade.inner || escape {
         platform.draw(|_, client, _| client.drawer = false);
     }
     if !read(platform, |_, client| client.drawer) {
-        // The next time it opens, it comes in from the side again.
-        ctx.animate_bool_with_time(egui::Id::NULL.with("drawer-out"), false, 0.0);
+        drawer_closed(ctx);
     }
+}
+
+fn drawer_id(what: &str) -> egui::Id {
+    egui::Id::NULL.with("drawer").with(what)
+}
+
+/// The drawer is closed, however that came about (a tap beside it, Escape or Back, its button, going somewhere from it,
+/// or room for the sidebar after a rotation): the next time it opens, it comes in from the side again.
+fn drawer_closed(ctx: &egui::Context) {
+    ctx.animate_bool_with_time(drawer_id("out"), false, 0.0);
+    ctx.data_mut(|d| d.remove::<bool>(drawer_id("open")));
 }
 
 /// What opens the [`drawer`], with a dot while something in it waits for the user.

@@ -58,7 +58,8 @@ bar. The keys are the last section.
 
 The phone keeps its panes: each pane's header says where it is (the board's plan, the tile's session), and the
 browser's own Back stays the page's. A tablet has the frame, with the sidebar in a drawer from the top bar where it does
-not fit, and the chief over the area under the top bar where it does not sit beside the agents.
+not fit (the browser's Back closes it while it is open), and the chief over the area under the top bar where it does
+not sit beside the agents.
 
 ## The keys that move around, on every client
 

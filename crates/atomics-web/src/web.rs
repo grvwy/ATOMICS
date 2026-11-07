@@ -96,6 +96,8 @@ extern "C" {
     fn load_view() -> String;
     #[wasm_bindgen(js_name = saveView)]
     fn save_view(name: &str);
+    #[wasm_bindgen(js_name = setDrawer)]
+    fn set_drawer(open: bool);
 }
 
 /// The page's own controls (the key bar, the Copy chip) in the theme's colours.
@@ -238,6 +240,8 @@ struct App {
     passkey_placed: Option<(egui::Rect, String)>,
     /// What the overlay was last set to.
     applied: Overlay,
+    /// Whether the page was last told the drawer is open, which gives it a step in the tab's history.
+    drawer: bool,
     /// The text boxes the page was last told of.
     applied_boxes: Vec<egui::Rect>,
     /// The view the switcher chose that this browser keeps, as last saved.
@@ -395,6 +399,7 @@ impl App {
             _passkey: passkey,
             passkey_placed: None,
             applied: Overlay::default(),
+            drawer: false,
             applied_boxes: Vec::new(),
             saved_view,
         }
@@ -653,6 +658,7 @@ impl eframe::App for App {
                 Input::Page(PageEvent::Term(input)) => self.view.term.inputs.push(input),
                 Input::Page(PageEvent::Viewport(viewport)) => self.view.viewport = viewport,
                 Input::Page(PageEvent::Note(note)) => self.driver.remote.say(note),
+                Input::Page(PageEvent::Back) => self.view.back = true,
             }
         }
         self.run_outputs();
@@ -680,6 +686,10 @@ impl eframe::App for App {
         self.run_outputs();
         self.apply_overlay();
         self.apply_passkey();
+        if self.client.drawer != self.drawer {
+            self.drawer = self.client.drawer;
+            set_drawer(self.drawer);
+        }
         if self.view.desk.panel != self.saved_view {
             save_view(desk::view_name(self.view.desk.panel));
             self.saved_view = self.view.desk.panel;

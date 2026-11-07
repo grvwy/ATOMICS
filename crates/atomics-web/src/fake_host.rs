@@ -84,6 +84,8 @@ pub struct FakeHost {
     pub contents: HashMap<(String, String), String>,
     /// Bytes of one `diff_file` page.
     pub page_budget: usize,
+    /// Bytes of one `history_chunk` frame. Past it the chunk is halved, keeping the newest lines, as the host does.
+    pub history_budget: usize,
     pub trace: atomics_core::trace_feed::TraceData,
     trace_revision: u64,
     follows_trace: bool,
@@ -312,6 +314,7 @@ impl FakeHost {
             listings: HashMap::new(),
             contents: HashMap::new(),
             page_budget: wire::MAX_FRAME_BYTES,
+            history_budget: wire::MAX_FRAME_BYTES,
             trace: Default::default(),
             trace_revision: 1,
             follows_trace: false,
@@ -1205,22 +1208,31 @@ impl FakeHost {
                 let oldest = first_line - terminal.history.len() as u64;
                 let before = get.before.0.min(first_line);
                 let from = before.saturating_sub(u64::from(get.count)).max(oldest);
-                let mut encoder = RowsEncoder::default();
-                for (row, id) in (from..before).enumerate() {
-                    encoder.push(row as u16, &terminal.history[(id - oldest) as usize]);
+                let all = before.saturating_sub(from);
+                let mut keep = all;
+                loop {
+                    let first = from + (all - keep);
+                    let mut encoder = RowsEncoder::default();
+                    for (row, id) in (first..before).enumerate() {
+                        encoder.push(row as u16, &terminal.history[(id - oldest) as usize]);
+                    }
+                    let (styles, lines) = encoder.finish();
+                    let chunk = HistoryChunk {
+                        session: get.session.clone(),
+                        generation: Seq(terminal.generation),
+                        cols: terminal.screen.cols,
+                        first: Seq(first),
+                        oldest: Seq(oldest),
+                        evicted: false,
+                        styles,
+                        lines,
+                    };
+                    let reply = host(Message::HistoryChunk(chunk)).reply_to(id.clone());
+                    if keep <= 1 || wire::encode(&reply).is_ok_and(|frame| frame.len() <= self.history_budget) {
+                        return vec![reply];
+                    }
+                    keep /= 2;
                 }
-                let (styles, lines) = encoder.finish();
-                let chunk = HistoryChunk {
-                    session: get.session.clone(),
-                    generation: Seq(terminal.generation),
-                    cols: terminal.screen.cols,
-                    first: Seq(from),
-                    oldest: Seq(oldest),
-                    evicted: false,
-                    styles,
-                    lines,
-                };
-                vec![host(Message::HistoryChunk(chunk)).reply_to(id)]
             }
             _ => Vec::new(),
         }

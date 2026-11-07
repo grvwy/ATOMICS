@@ -378,8 +378,9 @@ Commits, one per file group:
    Ungrouped or Repos tab, no `+ New`, Close plan or steer bar, and the board's Approve plan for a
    controller but not for a viewer.
 9. **The browser draws the frame** (W1, `atomics-web`). A wide window calls `shell::frame` over
-   `RemoteBackend` through `views::Web`, the browser's `Platform`: the connection's state is its
-   `top_bar_items`, the layout menu its `top_bar_settings`, and every other hook stays empty. The terminals
+   `RemoteBackend` through `views::Web`, the browser's `Platform`: the connection's state, the sign-in and the
+   workspace menu are its `top_bar_items`, and every other hook stays empty (the layout menu it had in
+   `top_bar_settings` at first is gone; the frame lays itself out). The terminals
    are `term_pane::Terminals`, the browser's `TerminalSurface`: the one the page's input goes to (the active
    session's, or the chief's once clicked into) is the `TermPane` under the `<textarea>` overlay, with a strip
    saying who types; every other is painted as it is, and a click on it moves the input there. The tile draws
