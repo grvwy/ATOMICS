@@ -353,7 +353,7 @@ fn codex_trust_lines_for(config: Option<&Config>, workspace: Option<&str>) -> Ve
     let socket = paths::socket_path();
     let installs: Vec<_> = atomics_installs(
         crate::setup::recorded_executable(&paths::atomics_home()),
-        crate::setup::executable_path().unwrap_or_else(|_| "atomics".into()),
+        crate::setup::hook_executable().unwrap_or_else(|_| "atomics".into()),
         &paths::home(),
     )
     .into_iter()
@@ -923,7 +923,7 @@ mod tests {
         let line = stdout.lines().find(|line| line.contains("Codex does not run every ATOMICS hook")).unwrap();
         assert!(line.starts_with("✗") && line.contains("(warning): untrusted: ") && line.contains(&file), "{line}");
         let hooks = atomics_core::hook::codex_hook_trust(
-            &crate::setup::executable_path().unwrap(),
+            &crate::setup::hook_executable().unwrap(),
             &dir.path().join("absent.sock"),
         );
         assert_eq!(hooks.len(), 8);
@@ -940,7 +940,7 @@ mod tests {
             .collect();
         std::fs::write(codex_home.join("config.toml"), &trusted).unwrap();
         let stdout = doctor();
-        let own = crate::setup::executable_path().unwrap().display().to_string();
+        let own = crate::setup::hook_executable().unwrap().display().to_string();
         assert!(
             stdout.contains(&format!(
                 "✓ Codex trusts ATOMICS's hooks for all 8 events, as {own} (this doctor; no desktop or host has run \

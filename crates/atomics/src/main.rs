@@ -435,7 +435,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some(Command::HooksJson { agent, pane }) => {
-            let exe = setup::executable_path().unwrap_or_else(|_| PathBuf::from("atomics"));
+            let exe = setup::hook_executable().unwrap_or_else(|_| PathBuf::from("atomics"));
             println!(
                 "{}",
                 serde_json::to_string_pretty(&atomics_core::hook::session_settings(

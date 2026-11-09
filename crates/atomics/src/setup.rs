@@ -232,15 +232,15 @@ fn write_whole(file: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Where the ATOMICS that serves a home's socket, a desktop or `atomics host`, records the
-/// executable it runs from. The hooks it passes bare Codex agents run that executable, so Codex's
-/// trust in them is for that path, which the doctor checks from whichever install it runs.
+/// executable its hooks run ([`hook_executable`]). The hooks it passes bare Codex agents name that
+/// path, so Codex's trust in them is for it, which the doctor checks from whichever install it runs.
 fn executable_record(home: &std::path::Path) -> PathBuf {
     home.join("executable.json")
 }
 
-/// Records this process's executable as the one that serves `home`'s socket.
+/// Records the path this process's hooks run it by as the one that serves `home`'s socket.
 pub(crate) fn record_executable(home: &std::path::Path) -> std::io::Result<()> {
-    let executable = executable_path()?;
+    let executable = hook_executable()?;
     write_whole(&executable_record(home), &serde_json::to_vec(&executable.to_string_lossy())?)
 }
 
@@ -318,6 +318,36 @@ pub fn executable_path() -> std::io::Result<PathBuf> {
         }
     }
     Ok(executable)
+}
+
+/// The path the hooks ATOMICS passes its agents run it by: one that survives updates where there is
+/// one, else [`executable_path`]. Codex trusts a hook by its command, and a Nix store path changes with
+/// every build, so a hook naming one needs review again after each update. A Nix package runs as
+/// `<package>/bin/.atomics-wrapped` behind the wrapper `<package>/bin/atomics`, which NixOS links into
+/// /run/current-system/sw/bin. A profile's link is used only while it leads into this very package,
+/// so a hook never runs another build than the ATOMICS that passed it.
+pub fn hook_executable() -> std::io::Result<PathBuf> {
+    let executable = executable_path()?;
+    let user = std::env::var("USER").unwrap_or_default();
+    let home = paths::home();
+    let links = [
+        PathBuf::from("/run/current-system/sw/bin/atomics"),
+        PathBuf::from(format!("/etc/profiles/per-user/{user}/bin/atomics")),
+        home.join(".nix-profile/bin/atomics"),
+        home.join(".local/state/nix/profile/bin/atomics"),
+    ];
+    Ok(profile_link(&executable, &links, Path::new("/nix/store")).unwrap_or(executable))
+}
+
+/// The first of `links` that leads into the same package of `store` as `executable`.
+fn profile_link(executable: &Path, links: &[PathBuf], store: &Path) -> Option<PathBuf> {
+    let package =
+        |path: &Path| path.strip_prefix(store).ok()?.components().next().map(|name| name.as_os_str().to_owned());
+    let own = package(executable)?;
+    links
+        .iter()
+        .find(|link| std::fs::canonicalize(link).ok().and_then(|real| package(&real)).as_ref() == Some(&own))
+        .cloned()
 }
 
 /// A variable as an interactive login shell sets it. `name` must be a plain identifier.
@@ -597,6 +627,42 @@ mod tests {
         );
         let listed = format!("{shown}:/usr/bin");
         assert_eq!(with_user_programs(&listed, home.path()), listed, "already there");
+    }
+
+    #[test]
+    fn hooks_run_a_nix_package_by_the_profile_link_that_leads_to_it() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let store = root.join("nix/store");
+        let package = |name: &str| {
+            let bin = store.join(name).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            crate::test_support::write_program(bin.join("atomics"), "#!/bin/sh\nexec .atomics-wrapped \"$@\"\n");
+            crate::test_support::write_program(bin.join(".atomics-wrapped"), "#!/bin/sh\nexit 0\n");
+            bin
+        };
+        let running = package("aaaa-atomics-0.1.13");
+        let other = package("bbbb-atomics-0.1.12");
+        // A system profile, as NixOS links /run/current-system/sw/bin/atomics, and a user's.
+        let link = |profile: &str, to: &Path| {
+            let bin = root.join(profile).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::os::unix::fs::symlink(to.join("atomics"), bin.join("atomics")).unwrap();
+            bin.join("atomics")
+        };
+        let system = link("system", &running);
+        let user = link("user", &running);
+        let stale = link("stale", &other);
+        let absent = root.join("absent/bin/atomics");
+        let executable = running.join(".atomics-wrapped");
+
+        assert_eq!(profile_link(&executable, &[absent.clone(), system.clone(), user], &store), Some(system.clone()));
+        // A link to another build is passed over: the hook would run another ATOMICS than this one.
+        assert_eq!(profile_link(&executable, &[stale.clone(), system.clone()], &store), Some(system));
+        assert_eq!(profile_link(&executable, &[stale.clone(), absent], &store), None, "no link to this build");
+        // Outside the store the program's own path stays, as a cargo build's or the app's does.
+        let built = root.join("target/debug/atomics");
+        assert_eq!(profile_link(&built, &[stale], &store), None);
     }
 
     #[test]

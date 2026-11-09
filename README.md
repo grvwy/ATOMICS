@@ -441,7 +441,9 @@ first line says where `PATH` came from: the login shell's folders added, already
 For Codex hook trust, doctor computes the hook definitions ATOMICS passes (its executable and socket) the way Codex
 does, and reads `[hooks.state]` in the Codex home those agents get (`<ATOMICS_HOME>/codex` for an explicit
 `ATOMICS_HOME`, else `$CODEX_HOME`, else `~/.codex`). The executable is the one the desktop or `atomics host` that
-serves this ATOMICS home runs from, which it records in `executable.json` there at every start, so a terminal's
+serves this ATOMICS home runs from (for a Nix package, the profile link that leads to it, such as
+`/run/current-system/sw/bin/atomics`, which the hooks name so that an update keeps Codex's trust), which it records
+in `executable.json` there at every start, so a terminal's
 doctor from another install (a cargo-installed CLI beside the app) checks the hooks the app passes; with none
 recorded yet, it checks its own, and its line names the binary either way. It names each event as trusted,
 untrusted, changed since trusted (a new install path, socket or definition) or disabled, and the fix: trust them in
