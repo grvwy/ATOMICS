@@ -59,7 +59,9 @@ another. Integrating a task commits what it left uncommitted and merges its bran
 own, so your main checkout is never touched. A conflict aborts the merge and keeps the task in review.
 Tasks with dependencies branch from the integration branch, the others from `base_ref`. Every plan ends
 with a final review task that starts from the integration branch in a fresh worktree (in its own sandbox
-in sandbox mode) and runs the plan's builds and tests. The plan completes when every task is accepted and
+in sandbox mode) and runs the plan's builds and tests. A task that finished without changing anything (its
+branch still where it started, nothing uncommitted) has nothing to integrate and counts as integrated; when no
+task changed anything, the final review is marked done with a note instead of started. The plan completes when every task is accepted and
 the `[workflow] done` milestone is reached. See [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back)
 and [Lifecycle and completion](tickets.md#lifecycle-and-completion).
 

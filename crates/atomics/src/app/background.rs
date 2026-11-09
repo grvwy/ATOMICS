@@ -197,7 +197,8 @@ impl State {
                     .as_ref()
                     .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-            let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
+            let start = result.as_ref().ok().and_then(|prepared| prepared.start.clone());
+            let outcome = result.and_then(|PreparedWorktree { path, warmed, .. }| {
                 let role = Role::Agent(launch.isolation);
                 self.interactive_start = launch.interactive;
                 let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
@@ -219,6 +220,9 @@ impl State {
                     Ok(id) => {
                         task.session = Some(id.clone());
                         task.worktree = self.sessions.iter().find(|s| &s.id == id).map(Session::root);
+                        if start.is_some() {
+                            task.start_commit = start;
+                        }
                     }
                     Err(err) => {
                         task.set_status(TaskStatus::Blocked);

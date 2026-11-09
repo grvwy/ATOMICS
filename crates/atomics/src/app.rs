@@ -312,6 +312,8 @@ struct Launch {
 struct PreparedWorktree {
     path: PathBuf,
     warmed: bool,
+    /// The commit the branch was created at, when this made it.
+    start: Option<String>,
 }
 
 /// A finished plan integration, to note on its task and answer.

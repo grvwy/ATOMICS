@@ -38,13 +38,17 @@ impl State {
             let result = if conflict {
                 Err(format!("Branch {branch} is already owned by another task or plan in {}", repo.display()))
             } else if existing {
-                Ok(PreparedWorktree { path, warmed: false })
+                Ok(PreparedWorktree { path, warmed: false, start: None })
             } else {
                 let _write = crate::ref_guard::host_write(&repo, [&branch]);
+                let branch_ref = format!("refs/heads/{branch}");
+                // A branch that exists already may hold commits of an earlier attempt: only a new one's start counts.
+                let new = git::commit_of(&repo, &branch_ref).is_ok_and(|tip| tip.is_none());
                 git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &base_ref)
                     .map(|()| {
                         let warmed = git::warm_worktree(&repo, &path, &warm);
-                        PreparedWorktree { path, warmed }
+                        let start = new.then(|| git::commit_of(&repo, &branch_ref).ok().flatten()).flatten();
+                        PreparedWorktree { path, warmed, start }
                     })
                     .map_err(|e| format!("{e:#}"))
             };

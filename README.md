@@ -718,6 +718,10 @@ task's branch tip is in the integration branch with nothing left uncommitted, ag
 must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
 finish within 150 s, says why on the task card and in `atomics_plan_get`, and runs again within 30 s. Dispatching checks
 such dependencies afresh and answers once their checks have, or after 100 s, inside the MCP client's limit for one call.
+A done task whose branch is still at the commit ATOMICS created it at, with nothing uncommitted, has nothing to
+integrate: it counts as integrated wherever the integration branch and `base_ref` have moved since. When every task
+finished that way, the final review has nothing to look at: it is marked done with a note saying so instead of being
+started, and the plan can complete.
 
 The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count
 and total changed lines (additions plus deletions) across those sessions. Its button shows the selected project's name

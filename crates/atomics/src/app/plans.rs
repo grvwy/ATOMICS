@@ -743,8 +743,15 @@ impl State {
         }
         self.pin_ticket_integration(index)?;
         self.refresh_integrations();
+        let skipped = self.skip_empty_review(index);
+        if skipped {
+            self.finish_plan_agents();
+        }
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
+        if ready.is_empty() && skipped {
+            return Err(super::integrations::NOTHING_TO_REVIEW.into());
+        }
         if ready.is_empty() {
             let plan = &self.plans[index];
             if let Some(task) = plan.tasks.iter().find(|task| {
