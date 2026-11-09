@@ -657,8 +657,8 @@ impl State {
             other => other,
         };
         if let Some(provider) = provider {
-            if sandboxed.is_none() {
-                if let Err(error) = crate::provider_launch::configure(
+            if sandboxed.is_none()
+                && let Err(error) = crate::provider_launch::configure(
                     provider,
                     &paths::atomics_home(),
                     Path::new(&exe),
@@ -667,10 +667,10 @@ impl State {
                     &id,
                     &mut args,
                     &mut env,
-                ) {
-                    crate::provider_launch::cleanup(&paths::atomics_home(), &id);
-                    return Err(error);
-                }
+                )
+            {
+                crate::provider_launch::cleanup(&paths::atomics_home(), &id);
+                return Err(error);
             }
             claude_id = match crate::provider_launch::interactive_args(
                 provider,
@@ -2473,11 +2473,15 @@ exec /bin/sleep 600
             app.runtime.verify_deliveries();
             assert!(rx.try_recv().is_err(), "uncertain reply is sent only once");
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
-            while !dir.path().join("received").exists() {
+            let received = loop {
+                if let Ok(received) = std::fs::read_to_string(dir.path().join("received"))
+                    && received.contains("do the work")
+                {
+                    break received;
+                }
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
-            }
-            let received = std::fs::read_to_string(dir.path().join("received")).unwrap();
+            };
             assert_eq!(received.matches("do the work").count(), 1);
             let session_id = app.runtime.sessions[index].claude_id.clone().unwrap();
             let payload = atomics_core::hook::normalize_native_payload(
