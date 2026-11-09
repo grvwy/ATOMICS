@@ -26,6 +26,8 @@ in
   imports = [
     "${modulesPath}/profiles/qemu-guest.nix"
     ./vm/image.nix
+    ./vm/hardened.nix
+    ./vm/egress.nix
   ];
 
   options.atomics.vm = {
@@ -143,14 +145,15 @@ in
     # it and registers x86_64 ELF binaries with binfmt's F flag for containers.
     virtualisation.rosetta.enable = true;
     virtualisation.rosetta.mountTag = "vz-rosetta";
-    virtualisation.docker.enable = true;
+    # Hardened mode gives the user rootless Docker instead (vm/hardened.nix).
+    virtualisation.docker.enable = !cfg.hardened;
 
     users.users.${cfg.user} = {
       isNormalUser = true;
       inherit home;
       createHome = true;
       uid = 1000;
-      extraGroups = [ "wheel" "docker" ];
+      extraGroups = lib.optionals (!cfg.hardened) [ "wheel" "docker" ];
     };
     systemd.tmpfiles.rules = [
       "d /home/${cfg.user}/repos 0755 ${cfg.user} users - -"
@@ -165,8 +168,8 @@ in
         PermitRootLogin = "no";
       };
     };
-    # The VM is one trust domain (docs/nixos-vm.md, Trust and secrets): agents may use sudo and
-    # Docker, so either is as good as root here.
+    # Without hardened mode the VM is one trust domain (docs/nixos-vm.md, Trust and secrets): agents may
+    # use sudo and Docker, so either is as good as root here. With it only the admin user is in wheel.
     security.sudo.wheelNeedsPassword = false;
 
     # Lima supplies only the SSH public key at boot. Credentials and user state
