@@ -696,6 +696,14 @@ and at most 16 connect workers (each with a bounded timeout). Each connection bu
 window in either direction. Socket reads and writes poll without blocking the protocol/UI thread;
 only connects use workers. No TCP I/O takes `State` or a shared projection lock.
 
+Data moves as soon as either side has it, whether or not the native window draws. The client's
+listeners and connections run on a relay thread of their own that waits on its sockets and on
+tunnel frames, which the connection's thread hands it straight from the WebSocket; its frames go
+straight back onto that connection, whose thread a queued frame wakes. The window's turns only open
+and close listeners. On the host, a session whose tunnels moved data in the last second polls them
+every millisecond instead of at its usual tick. A request through a preview costs about a
+millisecond more than one made on the host, with the window in front or not.
+
 `tunnel_close` means EOF in the sender's direction: pending bytes drain before TCP write shutdown,
 and the other direction can finish. `abort: true` drops both directions immediately. Explicit stop,
 a session exit/removal, loss of preview permission, or link loss closes local listeners and active
