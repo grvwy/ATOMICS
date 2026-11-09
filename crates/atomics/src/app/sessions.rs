@@ -857,10 +857,24 @@ impl State {
             let busy_text =
                 busy_text.or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
             let Some(busy_text) = busy_text else { continue };
-            if session.hooks_active && session.sandbox.is_none() || terminal.exited() {
+            if terminal.exited() {
                 continue;
             }
+            // A question answered in the agent's own terminal, such as Codex's "Hooks need review",
+            // asked nothing a hook or request could close, and with its hooks untrusted none reports
+            // the turn going on. With no request waiting and no menu left, its busy line says it works.
             if session.sandbox.is_none() && session.status == AgentStatus::NeedsInput {
+                let full = terminal.screen_text(60);
+                if !session.approval_hold
+                    && !atomics_core::approvals::first_run_prompt(&full)
+                    && view_busy(&full, &screen_tail(&full, 12), &busy_text)
+                {
+                    session.status = AgentStatus::Working;
+                    session.activity.observe(session.status);
+                }
+                continue;
+            }
+            if session.hooks_active && session.sandbox.is_none() {
                 continue;
             }
             let full = terminal.screen_text(60);
@@ -1550,6 +1564,64 @@ mod tests {
             }
             app.runtime.sessions.clear();
         });
+    }
+
+    #[test]
+    fn a_codex_agent_working_again_after_its_hook_review_no_longer_needs_you() {
+        with_app(
+            "app::sessions::tests::a_codex_agent_working_again_after_its_hook_review_no_longer_needs_you",
+            |app, _| {
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "test".into(),
+                    command: vec![],
+                    kind: AgentKind::Generic,
+                    busy_text: Some("esc to interrupt".into()),
+                    isolation: None,
+                });
+                let dir = crate::test_support::tempdir().unwrap();
+                // Codex's review, answered in its terminal; then it redraws and works on its prompt.
+                let script = "printf 'Hooks need review\n› 1. Trust all and continue\n  2. Continue without trusting\n'; \
+                              read answer; printf '\\033[2J\\033[H• Working (2s • esc to interrupt)\n\n› '; \
+                              exec sleep 600";
+                // Untrusted hooks never ran; trusted ones may have, before the hooks changed.
+                for hooks_active in [false, true] {
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.theme.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec!["-c".into(), script.into()],
+                        dir.path(),
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while !terminal.screen_text(60).contains("Continue without trusting") {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let mut worker = session("worker", AgentKind::Generic, AgentStatus::Starting, dir.path());
+                    worker.hooks_active = hooks_active;
+                    worker.terminal = Some(terminal);
+                    app.runtime.sessions = vec![worker];
+                    for _ in 0..2 {
+                        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                        app.runtime.track_busy();
+                        assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput, "while it asks");
+                    }
+                    let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+                    terminal.write(b"2\r".to_vec());
+                    while !terminal.screen_text(60).contains("esc to interrupt") {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                    app.runtime.track_busy();
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "hooks active: {hooks_active}");
+                    app.runtime.sessions.clear();
+                }
+            },
+        );
     }
 
     #[test]
