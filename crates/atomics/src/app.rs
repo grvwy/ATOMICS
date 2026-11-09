@@ -381,7 +381,8 @@ struct StatusEvent {
     task: Option<String>,
     /// Set for a `atomics_report` from the agent: (status, summary, task).
     report: Option<(String, String, Option<String>)>,
-    approval: Option<ApprovalRequest>,
+    /// The pending request the event is about, with its id (`approval_json`).
+    approval: Option<serde_json::Value>,
     findings: Option<Vec<atomics_core::heartbeat::Finding>>,
     /// Set when someone changed a linked ticket in its system.
     ticket: Option<serde_json::Value>,
@@ -389,6 +390,15 @@ struct StatusEvent {
     config: Option<serde_json::Value>,
     /// Set when a plan was approved, edited, closed or reopened.
     change: Option<&'static str>,
+}
+
+impl PendingApproval {
+    /// The request as the chief sees it: its `id`, which `approve` must name, and what it asks.
+    fn json(&self) -> serde_json::Value {
+        let mut value = json!(self.request);
+        value["id"] = json!(self.id);
+        value
+    }
 }
 
 impl StatusEvent {
@@ -429,7 +439,7 @@ impl StatusEvent {
             value["change"] = json!(change);
         }
         if let Some(request) = &self.approval {
-            value["approval"] = json!(request);
+            value["approval"] = request.clone();
         }
         value
     }

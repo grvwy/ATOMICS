@@ -494,8 +494,12 @@ atomics install-hooks      # merges into ~/.claude/settings.json, keeps a backup
 
 Codex permission hooks show **needs you**, the command, working directory and reason on the tile.
 `atomics_wait` wakes with that request in the event's `approval` field, plus `plan` and `task` ids when linked to a plan.
-`atomics_list` and `atomics_result` also include the oldest pending request. The chief can answer with
-`atomics_approve {session, decision: "allow" | "allow_always" | "deny", message?}`.
+`atomics_list` and `atomics_result` also include the oldest pending request. Each carries an `id`. The chief can answer
+with `atomics_approve {session, request, decision: "allow" | "allow_always" | "deny", message?}`, where `request` is
+the `id` of the request it decided about. Only the session's current request is answered, and only when `request`
+names it: a decision without an id, or with the id of a request no longer pending (answered, withdrawn, or followed
+by a newer one), answers nothing, and its error shows the current request and its id. A late decision can therefore
+never answer a request its maker has not seen.
 `allow_always` remembers the exact command, tool and directory for this session only; it does not
 write a global rule. Approval decisions and held input target the specified session, even while another plan
 is selected. Input held by one plan’s session is released only when that session’s permission request finishes.
@@ -948,7 +952,7 @@ codex mcp add ATOMICS -- atomics mcp
 ```
 
 Tools: `atomics_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
-`atomics_approve` (allow, allow_always or deny a pending permission request),
+`atomics_approve` (allow, allow_always or deny a pending permission request, named by its id),
 `atomics_result` (an agent's last prompt, final message and screen), `atomics_list`, `atomics_start` (in a folder, a new worktree from `repo` + `branch`, or with neither in a scratch folder; `isolation` overrides the settings for that session), `atomics_send` (a message, or raw
 keys for menus), `atomics_read` (screen text), `atomics_preview` (offer or remove a session's loopback web server), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.

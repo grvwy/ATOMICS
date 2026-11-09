@@ -859,7 +859,7 @@ impl State {
                 status: AgentStatus::NeedsInput,
                 at: atomics_core::store::now(),
                 report: None,
-                approval: self.sessions[index].approvals.last().map(|pending| pending.request.clone()),
+                approval: self.sessions[index].approvals.last().map(PendingApproval::json),
                 findings: None,
                 config: None,
                 ticket: None,
@@ -947,7 +947,7 @@ fn leave_to_agent(reply: Option<Arc<ipc::ApprovalReply>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{repository, request, session, with_app};
+    use super::super::tests::{answer_pending, repository, request, session, with_app};
     use super::*;
     use atomics_core::projection::{HostInfo, Projections, ResourceInfo};
 
@@ -1211,7 +1211,7 @@ mod tests {
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 // A real run: the memory agent ended while the main thread's hook waited for its answer.
                 background_thread_runs(app, &elsewhere);
-                let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                let answered = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                 assert!(answered.ok, "{answered:?}");
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 assert!(app.runtime.sessions[0].approvals.is_empty());
@@ -1282,7 +1282,7 @@ mod tests {
                 app.runtime.on_hook(spawned("UserPromptSubmit", None));
                 assert_eq!(followed(&app.runtime.sessions[0]), waiting);
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "its start must not retire the main request");
-                assert!(request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
+                assert!(answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
                 assert!(main_reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 app.runtime.on_hook(thread_hook("PostToolUse", "main-thread", &repo, MAIN, None));
                 let before = followed(&app.runtime.sessions[0]);
@@ -1293,7 +1293,7 @@ mod tests {
                 app.runtime.on_hook(spawned("PermissionRequest", Some(reply.clone())));
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 assert_eq!(app.runtime.sessions[0].cwd, repo);
-                assert!(request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
+                assert!(answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 app.runtime.on_hook(spawned("PostToolUse", None));
                 assert_eq!(followed(&app.runtime.sessions[0]), before, "back to where its request found the session");

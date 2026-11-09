@@ -1235,8 +1235,7 @@ fn a_dead_hook_head_expires_for_clients_and_the_chief_without_frames() {
         assert_eq!(resolved_as(&mut client, "dead"), Disposition::Expired);
         eventually(&host, |state| {
             state.events.iter().any(|event| {
-                event.seq > cursor
-                    && event.approval.as_ref().is_some_and(|request| request.command.as_deref() == Some("touch live"))
+                event.seq > cursor && event.approval.as_ref().is_some_and(|request| request["command"] == "touch live")
             })
         });
         assert_eq!(host.state().sessions[0].approvals[0].id, "live");
