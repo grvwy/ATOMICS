@@ -18,8 +18,16 @@ use crate::session::AgentStatus;
 
 /// Events ATOMICS subscribes to. Each one either changes a session's status or is a
 /// chance to deliver queued messages.
-pub const EVENTS: &[&str] =
-    &["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop", "SessionEnd", "CwdChanged"];
+pub const EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "Stop",
+    "SessionEnd",
+    "CwdChanged",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookRequest {
@@ -66,6 +74,8 @@ pub struct HookEvent {
     pub tool_response: Value,
     pub last_assistant_message: Option<String>,
     pub stop_hook_active: bool,
+    /// A failed tool call the user interrupted (Claude's `is_interrupt`).
+    pub interrupted: bool,
     pub thread: HookThread,
 }
 
@@ -96,6 +106,7 @@ impl HookEvent {
             tool_response: payload.get("tool_response").cloned().unwrap_or(Value::Null),
             last_assistant_message: text("last_assistant_message"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
+            interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
             thread,
         })
     }
@@ -113,6 +124,9 @@ impl HookEvent {
             "Stop" => Some(AgentStatus::Done),
             "SessionEnd" => Some(AgentStatus::Exited),
             "Interrupt" => Some(AgentStatus::Idle),
+            // Claude sends no Stop for a turn the user interrupts. A tool it was running then fails as
+            // interrupted; any other failure leaves the turn going.
+            "PostToolUseFailure" if self.interrupted => Some(AgentStatus::Idle),
             _ => None,
         }
     }
@@ -618,6 +632,25 @@ mod tests {
         assert!(!permission.can_deliver());
 
         assert!(HookEvent::from_payload(&json!({ "session_id": "s1" })).is_none());
+    }
+
+    #[test]
+    fn a_tool_the_user_interrupts_ends_the_turn_and_another_failure_does_not() {
+        let failure = |interrupt: Option<bool>| {
+            let mut payload = json!({
+                "hook_event_name": "PostToolUseFailure", "session_id": "s1", "cwd": "/x",
+                "transcript_path": "/t.jsonl", "tool_name": "Bash", "tool_input": {"command": "sleep 600"},
+                "tool_use_id": "toolu_1", "error": "Interrupted by user",
+            });
+            if let Some(interrupt) = interrupt {
+                payload["is_interrupt"] = json!(interrupt);
+            }
+            HookEvent::from_payload(&payload).unwrap()
+        };
+        assert_eq!(failure(Some(true)).status(), Some(AgentStatus::Idle));
+        assert_eq!(failure(Some(false)).status(), None);
+        assert_eq!(failure(None).status(), None);
+        assert!(EVENTS.contains(&"PostToolUseFailure"), "Claude agents report it");
     }
 
     #[test]
