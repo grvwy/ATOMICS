@@ -94,7 +94,10 @@ impl State {
                 self.agent_cleanup.checked.insert(id, checked);
             }
         }
-        for session in self.sessions.iter().filter(|s| idle(s) && self.provider_tracking_ready(s)) {
+        for session in self.sessions.iter().filter(|s| idle(s)) {
+            if !self.provider_tracking_ready(session) {
+                continue;
+            }
             let work = self.cleanup_work(session);
             if self.agent_cleanup.pending.contains_key(&session.id)
                 || self

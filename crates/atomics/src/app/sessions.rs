@@ -739,6 +739,7 @@ impl State {
                 if provider.is_some() {
                     if prompt.is_some() {
                         self.sessions[index].status = AgentStatus::Working;
+                        self.sessions[index].screen_busy = true;
                     }
                     self.sessions[index].warning = Some(if self.sessions[index].sandbox.is_some() {
                         "Lifecycle hooks cannot reach ATOMICS from this sandbox. Check its terminal; automatic completion remains unavailable.".into()

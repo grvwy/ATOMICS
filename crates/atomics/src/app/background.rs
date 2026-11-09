@@ -739,6 +739,7 @@ impl State {
             leave_to_agent(message.approval_reply);
             return;
         }
+        let same_conversation = session.claude_id.as_deref() == Some(event.session_id.as_str());
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
         if event.provider.is_some() {
@@ -813,10 +814,13 @@ impl State {
                 // authoritative; a subsequent SessionStart binds the replacement conversation.
                 session.hooks_active = false;
                 AgentStatus::Starting
-            } else if event.provider.is_some() && event.name == "SessionStart" && session.status == AgentStatus::Working
+            } else if event.provider.is_some()
+                && event.name == "SessionStart"
+                && (session.status == AgentStatus::Working
+                    || same_conversation && session.status == AgentStatus::NeedsInput)
             {
                 // Fire-and-forget start notifications can arrive after prompt submission.
-                AgentStatus::Working
+                session.status
             } else {
                 status
             };
@@ -826,7 +830,9 @@ impl State {
             // Keep the same cleanup guard as a visibly busy terminal until a lifecycle end.
             match event.name.as_str() {
                 "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => session.screen_busy = true,
-                "Stop" | "Interrupt" | "SessionEnd" => session.screen_busy = session.status == AgentStatus::Working,
+                "Stop" | "Interrupt" | "SessionEnd" if event.status().is_some() => {
+                    session.screen_busy = session.status == AgentStatus::Working;
+                }
                 "PostToolUseFailure" if event.interrupted => session.screen_busy = false,
                 _ => {}
             }
@@ -1027,6 +1033,9 @@ mod tests {
             assert!(app.runtime.sessions[0].hooks_active);
             assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("conversation"));
             assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "late start cannot end a running turn");
+            app.runtime.sessions[0].status = AgentStatus::NeedsInput;
+            app.runtime.on_hook(provider_hook(Cursor, "SessionStart", Some("pane")));
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput, "late start cannot dismiss a prompt");
         });
     }
 

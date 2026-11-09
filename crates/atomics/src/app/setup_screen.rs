@@ -55,10 +55,14 @@ fn install_click(program: &str, mac: bool, has: &dyn Fn(&str) -> bool) -> Option
 
 /// The programs a fresh machine needs: git, then the agents the config runs. A program whose name a person would not
 /// recognize keeps it, so a custom agent shows as what it runs.
-fn wanted_programs(
-    config: &Config,
-) -> Vec<(String, Option<String>, String, Option<atomics_core::config::AgentConfig>)> {
-    let mut wanted = vec![("git".to_string(), None, "git".to_string(), None)];
+struct WantedProgram {
+    name: String,
+    program: String,
+    config: Option<atomics_core::config::AgentConfig>,
+}
+
+fn wanted_programs(config: &Config) -> Vec<WantedProgram> {
+    let mut wanted = vec![WantedProgram { name: "git".into(), program: "git".into(), config: None }];
     for agent in &config.agents {
         let Some(program) = agent.command.first() else { continue };
         let name = match agent.kind {
@@ -67,7 +71,7 @@ fn wanted_programs(
             AgentKind::Generic if agent.is_codex() => "Codex".to_string(),
             AgentKind::Generic => agent.provider().map_or_else(|| agent.name.clone(), |p| p.title().into()),
         };
-        wanted.push((name, Some(agent.name.clone()), program.clone(), Some(agent.clone())));
+        wanted.push(WantedProgram { name, program: program.clone(), config: Some(agent.clone()) });
     }
     wanted
 }
@@ -178,7 +182,8 @@ impl State {
             let mac = cfg!(target_os = "macos");
             let programs = wanted
                 .into_iter()
-                .map(|(name, agent, program, config)| {
+                .map(|WantedProgram { name, program, config }| {
+                    let agent = config.as_ref().map(|config| config.name.clone());
                     let found = if let Some(config) = &config {
                         crate::setup::checked_agent_on_path(config, &path)
                     } else if program.contains('/') {
