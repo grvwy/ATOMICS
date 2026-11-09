@@ -41,7 +41,8 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "atomics";
-  version = "0.1.0";
+  # The workspace's own version, so the store path names the release it holds.
+  version = (lib.importTOML ../Cargo.toml).workspace.package.version;
   src = lib.fileset.toSource { inherit root; fileset = buildInputsOnly; };
 
   cargoLock.lockFile = ../Cargo.lock;
