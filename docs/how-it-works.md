@@ -57,7 +57,9 @@ Several plans can be open at once, each with a row in the top bar's Boards dropd
 Accepted tasks come together on the plan's integration branch, `atomics/plan-<plan id>` unless the plan names
 another. Integrating a task commits what it left uncommitted and merges its branch, in a worktree of its
 own, so your main checkout is never touched. A conflict aborts the merge and keeps the task in review.
-Tasks with dependencies branch from the integration branch, the others from `base_ref`. Every plan ends
+Tasks with dependencies branch from the integration branch, the others from `base_ref`, fetched from its remote
+just before (a local `main` or `master` base means the remote's default branch; a failed fetch falls back to what
+this machine has, with a warning). Every plan ends
 with a final review task that starts from the integration branch in a fresh worktree (in its own sandbox
 in sandbox mode) and runs the plan's builds and tests. A task that finished without changing anything (its
 branch still where it started, nothing uncommitted) has nothing to integrate and counts as integrated; when no

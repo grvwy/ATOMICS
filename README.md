@@ -717,7 +717,12 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked
+that build on them. Every new worktree, a task's or one `atomics_start` makes, fetches the repository's remote first
+and starts from the remote as it is now: from `base_ref` when it names a remote branch (`origin/main` by default), and
+from the remote's default branch (`origin/HEAD`, else `origin/main`, else `origin/master`) when `base_ref` is a local
+`main` or `master`, which is never moved. Another local branch, a tag or a commit is used as it is. A fetch that fails
+(offline, missing credentials) does not stop the agent: it starts from what this machine last fetched, and the task's
+notes, a toast and `atomics_start`'s `warning` say so. A new integration branch starts from the same fetched base. Returning a task to running clears its integration marker. Background checks verify that each marked
 task's branch tip is in the integration branch with nothing left uncommitted, again whenever a ref changes, so new commits
 must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
 finish within 150 s, says why on the task card and in `atomics_plan_get`, and runs again within 30 s. Dispatching checks

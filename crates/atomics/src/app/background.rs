@@ -198,6 +198,10 @@ impl State {
                     .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let start = result.as_ref().ok().and_then(|prepared| prepared.start.clone());
+            let warning = result.as_ref().ok().and_then(|prepared| prepared.warning.clone());
+            if let Some(warning) = &warning {
+                self.toast(format!("{branch}: {warning}"));
+            }
             let outcome = result.and_then(|PreparedWorktree { path, warmed, .. }| {
                 let role = Role::Agent(launch.isolation);
                 self.interactive_start = launch.interactive;
@@ -223,6 +227,9 @@ impl State {
                         if start.is_some() {
                             task.start_commit = start;
                         }
+                        if let Some(warning) = &warning {
+                            task.notes.push(warning.clone());
+                        }
                     }
                     Err(err) => {
                         task.set_status(TaskStatus::Blocked);
@@ -237,7 +244,13 @@ impl State {
                 }
             }
             let response = match outcome {
-                Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("just started"))),
+                Ok(id) => {
+                    let mut started = self.describe(self.find(&id).expect("just started"));
+                    if let Some(warning) = warning {
+                        started["warning"] = json!(warning);
+                    }
+                    ControlResponse::ok(started)
+                }
                 Err(err) => {
                     self.toast(err.clone());
                     ControlResponse::error(err)

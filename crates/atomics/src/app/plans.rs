@@ -1314,6 +1314,53 @@ mod tests {
         });
     }
 
+    /// A task starts from its remote fetched just now; offline, it starts anyway from what this machine
+    /// has, and says so.
+    #[test]
+    fn a_task_starts_from_the_fetched_remote_or_says_why_not() {
+        with_app("app::plans::tests::a_task_starts_from_the_fetched_remote_or_says_why_not", |app, _| {
+            let (dir, upstream) = repository();
+            let remote = dir.path().join("remote.git");
+            git::git(dir.path(), &["clone", "-q", "--bare", &upstream.to_string_lossy(), &remote.to_string_lossy()])
+                .unwrap();
+            let repo = dir.path().join("clone");
+            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &repo.to_string_lossy()]).unwrap();
+            // A second clone, that cannot reach its remote any more.
+            let offline = dir.path().join("offline");
+            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &offline.to_string_lossy()]).unwrap();
+            git::git(&offline, &["remote", "set-url", "origin", &dir.path().join("gone.git").to_string_lossy()])
+                .unwrap();
+            git::git(&upstream, &["commit", "--allow-empty", "-qm", "landed later"]).unwrap();
+            git::git(&upstream, &["push", "-q", &remote.to_string_lossy(), "main"]).unwrap();
+            let landed = git::git(&upstream, &["rev-parse", "main"]).unwrap().trim().to_string();
+            app.runtime.config.base_ref = "origin/main".into();
+            app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
+            let plan = |id: &str, project: &Path| Plan {
+                id: id.into(),
+                project: Some(project.to_path_buf()),
+                approved: true,
+                tasks: vec![Task { id: "a".into(), branch: Some(format!("{id}-a")), ..Default::default() }],
+                ..Default::default()
+            };
+            app.runtime.plans = vec![plan("fresh", &repo), plan("offline", &offline)];
+            let prepared = |app: &mut Desktop<'_>| {
+                let wait = crate::test_support::scaled_timeout(Duration::from_secs(10));
+                app.runtime.worktree_rx.recv_timeout(wait).unwrap().1.unwrap()
+            };
+            app.runtime.dispatch(0, Some("a")).unwrap();
+            let a = prepared(app);
+            assert_eq!(a.warning, None);
+            assert_eq!(a.start.as_deref(), Some(landed.as_str()), "a starts where the remote is now");
+            assert_eq!(git::git(&a.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed);
+
+            app.runtime.dispatch(1, Some("a")).unwrap();
+            let stale = prepared(app);
+            let warning = stale.warning.expect("the fetch failed");
+            assert!(warning.contains("could not fetch origin"), "{warning}");
+            assert_ne!(git::git(&stale.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed, "as fetched before");
+        });
+    }
+
     #[test]
     fn retry_keeps_a_pinned_branch_in_an_independent_repository() {
         with_app("app::plans::tests::retry_keeps_a_pinned_branch_in_an_independent_repository", |app, _| {
