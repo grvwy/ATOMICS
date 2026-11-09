@@ -1396,6 +1396,40 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_turn_interrupted_while_a_tool_runs_is_no_longer_working() {
+        with_app(
+            "app::background::tests::a_claude_turn_interrupted_while_a_tool_runs_is_no_longer_working",
+            |app, _| {
+                let (_repo_dir, repo) = repository();
+                main_thread_worker(app, &repo);
+                app.runtime.sessions[0].kind = AgentKind::Claude;
+                let hook = |payload: serde_json::Value| HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                };
+                let failure = |interrupt: bool| {
+                    json!({"hook_event_name":"PostToolUseFailure", "session_id":"main-thread", "cwd":&repo,
+                       "transcript_path":MAIN, "tool_name":"Bash", "tool_input":{"command":"sleep 600"},
+                       "error":"failed", "is_interrupt":interrupt})
+                };
+                app.runtime.on_hook(hook(json!({"hook_event_name":"UserPromptSubmit", "session_id":"main-thread",
+                                            "cwd":&repo, "transcript_path":MAIN, "prompt":"run it"})));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                // A command that fails leaves the turn going.
+                app.runtime.on_hook(hook(failure(false)));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                // Esc while it runs: Claude sends no Stop, only the tool's interrupted failure.
+                app.runtime.on_hook(hook(failure(true)));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Idle);
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    #[test]
     fn a_request_from_a_thread_the_session_does_not_follow_is_left_to_the_agent_at_once() {
         with_app(
             "app::background::tests::a_request_from_a_thread_the_session_does_not_follow_is_left_to_the_agent_at_once",
