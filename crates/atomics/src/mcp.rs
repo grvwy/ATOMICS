@@ -304,7 +304,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_list",
-            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch and diff size. Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
+            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch, diff size and previews (web servers offered with atomics_preview or detected). Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -426,7 +426,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_result",
-            "description": "What an agent produced: status, its last prompt, its final message (Claude), the tail of its screen, and its diff size. Read this when atomics_wait reports a turn done. Long texts are cut and say how much was left out.",
+            "description": "What an agent produced: status, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Long texts are cut and say how much was left out.",
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         },
         {

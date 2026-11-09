@@ -1677,10 +1677,18 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(host.projections().sessions.load().data[0].previews[0].path, "/demo");
+        // The control API shows what was registered, in list and in result.
+        let listed = command(&host, json!({"cmd":"list"})).result["sessions"][0]["previews"].clone();
+        let result = command(&host, json!({"cmd":"result","session":"worker"})).result["previews"].clone();
+        let expected = json!([{"port": 5173, "path": "/demo", "label": "Web", "title": "Web · 5173",
+            "url": "http://127.0.0.1:5173/demo", "source": "declared"}]);
+        assert_eq!(listed, expected);
+        assert_eq!(result, expected);
         command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"path":"/next"}));
         assert_eq!(host.state().previews.list("worker")[0].path, "/next");
         command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"remove":true}));
         assert!(host.state().previews.list("worker").is_empty());
+        assert_eq!(command(&host, json!({"cmd":"result","session":"worker"})).result["previews"], json!([]));
         let ControlOutcome::Done(refused) = host
             .command(serde_json::from_value(json!({"cmd":"preview","port":5173})).unwrap())
             .recv_timeout(Duration::from_secs(5))

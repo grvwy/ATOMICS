@@ -44,7 +44,37 @@ impl State {
                 queue_note(t.process_id(), &running, &waiting)
             }),
             "diff": stats,
+            "previews": self.previews_json(index),
         })
+    }
+
+    /// The session's previews, as clients are offered them: what it declared with atomics_preview, then
+    /// listeners found in its process tree (Linux). None once it exited. Whether a server speaks TLS is
+    /// only found out when a client opens it, so `url` is the plain-HTTP address on this host.
+    fn previews_json(&self, index: usize) -> serde_json::Value {
+        let s = &self.sessions[index];
+        if s.status == AgentStatus::Exited {
+            return json!([]);
+        }
+        let declared = self.previews.declared.get(&s.id);
+        let previews: Vec<_> = self
+            .previews
+            .list(&s.id)
+            .into_iter()
+            .map(|p| {
+                let source =
+                    if declared.is_some_and(|d| d.iter().any(|d| d.port == p.port)) { "declared" } else { "detected" };
+                json!({
+                    "port": p.port,
+                    "path": p.path,
+                    "label": p.label,
+                    "title": p.title(),
+                    "url": p.url(p.port),
+                    "source": source,
+                })
+            })
+            .collect();
+        json!(previews)
     }
 
     pub(super) fn control(&mut self, request: ControlRequest, reply: Sender<ControlOutcome>) {

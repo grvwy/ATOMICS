@@ -666,7 +666,10 @@ loopback or wildcard listeners belonging to that process tree qualify. Discovery
 never under `State` or on the protocol thread. macOS supports declared ports only.
 
 Session projections carry a `previews` list (port, path, label). Older clients ignore this additive
-field. The shared tile header offers **Preview**, with a label/port menu for multiple servers and
+field. The control API's `list` and `result` (`atomics_list`, `atomics_result`) give each live session's
+`previews` too: `port`, `path`, `label`, `title`, `url` (plain HTTP on the host's loopback) and `source`
+(`declared` with `atomics_preview`, or `detected`); an exited session has none. Whether a server speaks TLS
+is found out only when a client opens it, so it is not listed. The shared tile header offers **Preview**, with a label/port menu for multiple servers and
 **Stop** for an active forward; its details hover lists paths too. The in-process desktop opens
 `http://127.0.0.1:<port>/<path>` directly. Its terminal and runtime behavior stays unchanged.
 

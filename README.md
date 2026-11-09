@@ -674,7 +674,10 @@ Agents can offer a local web server with `atomics_preview {port: 5173, path: "/"
 `atomics_preview {port: 5173, remove: true}` removes the declaration. The tile's **Preview** button opens it
 in your browser. A native client connected to a remote host forwards the TCP connection over `atomics.v1`;
 the in-process desktop opens loopback directly. Linux also detects listeners owned by the agent's process
-tree; macOS requires declarations. Browser clients cannot create local forwards. See [Preview](docs/daemon.md#preview).
+tree; macOS requires declarations. Browser clients cannot create local forwards. `atomics_list` and
+`atomics_result` show each session's previews (port, path, label, title, plain-HTTP URL on the host, and whether
+it was declared or detected), so the chief can check a registration without reading the agent's transcript. See
+[Preview](docs/daemon.md#preview).
 
 `atomics_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
 first message is the brief. Every agent ATOMICS starts gets a `atomics_report` tool, pre-approved, to say when it is done,
