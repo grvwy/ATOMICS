@@ -770,7 +770,10 @@ impl State {
         } else if main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
             session.approvals.clear();
         }
+        // An agent's session follows its shell into another folder. The chief's stays where it was
+        // started: it looks into agents' worktrees to review them, which never makes their work its own.
         if main
+            && !session.chief
             && let Some(cwd) = &event.cwd
             && *cwd != session.cwd
         {
@@ -1349,6 +1352,47 @@ mod tests {
             }
             app.runtime.sessions.clear();
         });
+    }
+
+    #[test]
+    fn the_chief_stays_in_its_own_folder_when_its_shell_looks_into_an_agents_worktree() {
+        with_app(
+            "app::background::tests::the_chief_stays_in_its_own_folder_when_its_shell_looks_into_an_agents_worktree",
+            |app, _| {
+                let ((_repo_dir, repo), (_other_dir, worktree)) = (repository(), other_repository());
+                main_thread_worker(app, &repo);
+                let chief = &mut app.runtime.sessions[0];
+                chief.chief = true;
+                chief.rename("chief");
+                let root = chief.root();
+                let hook = |payload: serde_json::Value| HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                };
+                // `cd` into a plan agent's worktree to review it, reported either way Claude reports it.
+                for payload in [
+                    json!({"hook_event_name":"CwdChanged", "session_id":"main-thread", "cwd":&repo,
+                           "new_cwd":&worktree, "transcript_path":MAIN}),
+                    json!({"hook_event_name":"PostToolUse", "session_id":"main-thread", "cwd":&worktree,
+                           "transcript_path":MAIN}),
+                ] {
+                    app.runtime.on_hook(hook(payload));
+                    let chief = &app.runtime.sessions[0];
+                    assert_eq!((&chief.cwd, chief.root(), chief.branch()), (&repo, root.clone(), Some("main")));
+                    assert_eq!(chief.title, "chief");
+                }
+                // atomics_list shows it where it is, not on the agent's worktree and branch.
+                let listed = request(app, json!({"cmd":"list"})).result["sessions"][0].clone();
+                assert_eq!(listed["chief"], json!(true));
+                assert_eq!(listed["folder"], json!(repo));
+                assert_eq!(listed["worktree"], json!(root));
+                assert_eq!(listed["branch"], json!("main"));
+                app.runtime.sessions.clear();
+            },
+        );
     }
 
     #[test]
