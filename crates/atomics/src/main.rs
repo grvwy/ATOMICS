@@ -30,6 +30,7 @@ mod mcp_client;
 mod open_link;
 mod preview;
 mod protocol;
+mod provider_launch;
 mod ref_guard;
 mod relay;
 mod restart;
@@ -47,6 +48,8 @@ mod usage;
 mod vm;
 mod voice;
 mod watcher;
+#[cfg(target_os = "linux")]
+mod window_backend;
 
 // Drawing code that reads nothing from the host's model; atomics-ui owns it.
 use atomics_ui::{diff_view, markdown, panel_nav};
@@ -116,7 +119,7 @@ enum Command {
         #[command(subcommand)]
         command: TicketsCommand,
     },
-    /// Hook handler for Claude Code and Codex (reads the event on stdin)
+    /// Hook handler for agent CLIs (reads the event on stdin)
     Hook {
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -124,6 +127,11 @@ enum Command {
         pane: Option<String>,
         #[arg(long)]
         chief: bool,
+        #[arg(long, value_parser = ["copilot", "cursor"])]
+        provider: Option<String>,
+        /// Provider's native event name, supplied by its hook definition
+        #[arg(long, requires = "provider")]
+        event: Option<String>,
     },
     /// Forward Claude's status line data to ATOMICS, preserving the user's command
     Statusline {
@@ -135,7 +143,7 @@ enum Command {
     /// Print the hook settings ATOMICS passes to the agents it starts
     #[command(name = "print-hook-settings", alias = "hooks-json")]
     HooksJson {
-        #[arg(long, default_value = "codex", value_parser = ["codex", "claude"])]
+        #[arg(long, default_value = "codex", value_parser = ["codex", "claude", "copilot", "cursor"])]
         agent: String,
         /// Pane ID used by Claude hooks; Codex hook definitions do not contain it
         #[arg(long, default_value = "PANE_ID")]
@@ -419,8 +427,17 @@ fn main() -> eframe::Result {
             cli.workspace.as_deref(),
         )),
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
-        Some(Command::Hook { socket, pane, chief }) => {
-            hook_client::run(socket, pane, chief);
+        Some(Command::Hook { socket, pane, chief, provider, event }) => {
+            let provider = provider.map(|provider| match provider.as_str() {
+                "copilot" => atomics_core::config::AgentProvider::Copilot,
+                "cursor" => atomics_core::config::AgentProvider::Cursor,
+                _ => unreachable!("validated provider"),
+            });
+            if provider.is_none() {
+                hook_client::run(socket, pane, chief);
+            } else {
+                hook_client::run_with_provider(socket, pane, chief, provider, event);
+            }
             return Ok(());
         }
         Some(Command::Statusline { socket }) => {
@@ -436,16 +453,13 @@ fn main() -> eframe::Result {
         }
         Some(Command::HooksJson { agent, pane }) => {
             let exe = setup::hook_executable().unwrap_or_else(|_| PathBuf::from("atomics"));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&atomics_core::hook::session_settings(
-                    &exe,
-                    &atomics_core::paths::socket_path(),
-                    &pane,
-                    agent == "codex"
-                ))
-                .unwrap_or_default()
-            );
+            let socket = atomics_core::paths::socket_path();
+            let settings = match agent.as_str() {
+                "copilot" => atomics_core::hook::copilot_hooks(&exe),
+                "cursor" => atomics_core::hook::cursor_hooks(&exe, &socket, &pane),
+                _ => atomics_core::hook::session_settings(&exe, &socket, &pane, agent == "codex"),
+            };
+            println!("{}", serde_json::to_string_pretty(&settings).unwrap_or_default());
             return Ok(());
         }
         Some(Command::Mcp { agent, chief }) => {
@@ -537,7 +551,7 @@ fn main() -> eframe::Result {
                 .collect(),
             screenshot: cli.screenshot.clone().map(|path| (path, cli.screenshot_delay)),
         };
-        return client::run(target, launch, native_options(size, load_icon()));
+        return client::run(target, launch, native_options(size, load_icon())?);
     }
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
@@ -592,7 +606,7 @@ fn main() -> eframe::Result {
         remote_port: None,
     };
     let icon = load_icon();
-    let native = native_options(size, icon.clone());
+    let native = native_options(size, icon.clone())?;
     // Before the event loop: the Apple event that launches the app may arrive before the window exists.
     #[cfg(target_os = "macos")]
     open_link::macos::register();
@@ -610,7 +624,7 @@ fn main() -> eframe::Result {
 }
 
 /// The window: without `size` it fills the screen, which the layout is built to use.
-fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::NativeOptions {
+fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::Result<eframe::NativeOptions> {
     let mut native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ATOMICS")
@@ -630,7 +644,11 @@ fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::Nativ
             descriptor
         });
     }
-    native
+    #[cfg(target_os = "linux")]
+    window_backend::configure(&mut native).map_err(|error| {
+        eframe::Error::AppCreation(std::io::Error::new(std::io::ErrorKind::InvalidInput, error).into())
+    })?;
+    Ok(native)
 }
 
 fn load_icon() -> egui::IconData {
@@ -728,6 +746,19 @@ mod cli_tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(matches!(cli.command, Some(Command::Hook { chief: parsed, .. }) if parsed == chief));
         }
+    }
+
+    #[test]
+    fn native_hook_flags_are_explicit_and_validate_provider() {
+        for provider in ["copilot", "cursor"] {
+            let cli =
+                Cli::try_parse_from(["atomics", "hook", "--provider", provider, "--event", "sessionStart"]).unwrap();
+            assert!(matches!(cli.command,Some(Command::Hook {provider:Some(parsed),event:Some(event),..})
+                if parsed == provider && event == "sessionStart"));
+            assert!(Cli::try_parse_from(["atomics", "print-hook-settings", "--agent", provider]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["atomics", "hook", "--event", "stop"]).is_err());
+        assert!(Cli::try_parse_from(["atomics", "hook", "--provider", "unknown"]).is_err());
     }
 
     #[test]

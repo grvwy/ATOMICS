@@ -3,7 +3,7 @@
 //! its own, so it asks instead of failing (docs/isolation.md).
 use super::*;
 use crate::sandbox::steps;
-use atomics_core::config::AgentKind;
+use atomics_core::config::{AgentKind, AgentProvider};
 use atomics_core::isolation::IsolationMode;
 use atomics_core::projection::{
     SetupAction, SetupClick, SetupConnection, SetupFailure, SetupInfo, SetupJob, SetupProgram, StartChoice,
@@ -55,17 +55,39 @@ fn install_click(program: &str, mac: bool, has: &dyn Fn(&str) -> bool) -> Option
 
 /// The programs a fresh machine needs: git, then the agents the config runs. A program whose name a person would not
 /// recognize keeps it, so a custom agent shows as what it runs.
-fn wanted_programs(config: &Config) -> Vec<(String, Option<String>, String)> {
-    let mut wanted = vec![("git".to_string(), None, "git".to_string())];
+struct WantedProgram {
+    name: String,
+    program: String,
+    config: Option<atomics_core::config::AgentConfig>,
+    startable: bool,
+}
+
+fn wanted_programs(config: &Config) -> Vec<WantedProgram> {
+    let mut wanted = vec![WantedProgram { name: "git".into(), program: "git".into(), config: None, startable: false }];
     for agent in &config.agents {
         let Some(program) = agent.command.first() else { continue };
         let name = match agent.kind {
             AgentKind::Shell => continue,
             AgentKind::Claude => "Claude Code".to_string(),
             AgentKind::Generic if agent.is_codex() => "Codex".to_string(),
-            AgentKind::Generic => agent.name.clone(),
+            AgentKind::Generic => agent.provider().map_or_else(|| agent.name.clone(), |p| p.title().into()),
         };
-        wanted.push((name, Some(agent.name.clone()), program.clone()));
+        wanted.push(WantedProgram { name, program: program.clone(), config: Some(agent.clone()), startable: true });
+    }
+    let chief = config.chief.agent();
+    if let Some(provider) = chief.provider()
+        && let Some(program) = chief.command.first()
+        && !wanted
+            .iter()
+            .filter_map(|wanted| wanted.config.as_ref())
+            .any(|agent| agent.provider() == Some(provider) && agent.command == chief.command)
+    {
+        wanted.push(WantedProgram {
+            name: format!("Chief ({})", provider.title()),
+            program: program.clone(),
+            config: Some(chief),
+            startable: false,
+        });
     }
     wanted
 }
@@ -76,6 +98,16 @@ impl State {
             first_run: self.store.setup_pending,
             checking: self.programs_check.is_some(),
             programs: self.setup_programs.clone(),
+            agent_presets: AgentProvider::ALL
+                .into_iter()
+                .filter(|provider| {
+                    !self
+                        .config
+                        .agents
+                        .iter()
+                        .any(|agent| agent.provider() == Some(*provider) || agent.name == provider.name())
+                })
+                .collect(),
             project: self.open_projects.first().map(|project| paths::display(project)),
             connections: self.setup_connections(),
             sandbox_steps: self.sandbox_steps.clone(),
@@ -166,8 +198,11 @@ impl State {
             let mac = cfg!(target_os = "macos");
             let programs = wanted
                 .into_iter()
-                .map(|(name, agent, program)| {
-                    let found = if program.contains('/') {
+                .map(|WantedProgram { name, program, config, startable }| {
+                    let agent = config.as_ref().filter(|_| startable).map(|config| config.name.clone());
+                    let found = if let Some(config) = &config {
+                        crate::setup::checked_agent_on_path(config, &path)
+                    } else if program.contains('/') {
                         Path::new(&program).is_file().then(|| PathBuf::from(&program))
                     } else {
                         crate::setup::find_on_path(&program, &path)
@@ -315,6 +350,32 @@ impl State {
         Ok(())
     }
 
+    pub(super) fn add_agent_preset(&mut self, provider: AgentProvider) -> Result<(), String> {
+        if self.config.agents.iter().any(|agent| agent.provider() == Some(provider)) {
+            return Ok(());
+        }
+        if self.config.agents.iter().any(|agent| agent.name == provider.name()) {
+            return Err(format!(
+                "An agent named {} already exists; edit its configuration to choose a provider.",
+                provider.name()
+            ));
+        }
+        let mut agents = self.config.agents.clone();
+        agents.push(provider.preset());
+        let fragment = toml::to_string(&toml::Table::from_iter([(
+            "agents".into(),
+            toml::Value::try_from(agents).map_err(|error| error.to_string())?,
+        )]))
+        .map_err(|error| error.to_string())?;
+        self.write_machine_setting(&fragment)?;
+        if self.programs_check.is_some() {
+            self.setup_look_again = true;
+        } else {
+            self.check_programs();
+        }
+        Ok(())
+    }
+
     /// In this machine's own file: whether sandboxes can run here says nothing of another machine sharing the main one.
     pub(super) fn set_isolation(&mut self, mode: IsolationMode) -> Result<(), String> {
         self.write_machine_setting(&format!("[isolation]\nmode = \"{}\"", mode.name()))
@@ -404,5 +465,37 @@ impl State {
 fn remove_scratch(folder: &Path) {
     if paths::scratch_of(folder).is_some() {
         let _ = std::fs::remove_dir_all(folder);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn native_chief_wrappers_are_checked_without_becoming_worker_start_buttons() {
+        let config: Config = toml::from_str(
+            "[chief]\nprovider='cursor'\ncommand=['/opt/chief-wrapper','--configured']\n[[agents]]\nname='shell'\nkind='shell'",
+        ).unwrap();
+        let wanted = wanted_programs(&config);
+        assert_eq!(wanted.len(), 2, "git and the otherwise unrepresented native chief");
+        let chief = &wanted[1];
+        assert_eq!(chief.name, "Chief (Cursor CLI)");
+        assert_eq!(chief.program, "/opt/chief-wrapper");
+        assert!(!chief.startable, "the ordinary Start action would not launch the chief role");
+        let checked = chief.config.as_ref().expect("uses off-thread checked_agent_on_path discovery");
+        assert_eq!(checked.provider(), Some(AgentProvider::Cursor));
+        assert_eq!(checked.command, ["/opt/chief-wrapper", "--configured"]);
+    }
+
+    #[test]
+    fn native_chief_discovery_reuses_matching_worker_identity_only() {
+        let mut config: Config = toml::from_str("[chief]\ncommand=['agent']").unwrap();
+        assert!(wanted_programs(&config).iter().all(|wanted| !wanted.name.starts_with("Chief (")));
+        config.chief.provider = Some(atomics_core::config::ChiefProvider::Copilot);
+        let wanted = wanted_programs(&config);
+        assert!(wanted.iter().any(|wanted| wanted.name == "Chief (GitHub Copilot)"));
+        config.chief = atomics_core::config::ChiefConfig::default();
+        assert!(wanted_programs(&config).iter().all(|wanted| !wanted.name.starts_with("Chief (")));
     }
 }

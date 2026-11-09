@@ -120,6 +120,8 @@ pub struct Session {
     pub id: String,
     pub agent: String,
     pub kind: AgentKind,
+    /// Provider identity captured at launch; changing config never reclassifies a live PTY.
+    pub provider: Option<atomics_core::config::AgentProvider>,
     pub terminal: Option<Terminal>,
     pub claude_id: Option<String>,
     pub cwd: PathBuf,

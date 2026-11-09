@@ -1,4 +1,4 @@
-//! Lifecycle hooks bridge Claude Code and Codex to the app over a Unix socket.
+//! Lifecycle hooks bridge agent CLIs to the app over a Unix socket.
 //! ATOMICS passes socket and pane arguments directly to the handler. Hook stdout
 //! delivers context or answers a permission request.
 
@@ -14,7 +14,14 @@ pub const PERMISSION_WAIT_SECONDS: u64 = 540;
 /// environment instead, which the handlers inherit even through a wrapper on another machine.
 pub const HOOK_PANE_ENV: &str = "ATOMICS_HOOK_PANE";
 
+use crate::config::AgentProvider;
 use crate::session::AgentStatus;
+
+mod native;
+pub use native::{copilot_hooks, cursor_hooks, normalize_native_payload};
+
+/// Native providers use this with HOOK_PANE_ENV to route launch-local hooks safely.
+pub const HOOK_SOCKET_ENV: &str = "ATOMICS_HOOK_SOCKET";
 
 /// Events ATOMICS subscribes to. Each one either changes a session's status or is a
 /// chance to deliver queued messages.
@@ -62,6 +69,7 @@ pub enum HookThread {
 /// The fields of a hook payload ATOMICS cares about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookEvent {
+    pub provider: Option<AgentProvider>,
     pub name: String,
     pub session_id: String,
     pub cwd: Option<PathBuf>,
@@ -76,6 +84,8 @@ pub struct HookEvent {
     pub stop_hook_active: bool,
     /// A failed tool call the user interrupted (Claude's `is_interrupt`).
     pub interrupted: bool,
+    pub completion_status: Option<String>,
+    pub loop_count: Option<u64>,
     pub thread: HookThread,
 }
 
@@ -84,16 +94,23 @@ impl HookEvent {
         let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
         let name = text("hook_event_name")?;
         let session_id = text("session_id")?;
+        let provider = match payload.get("atomics_provider") {
+            Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+            None => None,
+        };
         // CwdChanged reports the new directory separately from the common `cwd`.
         let cwd = text("new_cwd").or_else(|| text("cwd")).map(PathBuf::from);
-        let thread = if payload.get("transcript_path").is_some_and(Value::is_null) {
+        let thread = if payload.get("atomics_background").and_then(Value::as_bool) == Some(true)
+            || (provider.is_none() && payload.get("transcript_path").is_some_and(Value::is_null))
+        {
             HookThread::Background
-        } else if text("agent_id").is_some() {
+        } else if text("agent_id").is_some() || payload.get("atomics_spawned").and_then(Value::as_bool) == Some(true) {
             HookThread::Spawned
         } else {
             HookThread::Main
         };
         Some(HookEvent {
+            provider,
             name,
             session_id,
             cwd,
@@ -107,6 +124,8 @@ impl HookEvent {
             last_assistant_message: text("last_assistant_message"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
             interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
+            completion_status: text("completion_status"),
+            loop_count: payload.get("loop_count").and_then(Value::as_u64),
             thread,
         })
     }
@@ -119,6 +138,14 @@ impl HookEvent {
             "PermissionRequest" => Some(AgentStatus::NeedsInput),
             "Notification" => match self.notification_type.as_deref() {
                 Some("permission_prompt") => Some(AgentStatus::NeedsInput),
+                Some("elicitation_dialog") if self.provider == Some(AgentProvider::Copilot) => {
+                    Some(AgentStatus::NeedsInput)
+                }
+                _ => None,
+            },
+            "Stop" if self.provider == Some(AgentProvider::Cursor) => match self.completion_status.as_deref() {
+                Some("completed") => Some(AgentStatus::Done),
+                Some("aborted" | "error") => Some(AgentStatus::Idle),
                 _ => None,
             },
             "Stop" => Some(AgentStatus::Done),
@@ -131,11 +158,54 @@ impl HookEvent {
         }
     }
 
-    /// Whether Claude Code reads `additionalContext` from this event's output, in the thread a
-    /// message for the session is meant for.
+    /// Whether the provider consumes queued context from this event's output in the main
+    /// conversation, including any native continuation limits.
     pub fn can_deliver(&self) -> bool {
-        self.thread == HookThread::Main
-            && matches!(self.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop")
+        if self.thread != HookThread::Main {
+            return false;
+        }
+        match self.provider {
+            Some(AgentProvider::Copilot) => {
+                matches!(self.name.as_str(), "SessionStart" | "PostToolUse")
+                    || (self.name == "Stop" && !self.stop_hook_active)
+            }
+            Some(AgentProvider::Cursor) => {
+                self.name == "PostToolUse"
+                    || (self.name == "PostToolUseFailure" && !self.interrupted)
+                    || (self.name == "Stop"
+                        && self.completion_status.as_deref() == Some("completed")
+                        && self.loop_count.unwrap_or(0) < 5)
+            }
+            None => matches!(self.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop"),
+        }
+    }
+
+    /// Static context may be returned at Cursor startup, but fire-and-forget startup is not a
+    /// reliable delivery point for queued user messages.
+    pub fn context_output(&self, context: &str) -> Option<String> {
+        if self.thread != HookThread::Main {
+            return None;
+        }
+        let output = match self.provider {
+            Some(AgentProvider::Copilot) if self.can_deliver() => {
+                if self.name == "Stop" {
+                    json!({"decision":"block", "reason":context})
+                } else {
+                    json!({"additionalContext":context})
+                }
+            }
+            Some(AgentProvider::Cursor) if self.name == "SessionStart" => json!({"additional_context":context}),
+            Some(AgentProvider::Cursor) if self.can_deliver() => {
+                if self.name == "Stop" {
+                    json!({"followup_message":context})
+                } else {
+                    json!({"additional_context":context})
+                }
+            }
+            Some(_) => return None,
+            None => return Some(context_output(&self.name, context)),
+        };
+        Some(output.to_string())
     }
 }
 

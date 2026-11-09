@@ -8,6 +8,7 @@ use atomics_core::isolation::IsolationMode;
 /// A stand-in agent that writes the folder it runs in to `out`, then waits.
 fn probe(name: &str, kind: AgentKind, out: &Path) -> atomics_core::config::AgentConfig {
     atomics_core::config::AgentConfig {
+        provider: None,
         name: name.into(),
         command: vec![
             "/bin/sh".into(),

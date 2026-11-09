@@ -506,9 +506,93 @@ pub fn resolve_program(program: &str) -> String {
     find_program(program).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| program.to_string())
 }
 
-/// Keep the version probe bounded even when a wrapper hangs or another child inherits stdout.
+/// A checked executable choice belongs to one provider, configured command, and login PATH.
+/// Discovery may reject the ambiguous `agent` name and choose `cursor-agent` instead; launches
+/// must keep that choice without running a version probe on the window's thread.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AgentResolution {
+    provider: Option<atomics_core::config::AgentProvider>,
+    command: Vec<String>,
+    path: String,
+}
+
+impl AgentResolution {
+    fn new(agent: &atomics_core::config::AgentConfig, path: &str) -> Self {
+        Self { provider: agent.provider(), command: agent.command.clone(), path: path.into() }
+    }
+}
+
+static CHECKED_AGENTS: LazyLock<Mutex<HashMap<AgentResolution, Option<PathBuf>>>> = LazyLock::new(Default::default);
+
+/// Resolves an agent without running it. Uses setup's checked choice when available, including
+/// rejection. Unknown commands retain normal executable resolution until discovery checks them.
+/// Cursor's desktop editor is never a CLI fallback.
+pub(crate) fn agent_program(agent: &atomics_core::config::AgentConfig) -> Option<PathBuf> {
+    resolved_agent_on_path(agent, &agent_path())
+}
+
+/// The same merged PATH used by setup's refresh, so a checked choice also applies at launch.
+pub(crate) fn agent_path() -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    with_login_path(&current, &login_path_now().unwrap_or_default())
+}
+
+fn resolved_agent_on_path(agent: &atomics_core::config::AgentConfig, path: &str) -> Option<PathBuf> {
+    let known = CHECKED_AGENTS.lock().unwrap().get(&AgentResolution::new(agent, path)).cloned();
+    known.unwrap_or_else(|| agent_on_path(agent, path, false))
+}
+
+/// Discovery for setup and doctor. Cursor's ambiguous `agent` executable must identify itself;
+/// these bounded probes belong off the window's thread. The result replaces the cached launch
+/// choice, so Check again also notices an installation or executable that changed.
+pub(crate) fn checked_agent_on_path(agent: &atomics_core::config::AgentConfig, path: &str) -> Option<PathBuf> {
+    let found = agent_on_path(agent, path, true);
+    CHECKED_AGENTS.lock().unwrap().insert(AgentResolution::new(agent, path), found.clone());
+    found
+}
+
+fn agent_on_path(agent: &atomics_core::config::AgentConfig, path: &str, check: bool) -> Option<PathBuf> {
+    use atomics_core::config::AgentProvider;
+    let program = agent.command.first()?;
+    let cursor = agent.provider() == Some(AgentProvider::Cursor);
+    // `cursor` launches the editor even if a provider was set by mistake.
+    if cursor && Path::new(program).file_name().is_some_and(|name| name == "cursor") {
+        return None;
+    }
+    let find = |program: &str| {
+        if program.contains('/') {
+            let candidate = PathBuf::from(program);
+            candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).then_some(candidate)
+        } else {
+            find_on_path(program, path)
+        }
+    };
+    let valid = |candidate: &PathBuf| !check || !cursor || cursor_cli(candidate, path, Duration::from_secs(2));
+    find(program).filter(valid).or_else(|| {
+        // A configured path or wrapper is intentional; only the standard short name has an alias.
+        (cursor && program == "agent").then(|| find("cursor-agent").filter(valid)).flatten()
+    })
+}
+
+fn cursor_cli(program: &Path, path: &str, timeout: Duration) -> bool {
+    let program = program.to_string_lossy();
+    let Some(version) = program_output(&program, "--version", Some(path), timeout) else { return false };
+    if version.trim().is_empty() {
+        return false;
+    }
+    program_output(&program, "--help", Some(path), timeout).is_some_and(|help| {
+        let help = help.to_ascii_lowercase();
+        help.contains("cursor") && help.contains("agent")
+    })
+}
+
+/// Keep probes bounded even when a wrapper hangs or another child inherits stdout.
 /// `path`, when given, is the probe's PATH ([`child_path`]); else it has this process's own.
-pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::time::Duration) -> Option<bool> {
+pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: Duration) -> Option<bool> {
+    atomics_core::hook::codex_supports_hooks(&program_output(program, "--version", path, timeout)?)
+}
+
+fn program_output(program: &str, argument: &str, path: Option<&str>, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -519,9 +603,8 @@ pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::tim
     stdout.set_nonblocking(true).ok()?;
     let mut command = Command::new(program);
     command
-        .arg("--version")
-        // Not wherever ATOMICS was started: a wrapper that runs the agent elsewhere, such as in a
-        // VM that has only some of this machine's folders, needs a folder it is sure to have.
+        .arg(argument)
+        // A remote wrapper needs a folder it is sure to have.
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(writer)))
@@ -531,15 +614,26 @@ pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::tim
     }
     let mut child = command.spawn().ok()?;
     let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::new();
     loop {
+        // Drain while the child runs: a long --help must not fill the socket and deadlock.
+        let mut chunk = [0; 4096];
+        for _ in 0..16 {
+            let Ok(count) = stdout.read(&mut chunk) else { break };
+            if count == 0 {
+                break;
+            }
+            if bytes.len() < 65536 {
+                bytes.extend_from_slice(&chunk[..count.min(65536 - bytes.len())]);
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                let mut bytes = Vec::new();
-                let _ = (&mut stdout).take(1024).read_to_end(&mut bytes);
-                return atomics_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&bytes));
+                let _ = (&mut stdout).take(65536_u64.saturating_sub(bytes.len() as u64)).read_to_end(&mut bytes);
+                return Some(String::from_utf8_lossy(&bytes).into_owned());
             }
             Ok(Some(_)) => return None,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -627,6 +721,63 @@ mod tests {
         );
         let listed = format!("{shown}:/usr/bin");
         assert_eq!(with_user_programs(&listed, home.path()), listed, "already there");
+    }
+
+    #[test]
+    fn cursor_discovery_rejects_an_unrelated_agent_and_falls_back_to_cursor_agent() {
+        use atomics_core::config::AgentProvider;
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().to_string_lossy();
+        let agent = dir.path().join("agent");
+        let fallback = dir.path().join("cursor-agent");
+        let editor = dir.path().join("cursor");
+        crate::test_support::write_program(&agent, "#!/bin/sh\nprintf 'unrelated agent 1.0\\n'\n");
+        crate::test_support::write_program(&editor, "#!/bin/sh\nprintf 'Cursor editor\\n'\n");
+        let mut config = AgentProvider::Cursor.preset();
+        assert_eq!(
+            resolved_agent_on_path(&config, &path),
+            Some(agent.clone()),
+            "unknown commands resolve without probes"
+        );
+        assert!(checked_agent_on_path(&config, &path).is_none(), "the editor is never a fallback");
+        assert!(resolved_agent_on_path(&config, &path).is_none(), "launch keeps discovery's rejection");
+        crate::test_support::write_program(&fallback, "#!/bin/sh\nprintf 'Cursor Agent 2026.01\\n'\n");
+        assert_eq!(checked_agent_on_path(&config, &path), Some(fallback.clone()));
+        assert_eq!(
+            resolved_agent_on_path(&config, &path),
+            Some(fallback.clone()),
+            "launch keeps discovery's checked winner"
+        );
+        let changed_path = format!("{path}:/new/tool/folder");
+        assert_eq!(
+            resolved_agent_on_path(&config, &changed_path),
+            Some(agent.clone()),
+            "a changed PATH gets a fresh choice"
+        );
+        let mut wrapper = config.clone();
+        wrapper.command = vec![agent.display().to_string()];
+        assert_eq!(
+            resolved_agent_on_path(&wrapper, &path),
+            Some(agent.clone()),
+            "explicit command changes do not reuse another command's rejection"
+        );
+        crate::test_support::write_program(&agent, "#!/bin/sh\nprintf 'Cursor Agent 2026.02\\n'\n");
+        assert_eq!(checked_agent_on_path(&config, &path), Some(agent.clone()));
+        assert_eq!(resolved_agent_on_path(&config, &path), Some(agent), "Check again refreshes the choice");
+        config.command = vec!["cursor".into()];
+        assert!(agent_on_path(&config, &path, false).is_none(), "explicit provider cannot launch editor");
+        config.command = vec![dir.path().join("intentional-wrapper").display().to_string()];
+        assert!(checked_agent_on_path(&config, &path).is_none(), "missing explicit paths do not fall back");
+    }
+
+    #[test]
+    fn cursor_identity_probe_is_bounded() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        crate::test_support::write_program(&agent, "#!/bin/sh\nprintf 'Cursor Agent\\n'\nwhile :; do :; done\n");
+        let start = std::time::Instant::now();
+        assert!(!cursor_cli(&agent, &dir.path().to_string_lossy(), Duration::from_millis(40)));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

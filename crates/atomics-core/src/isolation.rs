@@ -197,9 +197,12 @@ pub fn sbx_agent(agent: &AgentConfig) -> Option<&'static str> {
         AgentKind::Claude => Some("claude"),
         AgentKind::Shell => Some("shell"),
         AgentKind::Generic => {
+            if let Some(provider) = agent.provider() {
+                return Some(provider.name());
+            }
             let program = agent.command.first()?;
             let name = Path::new(program).file_name()?.to_str()?;
-            SBX_AGENTS.iter().copied().find(|known| *known == name)
+            SBX_AGENTS.iter().copied().find(|known| *known == name && *known != "cursor")
         }
     }
 }
@@ -591,6 +594,7 @@ mod tests {
             name: name.into(),
             command: command.iter().map(|c| c.to_string()).collect(),
             kind,
+            provider: None,
             busy_text: None,
             isolation,
         }
@@ -746,6 +750,14 @@ command = ["codex"]
         assert_eq!(sbx_agent(&agent("gemini", &["gemini"], AgentKind::Generic, None)), Some("gemini"));
         assert_eq!(sbx_agent(&agent("aider", &["aider"], AgentKind::Generic, None)), None);
         assert_eq!(sbx_agent(&agent("none", &[], AgentKind::Generic, None)), None);
+        assert_eq!(sbx_agent(&agent("cursor", &["agent"], AgentKind::Generic, None)), Some("cursor"));
+        assert_eq!(sbx_agent(&agent("cursor", &["cursor-agent"], AgentKind::Generic, None)), Some("cursor"));
+        assert_eq!(sbx_agent(&agent("editor", &["cursor"], AgentKind::Generic, None)), None);
+        for provider in crate::config::AgentProvider::ALL {
+            let mut configured = provider.preset();
+            configured.command = vec!["custom-wrapper".into()];
+            assert_eq!(sbx_agent(&configured), Some(provider.name()));
+        }
     }
 
     #[test]

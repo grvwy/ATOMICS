@@ -70,6 +70,7 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, even
 
 fn populate(app: &mut Desktop<'_>) {
     let agent = atomics_core::config::AgentConfig {
+        provider: None,
         name: "codex".into(),
         command: vec![],
         kind: AgentKind::Generic,

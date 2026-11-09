@@ -163,6 +163,35 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         }
     }
 
+    if let Ok((config, _)) = &config {
+        let path = crate::setup::agent_path();
+        let chief = config.chief.agent();
+        for (agent, is_chief) in config
+            .agents
+            .iter()
+            .map(|agent| (agent, false))
+            .chain(std::iter::once((&chief, true)))
+            .filter(|(agent, _)| agent.provider().is_some())
+        {
+            let provider = agent.provider().expect("filtered provider");
+            let found = crate::setup::checked_agent_on_path(agent, &path);
+            let label = if is_chief { format!("chief {}", provider.title()) } else { provider.title().into() };
+            let label = match &found {
+                Some(path) => format!("{label} CLI found ({})", path.display()),
+                None => format!("{label} CLI not found or identity check failed (warning)"),
+            };
+            let hint = match provider {
+                atomics_core::config::AgentProvider::Cursor => {
+                    "install Cursor CLI; check `agent --version` and `agent --help` (or `cursor-agent`); `cursor` is the editor"
+                }
+                atomics_core::config::AgentProvider::Copilot => {
+                    "install GitHub Copilot CLI, run `copilot login`, and check `copilot --version`"
+                }
+            };
+            lines.push(check_line(found.is_some(), &label, hint));
+        }
+    }
+
     lines.push(format!("Host: {}", paths::host_name()));
     let label = match &config {
         Ok(_) => format!("config parses ({})", config_path.display()),

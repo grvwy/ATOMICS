@@ -253,6 +253,9 @@ impl State {
                 });
             }
             SettingsTool::CheckPrograms => self.check_programs(),
+            SettingsTool::AddAgentPreset { provider } => {
+                self.add_agent_preset(provider).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+            }
             SettingsTool::SetIsolation { mode } => {
                 self.set_isolation(mode).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
                 self.check_sandbox();

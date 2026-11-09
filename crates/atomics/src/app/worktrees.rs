@@ -533,6 +533,7 @@ mod tests {
 
                 state.config.base_ref = "main".into();
                 state.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "login-codex".into(),
                     command: vec!["codex".into()],
                     kind: AgentKind::Generic,
@@ -599,6 +600,7 @@ mod tests {
                 let (_dir, repo) = repository();
                 state.config.base_ref = "main".into();
                 state.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "probe".into(),
                     command: vec![
                         "/bin/sh".into(),

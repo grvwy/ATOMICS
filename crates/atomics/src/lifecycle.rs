@@ -711,6 +711,7 @@ mod tests {
         plan.save_in(home).unwrap();
         let record = SessionRecord {
             chief: false,
+            chief_provider: None,
             pane: Some("pane".into()),
             claude_session_id: "conversation".into(),
             agent: "claude".into(),
@@ -772,6 +773,7 @@ mod tests {
         let mut store = Store::default();
         store.sessions.push(SessionRecord {
             chief: false,
+            chief_provider: None,
             pane: Some("live".into()),
             claude_session_id: "conversation".into(),
             agent: "claude".into(),
@@ -971,6 +973,7 @@ mod tests {
         let store = Store {
             sessions: vec![SessionRecord {
                 chief: false,
+                chief_provider: None,
                 pane: Some("alive".into()),
                 claude_session_id: "conversation".into(),
                 agent: "codex".into(),

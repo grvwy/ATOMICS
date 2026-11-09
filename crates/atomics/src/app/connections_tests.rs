@@ -146,6 +146,7 @@ fn sandboxed(app: &mut Desktop<'_>, ctx: &egui::Context, bin: &Path, prompt: &st
     app.runtime.config.isolation.mode = IsolationMode::Sandbox;
     if app.runtime.config.agent("probe").is_none() {
         app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+            provider: None,
             name: "probe".into(),
             command: vec!["/bin/sleep".into(), "600".into()],
             kind: AgentKind::Shell,

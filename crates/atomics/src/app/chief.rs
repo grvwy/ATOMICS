@@ -55,7 +55,32 @@ fn chief_work_open(plans: &[Plan], sessions: &[Session]) -> bool {
     }) || sessions.iter().any(|s| !s.chief && s.is_agent())
 }
 
+/// A transcript belongs to the provider that created it, even after chief config changes.
+pub(super) fn provider_identity(
+    provider: Option<atomics_core::config::AgentProvider>,
+) -> atomics_core::config::ChiefProvider {
+    use atomics_core::config::{AgentProvider, ChiefProvider};
+    match provider {
+        Some(AgentProvider::Copilot) => ChiefProvider::Copilot,
+        Some(AgentProvider::Cursor) => ChiefProvider::Cursor,
+        None => ChiefProvider::Claude,
+    }
+}
+
 impl State {
+    pub(super) fn check_chief_resume(&self, record: &SessionRecord) -> Result<(), String> {
+        use atomics_core::config::ChiefProvider;
+        let saved = record.chief_provider.unwrap_or(ChiefProvider::Claude);
+        let selected = provider_identity(self.config.chief.provider());
+        if saved != selected {
+            return Err(format!(
+                "Could not resume chief: its saved conversation belongs to {saved:?}, but [chief] now selects {selected:?}. \
+                 Restore that provider to resume it, or start a new chief conversation."
+            ));
+        }
+        Ok(())
+    }
+
     /// Runs on the host's background tick, including while the chief is hidden or no client is drawing.
     pub(super) fn wake_chief(&mut self) {
         if self.config.chief.wake_secs == 0 {
@@ -78,7 +103,7 @@ impl State {
             work_open: chief_work_open(&self.plans, &self.sessions),
             approval_pending: chief.approval_hold
                 || !chief.approvals.is_empty()
-                || atomics_core::approvals::menu_visible(&screen),
+                || chief.provider.is_none() && atomics_core::approvals::menu_visible(&screen),
             input_age: terminal.last_typed().map(|at| at.elapsed()),
             input_empty: terminal.input_empty_since(chief.activity.turn_ended),
             elapsed: chief.activity.wake_since.map(|at| at.elapsed()),
@@ -157,16 +182,24 @@ impl State {
                 delivery => Ok(delivery),
             },
             None => {
-                self.sessions.retain(|s| !s.chief);
+                self.close_old_chiefs();
                 self.start_chief(Some(text.to_string()))?;
                 Ok(Delivery::Sent)
             }
         }
     }
 
+    fn close_old_chiefs(&mut self) {
+        let chiefs: Vec<_> =
+            self.sessions.iter().filter(|session| session.chief).map(|session| session.id.clone()).collect();
+        for chief in chiefs {
+            self.close(&chief);
+        }
+    }
+
     pub(super) fn toggle_chief(&mut self) {
         if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
-            self.sessions.retain(|s| !s.chief);
+            self.close_old_chiefs();
             self.traces.retain(|id, _| self.sessions.iter().any(|session| session.id == *id && session.chief));
             if let Err(err) = self.start_chief(None) {
                 self.toast(err);
@@ -364,6 +397,167 @@ mod tests {
         assert!(!message.contains("agent-5"));
         assert!(message.ends_with("Close each listed agent with atomics_close or say why it should stay open."));
         assert_eq!(message.lines().count(), 1);
+    }
+
+    #[test]
+    fn native_chiefs_launch_orchestrate_and_resume_with_their_own_provider() {
+        use super::super::tests::{request, with_app};
+        use atomics_core::config::{AgentProvider, ChiefProvider};
+        with_app("app::chief::tests::native_chiefs_launch_orchestrate_and_resume_with_their_own_provider", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            for provider in [AgentProvider::Copilot, AgentProvider::Cursor] {
+                let executable = dir.path().join(match provider {
+                    AgentProvider::Copilot => "copilot",
+                    AgentProvider::Cursor => "cursor-agent",
+                });
+                crate::test_support::write_program(
+                    &executable,
+                    r#"#!/bin/sh
+printf '%s\n' "$@" > chief-argv
+printf '%s\n' "${COPILOT_CUSTOM_INSTRUCTIONS_DIRS-}" > chief-instructions-env
+if [ -t 0 ] && [ -t 1 ]; then printf 'chief-interactive-pty\n'; fi
+exec /bin/sleep 600
+"#,
+                );
+                app.runtime.config.chief.command = vec![executable.to_string_lossy().into_owned()];
+                app.runtime.config.chief.provider = Some(provider_identity(Some(provider)));
+                app.runtime.config.chief.args = vec!["--model".into(), "chief-model".into()];
+                app.runtime.config.chief.cwd = Some(dir.path().to_string_lossy().into_owned());
+                app.runtime.config.chief.resume = None;
+                app.runtime.config.chief.system_prompt =
+                    "CHIEF_INSTRUCTIONS: coordinate, plan, review {projects}".into();
+                let id = app.runtime.start_chief(Some("Plan the release".into())).unwrap();
+                let index = app.runtime.find(&id).unwrap();
+                assert!(app.runtime.sessions[index].chief);
+                assert_eq!(app.runtime.sessions[index].kind, AgentKind::Generic);
+                assert_eq!(app.runtime.sessions[index].provider, Some(provider));
+                assert!(app.runtime.sessions[index].sandbox.is_none());
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while !app.runtime.sessions[index]
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .screen_text(60)
+                    .contains("chief-interactive-pty")
+                {
+                    assert!(Instant::now() < deadline, "chief did not get an interactive PTY");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let args: Vec<String> = std::fs::read_to_string(dir.path().join("chief-argv"))
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                assert!(args.windows(2).any(|pair| pair == ["--model", "chief-model"]));
+                assert!(!args.iter().any(|arg| matches!(
+                    arg.as_str(),
+                    "--settings" | "--mcp-config" | "--append-system-prompt" | "--allowedTools"
+                )));
+                let plugin = crate::provider_launch::directory(&paths::atomics_home(), &id);
+                let mcp: serde_json::Value = match provider {
+                    AgentProvider::Copilot => {
+                        assert!(args.windows(2).any(|pair| pair == ["-i", "Plan the release"]));
+                        assert!(args.iter().any(|arg| arg == "--allow-tool=atomics(atomics_plan_set)"));
+                        assert!(!args.iter().any(|arg| arg == "--allow-tool=atomics(atomics_start)"));
+                        let at = args.iter().position(|arg| arg == "--additional-mcp-config").unwrap();
+                        serde_json::from_str(&args[at + 1]).unwrap()
+                    }
+                    AgentProvider::Cursor => {
+                        assert_eq!(args.last().map(String::as_str), Some("Plan the release"));
+                        serde_json::from_slice(&std::fs::read(plugin.join("mcp.json")).unwrap()).unwrap()
+                    }
+                };
+                assert_eq!(mcp["mcpServers"]["atomics"]["args"], json!(["mcp", "--chief"]));
+                assert_eq!(mcp["mcpServers"]["atomics"]["env"]["ATOMICS_PANE"], id);
+                let instructions = match provider {
+                    AgentProvider::Copilot => {
+                        assert!(
+                            std::fs::read_to_string(dir.path().join("chief-instructions-env"))
+                                .unwrap()
+                                .contains(plugin.join("instructions").to_str().unwrap())
+                        );
+                        std::fs::read_to_string(plugin.join("instructions/AGENTS.md")).unwrap()
+                    }
+                    AgentProvider::Cursor => std::fs::read_to_string(plugin.join("rules/atomics-chief.mdc")).unwrap(),
+                };
+                assert!(instructions.contains("CHIEF_INSTRUCTIONS: coordinate, plan, review"));
+                let conversation =
+                    app.runtime.sessions[index].claude_id.clone().unwrap_or_else(|| "cursor-chief-conversation".into());
+                let emit = |app: &mut Desktop<'_>, name: &str, fields: serde_json::Value| {
+                    let mut payload = fields;
+                    match provider {
+                        AgentProvider::Copilot => payload["sessionId"] = json!(conversation),
+                        AgentProvider::Cursor => payload["conversation_id"] = json!(conversation),
+                    }
+                    let payload = atomics_core::hook::normalize_native_payload(&payload, provider, name).unwrap();
+                    app.runtime.on_hook(HookMessage {
+                        pane: Some(id.clone()),
+                        ancestors: vec![],
+                        event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                        delivered: 0,
+                        approval_reply: None,
+                    });
+                };
+                emit(app, "sessionStart", json!({}));
+                emit(
+                    app,
+                    match provider {
+                        AgentProvider::Copilot => "userPromptSubmitted",
+                        AgentProvider::Cursor => "beforeSubmitPrompt",
+                    },
+                    json!({"prompt":"Plan the release"}),
+                );
+                assert!(app.runtime.sessions[index].hooks_active);
+                assert_eq!(app.runtime.sessions[index].status, AgentStatus::Working);
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":format!("Release via {}", provider.name()), "tasks":[{"id":"work", "title":"Implement the release"}]}),
+                );
+                assert!(plan.ok, "{plan:?}");
+                let read = request(app, json!({"cmd":"plan_get", "plan":plan.result["plan"]}));
+                assert!(read.ok);
+                assert_eq!(read.result["tasks"][0]["id"], "work");
+                // Config changes affect the next chief; hooks and persistence keep following this one.
+                app.runtime.config.chief.provider = Some(ChiefProvider::Claude);
+                emit(
+                    app,
+                    match provider {
+                        AgentProvider::Copilot => "agentStop",
+                        AgentProvider::Cursor => "stop",
+                    },
+                    json!({"status":"completed", "loop_count":0}),
+                );
+                assert_eq!(app.runtime.sessions[index].status, AgentStatus::Done);
+                app.runtime.remember(&id);
+                let saved = app
+                    .runtime
+                    .store
+                    .sessions
+                    .iter()
+                    .find(|record| record.claude_session_id == conversation)
+                    .unwrap()
+                    .clone();
+                assert_eq!(saved.chief_provider, Some(provider_identity(Some(provider))));
+                app.runtime.close(&id);
+                assert!(!plugin.exists());
+                let before = app.runtime.sessions.len();
+                app.runtime.resume_record(saved.clone());
+                assert_eq!(
+                    app.runtime.sessions.len(),
+                    before,
+                    "provider switch must not pass the old id to another CLI"
+                );
+                assert!(app.runtime.toast.as_ref().unwrap().0.contains("saved conversation belongs to"));
+                app.runtime.config.chief.provider = Some(provider_identity(Some(provider)));
+                app.runtime.resume_record(saved);
+                let resumed = app.runtime.sessions.iter().find(|session| session.chief).unwrap();
+                assert_eq!(resumed.provider, Some(provider));
+                assert_eq!(resumed.claude_id.as_deref(), Some(conversation.as_str()));
+                let resumed_id = resumed.id.clone();
+                assert!(crate::provider_launch::directory(&paths::atomics_home(), &resumed_id).exists());
+                app.runtime.close(&resumed_id);
+            }
+        });
     }
 
     #[test]

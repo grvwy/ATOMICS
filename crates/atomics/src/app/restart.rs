@@ -13,6 +13,12 @@ impl State {
         let mut blockers = Vec::new();
         for session in &self.sessions {
             let hands_off = session.chief && caller == Some(session.id.as_str());
+            if session.status != AgentStatus::Exited && !self.provider_tracking_ready(session) {
+                blockers.push(format!(
+                    "CLI session status or resume identity unavailable for {} ({})",
+                    session.title, session.id
+                ));
+            }
             if !hands_off && matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
                 blockers.push(format!("agent {} ({}) is {}", session.title, session.id, session.status.label()));
             }
@@ -170,6 +176,7 @@ impl State {
             .filter_map(|s| {
                 Some(SessionRecord {
                     chief: s.chief,
+                    chief_provider: s.chief_provider(),
                     pane: Some(s.id.clone()),
                     claude_session_id: s.claude_id.clone()?,
                     agent: s.agent.clone(),
@@ -259,6 +266,12 @@ impl State {
     }
 
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
+        if record.chief
+            && let Err(error) = self.check_chief_resume(&record)
+        {
+            self.toast(error);
+            return;
+        }
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let args = if record.chief { self.config.chief.args.clone() } else { Vec::new() };
@@ -534,6 +547,7 @@ mod tests {
                 .unwrap();
                 let record = SessionRecord {
                     chief: true,
+                    chief_provider: None,
                     pane: Some("old-pane".into()),
                     claude_session_id: "saved-claude-id".into(),
                     agent: "chief".into(),
@@ -622,6 +636,7 @@ mod tests {
                 old_version: "old-commit".into(),
                 sessions: vec![SessionRecord {
                     chief: true,
+                    chief_provider: None,
                     pane: Some("old-pane".into()),
                     claude_session_id: "restarted-claude-id".into(),
                     agent: "chief".into(),

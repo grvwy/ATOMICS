@@ -312,6 +312,10 @@ pub enum SettingsTool {
     CleanCredentials,
     /// Look for git and the agents again, with the login shell's PATH as it is now.
     CheckPrograms,
+    /// Add one built-in CLI preset to this machine's agent list, preserving existing entries.
+    AddAgentPreset {
+        provider: crate::config::AgentProvider,
+    },
     /// Where agents run on this machine, in this host's own config file. The user's own switch, so no proposal.
     SetIsolation {
         mode: crate::isolation::IsolationMode,

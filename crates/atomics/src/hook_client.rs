@@ -5,9 +5,31 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+use atomics_core::config::AgentProvider;
 use atomics_core::hook::{HookReply, HookRequest};
 
 pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool) {
+    run_with_provider(socket, pane, chief, None, None);
+}
+
+pub fn run_with_provider(
+    socket: Option<std::path::PathBuf>,
+    pane: Option<String>,
+    chief: bool,
+    provider: Option<AgentProvider>,
+    event: Option<String>,
+) {
+    let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
+    let socket = socket.or_else(|| {
+        provider.and_then(|_| {
+            std::env::var_os(atomics_core::hook::HOOK_SOCKET_ENV).filter(|v| !v.is_empty()).map(Into::into)
+        })
+    });
+    // Shared native-provider hooks must be inert in unrelated terminals. They cannot use the
+    // default socket or discover a pane by cwd when another ATOMICS instance may own the session.
+    if provider.is_some() && (socket.is_none() || pane.is_none()) {
+        return;
+    }
     // A globally installed Claude hook must not attach this pane to the default instance.
     if socket.is_none() && std::env::var("TERM_PROGRAM").as_deref() == Ok("atomics") {
         return;
@@ -17,8 +39,16 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
         return;
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
+    if let Some(provider) = provider {
+        let Some(native) =
+            event.as_deref().or_else(|| payload.get("hook_event_name").and_then(serde_json::Value::as_str))
+        else {
+            return;
+        };
+        let Some(normalized) = atomics_core::hook::normalize_native_payload(&payload, provider, native) else { return };
+        payload = normalized;
+    }
     prepare_tool_response(&mut payload, chief);
-    let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
     {
@@ -27,7 +57,13 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
         Vec::new()
     };
     let request = HookRequest { pane, ancestors, payload };
-    if let Some(stdout) = forward(&request, socket.unwrap_or_else(atomics_core::paths::socket_path)) {
+    let stdout = forward(&request, socket.unwrap_or_else(atomics_core::paths::socket_path)).or_else(|| {
+        // Observation must never gate Cursor's submitted prompt, including when ATOMICS is
+        // unavailable. This event cannot carry additional context.
+        (provider == Some(AgentProvider::Cursor) && event.as_deref() == Some("beforeSubmitPrompt"))
+            .then(|| serde_json::json!({"continue":true}).to_string())
+    });
+    if let Some(stdout) = stdout {
         print!("{stdout}");
         let _ = std::io::stdout().flush();
     }
@@ -98,8 +134,8 @@ fn forward_with_wait_duration(
 ) -> Option<String> {
     let stream = UnixStream::connect(socket).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
-    let permission =
-        request.payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("PermissionRequest");
+    let permission = request.payload.get("atomics_provider").is_none()
+        && request.payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("PermissionRequest");
     let timeout = if permission { atomics_core::hook::PERMISSION_WAIT_SECONDS + 10 } else { 12 };
     stream.set_read_timeout(Some(wait_duration(timeout))).ok()?;
     let mut writer = &stream;
@@ -335,5 +371,69 @@ mod tests {
         stream.write_all(b"{\"stdout\":null}\n").unwrap();
         let output = child.wait_output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn native_copilot_transport_uses_inherited_routing_and_canonical_fields() {
+        if std::env::var_os("ATOMICS_NATIVE_HOOK_TEST").is_some() {
+            run_with_provider(None, None, false, Some(AgentProvider::Copilot), Some("postToolUse".into()));
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let socket = dir.path().join("native.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut child = TestChild::spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hook_client::tests::native_copilot_transport_uses_inherited_routing_and_canonical_fields",
+                ])
+                .env("ATOMICS_NATIVE_HOOK_TEST", "1")
+                .env(atomics_core::hook::HOOK_SOCKET_ENV, &socket)
+                .env(atomics_core::hook::HOOK_PANE_ENV, "copilot-pane")
+                .stdin(Stdio::piped()),
+            CHILD_TIMEOUT,
+        )
+        .unwrap();
+        child
+            .child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({
+                    "sessionId":"native-session", "toolName":"bash", "toolArgs":{"command":"pwd"},
+                    "toolResult":{"resultType":"success","textResultForLlm":"large ".repeat(10000)}
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let (mut stream, _) = loop {
+            child.check_timeout().unwrap();
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("native hook connection: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(child.remaining())).unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        let request: HookRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(request.pane.as_deref(), Some("copilot-pane"));
+        assert!(request.ancestors.is_empty());
+        assert_eq!(request.payload["hook_event_name"], "PostToolUse");
+        assert_eq!(request.payload["session_id"], "native-session");
+        assert_eq!(request.payload["atomics_provider"], "copilot");
+        assert_eq!(request.payload["tool_input"]["command"], "pwd");
+        assert!(request.payload.get("toolResult").is_none());
+        assert!(request.payload["tool_response_summary"].to_string().len() <= MAX_TOOL_SUMMARY_BYTES);
+        stream.write_all(b"{\"stdout\":null}\n").unwrap();
+        assert!(child.wait_output().unwrap().status.success());
     }
 }

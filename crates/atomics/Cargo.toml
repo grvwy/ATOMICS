@@ -29,6 +29,7 @@ png = "0.18.1"
 rfd = "0.17.2"
 serde_json = "1.0.154"
 serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
 uuid = { version = "1.29.0", features = ["v4"] }
 # The ticket layer's MCP client speaks streamable HTTP too.
 # Browser sign-in for those servers (MCP authorization spec): S256 PKCE, URLs and base64url.
@@ -58,7 +59,10 @@ similar = "3.2.1"
 objc2 = "0.6.5"
 mach2 = "0.6.0"
 
+# Use the same event-loop backend as eframe, with an explicit WSLg compatibility policy.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "x11"] }
+
 [dev-dependencies]
 atomics-core = { path = "../atomics-core", features = ["test-support"] }
 atomics-ui = { path = "../atomics-ui", features = ["test-support"] }
-toml = "1.1.8"

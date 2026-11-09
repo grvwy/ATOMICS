@@ -41,6 +41,20 @@ machine only: its core count, its programs' paths, its repositories. A workspace
 `[isolation]` and `[chief] prompt`; open and close its projects in ATOMICS instead. A theme change writes one theme file; showing
 that theme is a separate `main` or `host` change to `[theme] name`.
 
+## Cursor and Copilot agents
+
+New configurations include `cursor` (`agent`) and `copilot` (`copilot`). In an existing installation,
+**Settings → Getting started → Add Cursor CLI / Add GitHub Copilot** adds the selected preset to this
+host's agent list and preserves existing agents. **Check again** refreshes executable discovery.
+
+The optional `provider = "cursor"` or `provider = "copilot"` in an `[[agents]]` entry selects native
+interactive launch, hooks and session restoration even when `command` names a wrapper or an absolute
+path. These providers use `kind = "generic"`. With no explicit provider, executable basenames `agent`,
+`cursor-agent` and `copilot` select their corresponding adapters. The `cursor` desktop editor does not.
+Other generic agents and the existing Claude/Codex settings retain their behavior.
+
+See [Cursor and Copilot CLI](cli-agents.md) for complete examples and testing instructions.
+
 ## Merge order
 
 ATOMICS starts from the built-in defaults, then applies `config.toml`, then this host's file:
@@ -244,7 +258,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
+| runs commands | `agents`, `approvals`, `chief.command`, `chief.provider`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 

@@ -16,6 +16,14 @@ impl State {
     }
 
     pub(super) fn release_held(&mut self, index: usize) {
+        let session = &self.sessions[index];
+        if session.provider.is_some()
+            && (!self.provider_tracking_ready(session)
+                || !matches!(session.status, AgentStatus::Idle | AgentStatus::Done)
+                || session.pending.is_some())
+        {
+            return;
+        }
         if !self.sessions[index].approval_hold
             && self.sessions[index].approvals.is_empty()
             && !self.sessions[index].pending.as_ref().is_some_and(|pending| pending.codex)
@@ -68,6 +76,11 @@ impl State {
         }
         for index in 0..self.sessions.len() {
             let session = &mut self.sessions[index];
+            // Provider-specific native dialogs are answered in their own terminals. The
+            // existing screen recognizer and keystroke answers target Claude and Codex.
+            if session.provider.is_some() {
+                continue;
+            }
             if session.sandbox.is_some() {
                 let had_approvals = !session.approvals.is_empty();
                 let mut expired = Vec::new();
@@ -198,7 +211,8 @@ impl State {
     /// withdraws its approval at once; a screen with no menu leaves it to the quiet period.
     pub(super) fn sync_native(&mut self, index: usize, screen: &str, now: Instant) {
         let session = &mut self.sessions[index];
-        if session.sandbox.is_some() || !session.is_agent() || session.terminal.is_none() {
+        if session.sandbox.is_some() || !session.is_agent() || session.terminal.is_none() || session.provider.is_some()
+        {
             return;
         }
         let visible = atomics_core::approvals::native_menu(screen);
@@ -1607,6 +1621,7 @@ mod tests {
             |app, _ctx| {
                 let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "test".into(),
                     command: vec![fixture.to_string_lossy().into_owned()],
                     kind: AgentKind::Generic,
@@ -1845,6 +1860,7 @@ mod tests {
             "app::approvals::tests::approvals_and_held_sends_stay_with_their_plan_across_tab_switches",
             |app, _ctx| {
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "test".into(),
                     command: vec![],
                     kind: AgentKind::Generic,

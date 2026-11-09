@@ -27,7 +27,8 @@ resume after a restart. See [What it does](../README.md#what-it-does).
 
 ## The chief
 
-The chief is a Claude session with every ATOMICS tool, started in the project's main checkout (**CHIEF**
+The chief uses Claude by default, or the configured Cursor or Copilot CLI, with every ATOMICS tool.
+It starts in the project's main checkout (**CHIEF**
 or `cmd+o`). It plans, waits for your approval, dispatches, verifies and reviews, and never pushes
 without asking. It always runs bare, on this machine, because it needs `atomics ctl`, git across
 repositories and the builds of bare tasks. It answers other agents' permission prompts

@@ -368,6 +368,7 @@ mod tests {
                 app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
                 app.runtime.config.isolation.bare_relay = true;
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "relay-probe".into(),
                     command: vec![script.display().to_string()],
                     kind: AgentKind::Claude,

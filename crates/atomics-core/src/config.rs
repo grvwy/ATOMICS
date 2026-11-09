@@ -91,6 +91,19 @@ command = ["codex"]
 kind = "generic"
 busy_text = "esc to interrupt"   # screen text that means "working", for agents without hooks
 
+# Cursor CLI uses `agent` (or `cursor-agent`), never the Cursor editor command `cursor`.
+[[agents]]
+name = "cursor"
+command = ["agent"]
+kind = "generic"
+provider = "cursor"
+
+[[agents]]
+name = "copilot"
+command = ["copilot"]
+kind = "generic"
+provider = "copilot"
+
 [[agents]]
 name = "shell"
 command = []                # empty = your login shell
@@ -458,11 +471,13 @@ wake_secs = 180              # wake an idle chief while work is open; 0 = off, m
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
+# For Cursor use command = ["agent"], for Copilot command = ["copilot"]; set args = [] to clear the Claude model.
+# provider = "cursor"      # optional explicit identity for a wrapper: "claude", "cursor" or "copilot"
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
                           # config.d/<host>.toml and the workspace file add theirs after this one
 # cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
-# resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
+# resume = "<id>"         # exact provider session id the chief continues instead of starting a new conversation
 # autostart = false       # start the chief when ATOMICS starts
 
 [steer]
@@ -691,7 +706,7 @@ every agent, diff and the plan board in the same window. Open projects: {project
 How to work:
 1. Understand the goal and read the code you need. You run in the project's main checkout: read it, never edit it.
 2. Write the plan with atomics_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
-can verify, dependencies, the agent (claude for design-heavy work, codex for well-specified changes) and its args. \
+can verify, dependencies, the agent (choose a configured agent such as claude, codex, cursor or copilot) and its args. \
 Without a plan id, atomics_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. atomics_plan_dispatch, then loop on atomics_wait (never sleep or poll). On reported or turn done, read atomics_result and atomics_diff.
@@ -727,14 +742,23 @@ pub enum ChiefDock {
     Docked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// Explicit chief identity, including Claude wrappers whose executable name is arbitrary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiefProvider {
+    Claude,
+    Cursor,
+    Copilot,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChiefConfig {
     pub heartbeat_secs: u64,
     /// Wake an idle chief while work is open; zero disables wakes, otherwise at least 30 seconds.
-    #[serde(deserialize_with = "deserialize_wake_secs")]
     pub wake_secs: u64,
     pub dock: ChiefDock,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ChiefProvider>,
     pub command: Vec<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
@@ -744,7 +768,7 @@ pub struct ChiefConfig {
     pub prompt: String,
     /// The folder the chief starts in (`~/` allowed). Unset: the main checkout of the project on screen.
     pub cwd: Option<String>,
-    /// A Claude conversation, by session id, that the chief continues instead of starting anew.
+    /// An exact provider conversation id that the chief continues instead of starting anew.
     pub resume: Option<String>,
     /// Start the chief as soon as ATOMICS starts, unless a restart already brings it back.
     pub autostart: bool,
@@ -766,6 +790,7 @@ impl Default for ChiefConfig {
             heartbeat_secs: 300,
             wake_secs: 180,
             dock: ChiefDock::Floating,
+            provider: None,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
@@ -774,6 +799,95 @@ impl Default for ChiefConfig {
             resume: None,
             autostart: false,
         }
+    }
+}
+
+impl ChiefConfig {
+    /// Native CLI integration for the chief. Unrecognized commands remain Claude wrappers,
+    /// preserving existing configurations; an explicit provider selects another integration.
+    pub fn provider(&self) -> Option<AgentProvider> {
+        match self.provider {
+            Some(ChiefProvider::Claude) => None,
+            Some(ChiefProvider::Cursor) => Some(AgentProvider::Cursor),
+            Some(ChiefProvider::Copilot) => Some(AgentProvider::Copilot),
+            None => AgentProvider::for_program(self.command.first()?),
+        }
+    }
+
+    pub fn agent(&self) -> AgentConfig {
+        let provider = self.provider();
+        AgentConfig {
+            name: "chief".into(),
+            command: self.command.clone(),
+            kind: if provider.is_some() { AgentKind::Generic } else { AgentKind::Claude },
+            provider,
+            busy_text: None,
+            isolation: Some(crate::isolation::IsolationMode::Bare),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChiefConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Optional command/args retain whether they were explicitly configured. In particular,
+        // selecting a native CLI must not inherit Claude's default model arguments.
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Fields {
+            heartbeat_secs: u64,
+            #[serde(deserialize_with = "deserialize_wake_secs")]
+            wake_secs: u64,
+            dock: ChiefDock,
+            provider: Option<ChiefProvider>,
+            command: Option<Vec<String>>,
+            args: Option<Vec<String>>,
+            system_prompt: String,
+            prompt: String,
+            cwd: Option<String>,
+            resume: Option<String>,
+            autostart: bool,
+        }
+        impl Default for Fields {
+            fn default() -> Self {
+                let chief = ChiefConfig::default();
+                Self {
+                    heartbeat_secs: chief.heartbeat_secs,
+                    wake_secs: chief.wake_secs,
+                    dock: chief.dock,
+                    provider: chief.provider,
+                    command: None,
+                    args: None,
+                    system_prompt: chief.system_prompt,
+                    prompt: chief.prompt,
+                    cwd: chief.cwd,
+                    resume: chief.resume,
+                    autostart: chief.autostart,
+                }
+            }
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let command = fields.command.unwrap_or_else(|| match fields.provider {
+            Some(ChiefProvider::Cursor) => vec!["agent".into()],
+            Some(ChiefProvider::Copilot) => vec!["copilot".into()],
+            _ => ChiefConfig::default().command,
+        });
+        let mut chief = Self {
+            heartbeat_secs: fields.heartbeat_secs,
+            wake_secs: fields.wake_secs,
+            dock: fields.dock,
+            provider: fields.provider,
+            command,
+            args: Vec::new(),
+            system_prompt: fields.system_prompt,
+            prompt: fields.prompt,
+            cwd: fields.cwd,
+            resume: fields.resume,
+            autostart: fields.autostart,
+        };
+        chief.args = fields
+            .args
+            .unwrap_or_else(|| if chief.provider().is_some() { Vec::new() } else { ChiefConfig::default().args });
+        Ok(chief)
     }
 }
 
@@ -853,6 +967,57 @@ pub enum AgentKind {
     Shell,
 }
 
+/// Provider-specific CLI integration, independent of the displayed agent name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProvider {
+    Copilot,
+    Cursor,
+}
+
+impl AgentProvider {
+    pub const ALL: [Self; 2] = [Self::Cursor, Self::Copilot];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Copilot => "GitHub Copilot",
+            Self::Cursor => "Cursor CLI",
+        }
+    }
+
+    fn for_program(program: &str) -> Option<Self> {
+        match std::path::Path::new(program).file_name()?.to_str()? {
+            "copilot" => Some(Self::Copilot),
+            "agent" | "cursor-agent" => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+
+    pub fn preset(self) -> AgentConfig {
+        AgentConfig {
+            name: self.name().into(),
+            command: vec![
+                match self {
+                    Self::Copilot => "copilot",
+                    Self::Cursor => "agent",
+                }
+                .into(),
+            ],
+            kind: AgentKind::Generic,
+            provider: Some(self),
+            busy_text: None,
+            isolation: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub name: String,
@@ -860,6 +1025,9 @@ pub struct AgentConfig {
     pub command: Vec<String>,
     #[serde(default = "AgentConfig::default_kind")]
     pub kind: AgentKind,
+    /// Explicit identity for wrappers and custom executable names. Applies only to generic agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<AgentProvider>,
     /// Text the agent shows while it works. Used to track status of agents without hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_text: Option<String>,
@@ -999,6 +1167,7 @@ impl Default for Config {
             name: name.into(),
             command: command.iter().map(|c| c.to_string()).collect(),
             kind,
+            provider: None,
             busy_text: busy.map(str::to_string),
             isolation: None,
         };
@@ -1016,6 +1185,8 @@ impl Default for Config {
             agents: vec![
                 agent("claude", &["claude"], AgentKind::Claude, None),
                 agent("codex", &["codex"], AgentKind::Generic, Some("esc to interrupt")),
+                AgentProvider::Cursor.preset(),
+                AgentProvider::Copilot.preset(),
                 agent("shell", &[], AgentKind::Shell, None),
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
@@ -1089,8 +1260,16 @@ impl Default for KeyConfig {
 }
 
 impl AgentConfig {
+    pub fn provider(&self) -> Option<AgentProvider> {
+        if self.kind != AgentKind::Generic {
+            return None;
+        }
+        self.provider.or_else(|| AgentProvider::for_program(self.command.first()?))
+    }
+
     pub fn is_codex(&self) -> bool {
         self.kind == AgentKind::Generic
+            && self.provider.is_none()
             && self
                 .command
                 .first()
@@ -1182,6 +1361,9 @@ impl Config {
         let mut config: Config = toml::Value::Table(Self::merged(tables)).try_into()?;
         if config.agents.is_empty() {
             config.agents = Config::default().agents;
+        }
+        if config.agents.iter().any(|agent| agent.provider.is_some() && agent.kind != AgentKind::Generic) {
+            return Err(<toml::de::Error as serde::de::Error>::custom("agents.provider requires kind = generic"));
         }
         Ok(config)
     }
@@ -1457,11 +1639,113 @@ kind = "shell"
                 name: name.into(),
                 command: command.into_iter().map(str::to_string).collect(),
                 kind,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             };
             assert_eq!(agent.is_codex(), expected, "{agent:?}");
         }
+    }
+
+    #[test]
+    fn providers_use_explicit_identity_then_cli_basename_and_preserve_legacy_kinds() {
+        for (program, expected) in [
+            ("copilot", Some(AgentProvider::Copilot)),
+            ("/opt/bin/copilot", Some(AgentProvider::Copilot)),
+            ("agent", Some(AgentProvider::Cursor)),
+            ("/opt/bin/cursor-agent", Some(AgentProvider::Cursor)),
+            ("cursor", None),
+            ("custom-wrapper", None),
+        ] {
+            let mut agent = AgentProvider::Copilot.preset();
+            agent.name = "arbitrary display name".into();
+            agent.command = vec![program.into()];
+            agent.provider = None;
+            assert_eq!(agent.provider(), expected, "{program}");
+            agent.provider = Some(AgentProvider::Cursor);
+            assert_eq!(agent.provider(), Some(AgentProvider::Cursor));
+            assert!(!agent.is_codex());
+            agent.kind = AgentKind::Claude;
+            assert_eq!(agent.provider(), None);
+            agent.kind = AgentKind::Shell;
+            assert_eq!(agent.provider(), None);
+        }
+        let bad: toml::Table = toml::from_str("[[agents]]\nname='x'\nkind='shell'\nprovider='cursor'").unwrap();
+        assert!(Config::from_tables([bad]).unwrap_err().to_string().contains("requires kind"));
+    }
+
+    #[test]
+    fn chief_native_selection_uses_agent_identity_and_provider_specific_defaults() {
+        for (selection, provider, executable) in [
+            ("command = ['agent']", AgentProvider::Cursor, "agent"),
+            ("command = ['/opt/bin/cursor-agent']", AgentProvider::Cursor, "/opt/bin/cursor-agent"),
+            ("command = ['copilot']", AgentProvider::Copilot, "copilot"),
+            ("provider = 'cursor'", AgentProvider::Cursor, "agent"),
+            ("provider = 'copilot'", AgentProvider::Copilot, "copilot"),
+        ] {
+            let config: Config = toml::from_str(&format!("[chief]\n{selection}")).unwrap();
+            let chief = config.chief.agent();
+            assert_eq!(chief.name, "chief");
+            assert_eq!(chief.kind, AgentKind::Generic);
+            assert_eq!(chief.provider(), Some(provider));
+            assert_eq!(chief.command, [executable]);
+            assert!(config.chief.args.is_empty(), "native providers do not inherit Claude's model: {selection}");
+            let saved = toml::to_string(&config).unwrap();
+            let loaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.chief.provider(), Some(provider));
+            assert!(loaded.chief.args.is_empty());
+        }
+    }
+
+    #[test]
+    fn chief_legacy_wrappers_and_explicit_provider_overrides_keep_their_settings() {
+        for text in
+            ["", "[chief]", "[chief]\ncommand=['/opt/claude-wrapper']", "[chief]\ncommand=['/bin/sh','wrapper']"]
+        {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.chief.agent().kind, AgentKind::Claude);
+            assert_eq!(config.chief.provider(), None);
+            assert_eq!(config.chief.args, ChiefConfig::default().args);
+        }
+        let config: Config =
+            toml::from_str("[chief]\ncommand=['wrapped']\nprovider='copilot'\nargs=['--model','custom']").unwrap();
+        assert_eq!(config.chief.agent().command, ["wrapped"]);
+        assert_eq!(config.chief.provider(), Some(AgentProvider::Copilot));
+        assert_eq!(config.chief.args, ["--model", "custom"]);
+        let config: Config = toml::from_str("[chief]\ncommand=['agent']\nprovider='claude'").unwrap();
+        assert_eq!(config.chief.agent().kind, AgentKind::Claude, "explicit identity wins over the executable name");
+        assert_eq!(config.chief.args, ChiefConfig::default().args);
+        let config: Config = toml::from_str("[chief]\nargs=[]").unwrap();
+        assert!(config.chief.args.is_empty(), "an explicit empty argument list is preserved for Claude too");
+    }
+
+    #[test]
+    fn chief_command_override_preserves_arguments_already_written_in_merged_config() {
+        let main: toml::Table = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let host: toml::Table = toml::from_str("[chief]\ncommand=['agent']").unwrap();
+        let config = Config::from_tables([main.clone(), host]).unwrap();
+        assert_eq!(config.chief.provider(), Some(AgentProvider::Cursor));
+        assert_eq!(config.chief.args, ChiefConfig::default().args, "explicit main-file arguments remain configured");
+        let host: toml::Table = toml::from_str("[chief]\ncommand=['agent']\nargs=[]").unwrap();
+        assert!(Config::from_tables([main, host]).unwrap().chief.args.is_empty());
+        assert!(toml::from_str::<Config>("[chief]\nprovider='shell'").is_err());
+    }
+
+    #[test]
+    fn provider_defaults_roundtrip_and_existing_agent_arrays_stay_intact() {
+        let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        for provider in AgentProvider::ALL {
+            assert_eq!(config.agent(provider.name()).unwrap().provider(), Some(provider));
+            let preset = provider.preset();
+            let saved = toml::to_string(&preset).unwrap();
+            assert_eq!(toml::from_str::<AgentConfig>(&saved).unwrap().provider(), Some(provider));
+        }
+        let existing: toml::Table =
+            toml::from_str("[[agents]]\nname='custom'\ncommand=['wrapped','--flag']\nbusy_text='busy'").unwrap();
+        let existing = Config::from_tables([existing]).unwrap();
+        assert_eq!(existing.agents.len(), 1);
+        assert_eq!(existing.agents[0].command, ["wrapped", "--flag"]);
+        assert_eq!(existing.agents[0].busy_text.as_deref(), Some("busy"));
     }
 
     #[test]

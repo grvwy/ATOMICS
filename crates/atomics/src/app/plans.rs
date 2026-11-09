@@ -1984,6 +1984,7 @@ mod tests {
                     std::fs::remove_file(&output).unwrap();
                 }
                 app.runtime.config.agents = vec![atomics_core::config::AgentConfig {
+                    provider: None,
                     name: agent.into(),
                     command: vec![
                         "/bin/sh".into(),
@@ -2307,6 +2308,7 @@ mod tests {
                 let (dir, repo) = repository();
                 app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "fixture".into(),
                     command: vec!["/bin/cat".into()],
                     kind: AgentKind::Shell,
@@ -2354,6 +2356,7 @@ mod tests {
                 let (dir, repo) = repository();
                 app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    provider: None,
                     name: "fixture".into(),
                     command: vec!["/bin/cat".into()],
                     kind: AgentKind::Shell,

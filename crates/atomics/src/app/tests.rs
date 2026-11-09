@@ -5,6 +5,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         id: id.into(),
         agent: "test".into(),
         kind,
+        provider: None,
         terminal: None,
         claude_id: Some(id.into()),
         cwd: cwd.into(),
@@ -499,6 +500,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
 
 fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+        provider: None,
         name: "test".into(),
         command: vec![],
         kind: AgentKind::Generic,

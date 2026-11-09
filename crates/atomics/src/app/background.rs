@@ -647,6 +647,18 @@ impl State {
 
     pub(super) fn on_hook(&mut self, message: HookMessage) {
         let event = message.event;
+        // Native provider hooks belong to the pane whose launch installed them. They must
+        // never attach an unrelated terminal or create an external Claude session.
+        if let Some(provider) = event.provider {
+            let owned = message.pane.as_ref().and_then(|pane| self.sessions.iter().find(|session| &session.id == pane));
+            if !owned.is_some_and(|session| session.provider == Some(provider))
+                || event.name == "PermissionRequest"
+                || event.thread != HookThread::Main
+            {
+                leave_to_agent(message.approval_reply);
+                return;
+            }
+        }
         // An agent's background threads inherit its pane, but what they do is not the session's.
         if event.thread == HookThread::Background || self.dismissed.contains(&event.session_id) {
             leave_to_agent(message.approval_reply);
@@ -676,6 +688,7 @@ impl State {
                     id: format!("ext:{}", event.session_id),
                     agent: "claude".into(),
                     kind: AgentKind::Claude,
+                    provider: None,
                     terminal: None,
                     claude_id: Some(event.session_id.clone()),
                     cwd,
@@ -712,6 +725,13 @@ impl State {
             }
         };
 
+        // A provider may also load older compatibility hooks from user configuration. Only
+        // events from this PTY's integration may change its conversation or permissions.
+        if self.sessions[index].provider != event.provider {
+            leave_to_agent(message.approval_reply);
+            return;
+        }
+
         // A command that drops shared stash entries says whose, for whoever decides.
         let (stash_warning, stash) = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
             .then(|| self.stash_warning(index, &ApprovalRequest::from_event(&event)))
@@ -726,8 +746,12 @@ impl State {
             leave_to_agent(message.approval_reply);
             return;
         }
+        let same_conversation = session.claude_id.as_deref() == Some(event.session_id.as_str());
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        if event.provider.is_some() {
+            session.warning = None;
+        }
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
@@ -786,13 +810,45 @@ impl State {
         if let Some(status) = event.status()
             && (main || session.status == AgentStatus::NeedsInput || !session.approvals.is_empty())
         {
-            session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
+            session.status = if !session.approvals.is_empty() {
+                AgentStatus::NeedsInput
+            } else if event.provider.is_some() && event.name == "Stop" && message.delivered > 0 {
+                // A provider stop reply schedules another turn with the queued review. The
+                // gap before that turn's first hook is not safe for cleanup or an update.
+                AgentStatus::Working
+            } else if event.provider.is_some() && event.name == "SessionEnd" && session.terminal.is_some() {
+                // /clear can end a conversation without ending the CLI. Only PTY exit is
+                // authoritative; a subsequent SessionStart binds the replacement conversation.
+                session.hooks_active = false;
+                AgentStatus::Starting
+            } else if event.provider.is_some()
+                && event.name == "SessionStart"
+                && (session.status == AgentStatus::Working
+                    || same_conversation && session.status == AgentStatus::NeedsInput)
+            {
+                // Fire-and-forget start notifications can arrive after prompt submission.
+                session.status
+            } else {
+                status
+            };
+        }
+        if event.provider.is_some() {
+            // Reports through MCP can arrive while the CLI is still finishing its turn.
+            // Keep the same cleanup guard as a visibly busy terminal until a lifecycle end.
+            match event.name.as_str() {
+                "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => session.screen_busy = true,
+                "Stop" | "Interrupt" | "SessionEnd" if event.status().is_some() => {
+                    session.screen_busy = session.status == AgentStatus::Working;
+                }
+                "PostToolUseFailure" if event.interrupted => session.screen_busy = false,
+                _ => {}
+            }
         }
         match event.name.as_str() {
             "UserPromptSubmit" if main => {
                 self.pending_questions.remove(&session.id);
                 if let Some(pending) = &mut session.pending
-                    && pending.codex
+                    && (pending.codex || event.provider.is_some())
                     && event.prompt.as_deref() == Some(&pending.text)
                 {
                     if let Some(reply) = pending.reply.take() {
@@ -947,6 +1003,121 @@ mod tests {
     use super::*;
     use atomics_core::projection::{HostInfo, Projections, ResourceInfo};
 
+    fn provider_hook(provider: atomics_core::config::AgentProvider, name: &str, pane: Option<&str>) -> HookMessage {
+        HookMessage {
+            pane: pane.map(str::to_owned),
+            ancestors: vec![],
+            delivered: 0,
+            approval_reply: None,
+            event: atomics_core::hook::HookEvent {
+                name: name.into(),
+                session_id: "conversation".into(),
+                provider: Some(provider),
+                completion_status: Some("completed".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn provider_hooks_require_the_matching_owned_pane() {
+        with_app("app::background::tests::provider_hooks_require_the_matching_owned_pane", |app, _| {
+            use atomics_core::config::AgentProvider::{Copilot, Cursor};
+            let mut worker = session("pane", AgentKind::Generic, AgentStatus::Working, &paths::atomics_home());
+            worker.agent = "cursor".into();
+            worker.provider = Some(Cursor);
+            worker.claude_id = None;
+            app.runtime.sessions = vec![worker];
+            app.runtime.on_hook(provider_hook(Cursor, "SessionStart", None));
+            app.runtime.on_hook(provider_hook(Cursor, "SessionStart", Some("missing")));
+            app.runtime.on_hook(provider_hook(Copilot, "SessionStart", Some("pane")));
+            let mut child = provider_hook(Cursor, "SessionStart", Some("pane"));
+            child.event.thread = HookThread::Spawned;
+            app.runtime.on_hook(child);
+            assert_eq!(app.runtime.sessions.len(), 1);
+            assert!(!app.runtime.sessions[0].hooks_active);
+            assert!(app.runtime.sessions[0].claude_id.is_none());
+            app.runtime.on_hook(provider_hook(Cursor, "SessionStart", Some("pane")));
+            assert!(app.runtime.sessions[0].hooks_active);
+            assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("conversation"));
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "late start cannot end a running turn");
+            app.runtime.sessions[0].status = AgentStatus::NeedsInput;
+            app.runtime.on_hook(provider_hook(Cursor, "SessionStart", Some("pane")));
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput, "late start cannot dismiss a prompt");
+        });
+    }
+
+    #[test]
+    fn native_chief_hooks_and_held_messages_follow_the_running_provider() {
+        with_app(
+            "app::background::tests::native_chief_hooks_and_held_messages_follow_the_running_provider",
+            |app, _| {
+                use atomics_core::config::AgentProvider::{Copilot, Cursor};
+                for provider in [Cursor, Copilot] {
+                    let mut chief =
+                        session("chief-pane", AgentKind::Generic, AgentStatus::Idle, &paths::atomics_home());
+                    chief.agent = "chief".into();
+                    chief.chief = true;
+                    chief.provider = Some(provider);
+                    chief.claude_id = None;
+                    chief.held.push("review this plan".into());
+                    app.runtime.sessions = vec![chief];
+                    // Even if the next chief is configured as Claude, the running PTY keeps its identity.
+                    app.runtime.config.chief.command = vec!["claude".into()];
+                    assert!(!app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));
+                    app.runtime.release_held(0);
+                    assert_eq!(app.runtime.sessions[0].held, ["review this plan"]);
+                    let wrong = if provider == Cursor { Copilot } else { Cursor };
+                    app.runtime.on_hook(provider_hook(wrong, "SessionStart", Some("chief-pane")));
+                    assert!(!app.runtime.sessions[0].hooks_active);
+                    for name in ["SessionStart", "PermissionRequest"] {
+                        let mut legacy = provider_hook(provider, name, Some("chief-pane"));
+                        legacy.event.provider = None;
+                        app.runtime.on_hook(legacy);
+                        assert!(!app.runtime.sessions[0].hooks_active);
+                        assert!(app.runtime.sessions[0].claude_id.is_none());
+                        assert!(app.runtime.sessions[0].approvals.is_empty());
+                    }
+                    app.runtime.on_hook(provider_hook(provider, "SessionStart", Some("chief-pane")));
+                    assert!(app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));
+                    app.runtime.on_hook(provider_hook(provider, "UserPromptSubmit", Some("chief-pane")));
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                    app.runtime.release_held(0);
+                    assert_eq!(app.runtime.sessions[0].held, ["review this plan"]);
+                    app.runtime.on_hook(provider_hook(provider, "Stop", Some("chief-pane")));
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn provider_followup_and_missing_hooks_keep_cleanup_and_restart_waiting() {
+        with_app(
+            "app::background::tests::provider_followup_and_missing_hooks_keep_cleanup_and_restart_waiting",
+            |app, _| {
+                use atomics_core::config::AgentProvider::Cursor;
+                let mut worker = session("pane", AgentKind::Generic, AgentStatus::Done, &paths::atomics_home());
+                worker.agent = "cursor".into();
+                worker.provider = Some(Cursor);
+                worker.claude_id = None;
+                app.runtime.sessions = vec![worker];
+                assert!(!app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));
+                assert!(app.runtime.restart_blockers().iter().any(|reason| reason.contains("resume identity")));
+                assert!(app.runtime.agent_cleanup_candidates().is_empty());
+                app.runtime.on_hook(provider_hook(Cursor, "SessionStart", Some("pane")));
+                assert!(app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));
+                let mut stopped = provider_hook(Cursor, "Stop", Some("pane"));
+                stopped.delivered = 1;
+                app.runtime.on_hook(stopped);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                assert!(app.runtime.restart_blockers().iter().any(|reason| reason.contains("working")));
+                app.runtime.on_hook(provider_hook(Cursor, "Stop", Some("pane")));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+            },
+        );
+    }
+
     #[test]
     fn resource_samples_publish_fresh_data_without_repainting_an_unchanged_view() {
         let before = ResourceInfo { sampled_at: 100, load: Some(4.21), cores: 8, ..Default::default() };
@@ -1024,6 +1195,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                provider: None,
                 name: "test".into(),
                 command: vec![],
                 kind: AgentKind::Generic,
