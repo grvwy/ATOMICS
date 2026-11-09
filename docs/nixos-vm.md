@@ -553,8 +553,8 @@ fixed text) and `login_NAME`. `onboard_option NAME HELP HANDLER` adds a `--NAME 
 
 ### Trust and secrets
 
-The VM is one trust domain. Every agent, the chief and everything they run (builds, package scripts,
-containers) run as `<user>`, and each of them can reach all of the following:
+Without [hardened mode](#hardened-mode) the VM is one trust domain. Every agent, the chief and everything
+they run (builds, package scripts, containers) run as `<user>`, and each of them can reach all of the following:
 
 - **Plain-text credentials.** The guest has no keyring or Secret Service, so Claude Code, Codex and gh
   (and in the example, az, Git Credential Manager and the Azure Artifacts credential provider) keep their
@@ -587,6 +587,60 @@ folder:
 limactl shell --workdir="$PWD" atomics bash --login -c \
   'bash nix/vm/onboard-test.sh "$(command -v atomics-onboard)" --journal /nix/store "$HOME"'
 ```
+
+### Hardened mode
+
+`atomics.vm.hardened = true` (in a module of your own, [Your own NixOS modules](#your-own-nixos-modules))
+keeps root away from `<user>`, and so from the host, the chief, every agent and what they run:
+
+- **No sudo.** `<user>` leaves `wheel`, and the rule cloud-init writes from Lima's user data on every boot
+  (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts. The host's service also
+  runs with `NoNewPrivileges`, so nothing it starts gains privileges through a setuid program.
+- **Rootless Docker.** `<user>` leaves `docker` and gets Docker of its own, under its own systemd from boot.
+  Containers run in its user namespace, with no more than `<user>` has, and their traffic leaves as
+  `<user>`'s, under the [network policy](#network-policy). `/run/docker.sock` leads to it, so tools that know
+  only that path work unchanged. Root's Docker is off; images and volumes from before start over.
+- **Read-only shares.** The Mac's folders are mounted read-only, unless a module sets a share's `writable`.
+  With the host in the VM, agents work on the VM's disk, and a writable `~/repos` would let one plant a git
+  hook or a NixOS module that later runs on the Mac. An existing instance keeps Lima's own mount settings:
+  make them match with `limactl edit <instance> --set '.mounts[].writable = false'` while it is stopped.
+- **An admin user.** `atomics.vm.adminUser` (`admin`) is the one user with sudo. Only the key Lima gives
+  `<user>` reaches it, read at every boot from Lima's read-only cidata disk, so nothing `<user>` can write
+  changes who logs in as it. `atomics vm update` builds the system and selects it as this user, over Lima's
+  ssh config (`ssh -F ~/.lima/<instance>/ssh.config -l admin lima-<instance>`), and asks about busy work as
+  `<user>`. Build and selection run as the same user, so an agent cannot hand the admin a system of its own.
+
+The first update that turns it on still runs as `<user>`, with sudo; later ones run as the admin. Sign-ins
+stay `<user>`'s, in plain-text files every agent can read, as above.
+
+### Network policy
+
+`atomics.vm.egress.enable = true` lets `<user>`'s new connections through only to listed domains. dnsmasq
+becomes the guest's resolver: it forwards listed domains, with their subdomains, to Lima's resolver (which
+asks the Mac's, and so its VPN's) and refuses every other name, so a lookup cannot carry data out either.
+Each address it hands out for a listed domain goes into an nftables set, and only those addresses are
+allowed, on ports 80 and 443 (`webPorts`), or on a rule's own ports. Root and system services are not
+filtered. Use it with [hardened mode](#hardened-mode): without it any agent can become root and lift it.
+
+```nix
+atomics.vm.egress = {
+  enable = true;
+  domains = [ "dev.azure.com" "login.microsoftonline.com" ];       # with their subdomains, on 80 and 443
+  rules = [ { domains = [ "db.example.database.windows.net" ]; ports = [ 1433 ]; } ];
+};
+```
+
+The defaults (`defaults = true`) cover what any agent here needs: Anthropic's and OpenAI's services,
+GitHub with its packages and downloads, npm, NuGet, .NET downloads, crates.io and rustup, PyPI, Docker Hub,
+MCR, NixOS, and documentation (Microsoft Learn, Stack Overflow and Stack Exchange, MDN and a few more).
+A team adds its cloud, ticket system and databases. Refused connections are logged:
+`journalctl -k -g atomics-egress` lists each with its destination; a refused name shows in a tool's own
+error. With `enforce = false` nothing is refused, only logged, which helps to learn what work needs before
+enforcing; names outside the list are refused either way.
+
+Limits: an allowed address is allowed whatever name led there, which matters behind shared CDNs, and an
+allowed service that stores data (a GitHub repository, a package feed) can still receive what an agent sends.
+The policy narrows where data can go; it does not make the sign-ins in the VM safe to leak.
 
 ## Agents in the VM
 

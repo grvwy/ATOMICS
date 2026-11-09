@@ -38,6 +38,10 @@ pub struct BundleInfo {
     /// The ATOMICS host in the VM, when the bundle was built with it (`--host`).
     #[serde(default)]
     pub host: Option<HostInfo>,
+    /// The guest user that builds and switches the system when the VM's own user may not use sudo
+    /// (`atomics.vm.hardened`). Updates reach it over Lima's ssh config, with the key only this Mac has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<String>,
     /// Build inputs saved by newer bundles; older bundles recover these from Lima's config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildInfo>,
@@ -241,6 +245,32 @@ pub fn guest_shell(info: &BundleInfo) -> Result<Command> {
     let mut command = limactl_command()?;
     command.args(["shell", &format!("--workdir={}", info.home), &info.instance]);
     Ok(command)
+}
+
+/// A bash in the guest that runs the script on its stdin, for changes to the system: as the admin user over
+/// Lima's ssh config in hardened mode, where the VM's own user has no sudo, and as that user otherwise. A login
+/// shell sets PATH and the profile up, then hands over to a plain bash: an `exit` in a login shell would source
+/// /etc/bash_logout, which fails under a script's `set -u`.
+pub fn system_shell(info: &BundleInfo) -> Result<Command> {
+    let Some(admin) = &info.admin else {
+        let mut command = guest_shell(info)?;
+        command.args(["bash", "--login", "-c", "exec bash -s"]);
+        return Ok(command);
+    };
+    let mut command = Command::new("ssh");
+    command
+        .arg("-F")
+        .arg(lima_home().join(&info.instance).join("ssh.config"))
+        .args(["-o", "LogLevel=ERROR", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-T", "-l", admin])
+        .arg(format!("lima-{}", info.instance))
+        // ssh hands the remote shell one command line.
+        .arg("bash --login -c 'exec bash -s'");
+    Ok(command)
+}
+
+/// Where Lima keeps its instances.
+fn lima_home() -> PathBuf {
+    std::env::var_os("LIMA_HOME").map(PathBuf::from).unwrap_or_else(|| atomics_core::paths::home().join(".lima"))
 }
 
 /// The VM's status, kept current on a thread of its own for the UI: Lima is asked every few seconds

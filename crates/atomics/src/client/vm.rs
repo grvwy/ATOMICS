@@ -342,6 +342,7 @@ mod tests {
             mac_user: "user".into(),
             install_dir: dir.display().to_string(),
             host: Some(HostInfo { port }),
+            admin: None,
             build: None,
         }
     }

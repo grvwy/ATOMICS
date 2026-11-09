@@ -325,6 +325,8 @@ let
     build = { inherit (config.atomics.vm) cpus memoryGiB diskGiB; };
   } // lib.optionalAttrs (cfg.hostPort != null) {
     host.port = cfg.hostPort;
+  } // lib.optionalAttrs (cfg.adminUser != null) {
+    admin = cfg.adminUser;
   });
 
   textFile = name: text: executable: pkgs.writeTextFile { inherit name text executable; };
@@ -447,6 +449,15 @@ in
         Variables the wrappers pass from the Mac's terminal to the program here. Everything else
         comes from this machine's login environment; the Mac's PATH, job server, compiler cache
         and credential relay mean nothing here.
+      '';
+    };
+
+    adminUser = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        The guest user `atomics vm update` builds and switches the system as, over Lima's ssh config, when
+        the VM's own user may not use sudo (atomics.vm.hardened). Null: the VM's user, with sudo.
       '';
     };
 

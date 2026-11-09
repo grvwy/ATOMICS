@@ -217,6 +217,23 @@ fn guest(info: &BundleInfo, script: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+/// Runs `script` where the system may be changed: as the admin user in hardened mode (super::system_shell).
+fn system(info: &BundleInfo, script: &str) -> Result<String> {
+    use std::io::Write;
+    let mut child = super::system_shell(info)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("running the VM update step")?;
+    child.stdin.take().context("the VM update step's stdin")?.write_all(script.as_bytes())?;
+    let output = child.wait_with_output().context("running the VM update step")?;
+    if !output.status.success() {
+        bail!("the VM update step failed (above)");
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
 fn busy(answer: &Value) -> Result<Vec<String>> {
     if answer["ok"] != true || !answer["result"]["sessions"].is_array() {
         bail!("the VM's host did not answer list; keeping its current system");
@@ -280,7 +297,7 @@ struct Built<'a> {
 
 impl Drop for Built<'_> {
     fn drop(&mut self) {
-        if let Err(error) = guest(self.info, &format!("rm -rf -- {}", quote(&self.dir))) {
+        if let Err(error) = system(self.info, &format!("rm -rf -- {}", quote(&self.dir))) {
             eprintln!("Could not remove the VM's temporary build roots: {error:#}");
         }
     }
@@ -298,16 +315,18 @@ fn build<'a>(info: &'a BundleInfo, script: &str, local: &Path) -> Result<Built<'
     let input = local.join("build.sh");
     let output = local.join("paths");
     std::fs::write(&input, script)?;
-    let command = vec![
+    // Built as the user that switches to it: an agent of the VM's user cannot hand the admin a system of its own.
+    let shell = super::system_shell(info)?;
+    let mut command: Vec<String> = vec![
         "/bin/sh".into(),
         "-c".into(),
-        r#"exec "$0" shell --workdir="$1" "$2" bash --login -s < "$3" > "$4""#.into(),
-        super::limactl().context("limactl is not installed")?.display().to_string(),
-        info.home.clone(),
-        info.instance.clone(),
+        r#"input=$1 output=$2; shift 2; exec "$@" < "$input" > "$output""#.into(),
+        "atomics-vm-build".into(),
         input.display().to_string(),
         output.display().to_string(),
+        shell.get_program().to_string_lossy().into_owned(),
     ];
+    command.extend(shell.get_args().map(|arg| arg.to_string_lossy().into_owned()));
     let code = crate::governor::run_queued(
         &atomics_core::paths::socket_path(),
         atomics_core::governor::SlotClass::Test,
@@ -440,7 +459,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         install(&backup).context("restoring the previous Mac bundle")?;
         return Err(error);
     }
-    let changed = match guest(info, &switch_script(&built.top)) {
+    let changed = match system(info, &switch_script(&built.top)) {
         Ok(result) if result == "changed" || result == "unchanged" => result == "changed",
         result => {
             install(&backup).context("restoring the previous Mac bundle")?;
