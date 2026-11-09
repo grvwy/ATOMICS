@@ -642,6 +642,23 @@ Limits: an allowed address is allowed whatever name led there, which matters beh
 allowed service that stores data (a GitHub repository, a package feed) can still receive what an agent sends.
 The policy narrows where data can go; it does not make the sign-ins in the VM safe to leak.
 
+### Shared Docker images
+
+Agents share one Docker, so an image one pulled or built is there for the next. `atomics.vm.docker.images`
+pulls a list at boot when missing, so the first agent after a fresh start, or after hardened mode resets
+Docker, does not wait for them. An image without an arm64 build names its platform and runs under Rosetta:
+
+```nix
+atomics.vm.docker.images = [
+  "redis:6.0-alpine"
+  { name = "elasticsearch:7.2.1"; platform = "linux/amd64"; }
+];
+```
+
+The pulls run as `atomics-docker-images`, a service of the VM's user in hardened mode
+(`systemctl --user status atomics-docker-images`) and of root otherwise. A failed pull is retried every minute
+and never holds anything else up. Images a repository builds itself stay its own: the first build is shared.
+
 ## Agents in the VM
 
 This is the layout with the host on the Mac: a bundle built without the host. With
