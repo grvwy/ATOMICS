@@ -542,6 +542,13 @@ pub(crate) struct State {
     /// The GitHub counter and controls: what the API last said, sign-in and actions under way.
     github: github::Github,
     lifecycle_jobs: Vec<crate::lifecycle::Job>,
+    /// Closed plans' worktrees whose removal waits for the processes still using them; kept on disk.
+    deferred_cleanup: Vec<crate::lifecycle::Deferred>,
+    /// When they were last checked, and whether a check is under way.
+    deferred_checked: Option<Instant>,
+    deferred_checking: Arc<AtomicBool>,
+    /// The plan whose cleanup is closing its sessions, and covers their worktrees itself.
+    cleaning_plan: Option<String>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
     sandbox_check: Option<Receiver<(Vec<String>, Vec<atomics_core::projection::SetupStep>)>>,
@@ -1108,6 +1115,10 @@ impl State {
             interactive_start: false,
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
+            deferred_cleanup: crate::lifecycle::deferred(&paths::atomics_home()),
+            deferred_checked: None,
+            deferred_checking: Arc::default(),
+            cleaning_plan: None,
             startup_cleanup: None,
             shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),

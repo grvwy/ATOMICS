@@ -53,6 +53,7 @@ impl State {
         self.serve_dispatches();
         changed |= self.poll_cleanup();
         changed |= self.poll_plan_cleanup();
+        self.recheck_deferred_cleanup();
         changed |= self.usage.drain();
         changed |= self.poll_resources();
         changed |= self.poll_update();

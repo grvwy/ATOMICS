@@ -139,7 +139,11 @@ branches (`[cleanup]`). Removing a worktree also removes its sandboxes, their MC
 rules. ATOMICS records each sandbox in `sandbox-ownership.json` before making it, so a crash leaves nothing
 the next start's sweep cannot find; that sweep also removes stale briefs, unused warm worktrees and
 scratch folders. Dirty worktrees and the main checkout are always kept, and resources of another ATOMICS
-home are never touched. See [Lifecycle](isolation.md#lifecycle).
+home are never touched. A task worktree that a process still uses when its plan closes (its working
+directory is there, or it holds a file open there, such as a dev server an agent left running for you) is
+kept until nothing does, then removed as the plan's cleanup would have, branch included. One kept because
+its session was still open goes when that session closes. See
+[Lifecycle](isolation.md#lifecycle).
 
 ## Updates
 
