@@ -231,8 +231,13 @@ pub(super) fn programs(ui: &mut egui::Ui, client: &mut Client, enabled: bool, se
             copy_button(ui, client, &program.install);
         }
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add_enabled_ui(enabled && !setup.checking, |ui| {
+            for provider in &setup.agent_presets {
+                if button(ui, client, format!("Add {}", provider.title())).clicked() {
+                    tool(client, SettingsTool::AddAgentPreset { provider: *provider });
+                }
+            }
             if button(ui, client, "Check again").clicked() {
                 tool(client, SettingsTool::CheckPrograms);
             }

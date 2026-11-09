@@ -622,3 +622,33 @@ fn a_folder_with_no_repository_can_be_made_a_first_project_and_a_repository_stay
         },
     );
 }
+
+#[test]
+fn adding_provider_presets_preserves_custom_agents_and_the_main_file() {
+    use atomics_core::config::AgentProvider;
+    with_app("app::setup_tests::adding_provider_presets_preserves_custom_agents_and_the_main_file", |app, ctx| {
+        let main = std::fs::read_to_string(&app.runtime.config_path).unwrap();
+        let mut custom = AgentProvider::Copilot.preset();
+        custom.name = "custom".into();
+        custom.command = vec!["custom-wrapper".into(), "--model".into(), "example".into()];
+        custom.provider = None;
+        custom.busy_text = Some("working".into());
+        app.runtime.config.agents = vec![custom];
+        assert_eq!(app.runtime.setup_info().agent_presets, AgentProvider::ALL);
+        app.runtime
+            .manage(HostAction::SettingsTool { tool: SettingsTool::AddAgentPreset { provider: AgentProvider::Cursor } })
+            .unwrap();
+        assert_eq!(app.runtime.config.agents.len(), 2);
+        let custom = app.runtime.config.agent("custom").unwrap();
+        assert_eq!(custom.command, ["custom-wrapper", "--model", "example"]);
+        assert_eq!(custom.busy_text.as_deref(), Some("working"));
+        assert_eq!(app.runtime.config.agent("cursor").unwrap().provider(), Some(AgentProvider::Cursor));
+        assert_eq!(app.runtime.setup_info().agent_presets, [AgentProvider::Copilot]);
+        let [_, host] = Config::source_paths(&app.runtime.config_path);
+        let saved = std::fs::read_to_string(&host).unwrap();
+        app.runtime.add_agent_preset(AgentProvider::Cursor).unwrap();
+        assert_eq!(std::fs::read_to_string(&host).unwrap(), saved, "adding twice is a no-op");
+        assert_eq!(std::fs::read_to_string(&app.runtime.config_path).unwrap(), main);
+        tick_until(app, ctx, "provider discovery", |app| app.runtime.programs_check.is_none());
+    });
+}

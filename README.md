@@ -5,7 +5,7 @@
 [![CI](https://github.com/xmagit/ATOMICS/actions/workflows/ci.yml/badge.svg)](https://github.com/xmagit/ATOMICS/actions/workflows/ci.yml)
 
 A lightweight, review-first workspace for coding agents, written in Rust. Run Claude Code,
-Codex and shells side by side, each in its own git worktree. Click any agent's title to see its worktree's diff
+Codex, Cursor CLI, GitHub Copilot CLI and shells side by side, each in its own git worktree. Click any agent's title to see its worktree's diff
 against main, comment on lines, and send the review straight to the agent while it keeps working. Or let an
 orchestrating agent plan the work, hand out tasks and review the results while you approve and steer.
 
@@ -119,6 +119,10 @@ atomics ~/repos/app                     # opens that project
 atomics --workspace daily               # opens a saved workspace
 atomics --open claude:~/repos/app --open codex:~/repos/app-feature
 ```
+
+Cursor CLI starts as `agent` and GitHub Copilot CLI as `copilot`. Existing configurations can add them from
+**Settings → Getting started** without replacing custom agents. See [Cursor and Copilot CLI](docs/cli-agents.md)
+for configuration, current integration boundaries and a WSL test checklist.
 
 On macOS, `scripts/macos-app.sh` builds `~/Applications/ATOMICS.app` (release binary, the atomisk.ai icon, microphone
 permission text), so ATOMICS runs from the Dock or Spotlight and keeps running when terminals close:

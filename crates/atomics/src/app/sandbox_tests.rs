@@ -296,6 +296,7 @@ fn worktree(repo: &Path, name: &str) -> PathBuf {
 
 fn probe(name: &str, out: &Path, isolation: Option<IsolationMode>) -> atomics_core::config::AgentConfig {
     atomics_core::config::AgentConfig {
+        provider: None,
         name: name.into(),
         command: vec![
             "/bin/sh".into(),
@@ -828,6 +829,7 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
             format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}.$$.tmp\nmv {0}.$$.tmp {0}\n", out.display()),
         );
         app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+            provider: None,
             name: "bare-agent".into(),
             command: vec![script.display().to_string()],
             kind: AgentKind::Generic,

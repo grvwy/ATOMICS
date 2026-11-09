@@ -163,6 +163,27 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         }
     }
 
+    if let Ok((config, _)) = &config {
+        let path = crate::setup::agent_path();
+        for agent in config.agents.iter().filter(|agent| agent.provider().is_some()) {
+            let provider = agent.provider().expect("filtered provider");
+            let found = crate::setup::checked_agent_on_path(agent, &path);
+            let label = match &found {
+                Some(path) => format!("{} CLI found ({})", provider.title(), path.display()),
+                None => format!("{} CLI not found or identity check failed (warning)", provider.title()),
+            };
+            let hint = match provider {
+                atomics_core::config::AgentProvider::Cursor => {
+                    "install Cursor CLI; check `agent --version` and `agent --help` (or `cursor-agent`); `cursor` is the editor"
+                }
+                atomics_core::config::AgentProvider::Copilot => {
+                    "install GitHub Copilot CLI, run `copilot login`, and check `copilot --version`"
+                }
+            };
+            lines.push(check_line(found.is_some(), &label, hint));
+        }
+    }
+
     lines.push(format!("Host: {}", paths::host_name()));
     let label = match &config {
         Ok(_) => format!("config parses ({})", config_path.display()),

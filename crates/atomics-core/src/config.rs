@@ -91,6 +91,19 @@ command = ["codex"]
 kind = "generic"
 busy_text = "esc to interrupt"   # screen text that means "working", for agents without hooks
 
+# Cursor CLI uses `agent` (or `cursor-agent`), never the Cursor editor command `cursor`.
+[[agents]]
+name = "cursor"
+command = ["agent"]
+kind = "generic"
+provider = "cursor"
+
+[[agents]]
+name = "copilot"
+command = ["copilot"]
+kind = "generic"
+provider = "copilot"
+
 [[agents]]
 name = "shell"
 command = []                # empty = your login shell
@@ -691,7 +704,7 @@ every agent, diff and the plan board in the same window. Open projects: {project
 How to work:
 1. Understand the goal and read the code you need. You run in the project's main checkout: read it, never edit it.
 2. Write the plan with atomics_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
-can verify, dependencies, the agent (claude for design-heavy work, codex for well-specified changes) and its args. \
+can verify, dependencies, the agent (choose a configured agent such as claude, codex, cursor or copilot) and its args. \
 Without a plan id, atomics_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. atomics_plan_dispatch, then loop on atomics_wait (never sleep or poll). On reported or turn done, read atomics_result and atomics_diff.
@@ -853,6 +866,49 @@ pub enum AgentKind {
     Shell,
 }
 
+/// Provider-specific CLI integration, independent of the displayed agent name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProvider {
+    Copilot,
+    Cursor,
+}
+
+impl AgentProvider {
+    pub const ALL: [Self; 2] = [Self::Cursor, Self::Copilot];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Copilot => "GitHub Copilot",
+            Self::Cursor => "Cursor CLI",
+        }
+    }
+
+    pub fn preset(self) -> AgentConfig {
+        AgentConfig {
+            name: self.name().into(),
+            command: vec![
+                match self {
+                    Self::Copilot => "copilot",
+                    Self::Cursor => "agent",
+                }
+                .into(),
+            ],
+            kind: AgentKind::Generic,
+            provider: Some(self),
+            busy_text: None,
+            isolation: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub name: String,
@@ -860,6 +916,9 @@ pub struct AgentConfig {
     pub command: Vec<String>,
     #[serde(default = "AgentConfig::default_kind")]
     pub kind: AgentKind,
+    /// Explicit identity for wrappers and custom executable names. Applies only to generic agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<AgentProvider>,
     /// Text the agent shows while it works. Used to track status of agents without hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_text: Option<String>,
@@ -999,6 +1058,7 @@ impl Default for Config {
             name: name.into(),
             command: command.iter().map(|c| c.to_string()).collect(),
             kind,
+            provider: None,
             busy_text: busy.map(str::to_string),
             isolation: None,
         };
@@ -1016,6 +1076,8 @@ impl Default for Config {
             agents: vec![
                 agent("claude", &["claude"], AgentKind::Claude, None),
                 agent("codex", &["codex"], AgentKind::Generic, Some("esc to interrupt")),
+                AgentProvider::Cursor.preset(),
+                AgentProvider::Copilot.preset(),
                 agent("shell", &[], AgentKind::Shell, None),
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
@@ -1089,8 +1151,20 @@ impl Default for KeyConfig {
 }
 
 impl AgentConfig {
+    pub fn provider(&self) -> Option<AgentProvider> {
+        if self.kind != AgentKind::Generic {
+            return None;
+        }
+        self.provider.or_else(|| match std::path::Path::new(self.command.first()?).file_name()?.to_str()? {
+            "copilot" => Some(AgentProvider::Copilot),
+            "agent" | "cursor-agent" => Some(AgentProvider::Cursor),
+            _ => None,
+        })
+    }
+
     pub fn is_codex(&self) -> bool {
         self.kind == AgentKind::Generic
+            && self.provider.is_none()
             && self
                 .command
                 .first()
@@ -1182,6 +1256,9 @@ impl Config {
         let mut config: Config = toml::Value::Table(Self::merged(tables)).try_into()?;
         if config.agents.is_empty() {
             config.agents = Config::default().agents;
+        }
+        if config.agents.iter().any(|agent| agent.provider.is_some() && agent.kind != AgentKind::Generic) {
+            return Err(<toml::de::Error as serde::de::Error>::custom("agents.provider requires kind = generic"));
         }
         Ok(config)
     }
@@ -1457,11 +1534,56 @@ kind = "shell"
                 name: name.into(),
                 command: command.into_iter().map(str::to_string).collect(),
                 kind,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             };
             assert_eq!(agent.is_codex(), expected, "{agent:?}");
         }
+    }
+
+    #[test]
+    fn providers_use_explicit_identity_then_cli_basename_and_preserve_legacy_kinds() {
+        for (program, expected) in [
+            ("copilot", Some(AgentProvider::Copilot)),
+            ("/opt/bin/copilot", Some(AgentProvider::Copilot)),
+            ("agent", Some(AgentProvider::Cursor)),
+            ("/opt/bin/cursor-agent", Some(AgentProvider::Cursor)),
+            ("cursor", None),
+            ("custom-wrapper", None),
+        ] {
+            let mut agent = AgentProvider::Copilot.preset();
+            agent.name = "arbitrary display name".into();
+            agent.command = vec![program.into()];
+            agent.provider = None;
+            assert_eq!(agent.provider(), expected, "{program}");
+            agent.provider = Some(AgentProvider::Cursor);
+            assert_eq!(agent.provider(), Some(AgentProvider::Cursor));
+            assert!(!agent.is_codex());
+            agent.kind = AgentKind::Claude;
+            assert_eq!(agent.provider(), None);
+            agent.kind = AgentKind::Shell;
+            assert_eq!(agent.provider(), None);
+        }
+        let bad: toml::Table = toml::from_str("[[agents]]\nname='x'\nkind='shell'\nprovider='cursor'").unwrap();
+        assert!(Config::from_tables([bad]).unwrap_err().to_string().contains("requires kind"));
+    }
+
+    #[test]
+    fn provider_defaults_roundtrip_and_existing_agent_arrays_stay_intact() {
+        let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        for provider in AgentProvider::ALL {
+            assert_eq!(config.agent(provider.name()).unwrap().provider(), Some(provider));
+            let preset = provider.preset();
+            let saved = toml::to_string(&preset).unwrap();
+            assert_eq!(toml::from_str::<AgentConfig>(&saved).unwrap().provider(), Some(provider));
+        }
+        let existing: toml::Table =
+            toml::from_str("[[agents]]\nname='custom'\ncommand=['wrapped','--flag']\nbusy_text='busy'").unwrap();
+        let existing = Config::from_tables([existing]).unwrap();
+        assert_eq!(existing.agents.len(), 1);
+        assert_eq!(existing.agents[0].command, ["wrapped", "--flag"]);
+        assert_eq!(existing.agents[0].busy_text.as_deref(), Some("busy"));
     }
 
     #[test]

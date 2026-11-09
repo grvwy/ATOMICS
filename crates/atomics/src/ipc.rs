@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::host::Window;
 use anyhow::{Result, bail};
 use atomics_core::control::{ControlRequest, ControlResponse, describe_diff};
-use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread, context_output};
+use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -116,6 +116,26 @@ pub struct Channels {
 }
 
 impl Hub {
+    /// Serialize native hook delivery with removal from the outbox. A failed socket write
+    /// retains the messages for the next supported event; concurrent hooks cannot take them twice.
+    fn reply_to(&mut self, event: &HookEvent, writer: &mut impl Write) -> Result<usize> {
+        let queued = event.can_deliver().then(|| self.outbox.get(&event.session_id).cloned()).flatten();
+        let (reply, delivered) = self.reply(event);
+        let write = (|| -> Result<()> {
+            writer.write_all(serde_json::to_string(&reply)?.as_bytes())?;
+            writer.write_all(b"\n")?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            if let Some(mut messages) = queued {
+                messages.extend(self.outbox.remove(&event.session_id).unwrap_or_default());
+                self.outbox.insert(event.session_id.clone(), messages);
+            }
+            return Err(error);
+        }
+        Ok(delivered)
+    }
+
     /// The stdout for one hook call: session context on start, plus any queued messages.
     pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
         let mut parts = Vec::new();
@@ -131,7 +151,7 @@ impl Hub {
                 parts.push(format!("{}\n{message}", self.external_prefix));
             }
         }
-        let stdout = (!parts.is_empty()).then(|| context_output(&event.name, &parts.join("\n\n")));
+        let stdout = (!parts.is_empty()).then(|| event.context_output(&parts.join("\n\n"))).flatten();
         (HookReply { stdout }, delivered)
     }
 }
@@ -210,8 +230,23 @@ fn handle_with_wait_duration(
     let Some(event) = HookEvent::from_payload(&request.payload) else {
         bail!("hook payload without event name or session id");
     };
+    if event.provider.is_some() {
+        // Native approvals stay in their CLI. Sending a reply requires no UI/chief work and
+        // queued delivery is only committed when the short socket write succeeds.
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let delivered = hub.lock().unwrap().reply_to(&event, &mut &stream)?;
+        let _ = channels.hooks.send(HookMessage {
+            pane: request.pane,
+            ancestors: request.ancestors,
+            event,
+            delivered,
+            approval_reply: None,
+        });
+        window.request_repaint();
+        return Ok(());
+    }
     let (mut reply, delivered) = hub.lock().unwrap().reply(&event);
-    let permission = event.name == "PermissionRequest";
+    let permission = event.provider.is_none() && event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
     let _ = channels.hooks.send(HookMessage {
         pane: request.pane,
@@ -650,5 +685,46 @@ mod tests {
         let (reply, _) = hub.reply(&event("SessionStart"));
         assert!(reply.stdout.unwrap().contains("You run in ATOMICS."));
         assert!(hub.reply(&event("Stop")).0.stdout.is_none());
+    }
+
+    #[test]
+    fn native_queues_wait_for_supported_output_and_survive_failed_writes() {
+        use atomics_core::config::AgentProvider;
+        use atomics_core::hook::normalize_native_payload;
+        let mut hub = Hub { external_prefix: "From ATOMICS:".into(), ..Hub::default() };
+        hub.outbox.insert("s1".into(), vec!["review this".into()]);
+        let native = |name: &str| {
+            HookEvent::from_payload(
+                &normalize_native_payload(
+                    &serde_json::json!({"conversation_id":"s1","status":"completed","loop_count":0}),
+                    AgentProvider::Cursor,
+                    name,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        for name in ["sessionStart", "beforeSubmitPrompt", "sessionEnd"] {
+            assert_eq!(hub.reply(&native(name)).1, 0);
+            assert_eq!(hub.outbox["s1"], ["review this"]);
+        }
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(hub.reply_to(&native("stop"), &mut Broken).is_err());
+        assert_eq!(hub.outbox["s1"], ["review this"]);
+        let mut wire = Vec::new();
+        assert_eq!(hub.reply_to(&native("stop"), &mut wire).unwrap(), 1);
+        let reply: HookReply = serde_json::from_slice(&wire).unwrap();
+        let output: Value = serde_json::from_str(&reply.stdout.unwrap()).unwrap();
+        assert_eq!(output["followup_message"], "From ATOMICS:\nreview this");
+        assert_eq!(hub.reply_to(&native("stop"), &mut Vec::new()).unwrap(), 0);
+        assert!(!hub.outbox.contains_key("s1"));
     }
 }

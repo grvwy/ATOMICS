@@ -224,6 +224,7 @@ mod tests {
                     [("custom-codex", "/tools/codex", true), ("codex", "/tools/other", false)]
                 {
                     app.runtime.config.agents = vec![atomics_core::config::AgentConfig {
+                        provider: None,
                         name: name.into(),
                         command: vec![program.into()],
                         kind: AgentKind::Generic,

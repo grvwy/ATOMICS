@@ -499,6 +499,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
 
 fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+        provider: None,
         name: "test".into(),
         command: vec![],
         kind: AgentKind::Generic,

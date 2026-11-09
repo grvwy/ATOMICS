@@ -428,6 +428,10 @@ pub(crate) fn install_command(program: &str, mac: bool, has: &dyn Fn(&str) -> bo
     match (program, mac) {
         ("git", true) => "xcode-select --install".into(),
         ("git", false) => packages("git", "git"),
+        ("agent" | "cursor-agent", _) => "curl https://cursor.com/install -fsS | bash".into(),
+        ("copilot", _) => {
+            "install Copilot CLI from https://docs.github.com/copilot/how-tos/set-up/install-copilot-cli".into()
+        }
         ("claude", _) => "curl -fsSL https://claude.ai/install.sh | bash".into(),
         ("codex", true) => "brew install --cask codex".into(),
         ("codex", false) if has("npm") => "npm install -g @openai/codex".into(),

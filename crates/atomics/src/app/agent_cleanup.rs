@@ -47,6 +47,13 @@ fn idle(session: &Session) -> bool {
 }
 
 impl State {
+    /// Native providers need an observed lifecycle and an exact conversation before ATOMICS
+    /// can safely act on an apparently idle session. MCP reports alone do not end a turn.
+    pub(super) fn provider_tracking_ready(&self, session: &Session) -> bool {
+        self.config.agent(&session.agent).and_then(|agent| agent.provider()).is_none()
+            || session.hooks_active && session.claude_id.as_ref().is_some_and(|id| !id.is_empty())
+    }
+
     fn cleanup_work(&self, session: &Session) -> Work {
         let root = session.root();
         let owner = self.plans.iter().find_map(|plan| {
@@ -87,7 +94,7 @@ impl State {
                 self.agent_cleanup.checked.insert(id, checked);
             }
         }
-        for session in self.sessions.iter().filter(|s| idle(s)) {
+        for session in self.sessions.iter().filter(|s| idle(s) && self.provider_tracking_ready(s)) {
             let work = self.cleanup_work(session);
             if self.agent_cleanup.pending.contains_key(&session.id)
                 || self
@@ -110,6 +117,7 @@ impl State {
     fn agent_health(&self, session: &Session) -> Option<&Result<Health, String>> {
         let checked = self.agent_cleanup.checked.get(&session.id)?;
         (idle(session)
+            && self.provider_tracking_ready(session)
             && !self.integration_dirty.load(Ordering::Relaxed)
             && checked.work == self.cleanup_work(session)
             && checked.at.elapsed() < RECHECK)
@@ -134,6 +142,9 @@ impl State {
         Some(match self.agent_health(session) {
             Some(Ok(Health { clean: false, .. })) => "Agent kept open: worktree has uncommitted work".into(),
             Some(Err(_)) => "Agent kept open: worktree could not be checked for uncommitted work".into(),
+            _ if !self.provider_tracking_ready(session) => {
+                "Agent kept open: waiting for its CLI to report session status".into()
+            }
             _ if !idle(session) => "Agent kept open: waiting for its turn and pending messages to finish".into(),
             None => "Agent kept open: checking worktree for uncommitted work".into(),
             _ => return None,

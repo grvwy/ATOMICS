@@ -181,6 +181,7 @@ impl State {
                 name: "chief".into(),
                 command: self.config.chief.command.clone(),
                 kind: AgentKind::Claude,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             }
@@ -304,7 +305,7 @@ impl State {
         let sbx_agent = isolation::sbx_agent(agent).ok_or_else(|| {
             let program = agent.command.first().map_or("an empty command", String::as_str);
             let fix = if config.isolation.required {
-                "Its repository requires sandboxed agents in .atomics/config.toml; use claude, codex or shell there."
+                "Its repository requires sandboxed agents in .atomics/config.toml; use claude, codex, cursor, copilot or shell there."
             } else {
                 "Set isolation = \"bare\" on it in [[agents]] to run it on this machine."
             };
@@ -496,11 +497,20 @@ impl State {
             None => args.to_vec(),
         };
         let extra_args = own_args(&extra_args);
-        let (program, mut args) = match agent.command.split_first() {
+        let (mut program, mut args) = match agent.command.split_first() {
             Some((program, rest)) => (program.clone(), own_args(rest)),
             None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
+        let provider = agent.provider();
+        if sandboxed.is_none() && provider.is_some() {
+            program = crate::setup::agent_program(&agent)
+                .ok_or_else(|| {
+                    format!("Could not find {} CLI; install it or configure its executable path", agent.name)
+                })?
+                .to_string_lossy()
+                .into_owned();
+        }
         let mut claude_id = None;
         // Every agent ATOMICS starts can report back to the plan with `atomics_report`.
         let exe = crate::setup::executable_path()
@@ -618,10 +628,10 @@ impl State {
                     _ => isolation::claude_settings().to_string(),
                 },
             });
-            let session_id = match resume {
+            let session_id = match resume.as_ref() {
                 Some(id) => {
                     args.extend(["--resume".to_string(), id.clone()]);
-                    id
+                    id.clone()
                 }
                 None => {
                     let id = uuid::Uuid::new_v4().to_string();
@@ -630,9 +640,11 @@ impl State {
                 }
             };
             claude_id = Some(session_id);
-        } else if let Some(id) = resume {
+        } else if provider.is_none()
+            && let Some(id) = resume.as_ref()
+        {
             args.extend(["resume".into(), if id.is_empty() { "--last".into() } else { id.clone() }]);
-            claude_id = (!id.is_empty()).then_some(id);
+            claude_id = (!id.is_empty()).then(|| id.clone());
         }
         args.extend(extra_args);
         let prompt = match prompt {
@@ -644,9 +656,38 @@ impl State {
             }
             other => other,
         };
+        if let Some(provider) = provider {
+            if sandboxed.is_none() {
+                if let Err(error) = crate::provider_launch::configure(
+                    provider,
+                    &paths::atomics_home(),
+                    Path::new(&exe),
+                    &hooks_exe,
+                    Path::new(&socket),
+                    &id,
+                    &mut args,
+                    &mut env,
+                ) {
+                    crate::provider_launch::cleanup(&paths::atomics_home(), &id);
+                    return Err(error);
+                }
+            }
+            claude_id = match crate::provider_launch::interactive_args(
+                provider,
+                &mut args,
+                resume.as_deref(),
+                prompt.as_deref(),
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    crate::provider_launch::cleanup(&paths::atomics_home(), &id);
+                    return Err(error);
+                }
+            };
+        }
         let shell_prompt = match (&prompt, agent.kind) {
             (Some(prompt), AgentKind::Shell) => Some(prompt.clone()),
-            (Some(prompt), _) => {
+            (Some(prompt), _) if provider.is_none() => {
                 args.push(prompt.clone());
                 None
             }
@@ -695,6 +736,17 @@ impl State {
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 self.sessions[index].ref_guard = ref_guard;
                 self.sessions[index].relay = relay;
+                if provider.is_some() {
+                    if prompt.is_some() {
+                        self.sessions[index].status = AgentStatus::Working;
+                    }
+                    self.sessions[index].warning = Some(if self.sessions[index].sandbox.is_some() {
+                        "Lifecycle hooks cannot reach ATOMICS from this sandbox. Check its terminal; automatic completion remains unavailable.".into()
+                    } else {
+                        "Waiting for provider lifecycle hooks. Trust its ATOMICS plugin in the terminal if prompted."
+                            .into()
+                    });
+                }
                 if chief {
                     self.load_chief_trace(&id);
                     self.hub.lock().unwrap().chief_running = true;
@@ -710,7 +762,10 @@ impl State {
                 self.remember(&id);
                 Ok(id)
             }
-            Err(err) => Err(format!("Could not start {agent_name}: {err:#}")),
+            Err(err) => {
+                crate::provider_launch::cleanup(&paths::atomics_home(), &id);
+                Err(format!("Could not start {agent_name}: {err:#}"))
+            }
         }
     }
 
@@ -740,13 +795,19 @@ impl State {
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
+            let native = self.config.agent(&session.agent).is_some_and(|agent| agent.provider().is_some());
+            if native && pending.attempts == u8::MAX {
+                continue;
+            }
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
-            let in_transcript = if pending.codex {
+            let in_transcript = if native {
+                false // Only the provider prompt hook proves receipt.
+            } else if pending.codex {
                 let marker = codex_composer(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
                     marker && !codex_composer(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
@@ -763,6 +824,22 @@ impl State {
                 continue;
             }
             if !terminal.exited() && pending.sent.elapsed() < DELIVERY_TIMEOUT {
+                continue;
+            }
+            if native {
+                // Keep the only copy of unconfirmed review/steering text until a late hook receipt
+                // acknowledges it or the user closes the pane. Retrying could perform work twice.
+                if pending.attempts != u8::MAX {
+                    if let Some(reply) = pending.reply.take() {
+                        let mut response = ControlResponse::error(
+                            "message delivery unconfirmed: no receipt from the agent; check its terminal",
+                        );
+                        response.result = json!({ "unconfirmed": true });
+                        let _ = reply.send(ControlOutcome::Done(response));
+                    }
+                    warnings.push(session.title.clone());
+                    pending.attempts = u8::MAX;
+                }
                 continue;
             }
             if terminal.exited() || pending.attempts >= DELIVERY_ATTEMPTS {
@@ -828,8 +905,10 @@ impl State {
                 session.activity.observe(session.status);
                 continue;
             }
+            let native = self.config.agent(&session.agent).is_some_and(|agent| agent.provider().is_some());
             // A command menu drawn with no hook asking is the session's pending approval.
             if session.is_agent()
+                && !native
                 && session.sandbox.is_none()
                 && !terminal.exited()
                 && matches!(
@@ -845,12 +924,17 @@ impl State {
             }
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
+                && !native
                 && !terminal.exited()
                 && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done)
                 && atomics_core::approvals::first_run_prompt(&terminal.screen_text(60))
             {
                 session.status = AgentStatus::NeedsInput;
                 session.activity.observe(session.status);
+                continue;
+            }
+            // Native providers require real lifecycle hooks. A missing spinner is not an idle receipt.
+            if native {
                 continue;
             }
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
@@ -999,6 +1083,11 @@ impl State {
                     }
                 });
             }
+            if self.config.agent(&session.agent).is_some_and(|agent| agent.provider().is_some()) {
+                // Drop kills this pane's process group before removing the plugin it may still read.
+                drop(session.terminal.take());
+                crate::provider_launch::cleanup(&paths::atomics_home(), id);
+            }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
             {
@@ -1038,10 +1127,16 @@ impl State {
     /// next hook of sessions running elsewhere.
     pub(super) fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         self.check_refs(index);
+        let native = self.config.agent(&self.sessions[index].agent).is_some_and(|agent| agent.provider().is_some());
         let session = &mut self.sessions[index];
+        if native && (session.status == AgentStatus::Exited || session.terminal.as_ref().is_some_and(Terminal::exited))
+        {
+            return Delivery::Unavailable;
+        }
         if session.approval_hold
             || !session.approvals.is_empty()
-            || session.pending.as_ref().is_some_and(|pending| pending.codex)
+            || session.pending.as_ref().is_some_and(|pending| pending.codex || native)
+            || native && (!session.hooks_active || !matches!(session.status, AgentStatus::Idle | AgentStatus::Done))
         {
             session.activity.held_since.get_or_insert_with(atomics_core::store::now);
             session.first_prompt(text);
@@ -1059,10 +1154,15 @@ impl State {
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
             terminal.submit(text);
             let trackable = session.kind == AgentKind::Claude
+                || native
                 || codex
                 || self.config.agent(&session.agent).is_some_and(|a| a.busy_text.is_some());
             if trackable {
                 let was_working = session.status == AgentStatus::Working;
+                if native {
+                    // Until a hook confirms receipt or completion, the turn may already be running.
+                    session.status = AgentStatus::Working;
+                }
                 session.pending = Some(Pending {
                     text: text.to_string(),
                     sent: Instant::now(),
@@ -1076,7 +1176,7 @@ impl State {
             } else if session.is_agent() {
                 session.status = AgentStatus::Working;
             }
-            return if codex { Delivery::Pending } else { Delivery::Sent };
+            return if codex || native { Delivery::Pending } else { Delivery::Sent };
         }
         let Some(claude_id) = session.claude_id.clone() else { return Delivery::Unavailable };
         self.hub.lock().unwrap().outbox.entry(claude_id).or_default().push(text.to_string());
@@ -1575,6 +1675,7 @@ mod tests {
                     name: "test".into(),
                     command: vec![],
                     kind: AgentKind::Generic,
+                    provider: None,
                     busy_text: Some("esc to interrupt".into()),
                     isolation: None,
                 });
@@ -1631,6 +1732,7 @@ mod tests {
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "trust-probe".into(),
                 kind: AgentKind::Generic,
+                provider: None,
                 command: vec!["/bin/sh".into(), "-c".into(),
                     "mkdir -p \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\"; echo trusted > \"$CODEX_HOME/config.toml\"; echo trusted > \"$CLAUDE_CONFIG_DIR/.claude.json\"".into()],
                 busy_text: None,
@@ -1706,6 +1808,7 @@ mod tests {
                     name: "probe".into(),
                     command: vec!["/bin/sh".into(), "-c".into(), script],
                     kind: AgentKind::Generic,
+                    provider: None,
                     busy_text: None,
                     isolation: None,
                 });
@@ -1755,6 +1858,7 @@ mod tests {
                     format!("env > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display()),
                 ],
                 kind: AgentKind::Generic,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             });
@@ -1805,6 +1909,7 @@ fi
                     name: name.into(),
                     command: vec![program.to_string_lossy().into_owned()],
                     kind: AgentKind::Generic,
+                    provider: None,
                     busy_text: None,
                     isolation: None,
                 });
@@ -1895,6 +2000,7 @@ fi
                     name: "flaky".into(),
                     command: vec![name.clone()],
                     kind: AgentKind::Generic,
+                    provider: None,
                     busy_text: None,
                     isolation: None,
                 });
@@ -1949,6 +2055,7 @@ fi
                     name: "probed".into(),
                     command: vec![program.to_string_lossy().into_owned()],
                     kind: AgentKind::Generic,
+                    provider: None,
                     busy_text: None,
                     isolation: None,
                 });
@@ -2002,6 +2109,7 @@ fi
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             });
@@ -2105,6 +2213,7 @@ fi
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             });
@@ -2184,6 +2293,7 @@ fi
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             });
@@ -2237,6 +2347,158 @@ fi
     }
 
     #[test]
+    fn native_provider_launches_use_interactive_pty_and_exact_resume() {
+        use atomics_core::config::AgentProvider;
+        with_app("app::sessions::tests::native_provider_launches_use_interactive_pty_and_exact_resume", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            app.runtime.config.resources.agent_nice = 0;
+            for provider in [AgentProvider::Copilot, AgentProvider::Cursor] {
+                let executable = dir.path().join(match provider {
+                    AgentProvider::Copilot => "copilot",
+                    AgentProvider::Cursor => "cursor-agent",
+                });
+                crate::test_support::write_program(
+                    &executable,
+                    r#"#!/bin/sh
+printf '%s\n' "$@" > argv
+if [ -t 0 ] && [ -t 1 ]; then printf 'interactive-pty\n'; fi
+exec /bin/sleep 600
+"#,
+                );
+                app.runtime.config.agents.retain(|agent| agent.name != provider.name());
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: provider.name().into(),
+                    command: vec![executable.to_string_lossy().into_owned()],
+                    kind: AgentKind::Generic,
+                    provider: Some(provider),
+                    busy_text: None,
+                    isolation: Some(IsolationMode::Bare),
+                });
+                for resume in [None, Some("12345678-1234-4321-9234-123456789012".to_string())] {
+                    let id = app
+                        .runtime
+                        .start(
+                            provider.name(),
+                            dir.path().into(),
+                            resume.clone(),
+                            vec!["--model".into(), "example-model".into()],
+                            Some("fix tests".into()),
+                        )
+                        .unwrap();
+                    let index = app.runtime.find(&id).unwrap();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while !app.runtime.sessions[index]
+                        .terminal
+                        .as_ref()
+                        .unwrap()
+                        .screen_text(60)
+                        .contains("interactive-pty")
+                    {
+                        assert!(Instant::now() < deadline, "provider did not get a PTY");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let args: Vec<String> =
+                        std::fs::read_to_string(dir.path().join("argv")).unwrap().lines().map(str::to_owned).collect();
+                    assert!(args.windows(2).any(|a| a == ["--model", "example-model"]));
+                    assert!(args.windows(2).any(|a| a
+                        == [
+                            "--plugin-dir",
+                            crate::provider_launch::directory(&paths::atomics_home(), &id).to_str().unwrap()
+                        ]));
+                    match provider {
+                        AgentProvider::Copilot => {
+                            assert!(args.windows(2).any(|a| a == ["-i", "fix tests"]));
+                            let saved = app.runtime.sessions[index].claude_id.as_ref().unwrap();
+                            assert!(args.windows(2).any(|a| a == ["--session-id", saved]));
+                            if let Some(resume) = &resume {
+                                assert_eq!(saved, resume);
+                            }
+                            assert!(app.runtime.store.sessions.iter().any(|record| record.claude_session_id == *saved));
+                        }
+                        AgentProvider::Cursor => {
+                            assert_eq!(args.last().map(String::as_str), Some("fix tests"));
+                            assert_eq!(app.runtime.sessions[index].claude_id, resume);
+                            if let Some(resume) = &resume {
+                                assert!(args.windows(2).any(|a| a == ["--resume", resume]));
+                            }
+                        }
+                    }
+                    assert!(!args.iter().any(|a| matches!(a.as_str(), "--continue" | "-p" | "--force" | "--yolo")));
+                    // Until a real provider hook establishes readiness, quiet output never means idle.
+                    app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                    app.runtime.track_busy();
+                    assert_eq!(app.runtime.sessions[index].status, AgentStatus::Working);
+                    assert_eq!(app.runtime.deliver(index, "follow-up"), Delivery::Held);
+                    app.runtime.close(&id);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_provider_delivery_never_repeats_an_unconfirmed_paste() {
+        use atomics_core::config::AgentProvider;
+        with_app("app::sessions::tests::native_provider_delivery_never_repeats_an_unconfirmed_paste", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let executable = dir.path().join("copilot");
+            crate::test_support::write_program(
+                &executable,
+                "#!/bin/sh\nstty -echo\nwhile IFS= read -r line; do printf 'received: %s\\n' \"$line\" >> received; done\n",
+            );
+            app.runtime.config.resources.agent_nice = 0;
+            let mut agent = AgentProvider::Copilot.preset();
+            agent.command = vec![executable.to_string_lossy().into_owned()];
+            agent.isolation = Some(IsolationMode::Bare);
+            app.runtime.config.agents.retain(|agent| agent.name != "copilot");
+            app.runtime.config.agents.push(agent);
+            let id = app.runtime.start("copilot", dir.path().into(), None, vec![], None).unwrap();
+            let index = app.runtime.find(&id).unwrap();
+            app.runtime.sessions[index].hooks_active = true;
+            app.runtime.sessions[index].status = AgentStatus::Idle;
+            assert_eq!(app.runtime.deliver(index, "do the work"), Delivery::Pending);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let pending = app.runtime.sessions[index].pending.as_mut().unwrap();
+            pending.reply = Some(tx);
+            pending.sent = Instant::now() - DELIVERY_TIMEOUT;
+            app.runtime.verify_deliveries();
+            let pending = app.runtime.sessions[index].pending.as_ref().unwrap();
+            assert_eq!(pending.text, "do the work");
+            assert!(pending.reply.is_none());
+            assert_eq!(pending.attempts, u8::MAX);
+            assert_eq!(app.runtime.sessions[index].status, AgentStatus::Working);
+            assert!(
+                matches!(rx.try_recv(), Ok(ControlOutcome::Done(response)) if response.result["unconfirmed"] == true)
+            );
+            app.runtime.verify_deliveries();
+            assert!(rx.try_recv().is_err(), "uncertain reply is sent only once");
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+            while !dir.path().join("received").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let received = std::fs::read_to_string(dir.path().join("received")).unwrap();
+            assert_eq!(received.matches("do the work").count(), 1);
+            let session_id = app.runtime.sessions[index].claude_id.clone().unwrap();
+            let payload = atomics_core::hook::normalize_native_payload(
+                &json!({"sessionId":session_id, "prompt":"do the work"}),
+                AgentProvider::Copilot,
+                "userPromptSubmitted",
+            )
+            .unwrap();
+            app.runtime.on_hook(HookMessage {
+                pane: Some(id.clone()),
+                ancestors: vec![],
+                event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                delivered: 0,
+                approval_reply: None,
+            });
+            assert!(app.runtime.sessions[index].pending.is_none(), "late exact receipt resolves the retained message");
+            assert!(rx.try_recv().is_err(), "late receipt never replies to an operation twice");
+            app.runtime.close(&id);
+        });
+    }
+
+    #[test]
     fn session_start_does_not_wait_for_git() {
         if std::env::var_os("ATOMICS_START_GIT_TEST").is_some() {
             let dir = std::env::current_dir().unwrap();
@@ -2244,6 +2506,7 @@ fi
                 name: "test".into(),
                 command: vec![],
                 kind: AgentKind::Shell,
+                provider: None,
                 busy_text: None,
                 isolation: None,
             };

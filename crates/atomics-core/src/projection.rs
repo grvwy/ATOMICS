@@ -300,6 +300,8 @@ pub struct SetupInfo {
     pub checking: bool,
     /// git and the agents, once the host has looked for them.
     pub programs: Vec<SetupProgram>,
+    /// Built-in CLI presets that can be added without replacing the configured agents.
+    pub agent_presets: Vec<crate::config::AgentProvider>,
     /// The first project open on the host.
     pub project: Option<String>,
     pub connections: Vec<SetupConnection>,

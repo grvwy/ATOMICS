@@ -495,6 +495,7 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
     with_state("app::host_tests::held_terminal_input_gets_a_receipt_without_frames", |mut state, _| {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
         state.config.agents.push(atomics_core::config::AgentConfig {
+            provider: None,
             name: "fake-codex".into(),
             command: vec![fixture.to_string_lossy().into_owned()],
             kind: AgentKind::Generic,

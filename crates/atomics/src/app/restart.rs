@@ -13,6 +13,12 @@ impl State {
         let mut blockers = Vec::new();
         for session in &self.sessions {
             let hands_off = session.chief && caller == Some(session.id.as_str());
+            if session.status != AgentStatus::Exited && !self.provider_tracking_ready(session) {
+                blockers.push(format!(
+                    "CLI session status or resume identity unavailable for {} ({})",
+                    session.title, session.id
+                ));
+            }
             if !hands_off && matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
                 blockers.push(format!("agent {} ({}) is {}", session.title, session.id, session.status.label()));
             }
