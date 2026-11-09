@@ -27,7 +27,15 @@ impl Preview {
     }
 
     pub fn url(&self, local: u16) -> String {
-        format!("http://127.0.0.1:{local}/{}", self.path.trim_start_matches('/'))
+        self.url_with(local, false)
+    }
+
+    /// The browser's address for the server forwarded to `local` on this machine. A server that speaks TLS
+    /// gets `https://localhost`, the name a local development certificate is made for; any other gets
+    /// `http://127.0.0.1`.
+    pub fn url_with(&self, local: u16, tls: bool) -> String {
+        let path = self.path.trim_start_matches('/');
+        if tls { format!("https://localhost:{local}/{path}") } else { format!("http://127.0.0.1:{local}/{path}") }
     }
 
     pub fn title(&self) -> String {
@@ -61,6 +69,7 @@ mod tests {
             let preview = Preview { port: 5173, path: path.into(), label: "Web".into() };
             preview.validate().unwrap();
             assert!(preview.url(5173).starts_with("http://127.0.0.1:5173/"));
+            assert!(preview.url_with(5173, true).starts_with("https://localhost:5173/"));
         }
         assert!(Preview { port: 5173, path: "bad\npath".into(), label: String::new() }.validate().is_err());
     }
