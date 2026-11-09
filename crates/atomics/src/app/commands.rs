@@ -68,10 +68,10 @@ impl Local<'_> {
         match command {
             Command::OpenPreview { preview, .. } => {
                 if preview.validate().is_ok() {
-                    let url = preview.url(preview.port);
-                    // Browser launch runs outside the runtime and its lock.
+                    // The TLS probe and the browser launch run outside the runtime and its lock.
                     std::thread::spawn(move || {
-                        let _ = crate::preview::client::open_browser(&url);
+                        let tls = crate::preview::client::speaks_tls(preview.port);
+                        let _ = crate::preview::client::open_browser(&preview.url_with(preview.port, tls));
                     });
                 }
             }
