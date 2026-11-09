@@ -110,7 +110,7 @@ impl State {
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the
-    /// chief there too: the folder its hooks last reported follows wherever its shell went.
+    /// chief there too, and without one in the folder it was started in.
     pub(super) fn chief_cwd(&self) -> Option<PathBuf> {
         let launch = self.tickets.workspace_chief.as_ref().and_then(|chief| chief.cwd.clone());
         setting(launch).or_else(|| setting(self.config.chief.cwd.clone())).map(|dir| paths::expand(&dir))
