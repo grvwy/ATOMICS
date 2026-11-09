@@ -48,6 +48,8 @@ mod usage;
 mod vm;
 mod voice;
 mod watcher;
+#[cfg(target_os = "linux")]
+mod window_backend;
 
 // Drawing code that reads nothing from the host's model; atomics-ui owns it.
 use atomics_ui::{diff_view, markdown, panel_nav};
@@ -549,7 +551,7 @@ fn main() -> eframe::Result {
                 .collect(),
             screenshot: cli.screenshot.clone().map(|path| (path, cli.screenshot_delay)),
         };
-        return client::run(target, launch, native_options(size, load_icon()));
+        return client::run(target, launch, native_options(size, load_icon())?);
     }
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
@@ -604,7 +606,7 @@ fn main() -> eframe::Result {
         remote_port: None,
     };
     let icon = load_icon();
-    let native = native_options(size, icon.clone());
+    let native = native_options(size, icon.clone())?;
     // Before the event loop: the Apple event that launches the app may arrive before the window exists.
     #[cfg(target_os = "macos")]
     open_link::macos::register();
@@ -622,7 +624,7 @@ fn main() -> eframe::Result {
 }
 
 /// The window: without `size` it fills the screen, which the layout is built to use.
-fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::NativeOptions {
+fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::Result<eframe::NativeOptions> {
     let mut native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ATOMICS")
@@ -642,7 +644,11 @@ fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::Nativ
             descriptor
         });
     }
-    native
+    #[cfg(target_os = "linux")]
+    window_backend::configure(&mut native).map_err(|error| {
+        eframe::Error::AppCreation(std::io::Error::new(std::io::ErrorKind::InvalidInput, error).into())
+    })?;
+    Ok(native)
 }
 
 fn load_icon() -> egui::IconData {

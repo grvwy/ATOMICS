@@ -389,6 +389,7 @@ impl Risk {
                 "agents",
                 "approvals",
                 "chief.command",
+                "chief.provider",
                 "chief.args",
                 "editor",
                 "github.actions",
@@ -1238,6 +1239,17 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         assert!(edit(text, "", &["tickets.missing".into()]).unwrap_err().contains("not set"));
         assert!(edit(text, "[tickets", &[]).unwrap_err().contains("not valid TOML"));
         assert_eq!(edit("", "[layout]\nsidebar_width = 300.0", &[]).unwrap(), "[layout]\nsidebar_width = 300.0\n");
+    }
+
+    #[test]
+    fn chief_provider_changes_are_known_and_labeled_as_command_execution() {
+        let layers = [layer(Source::Main, "[chief]\ncommand=['wrapped-chief']\nargs=[]")];
+        let proposal = propose(Scope::Main, &layers, "[chief]\nprovider='copilot'", &[]).unwrap();
+        assert_eq!(proposal.risks(), [(Risk::RunsCommands, vec!["chief.provider"])]);
+        assert!(!proposal.warnings.iter().any(|warning| warning.contains("does not know chief.provider")));
+        let config: Config = toml::from_str(&proposal.after).unwrap();
+        assert_eq!(config.chief.provider(), Some(crate::config::AgentProvider::Copilot));
+        assert_eq!(config.chief.command, ["wrapped-chief"]);
     }
 
     #[test]

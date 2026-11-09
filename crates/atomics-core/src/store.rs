@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "native")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::ChiefDock;
+use crate::config::{ChiefDock, ChiefProvider};
 
 #[cfg(feature = "native")]
 use anyhow::Result;
@@ -17,6 +17,9 @@ const MAX_RECORDS: usize = 60;
 pub struct SessionRecord {
     #[serde(default)]
     pub chief: bool,
+    /// Provider that owns this chief conversation. Legacy records without it belong to Claude.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_provider: Option<ChiefProvider>,
     #[serde(default)]
     pub pane: Option<String>,
     pub claude_session_id: String,
@@ -137,6 +140,7 @@ mod tests {
     fn record(id: &str, prompt: Option<&str>) -> SessionRecord {
         SessionRecord {
             chief: false,
+            chief_provider: None,
             pane: None,
             claude_session_id: id.into(),
             agent: "claude".into(),

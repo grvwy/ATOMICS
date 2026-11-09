@@ -50,7 +50,7 @@ impl State {
     /// Native providers need an observed lifecycle and an exact conversation before ATOMICS
     /// can safely act on an apparently idle session. MCP reports alone do not end a turn.
     pub(super) fn provider_tracking_ready(&self, session: &Session) -> bool {
-        self.config.agent(&session.agent).and_then(|agent| agent.provider()).is_none()
+        session.provider.is_none()
             || session.hooks_active && session.claude_id.as_ref().is_some_and(|id| !id.is_empty())
     }
 

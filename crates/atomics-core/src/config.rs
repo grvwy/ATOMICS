@@ -471,11 +471,13 @@ wake_secs = 180              # wake an idle chief while work is open; 0 = off, m
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
+# For Cursor use command = ["agent"], for Copilot command = ["copilot"]; set args = [] to clear the Claude model.
+# provider = "cursor"      # optional explicit identity for a wrapper: "claude", "cursor" or "copilot"
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
                           # config.d/<host>.toml and the workspace file add theirs after this one
 # cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
-# resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
+# resume = "<id>"         # exact provider session id the chief continues instead of starting a new conversation
 # autostart = false       # start the chief when ATOMICS starts
 
 [steer]
@@ -740,14 +742,23 @@ pub enum ChiefDock {
     Docked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// Explicit chief identity, including Claude wrappers whose executable name is arbitrary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiefProvider {
+    Claude,
+    Cursor,
+    Copilot,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChiefConfig {
     pub heartbeat_secs: u64,
     /// Wake an idle chief while work is open; zero disables wakes, otherwise at least 30 seconds.
-    #[serde(deserialize_with = "deserialize_wake_secs")]
     pub wake_secs: u64,
     pub dock: ChiefDock,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ChiefProvider>,
     pub command: Vec<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
@@ -757,7 +768,7 @@ pub struct ChiefConfig {
     pub prompt: String,
     /// The folder the chief starts in (`~/` allowed). Unset: the main checkout of the project on screen.
     pub cwd: Option<String>,
-    /// A Claude conversation, by session id, that the chief continues instead of starting anew.
+    /// An exact provider conversation id that the chief continues instead of starting anew.
     pub resume: Option<String>,
     /// Start the chief as soon as ATOMICS starts, unless a restart already brings it back.
     pub autostart: bool,
@@ -779,6 +790,7 @@ impl Default for ChiefConfig {
             heartbeat_secs: 300,
             wake_secs: 180,
             dock: ChiefDock::Floating,
+            provider: None,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
@@ -787,6 +799,95 @@ impl Default for ChiefConfig {
             resume: None,
             autostart: false,
         }
+    }
+}
+
+impl ChiefConfig {
+    /// Native CLI integration for the chief. Unrecognized commands remain Claude wrappers,
+    /// preserving existing configurations; an explicit provider selects another integration.
+    pub fn provider(&self) -> Option<AgentProvider> {
+        match self.provider {
+            Some(ChiefProvider::Claude) => None,
+            Some(ChiefProvider::Cursor) => Some(AgentProvider::Cursor),
+            Some(ChiefProvider::Copilot) => Some(AgentProvider::Copilot),
+            None => AgentProvider::for_program(self.command.first()?),
+        }
+    }
+
+    pub fn agent(&self) -> AgentConfig {
+        let provider = self.provider();
+        AgentConfig {
+            name: "chief".into(),
+            command: self.command.clone(),
+            kind: if provider.is_some() { AgentKind::Generic } else { AgentKind::Claude },
+            provider,
+            busy_text: None,
+            isolation: Some(crate::isolation::IsolationMode::Bare),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChiefConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Optional command/args retain whether they were explicitly configured. In particular,
+        // selecting a native CLI must not inherit Claude's default model arguments.
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Fields {
+            heartbeat_secs: u64,
+            #[serde(deserialize_with = "deserialize_wake_secs")]
+            wake_secs: u64,
+            dock: ChiefDock,
+            provider: Option<ChiefProvider>,
+            command: Option<Vec<String>>,
+            args: Option<Vec<String>>,
+            system_prompt: String,
+            prompt: String,
+            cwd: Option<String>,
+            resume: Option<String>,
+            autostart: bool,
+        }
+        impl Default for Fields {
+            fn default() -> Self {
+                let chief = ChiefConfig::default();
+                Self {
+                    heartbeat_secs: chief.heartbeat_secs,
+                    wake_secs: chief.wake_secs,
+                    dock: chief.dock,
+                    provider: chief.provider,
+                    command: None,
+                    args: None,
+                    system_prompt: chief.system_prompt,
+                    prompt: chief.prompt,
+                    cwd: chief.cwd,
+                    resume: chief.resume,
+                    autostart: chief.autostart,
+                }
+            }
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let command = fields.command.unwrap_or_else(|| match fields.provider {
+            Some(ChiefProvider::Cursor) => vec!["agent".into()],
+            Some(ChiefProvider::Copilot) => vec!["copilot".into()],
+            _ => ChiefConfig::default().command,
+        });
+        let mut chief = Self {
+            heartbeat_secs: fields.heartbeat_secs,
+            wake_secs: fields.wake_secs,
+            dock: fields.dock,
+            provider: fields.provider,
+            command,
+            args: Vec::new(),
+            system_prompt: fields.system_prompt,
+            prompt: fields.prompt,
+            cwd: fields.cwd,
+            resume: fields.resume,
+            autostart: fields.autostart,
+        };
+        chief.args = fields
+            .args
+            .unwrap_or_else(|| if chief.provider().is_some() { Vec::new() } else { ChiefConfig::default().args });
+        Ok(chief)
     }
 }
 
@@ -888,6 +989,14 @@ impl AgentProvider {
         match self {
             Self::Copilot => "GitHub Copilot",
             Self::Cursor => "Cursor CLI",
+        }
+    }
+
+    fn for_program(program: &str) -> Option<Self> {
+        match std::path::Path::new(program).file_name()?.to_str()? {
+            "copilot" => Some(Self::Copilot),
+            "agent" | "cursor-agent" => Some(Self::Cursor),
+            _ => None,
         }
     }
 
@@ -1155,11 +1264,7 @@ impl AgentConfig {
         if self.kind != AgentKind::Generic {
             return None;
         }
-        self.provider.or_else(|| match std::path::Path::new(self.command.first()?).file_name()?.to_str()? {
-            "copilot" => Some(AgentProvider::Copilot),
-            "agent" | "cursor-agent" => Some(AgentProvider::Cursor),
-            _ => None,
-        })
+        self.provider.or_else(|| AgentProvider::for_program(self.command.first()?))
     }
 
     pub fn is_codex(&self) -> bool {
@@ -1567,6 +1672,63 @@ kind = "shell"
         }
         let bad: toml::Table = toml::from_str("[[agents]]\nname='x'\nkind='shell'\nprovider='cursor'").unwrap();
         assert!(Config::from_tables([bad]).unwrap_err().to_string().contains("requires kind"));
+    }
+
+    #[test]
+    fn chief_native_selection_uses_agent_identity_and_provider_specific_defaults() {
+        for (selection, provider, executable) in [
+            ("command = ['agent']", AgentProvider::Cursor, "agent"),
+            ("command = ['/opt/bin/cursor-agent']", AgentProvider::Cursor, "/opt/bin/cursor-agent"),
+            ("command = ['copilot']", AgentProvider::Copilot, "copilot"),
+            ("provider = 'cursor'", AgentProvider::Cursor, "agent"),
+            ("provider = 'copilot'", AgentProvider::Copilot, "copilot"),
+        ] {
+            let config: Config = toml::from_str(&format!("[chief]\n{selection}")).unwrap();
+            let chief = config.chief.agent();
+            assert_eq!(chief.name, "chief");
+            assert_eq!(chief.kind, AgentKind::Generic);
+            assert_eq!(chief.provider(), Some(provider));
+            assert_eq!(chief.command, [executable]);
+            assert!(config.chief.args.is_empty(), "native providers do not inherit Claude's model: {selection}");
+            let saved = toml::to_string(&config).unwrap();
+            let loaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.chief.provider(), Some(provider));
+            assert!(loaded.chief.args.is_empty());
+        }
+    }
+
+    #[test]
+    fn chief_legacy_wrappers_and_explicit_provider_overrides_keep_their_settings() {
+        for text in
+            ["", "[chief]", "[chief]\ncommand=['/opt/claude-wrapper']", "[chief]\ncommand=['/bin/sh','wrapper']"]
+        {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.chief.agent().kind, AgentKind::Claude);
+            assert_eq!(config.chief.provider(), None);
+            assert_eq!(config.chief.args, ChiefConfig::default().args);
+        }
+        let config: Config =
+            toml::from_str("[chief]\ncommand=['wrapped']\nprovider='copilot'\nargs=['--model','custom']").unwrap();
+        assert_eq!(config.chief.agent().command, ["wrapped"]);
+        assert_eq!(config.chief.provider(), Some(AgentProvider::Copilot));
+        assert_eq!(config.chief.args, ["--model", "custom"]);
+        let config: Config = toml::from_str("[chief]\ncommand=['agent']\nprovider='claude'").unwrap();
+        assert_eq!(config.chief.agent().kind, AgentKind::Claude, "explicit identity wins over the executable name");
+        assert_eq!(config.chief.args, ChiefConfig::default().args);
+        let config: Config = toml::from_str("[chief]\nargs=[]").unwrap();
+        assert!(config.chief.args.is_empty(), "an explicit empty argument list is preserved for Claude too");
+    }
+
+    #[test]
+    fn chief_command_override_preserves_arguments_already_written_in_merged_config() {
+        let main: toml::Table = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let host: toml::Table = toml::from_str("[chief]\ncommand=['agent']").unwrap();
+        let config = Config::from_tables([main.clone(), host]).unwrap();
+        assert_eq!(config.chief.provider(), Some(AgentProvider::Cursor));
+        assert_eq!(config.chief.args, ChiefConfig::default().args, "explicit main-file arguments remain configured");
+        let host: toml::Table = toml::from_str("[chief]\ncommand=['agent']\nargs=[]").unwrap();
+        assert!(Config::from_tables([main, host]).unwrap().chief.args.is_empty());
+        assert!(toml::from_str::<Config>("[chief]\nprovider='shell'").is_err());
     }
 
     #[test]

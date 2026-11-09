@@ -530,6 +530,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
+ "winit",
  "zeroize",
  "zstd",
 ]

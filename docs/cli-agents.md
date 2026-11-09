@@ -64,9 +64,37 @@ Permission dialogs are answered in the CLI terminal. The existing centralized Cl
 recognizer does not answer Cursor/Copilot dialogs. An MCP task report can arrive before the CLI's
 turn ends; lifecycle tracking keeps the session open until the turn actually ends.
 
-The chief remains a Claude session. Cursor and Copilot can be selected as workers in its plans;
+Cursor and Copilot can be selected as workers or as the chief;
 model arguments are passed to the selected CLI. Account quota meters are currently available only
 for the existing Claude/Codex integrations.
+
+## Use Cursor or Copilot as chief
+
+Set the chief's command in your main or host configuration. For Cursor:
+
+```toml
+[chief]
+command = ["agent"]
+args = []
+```
+
+For Copilot, use `command = ["copilot"]` instead. `args = []` clears a Claude model already present
+in another configuration layer; otherwise put the chosen CLI's model arguments here. When no layer
+sets `args`, native chiefs use their CLI defaults. A custom wrapper can set `provider = "cursor"`
+or `provider = "copilot"` explicitly. Existing unrecognized wrapper commands retain Claude behavior;
+`provider = "claude"` also selects it explicitly.
+
+The chief always runs bare and receives the chief MCP tool set and orchestration instructions.
+Its native lifecycle hooks track turns and queued messages just as for workers. Trust the plugin,
+instructions and MCP server when the CLI asks; native CLI permissions remain in its terminal.
+Copilot receives the existing chief tool allowlist using its native per-tool syntax. Cursor uses
+its own MCP permission prompts. Detailed trace cards still depend on the CLI's tool naming and
+need separate qualification with real Cursor/Copilot hooks.
+
+Saved chief conversations carry their provider and can only be restored with that provider.
+After changing providers, open **CHIEF** to start a new conversation; a mismatched saved
+conversation is not passed to the new CLI. A running chief keeps its provider until it exits.
+An explicit `[chief] resume` must name a conversation belonging to the selected provider.
 
 ## Sandbox behavior
 
@@ -85,6 +113,12 @@ authentication, and verify sandbox behavior separately.
 Run the Linux build of ATOMICS and both Linux CLIs in the same WSL2 distribution. WSLg supplies the
 window. Keep the test repository under the Linux home directory, for example `~/src`, and verify
 the Linux CLI logins independently of any Windows editor installation.
+
+Under detected WSLg with an X display, ATOMICS selects X11 automatically to avoid the reported
+Weston crash during native Wayland startup. This is a workaround; the suspected icon cause has
+not been reproduced. Ordinary Linux desktop sessions retain their normal backend selection.
+Use `ATOMICS_WINDOW_BACKEND=wayland ./target/debug/atomics` to explicitly retest native Wayland,
+or `ATOMICS_WINDOW_BACKEND=x11 ./target/debug/atomics` to select X11 yourself.
 
 Record `wsl --version` and `wsl -l -v` in PowerShell. Inside WSL, record `uname -a`, `command -v agent`,
 `command -v copilot`, and both CLIs' `--version` output. Check `--help` for the required flags. If only
@@ -139,6 +173,13 @@ For each provider:
 
 Capture the CLI version, provider, test step, observed behavior and a small anonymized hook/TUI
 sample for failures. Actual CLI captures should be added as versioned fixtures after qualification.
+
+Also test each provider as chief: configure it as above, open **CHIEF**, ask it to create a small
+plan, approve the plan and have it dispatch a worker. Confirm it can wait for and review the result,
+receive a second message, and restore the same conversation after an idle restart. Then switch
+the chief provider and verify that the previous conversation is not resumed in the new CLI.
+For WSLg, record Debian/other distribution and WSL versions, the selected backend, and any Weston
+log from `/mnt/wslg/weston.log` when comparing the default X11 start with the explicit Wayland test.
 
 ## References
 

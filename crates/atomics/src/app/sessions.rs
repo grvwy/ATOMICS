@@ -24,6 +24,7 @@ impl Session {
             id,
             agent: agent.name.clone(),
             kind: agent.kind,
+            provider: agent.provider(),
             terminal: None,
             claude_id: None,
             cwd,
@@ -53,6 +54,11 @@ impl Session {
             mcp_needed: Vec::new(),
             warning: None,
         }
+    }
+
+    /// Persist the provider owning a chief's transcript, independent of later config changes.
+    pub(super) fn chief_provider(&self) -> Option<atomics_core::config::ChiefProvider> {
+        self.chief.then_some(chief::provider_identity(self.provider))
     }
 
     /// Names a scratch session after its first prompt, once.
@@ -177,20 +183,20 @@ impl State {
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
         let agent = if chief {
-            atomics_core::config::AgentConfig {
-                name: "chief".into(),
-                command: self.config.chief.command.clone(),
-                kind: AgentKind::Claude,
-                provider: None,
-                busy_text: None,
-                isolation: None,
-            }
+            self.config.chief.agent()
         } else {
             let Some(agent) = self.config.agent(agent_name).cloned() else {
                 return Err(format!("No agent named {agent_name} in the config"));
             };
             agent
         };
+        if chief
+            && let Some(resume) = resume.as_deref()
+            && let Some(record) =
+                self.store.sessions.iter().find(|record| record.chief && record.claude_session_id == resume)
+        {
+            self.check_chief_resume(record)?;
+        }
         if !cwd.is_dir() {
             return Err(format!("{} is not a folder", cwd.display()));
         }
@@ -511,6 +517,7 @@ impl State {
                 .to_string_lossy()
                 .into_owned();
         }
+        let chief_instructions = (chief && provider.is_some()).then(|| self.chief_prompt());
         let mut claude_id = None;
         // Every agent ATOMICS starts can report back to the plan with `atomics_report`.
         let exe = crate::setup::executable_path()
@@ -647,6 +654,11 @@ impl State {
             claude_id = (!id.is_empty()).then(|| id.clone());
         }
         args.extend(extra_args);
+        if chief && provider == Some(atomics_core::config::AgentProvider::Copilot) {
+            args.extend(CHIEF_ALLOWED_TOOLS.iter().filter_map(|tool| {
+                tool.strip_prefix("mcp__atomics__").map(|tool| format!("--allow-tool=atomics({tool})"))
+            }));
+        }
         let prompt = match prompt {
             Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => {
                 let session = sandboxed.as_ref().map_or(id.as_str(), |sandbox| {
@@ -665,6 +677,7 @@ impl State {
                     &hooks_exe,
                     Path::new(&socket),
                     &id,
+                    chief_instructions.as_deref(),
                     &mut args,
                     &mut env,
                 )
@@ -796,7 +809,7 @@ impl State {
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
-            let native = self.config.agent(&session.agent).is_some_and(|agent| agent.provider().is_some());
+            let native = session.provider.is_some();
             if native && pending.attempts == u8::MAX {
                 continue;
             }
@@ -906,7 +919,7 @@ impl State {
                 session.activity.observe(session.status);
                 continue;
             }
-            let native = self.config.agent(&session.agent).is_some_and(|agent| agent.provider().is_some());
+            let native = session.provider.is_some();
             // A command menu drawn with no hook asking is the session's pending approval.
             if session.is_agent()
                 && !native
@@ -1084,7 +1097,7 @@ impl State {
                     }
                 });
             }
-            if self.config.agent(&session.agent).is_some_and(|agent| agent.provider().is_some()) {
+            if session.provider.is_some() {
                 // Drop kills this pane's process group before removing the plugin it may still read.
                 drop(session.terminal.take());
                 crate::provider_launch::cleanup(&paths::atomics_home(), id);
@@ -1109,6 +1122,7 @@ impl State {
         let Some(claude_id) = s.claude_id.clone() else { return };
         self.store.upsert(SessionRecord {
             chief: s.chief,
+            chief_provider: s.chief_provider(),
             pane: Some(s.id.clone()),
             claude_session_id: claude_id,
             agent: s.agent.clone(),
@@ -1128,7 +1142,7 @@ impl State {
     /// next hook of sessions running elsewhere.
     pub(super) fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         self.check_refs(index);
-        let native = self.config.agent(&self.sessions[index].agent).is_some_and(|agent| agent.provider().is_some());
+        let native = self.sessions[index].provider.is_some();
         let session = &mut self.sessions[index];
         if native && (session.status == AgentStatus::Exited || session.terminal.as_ref().is_some_and(Terminal::exited))
         {

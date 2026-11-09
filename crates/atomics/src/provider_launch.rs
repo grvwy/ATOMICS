@@ -69,13 +69,22 @@ pub(crate) fn configure(
     hook_exe: &Path,
     socket: &Path,
     pane: &str,
+    chief_prompt: Option<&str>,
     args: &mut Vec<String>,
     env: &mut HashMap<String, String>,
 ) -> Result<(), String> {
+    if chief_prompt.is_some()
+        && provider == AgentProvider::Copilot
+        && args.iter().any(|arg| arg == "--no-custom-instructions")
+    {
+        return Err(
+            "Copilot chief requires custom instructions; remove --no-custom-instructions from [chief].args".into()
+        );
+    }
     let dir = directory(home, pane);
     std::fs::create_dir_all(dir.join("hooks")).map_err(|error| format!("Creating provider plugin: {error}"))?;
     let mut mcp = json!({"mcpServers": {"atomics": {
-        "command": exe, "args": ["mcp", "--agent"],
+        "command": exe, "args": ["mcp", if chief_prompt.is_some() { "--chief" } else { "--agent" }],
         "env": {"ATOMICS_PANE": pane, "ATOMICS_SOCKET": socket}
     }}});
     match provider {
@@ -86,7 +95,33 @@ pub(crate) fn configure(
                     "name": "atomics-session", "version": "1.0.0", "hooks": "hooks/hooks.json"
                 }),
             )?;
-            write_json(&dir.join("hooks/hooks.json"), &atomics_core::hook::copilot_hooks(hook_exe))?;
+            let mut hooks = atomics_core::hook::copilot_hooks(hook_exe);
+            if let Some(prompt) = chief_prompt {
+                mark_chief_hooks(&mut hooks);
+                let instructions = dir.join("instructions");
+                std::fs::create_dir_all(&instructions)
+                    .map_err(|error| format!("Creating chief instructions: {error}"))?;
+                write_text(&instructions.join("AGENTS.md"), prompt)?;
+                // The native CLI merges these with the user's existing instructions on every
+                // turn, including exact resumes. Authentication and history keep their home.
+                let inherited = env
+                    .get("COPILOT_CUSTOM_INSTRUCTIONS_DIRS")
+                    .cloned()
+                    .or_else(|| std::env::var("COPILOT_CUSTOM_INSTRUCTIONS_DIRS").ok())
+                    .filter(|value| !value.trim().is_empty());
+                let path = instructions.to_string_lossy();
+                if path.contains(',') {
+                    return Err("Copilot chief instructions require an ATOMICS_HOME path without commas".into());
+                }
+                env.insert(
+                    "COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(),
+                    match inherited {
+                        Some(inherited) => format!("{inherited},{path}"),
+                        None => path.into_owned(),
+                    },
+                );
+            }
+            write_json(&dir.join("hooks/hooks.json"), &hooks)?;
             env.insert(atomics_core::hook::HOOK_PANE_ENV.into(), pane.into());
             env.insert(atomics_core::hook::HOOK_SOCKET_ENV.into(), socket.to_string_lossy().into_owned());
             mcp["mcpServers"]["atomics"]["type"] = json!("local");
@@ -102,7 +137,19 @@ pub(crate) fn configure(
                     "name": "atomics-session", "version": "1.0.0"
                 }),
             )?;
-            write_json(&dir.join("hooks/hooks.json"), &atomics_core::hook::cursor_hooks(hook_exe, socket, pane))?;
+            let mut hooks = atomics_core::hook::cursor_hooks(hook_exe, socket, pane);
+            if let Some(prompt) = chief_prompt {
+                mark_chief_hooks(&mut hooks);
+                let rules = dir.join("rules");
+                std::fs::create_dir_all(&rules).map_err(|error| format!("Creating chief rules: {error}"))?;
+                write_text(
+                    &rules.join("atomics-chief.mdc"),
+                    &format!(
+                        "---\ndescription: ATOMICS chief orchestration instructions\nalwaysApply: true\n---\n\n{prompt}\n"
+                    ),
+                )?;
+            }
+            write_json(&dir.join("hooks/hooks.json"), &hooks)?;
             write_json(&dir.join("mcp.json"), &mcp)?;
         }
     }
@@ -122,6 +169,22 @@ pub(crate) fn cleanup(home: &Path, pane: &str) {
     {
         eprintln!("ATOMICS: removing {}: {error}", dir.display());
     }
+}
+
+fn mark_chief_hooks(hooks: &mut Value) {
+    if let Some(events) = hooks["hooks"].as_object_mut() {
+        for entries in events.values_mut().filter_map(Value::as_array_mut) {
+            for entry in entries {
+                if let Some(command) = entry["command"].as_str() {
+                    entry["command"] = format!("{command} --chief").into();
+                }
+            }
+        }
+    }
+}
+
+fn write_text(path: &Path, text: &str) -> Result<(), String> {
+    std::fs::write(path, text).map_err(|error| format!("Writing {}: {error}", path.display()))
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -169,6 +232,7 @@ mod tests {
                 Path::new("/atomics-hook"),
                 Path::new("/socket"),
                 pane,
+                None,
                 &mut args,
                 &mut env,
             )
@@ -191,6 +255,63 @@ mod tests {
             }
             assert_eq!(mcp["mcpServers"]["atomics"]["args"], json!(["mcp", "--agent"]));
             assert_eq!(mcp["mcpServers"]["atomics"]["env"]["ATOMICS_PANE"], pane);
+        }
+    }
+
+    #[test]
+    fn chief_plugins_load_persistent_instructions_and_chief_only_tools() {
+        let home = tempfile::tempdir().unwrap();
+        for provider in [AgentProvider::Copilot, AgentProvider::Cursor] {
+            let pane = provider.name();
+            let mut args = Vec::new();
+            let mut env = HashMap::from([("COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(), "/user/instructions".into())]);
+            configure(
+                provider,
+                home.path(),
+                Path::new("/atomics"),
+                Path::new("/hook"),
+                Path::new("/socket"),
+                pane,
+                Some("CHIEF_INSTRUCTIONS: plan, coordinate and review."),
+                &mut args,
+                &mut env,
+            )
+            .unwrap();
+            let plugin = directory(home.path(), pane);
+            let mcp: Value = match provider {
+                AgentProvider::Copilot => serde_json::from_str(&args[1]).unwrap(),
+                AgentProvider::Cursor => {
+                    serde_json::from_slice(&std::fs::read(plugin.join("mcp.json")).unwrap()).unwrap()
+                }
+            };
+            assert_eq!(mcp["mcpServers"]["atomics"]["args"], json!(["mcp", "--chief"]));
+            let hooks: Value =
+                serde_json::from_slice(&std::fs::read(plugin.join("hooks/hooks.json")).unwrap()).unwrap();
+            for entries in hooks["hooks"].as_object().unwrap().values() {
+                assert!(
+                    entries
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry["command"].as_str().unwrap().ends_with(" --chief"))
+                );
+            }
+            let instructions = match provider {
+                AgentProvider::Copilot => {
+                    assert_eq!(
+                        env["COPILOT_CUSTOM_INSTRUCTIONS_DIRS"],
+                        format!("/user/instructions,{}", plugin.join("instructions").display())
+                    );
+                    std::fs::read_to_string(plugin.join("instructions/AGENTS.md")).unwrap()
+                }
+                AgentProvider::Cursor => {
+                    let rule = std::fs::read_to_string(plugin.join("rules/atomics-chief.mdc")).unwrap();
+                    assert!(rule.contains("alwaysApply: true"));
+                    rule
+                }
+            };
+            assert!(instructions.contains("CHIEF_INSTRUCTIONS: plan, coordinate and review."));
+            assert!(!env.contains_key("COPILOT_HOME"));
         }
     }
 }

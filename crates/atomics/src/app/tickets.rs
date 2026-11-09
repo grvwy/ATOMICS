@@ -286,7 +286,8 @@ impl State {
     }
 
     pub(super) fn chief_author(&self) -> Author {
-        Author::Chief(ticket::model_label("claude", &self.config.chief.args))
+        let provider = self.config.chief.provider().map_or("claude", |provider| provider.name());
+        Author::Chief(ticket::model_label(provider, &self.config.chief.args))
     }
 
     /// The chief's prompt with the configured ticket workflow added, then the user's own

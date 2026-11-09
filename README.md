@@ -604,7 +604,7 @@ repository's stash.
 
 ## The chief agent
 
-Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: Claude in a large window in the middle of the
+Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: your configured CLI in a large window in the middle of the
 screen, started in the project's main checkout with every ATOMICS tool and a built-in way of working (plan, wait for your
 approval, dispatch, verify, end with a fresh reviewer, never push without asking). Close the window to minimize it to
 the pill. The **Dock** / **Float** button in its header switches between the floating window and a full-height column
@@ -612,6 +612,11 @@ beside the agents; the pill's context menu offers both modes too. Drag the dock'
 to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"docked"`) sets the initial mode.
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
+
+Claude is the default chief. Cursor CLI and GitHub Copilot CLI can also fill this role: set `[chief] command`
+to `["agent"]` or `["copilot"]` and `args = []` to clear any configured Claude model. An explicit
+`provider = "cursor"` or `"copilot"` selects the integration for a wrapper command. See
+[CLI agents](docs/cli-agents.md#use-cursor-or-copilot-as-chief) for configuration and testing.
 
 When the chief works on tickets, a **trace lane** under its terminal shows each call as a card instead of JSON: searches,
 reads, children, related tickets and the plan it builds, each with a spinner, then a check or a cross. Click a ticket in it
@@ -635,7 +640,7 @@ typing in the chief terminal within the last 60 seconds, or an unfinished prompt
 Pending input is tracked from native keystrokes and pastes since the last turn ended or submit (Enter), so
 Claude's suggested prompts do not suppress wakes. Without input history, the screen fallback ignores styled suggestions.
 
-The chief may read, plan, review and run the plan you approved without asking. It can also answer other
+With Claude as chief, it may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `atomics_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
 It verifies a sandboxed task inside its sandbox, with the pre-approved `atomics_exec`, which reaches no more
@@ -654,7 +659,7 @@ settings with a team; see [Repository workflows](docs/repo-workflow.md).
 
 ## Orchestration: several plans you approve, agents that report back
 
-An orchestrator (a Claude session with the ATOMICS MCP server) turns a goal into a plan with `atomics_plan_set`: tasks with a
+An orchestrator with the ATOMICS MCP server turns a goal into a plan with `atomics_plan_set`: tasks with a
 brief, acceptance checks, dependencies, and which agent and model should do them. Without `plan`, this creates a new
 plan and returns its unique id; pass `plan: "<id>"` to update that plan and to get, update, dispatch or integrate its
 tasks. Rewording an existing plan’s goal preserves its task progress and integration branch.

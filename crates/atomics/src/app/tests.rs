@@ -5,6 +5,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         id: id.into(),
         agent: "test".into(),
         kind,
+        provider: None,
         terminal: None,
         claude_id: Some(id.into()),
         cwd: cwd.into(),

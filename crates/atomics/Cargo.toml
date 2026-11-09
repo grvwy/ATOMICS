@@ -59,6 +59,10 @@ similar = "3.2.1"
 objc2 = "0.6.5"
 mach2 = "0.6.0"
 
+# Use the same event-loop backend as eframe, with an explicit WSLg compatibility policy.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "x11"] }
+
 [dev-dependencies]
 atomics-core = { path = "../atomics-core", features = ["test-support"] }
 atomics-ui = { path = "../atomics-ui", features = ["test-support"] }

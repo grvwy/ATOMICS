@@ -59,10 +59,11 @@ struct WantedProgram {
     name: String,
     program: String,
     config: Option<atomics_core::config::AgentConfig>,
+    startable: bool,
 }
 
 fn wanted_programs(config: &Config) -> Vec<WantedProgram> {
-    let mut wanted = vec![WantedProgram { name: "git".into(), program: "git".into(), config: None }];
+    let mut wanted = vec![WantedProgram { name: "git".into(), program: "git".into(), config: None, startable: false }];
     for agent in &config.agents {
         let Some(program) = agent.command.first() else { continue };
         let name = match agent.kind {
@@ -71,7 +72,22 @@ fn wanted_programs(config: &Config) -> Vec<WantedProgram> {
             AgentKind::Generic if agent.is_codex() => "Codex".to_string(),
             AgentKind::Generic => agent.provider().map_or_else(|| agent.name.clone(), |p| p.title().into()),
         };
-        wanted.push(WantedProgram { name, program: program.clone(), config: Some(agent.clone()) });
+        wanted.push(WantedProgram { name, program: program.clone(), config: Some(agent.clone()), startable: true });
+    }
+    let chief = config.chief.agent();
+    if let Some(provider) = chief.provider()
+        && let Some(program) = chief.command.first()
+        && !wanted
+            .iter()
+            .filter_map(|wanted| wanted.config.as_ref())
+            .any(|agent| agent.provider() == Some(provider) && agent.command == chief.command)
+    {
+        wanted.push(WantedProgram {
+            name: format!("Chief ({})", provider.title()),
+            program: program.clone(),
+            config: Some(chief),
+            startable: false,
+        });
     }
     wanted
 }
@@ -182,8 +198,8 @@ impl State {
             let mac = cfg!(target_os = "macos");
             let programs = wanted
                 .into_iter()
-                .map(|WantedProgram { name, program, config }| {
-                    let agent = config.as_ref().map(|config| config.name.clone());
+                .map(|WantedProgram { name, program, config, startable }| {
+                    let agent = config.as_ref().filter(|_| startable).map(|config| config.name.clone());
                     let found = if let Some(config) = &config {
                         crate::setup::checked_agent_on_path(config, &path)
                     } else if program.contains('/') {
@@ -449,5 +465,37 @@ impl State {
 fn remove_scratch(folder: &Path) {
     if paths::scratch_of(folder).is_some() {
         let _ = std::fs::remove_dir_all(folder);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn native_chief_wrappers_are_checked_without_becoming_worker_start_buttons() {
+        let config: Config = toml::from_str(
+            "[chief]\nprovider='cursor'\ncommand=['/opt/chief-wrapper','--configured']\n[[agents]]\nname='shell'\nkind='shell'",
+        ).unwrap();
+        let wanted = wanted_programs(&config);
+        assert_eq!(wanted.len(), 2, "git and the otherwise unrepresented native chief");
+        let chief = &wanted[1];
+        assert_eq!(chief.name, "Chief (Cursor CLI)");
+        assert_eq!(chief.program, "/opt/chief-wrapper");
+        assert!(!chief.startable, "the ordinary Start action would not launch the chief role");
+        let checked = chief.config.as_ref().expect("uses off-thread checked_agent_on_path discovery");
+        assert_eq!(checked.provider(), Some(AgentProvider::Cursor));
+        assert_eq!(checked.command, ["/opt/chief-wrapper", "--configured"]);
+    }
+
+    #[test]
+    fn native_chief_discovery_reuses_matching_worker_identity_only() {
+        let mut config: Config = toml::from_str("[chief]\ncommand=['agent']").unwrap();
+        assert!(wanted_programs(&config).iter().all(|wanted| !wanted.name.starts_with("Chief (")));
+        config.chief.provider = Some(atomics_core::config::ChiefProvider::Copilot);
+        let wanted = wanted_programs(&config);
+        assert!(wanted.iter().any(|wanted| wanted.name == "Chief (GitHub Copilot)"));
+        config.chief = atomics_core::config::ChiefConfig::default();
+        assert!(wanted_programs(&config).iter().all(|wanted| !wanted.name.starts_with("Chief (")));
     }
 }

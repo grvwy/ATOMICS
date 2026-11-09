@@ -651,9 +651,8 @@ impl State {
         // never attach an unrelated terminal or create an external Claude session.
         if let Some(provider) = event.provider {
             let owned = message.pane.as_ref().and_then(|pane| self.sessions.iter().find(|session| &session.id == pane));
-            if !owned.is_some_and(|session| {
-                self.config.agent(&session.agent).and_then(|agent| agent.provider()) == Some(provider)
-            }) || event.name == "PermissionRequest"
+            if !owned.is_some_and(|session| session.provider == Some(provider))
+                || event.name == "PermissionRequest"
                 || event.thread != HookThread::Main
             {
                 leave_to_agent(message.approval_reply);
@@ -689,6 +688,7 @@ impl State {
                     id: format!("ext:{}", event.session_id),
                     agent: "claude".into(),
                     kind: AgentKind::Claude,
+                    provider: None,
                     terminal: None,
                     claude_id: Some(event.session_id.clone()),
                     cwd,
@@ -724,6 +724,13 @@ impl State {
                 self.sessions.len() - 1
             }
         };
+
+        // A provider may also load older compatibility hooks from user configuration. Only
+        // events from this PTY's integration may change its conversation or permissions.
+        if self.sessions[index].provider != event.provider {
+            leave_to_agent(message.approval_reply);
+            return;
+        }
 
         // A command that drops shared stash entries says whose, for whoever decides.
         let (stash_warning, stash) = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
@@ -1018,6 +1025,7 @@ mod tests {
             use atomics_core::config::AgentProvider::{Copilot, Cursor};
             let mut worker = session("pane", AgentKind::Generic, AgentStatus::Working, &paths::atomics_home());
             worker.agent = "cursor".into();
+            worker.provider = Some(Cursor);
             worker.claude_id = None;
             app.runtime.sessions = vec![worker];
             app.runtime.on_hook(provider_hook(Cursor, "SessionStart", None));
@@ -1040,6 +1048,50 @@ mod tests {
     }
 
     #[test]
+    fn native_chief_hooks_and_held_messages_follow_the_running_provider() {
+        with_app(
+            "app::background::tests::native_chief_hooks_and_held_messages_follow_the_running_provider",
+            |app, _| {
+                use atomics_core::config::AgentProvider::{Copilot, Cursor};
+                for provider in [Cursor, Copilot] {
+                    let mut chief =
+                        session("chief-pane", AgentKind::Generic, AgentStatus::Idle, &paths::atomics_home());
+                    chief.agent = "chief".into();
+                    chief.chief = true;
+                    chief.provider = Some(provider);
+                    chief.claude_id = None;
+                    chief.held.push("review this plan".into());
+                    app.runtime.sessions = vec![chief];
+                    // Even if the next chief is configured as Claude, the running PTY keeps its identity.
+                    app.runtime.config.chief.command = vec!["claude".into()];
+                    assert!(!app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));
+                    app.runtime.release_held(0);
+                    assert_eq!(app.runtime.sessions[0].held, ["review this plan"]);
+                    let wrong = if provider == Cursor { Copilot } else { Cursor };
+                    app.runtime.on_hook(provider_hook(wrong, "SessionStart", Some("chief-pane")));
+                    assert!(!app.runtime.sessions[0].hooks_active);
+                    for name in ["SessionStart", "PermissionRequest"] {
+                        let mut legacy = provider_hook(provider, name, Some("chief-pane"));
+                        legacy.event.provider = None;
+                        app.runtime.on_hook(legacy);
+                        assert!(!app.runtime.sessions[0].hooks_active);
+                        assert!(app.runtime.sessions[0].claude_id.is_none());
+                        assert!(app.runtime.sessions[0].approvals.is_empty());
+                    }
+                    app.runtime.on_hook(provider_hook(provider, "SessionStart", Some("chief-pane")));
+                    assert!(app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));
+                    app.runtime.on_hook(provider_hook(provider, "UserPromptSubmit", Some("chief-pane")));
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                    app.runtime.release_held(0);
+                    assert_eq!(app.runtime.sessions[0].held, ["review this plan"]);
+                    app.runtime.on_hook(provider_hook(provider, "Stop", Some("chief-pane")));
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                }
+            },
+        );
+    }
+
+    #[test]
     fn provider_followup_and_missing_hooks_keep_cleanup_and_restart_waiting() {
         with_app(
             "app::background::tests::provider_followup_and_missing_hooks_keep_cleanup_and_restart_waiting",
@@ -1047,6 +1099,7 @@ mod tests {
                 use atomics_core::config::AgentProvider::Cursor;
                 let mut worker = session("pane", AgentKind::Generic, AgentStatus::Done, &paths::atomics_home());
                 worker.agent = "cursor".into();
+                worker.provider = Some(Cursor);
                 worker.claude_id = None;
                 app.runtime.sessions = vec![worker];
                 assert!(!app.runtime.provider_tracking_ready(&app.runtime.sessions[0]));

@@ -165,12 +165,20 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
 
     if let Ok((config, _)) = &config {
         let path = crate::setup::agent_path();
-        for agent in config.agents.iter().filter(|agent| agent.provider().is_some()) {
+        let chief = config.chief.agent();
+        for (agent, is_chief) in config
+            .agents
+            .iter()
+            .map(|agent| (agent, false))
+            .chain(std::iter::once((&chief, true)))
+            .filter(|(agent, _)| agent.provider().is_some())
+        {
             let provider = agent.provider().expect("filtered provider");
             let found = crate::setup::checked_agent_on_path(agent, &path);
+            let label = if is_chief { format!("chief {}", provider.title()) } else { provider.title().into() };
             let label = match &found {
-                Some(path) => format!("{} CLI found ({})", provider.title(), path.display()),
-                None => format!("{} CLI not found or identity check failed (warning)", provider.title()),
+                Some(path) => format!("{label} CLI found ({})", path.display()),
+                None => format!("{label} CLI not found or identity check failed (warning)"),
             };
             let hint = match provider {
                 atomics_core::config::AgentProvider::Cursor => {

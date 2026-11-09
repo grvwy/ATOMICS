@@ -85,6 +85,7 @@ impl State {
         let s = &self.sessions[index];
         let record = SessionRecord {
             chief: s.chief,
+            chief_provider: s.chief_provider(),
             pane: Some(s.id.clone()),
             claude_session_id: s.claude_id.clone().unwrap_or_default(),
             agent: s.agent.clone(),

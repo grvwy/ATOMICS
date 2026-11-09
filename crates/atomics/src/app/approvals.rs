@@ -17,7 +17,7 @@ impl State {
 
     pub(super) fn release_held(&mut self, index: usize) {
         let session = &self.sessions[index];
-        if self.config.agent(&session.agent).and_then(|agent| agent.provider()).is_some()
+        if session.provider.is_some()
             && (!self.provider_tracking_ready(session)
                 || !matches!(session.status, AgentStatus::Idle | AgentStatus::Done)
                 || session.pending.is_some())
@@ -78,7 +78,7 @@ impl State {
             let session = &mut self.sessions[index];
             // Provider-specific native dialogs are answered in their own terminals. The
             // existing screen recognizer and keystroke answers target Claude and Codex.
-            if self.config.agent(&session.agent).and_then(|agent| agent.provider()).is_some() {
+            if session.provider.is_some() {
                 continue;
             }
             if session.sandbox.is_some() {
@@ -211,10 +211,7 @@ impl State {
     /// withdraws its approval at once; a screen with no menu leaves it to the quiet period.
     pub(super) fn sync_native(&mut self, index: usize, screen: &str, now: Instant) {
         let session = &mut self.sessions[index];
-        if session.sandbox.is_some()
-            || !session.is_agent()
-            || session.terminal.is_none()
-            || self.config.agent(&session.agent).and_then(|agent| agent.provider()).is_some()
+        if session.sandbox.is_some() || !session.is_agent() || session.terminal.is_none() || session.provider.is_some()
         {
             return;
         }
