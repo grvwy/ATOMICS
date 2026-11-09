@@ -507,6 +507,8 @@ impl State {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "atomics".into());
         let socket = paths::socket_path().to_string_lossy().into_owned();
+        // Hooks name a path that survives updates where there is one, so Codex's trust in them lasts.
+        let hooks_exe = crate::setup::hook_executable().unwrap_or_else(|_| PathBuf::from(&exe));
         match agent.kind {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
@@ -555,7 +557,7 @@ impl State {
                     if !args.iter().any(|arg| arg == "--no-daemon") {
                         args.push("--no-daemon".into());
                     }
-                    args.extend(atomics_core::hook::codex_hook_args(Path::new(&exe), Path::new(&socket), &id));
+                    args.extend(atomics_core::hook::codex_hook_args(&hooks_exe, Path::new(&socket), &id));
                     // The handlers find this pane without process ancestry, which a wrapper
                     // such as ssh into a VM would hide.
                     env.insert(atomics_core::hook::HOOK_PANE_ENV.into(), id.clone());
@@ -593,9 +595,9 @@ impl State {
             args.push(match sandboxed {
                 None => {
                     let mut settings = if chief {
-                        atomics_core::hook::chief_session_settings(Path::new(&exe), Path::new(&socket), &id)
+                        atomics_core::hook::chief_session_settings(&hooks_exe, Path::new(&socket), &id)
                     } else {
-                        atomics_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false)
+                        atomics_core::hook::session_settings(&hooks_exe, Path::new(&socket), &id, false)
                     };
                     if let Some(granted) = &relay {
                         settings["apiKeyHelper"] = "".into();
