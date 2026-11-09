@@ -719,7 +719,7 @@ such dependencies afresh and answers once their checks have, or after 100 s, ins
 The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count
 and total changed lines (additions plus deletions) across those sessions. Its button shows the selected project's name
 in a project view, otherwise **Repos · total changes**. Then comes one **Boards** dropdown. Its button names the board on
-screen, and a warning marker counts the boards that need you. Its menu lists those first, under **Needs you**: plans
+screen, at most 360 points wide (a longer goal ends in an ellipsis; hover for all of it), and a warning marker counts the boards that need you. Its menu lists those first, under **Needs you**: plans
 waiting for approval, and plans with a blocked task, a question or an agent's permission request. Then **Active** lists
 the other open boards, each with done/total and its state, then **History**. A row shows its board, and the board's
 **Approve plan** approves it. Each open board's row has a close button that asks first. Tabs that do not fit fold into this menu too, the selected one last.

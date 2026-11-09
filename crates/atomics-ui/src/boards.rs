@@ -17,6 +17,9 @@ const FONT: f32 = 13.0;
 /// A row's height, and the widest the menu gets.
 const ROW: f32 = 28.0;
 const MENU_WIDTH: f32 = 480.0;
+/// The widest the button gets in the bar, however wide the window: a longer goal ends in an ellipsis, and the
+/// button's hover shows it whole.
+const BUTTON_WIDTH: f32 = 360.0;
 /// The columns right of a board's name: its progress, then its state.
 const PROGRESS: f32 = 44.0;
 const STATE: f32 = 96.0;
@@ -107,7 +110,8 @@ impl Boards {
     }
 }
 
-/// The dropdown's width in the bar: as it wants to be, and with no more than the word for a label.
+/// The dropdown's width in the bar: as it wants to be, up to [`BUTTON_WIDTH`], and with no more than the word for a
+/// label.
 pub fn widths(ui: &mut egui::Ui, backend: &dyn Backend, palette: &Palette) -> (f32, f32) {
     let boards = Boards::read(backend);
     let waiting = boards.waiting(backend);
@@ -118,7 +122,7 @@ pub fn widths(ui: &mut egui::Ui, backend: &dyn Backend, palette: &Palette) -> (f
     let word = measure(ui, |ui| {
         ui.add(button("Boards", waiting, selected, palette));
     });
-    (natural, natural.min(word))
+    (natural.min(BUTTON_WIDTH.max(word)), natural.min(word))
 }
 
 /// The Boards dropdown, `width` wide, with what `folded` draws, if anything is folded, at the end of its menu.

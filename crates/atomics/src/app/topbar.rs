@@ -98,10 +98,22 @@ mod tests {
         width: f32,
         events: Vec<egui::Event>,
     ) -> (Vec<(String, Rect)>, egui::FullOutput) {
+        render_at(app, ctx, width, None, events)
+    }
+
+    /// [`render`] at `time`, for what shows only after a while, such as a hover's text.
+    fn render_at(
+        app: &mut Desktop<'_>,
+        ctx: &egui::Context,
+        width: f32,
+        time: Option<f64>,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, Rect)>, egui::FullOutput) {
         ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("topbar-items"), Vec::<(String, Rect)>::new()));
         let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 800.0))),
+                time,
                 events,
                 ..Default::default()
             },
@@ -695,7 +707,9 @@ mod tests {
                 app.runtime.toast = None;
                 app.runtime.config_error = None;
                 app.runtime.hook_error = None;
-                let goal = "Plan 2: resource budgets and built-in approval rules";
+                // Short enough for the button at its widest.
+                let goal = "Plan 2: resource budgets and approvals";
+                app.runtime.plans[2].goal = goal.into();
                 let name_of = |output: &egui::FullOutput, boards: Rect| {
                     output.shapes.iter().find_map(|shape| match &shape.shape {
                         egui::Shape::Text(text)
@@ -714,6 +728,51 @@ mod tests {
                 let boards = narrow.0.iter().find(|(name, _)| name == "Boards").unwrap().1;
                 assert_eq!(name_of(&narrow.1, boards), Some(true), "it shortens rather than leaves the bar");
                 narrow.1.drop_without_applying_deltas();
+            },
+        );
+    }
+
+    #[test]
+    fn a_long_goal_keeps_the_button_narrow_in_a_wide_bar_and_shows_whole_on_hover() {
+        with_app(
+            "app::topbar::tests::a_long_goal_keeps_the_button_narrow_in_a_wide_bar_and_shows_whole_on_hover",
+            |app, ctx| {
+                fixture(app, 3);
+                app.runtime.toast = None;
+                app.runtime.config_error = None;
+                app.runtime.hook_error = None;
+                let goal =
+                    format!("Plan 2: {}", "resource budgets and built-in approval rules for every agent, ".repeat(8));
+                let goal = goal.trim_end().to_string();
+                app.runtime.plans[2].goal = goal.clone();
+                let texts = |output: &egui::FullOutput| -> Vec<(bool, Pos2)> {
+                    output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text().starts_with(&goal) => {
+                                Some((text.galley.elided, text.visual_bounding_rect().center()))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+                // A window about 3750 points wide: the button stays near 360 points, the goal cut short in it.
+                let width = 3750.0;
+                let (items, output) = render_at(app, ctx, width, Some(0.0), vec![]);
+                let boards = items.iter().find(|(name, _)| name == "Boards").unwrap().1;
+                assert!(boards.width() <= 361.0, "{boards:?}");
+                let shown = texts(&output);
+                assert!(shown.iter().any(|&(elided, at)| elided && boards.contains(at)), "{shown:?}");
+                output.drop_without_applying_deltas();
+                // Hovering it shows the whole goal.
+                for (time, events) in [(1.0, vec![egui::Event::PointerMoved(boards.center())]), (2.0, vec![])] {
+                    render_at(app, ctx, width, Some(time), events).1.drop_without_applying_deltas();
+                }
+                let (_, output) = render_at(app, ctx, width, Some(3.0), vec![]);
+                let shown = texts(&output);
+                assert!(shown.iter().any(|&(elided, at)| !elided && !boards.contains(at)), "{shown:?}");
+                output.drop_without_applying_deltas();
             },
         );
     }
