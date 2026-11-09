@@ -28,6 +28,7 @@ in
     ./vm/image.nix
     ./vm/hardened.nix
     ./vm/egress.nix
+    ./vm/docker-images.nix
   ];
 
   options.atomics.vm = {
